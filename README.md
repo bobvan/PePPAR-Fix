@@ -20,6 +20,11 @@ Carrier-phase observations are ~100x more precise than code.  A fixed-position
 PPP-AR filter can estimate the receiver clock continuously at 1-10 Hz with
 sub-nanosecond precision, giving a much richer error signal to the PHC servo.
 
+Critically, carrier phase provides the clock *frequency* (dt_dot) at sub-ppb
+precision.  The PPS path through the NIC's SDP pin (~15-30 ns jitter on i226)
+only needs to carry the slowly-varying *phase* correction — not the frequency —
+so it can be averaged much more aggressively than in a PPS-only GPSDO.
+
 ## Architecture
 
 ```
