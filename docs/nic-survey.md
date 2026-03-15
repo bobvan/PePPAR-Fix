@@ -15,6 +15,57 @@ Devices without both are disqualified.
 | TimeNIC | 1 ns | ~0.12 | ±62.5 ppm | 2 SMA | TCXO ±280 ppb | PCIe 3.1 x1, 2.5G | $200 | i226 + TCXO + SMA, turnkey |
 | TimeHAT | 1 ns | ~0.12 | ±62.5 ppm | 2 SMA + 2 U.FL | TCXO ±280 ppb | Pi 5 HAT, 2.5G | $200 | i226 + TCXO, Pi 5 only |
 
+### Solarflare (AMD/Xilinx) — Bob has ×2 SFN6322F, ×4 SFN8522
+
+| Device | PHC Res | adjfine | max_adj | PPS I/O | Oscillator | Interface | Price | Notes |
+|---|---|---|---|---|---|---|---|---|
+| **SFN6322F** ×2 | 1 ns | Unknown | Unknown | **u.FL on PCB** (PPS bracket) | Stratum 3 (<0.37 PPM/day) | PCIe 2.0/3.0, 2×10G SFP+ | ~$30 used | PTP standard (no license). HW tstamp: PTP pkts only, single port. **Bob has 2.** |
+| **SFN8522** ×4 | 1 ns | Unknown | Unknown | **u.FL on PCB** | Stratum 3 (<0.37 PPM/day) | PCIe 3.1 x8, 2×10G SFP+ | ~$25 used | **Needs AppFlex PTP license** (PLUS variant has it pre-installed). HW tstamp: all packets. **Bob has 4 (license status unknown).** |
+| SFN8522-PLUS | 1 ns | Unknown | Unknown | u.FL on PCB | Stratum 3 (<0.37 PPM/day) | PCIe 3.1 x8, 2×10G SFP+ | ~$50 used | PTP license pre-installed. Same HW as SFN8522. |
+
+**Solarflare notes:**
+- All use `sfc` driver + `sfptpd` daemon (AMD maintains both, open source)
+- Stratum 3 oscillator: < 0.37 PPM/day, < 4.6 PPM over 20 years — better than
+  bare i226 XO (~20-50 PPM/temp) but worse than TimeHAT TCXO (±280 ppb)
+- PPS connectors are **u.FL on the PCB**, not SMA on the bracket. Need u.FL→SMA
+  pigtails to connect to external PPS sources/sinks
+- adjfine/adjfreq granularity not documented in public sources
+- SFN6322F: HW timestamping limited to PTP packets, single port (closest to PCIe)
+- SFN8522/PLUS: HW timestamps on ALL packets, both ports — significantly better
+
+#### Testing for PTP license on SFN8522
+
+The SFN8522 base model requires an AppFlex license key for PTP. To check:
+
+```bash
+# 1. Install Solarflare utilities (sfkey, sfupdate, sfboot)
+#    Available from AMD: https://www.amd.com/en/support/downloads/drivers.html/solarflare.html
+
+# 2. List installed license keys
+sfkey list
+
+# 3. Check hardware timestamping capability (quick test)
+ethtool -T <interface>
+# If PTP is licensed, you'll see:
+#   SOF_TIMESTAMPING_TX_HARDWARE
+#   SOF_TIMESTAMPING_RX_HARDWARE
+#   SOF_TIMESTAMPING_RAW_HARDWARE
+# If NOT licensed, only software timestamping will appear.
+
+# 4. Check if PHC device appeared
+ls /dev/ptp*
+# A /dev/ptpN should appear for a licensed adapter
+
+# 5. Verify driver version and firmware
+ethtool -i <interface>
+```
+
+If no PTP license is present, the cards are still 10G NICs but cannot do
+hardware timestamping or PPS — functionally equivalent to the base SFN8122F
+for our purposes (disqualified). AppFlex license keys were sold by Solarflare;
+with the company absorbed into AMD, obtaining new keys may be difficult.
+Check if the keys are tied to the NIC's MAC or serial number.
+
 ### Enterprise Tier
 
 | Device | PHC Res | adjfine | max_adj | PPS I/O | Oscillator | Interface | Price | Notes |
@@ -68,8 +119,7 @@ needs to maintain accuracy during brief GNSS outages, the TCXO is essential.
 | Device | Reason |
 |---|---|
 | Broadcom BCM54210PE (CM4/CM5) | Single pin for PPS — can't do simultaneous IN + OUT |
-| Solarflare SFN6122F | Base 10G NIC — no PTP timestamping, no PPS I/O. The PTP variant is SFN**6322**F (different hardware with precision oscillator + SMA bracket). Bob has this card. |
-| Solarflare SFN7122F | Base 10G NIC — has PHC via `sfc` driver but no PPS connectors. PPS bracket kit (SOLR-PPS-DP10G) was a special-order retrofit for SFN7000 series but is unobtainable (Solarflare → Xilinx → AMD). The PTP variant SFN**7322**F has SMA PPS I/O built-in. Bob has this card. |
+| Solarflare SFN6122F / SFN7122F | Base 10G NICs — no PPS connectors. PTP variants (SFN6322F / SFN7322F) have PPS. SFN7000 bracket kit (SOLR-PPS-DP10G) unobtainable. |
 | Marvell/Aquantia AQR | No PPS I/O pins |
 | Microchip LAN743x | No PPS input (n_ext_ts=0) |
 | Microchip LAN937x | No PPS I/O |
@@ -78,11 +128,6 @@ needs to maintain accuracy during brief GNSS outages, the TCXO is essential.
 | Calnex Sentinel | Test equipment ($15k+), not a timing card |
 | EndRun Technologies | Complete appliances, not PCIe cards |
 
-**Note on Solarflare PTP variants (SFN6322F / SFN7322F):** These *would* qualify —
-1 ns PHC resolution, SMA PPS IN + OUT, Stratum 3 oscillator (< 1 PPM/year),
-`sfc` driver + sfptpd. But Bob has the base models (6122F / 7122F), not the
-PTP variants, and the PPS bracket kit is unobtainable. Used SFN7322F cards
-occasionally appear on eBay for $50-100 and would be worth grabbing if spotted.
 
 ## Recommendation for PePPAR Fix
 
@@ -102,22 +147,28 @@ Each setup needs: F9T receiver + NIC with PHC + PPS IN + PPS OUT.
 **Current setup (TimeHat)**: TimeHAT v5 (i226) + F9T-TOP → runs SatPulse.
 This is already deployed and working.
 
-**Second setup needed for PePPAR Fix**: Needs another Pi 5 + NIC with PPS I/O,
-or a PCIe host. Options:
+**Second setup needed for PePPAR Fix**: Needs another NIC with PHC + PPS I/O,
+plus a host with PCIe or a Pi 5. Options from inventory first:
 
 | Option | Cost | Pros | Cons |
 |--------|------|------|------|
-| TimeHAT v6 + Pi 5 | ~$200 + Pi 5 | Identical to SatPulse setup, proven | Need another Pi 5 |
-| TimeNIC + any x86 | ~$200 | Same i226+TCXO, works with any PCIe host | Needs an available PCIe slot |
-| Intel i210 + breakout | ~$50 + wiring | Cheapest, best timing docs | Pin header needs SMA breakout board, no TCXO |
-| Solarflare SFN7322F (used) | ~$50-100 if found | 10G, Stratum 3 osc, SMA PPS | Rare, old, sfptpd instead of standard tools |
+| **SFN6322F** (have ×2) | $0 + u.FL pigtails | Already owned, Stratum 3 osc, 10G | Needs PCIe host, sfptpd toolchain, HW tstamp PTP-only |
+| **SFN8522** (have ×4) | $0 + u.FL pigtails | Already owned, Stratum 3, all-pkt tstamp | **PTP license may be missing** — must test with `ethtool -T` |
+| TimeHAT v6 + Pi 5 | ~$200 + Pi 5 | Identical to SatPulse setup, proven | Cost |
+| TimeNIC + any x86 | ~$200 | Same i226+TCXO, works with any PCIe host | Cost |
+| Intel i210 + breakout | ~$50 + wiring | Cheapest, best timing docs | Pin header needs SMA breakout, no TCXO |
 
-**Recommendation**: Second TimeHAT ($200) on a second Pi 5. Keeps both setups
-identical, both proven with SatPulse/PePPAR Fix, minimal integration risk.
-The Solarflare cards Bob already has (6122F, 7122F) are disqualified — no PPS I/O.
+**Recommendation**: Test the SFN8522 cards first — if any have the PTP license,
+that's a $0 solution with a better oscillator than a bare i226. The SFN6322F
+pair is a guaranteed fallback (PTP is standard, no license needed). Either way
+you'll need u.FL→SMA pigtails (~$5 each) and a PCIe host. If no PCIe host is
+available, a second TimeHAT on a Pi 5 remains the cleanest path.
 
-**Order now**:
-- [ ] TimeHAT v6 ($200) — second setup for PePPAR Fix
+**Action items**:
+- [ ] Plug an SFN8522 into any Linux box, run `ethtool -T <iface>` to check PTP license
+- [ ] If licensed → u.FL pigtails + PCIe host = done
+- [ ] If not licensed → use SFN6322F (PTP standard, guaranteed)
+- [ ] Order u.FL→SMA pigtails (×2 per card: PPS IN + PPS OUT)
 - [ ] Intel E810-XXVDA4T (~$1,100) — precision upgrade (later)
 
 ## Sources
@@ -138,3 +189,5 @@ The Solarflare cards Bob already has (6122F, 7122F) are disqualified — no PPS 
 - [sfptpd — AMD Solarflare Enhanced PTP Daemon](https://github.com/Xilinx-CNS/sfptpd)
 - [Solarflare SFN6322F product brief](https://www.bhphotovideo.com/c/product/1017856-REG/solarflare_sfn6322f_solarflare_srvr_adptr_crd.html)
 - [Solarflare PPS I/O specification (Manualzz)](https://manualzz.com/doc/o/k605n/solarflare-enhanced-ptp-user-guide-solarflare-sfptpd-1pps-i-o-specification)
+- [Solarflare Server Adapter User Guide (sfkey/sfboot/sfupdate)](https://www.amd.com/content/dam/amd/en/support/downloads/solarflare/drivers-software/SF-103837-CD-28_Solarflare_Server_Adapter_User_Guide.pdf)
+- [SFN8522-PLUS product brief](https://www.xilinx.com/content/dam/amd/en/documents/products/ethernet-adapters/SFN8522-plus-Onload-product-brief.pdf)
