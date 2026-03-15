@@ -225,8 +225,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                     cp_f1 = f1['cp']
                     cp_f2 = f2['cp']
 
-                    # Apply SSR code/phase biases before IF combination
-                    n_bias = 0
+                    # Apply SSR code biases before IF combination
                     if ssr is not None:
                         rinex_f1 = SIG_TO_RINEX.get(f1['sig_name'])
                         rinex_f2 = SIG_TO_RINEX.get(f2['sig_name'])
@@ -236,7 +235,10 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                             if cb_f1 is not None and cb_f2 is not None:
                                 pr_f1 -= cb_f1
                                 pr_f2 -= cb_f2
-                                n_bias += 1
+                                if n_epochs < 2:
+                                    log.info(f"    BIAS {sv}: {rinex_f1[0]}={cb_f1:.3f}m "
+                                             f"{rinex_f2[0]}={cb_f2:.3f}m "
+                                             f"IF_delta={(a1*cb_f1 - a2*cb_f2):.3f}m")
 
                     pr_if = a1 * pr_f1 - a2 * pr_f2
                     wl_f1, wl_f2, _, _ = IF_WL[prefix]
@@ -273,7 +275,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                                  f"f1={f1_sig}:{f1_pr:.1f} "
                                  f"f2={f2_sig}:{f2_pr:.1f}")
 
-                if len(observations) >= 4:
+                if len(observations) >= 3:
                     # Compute GPS time from RAWX header
                     gps_epoch = datetime(1980, 1, 6, tzinfo=timezone.utc)
                     gps_time = gps_epoch + timedelta(weeks=week, seconds=rcvTow)
