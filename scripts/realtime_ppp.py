@@ -87,11 +87,15 @@ for _mt in range(1240, 1264):
 
 # ── Serial observation reader ──────────────────────────────────────────────── #
 
-def serial_reader(port, baud, obs_queue, stop_event, beph):
+def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None):
     """Read UBX messages from F9T serial port.
 
     Puts (timestamp, observations_list) tuples onto obs_queue for each
     RXM-RAWX epoch. Also feeds RXM-SFRBX to broadcast ephemeris.
+
+    Args:
+        systems: set of system names to include (e.g. {'gps', 'gal', 'bds'}).
+                 None means all systems.
     """
     try:
         from pyubx2 import UBXReader
@@ -190,7 +194,15 @@ def serial_reader(port, baud, obs_queue, stop_event, beph):
 
                 # Form IF observations
                 observations = []
+                PREFIX_TO_SYS = {'G': 'gps', 'E': 'gal', 'C': 'bds'}
                 for sv, roles in raw_obs.items():
+                    prefix = sv[0]
+                    sys_name = PREFIX_TO_SYS.get(prefix)
+
+                    # System filter
+                    if systems and sys_name not in systems:
+                        continue
+
                     if 'f1' not in roles or 'f2' not in roles:
                         continue
                     f1 = roles['f1']
@@ -203,7 +215,6 @@ def serial_reader(port, baud, obs_queue, stop_event, beph):
 
                     a1 = f1['alpha_f1']
                     a2 = f1['alpha_f2']
-                    prefix = sv[0]
 
                     pr_if = a1 * f1['pr'] - a2 * f2['pr']
                     wl_f1, wl_f2, _, _ = IF_WL[prefix]
@@ -211,13 +222,34 @@ def serial_reader(port, baud, obs_queue, stop_event, beph):
 
                     observations.append({
                         'sv': sv,
-                        'sys': 'gps' if prefix == 'G' else ('gal' if prefix == 'E' else 'bds'),
+                        'sys': sys_name,
                         'pr_if': pr_if,
                         'phi_if_m': phi_if_m,
                         'cno': min(f1['cno'], f2['cno']),
                         'lock_duration_ms': min(f1['lock_ms'], f2['lock_ms']),
                         'half_cyc_ok': True,
                     })
+
+                # Diagnostic dump (first 3 epochs, then every 60)
+                if n_epochs < 3 or n_epochs % 60 == 0:
+                    log.info(f"Serial diag epoch {n_epochs}: "
+                             f"raw_obs={len(raw_obs)} SVs, "
+                             f"IF_obs={len(observations)} SVs, "
+                             f"systems_filter={systems}")
+                    for sv, roles in sorted(raw_obs.items()):
+                        prefix = sv[0]
+                        sys_name = PREFIX_TO_SYS.get(prefix, '?')
+                        filtered = systems and sys_name not in systems
+                        has_dual = 'f1' in roles and 'f2' in roles
+                        f1_pr = roles.get('f1', {}).get('pr', 0)
+                        f2_pr = roles.get('f2', {}).get('pr', 0)
+                        f1_sig = roles.get('f1', {}).get('sig_name', '?')
+                        f2_sig = roles.get('f2', {}).get('sig_name', '?')
+                        log.info(f"  {sv} sys={sys_name} "
+                                 f"{'FILTERED' if filtered else 'PASS'} "
+                                 f"dual={'Y' if has_dual else 'N'} "
+                                 f"f1={f1_sig}:{f1_pr:.1f} "
+                                 f"f2={f2_sig}:{f2_pr:.1f}")
 
                 if len(observations) >= 4:
                     # Compute GPS time from RAWX header
@@ -422,10 +454,14 @@ def run_realtime(args):
                 log.info(f"  Warmup: {beph.summary()}")
         log.info(f"Warmup complete: {beph.summary()}")
 
+    # Parse systems filter
+    systems = set(args.systems.split(',')) if args.systems else None
+    log.info(f"Systems filter: {systems}")
+
     # Start serial reader
     t_serial = threading.Thread(
         target=serial_reader,
-        args=(args.serial, args.baud, obs_queue, stop_event, beph),
+        args=(args.serial, args.baud, obs_queue, stop_event, beph, systems),
         daemon=True,
     )
     t_serial.start()
