@@ -1,0 +1,4 @@
+numpy
+pyubx2>=1.2.60
+pyserial
+pyrtcm>=1.1.0

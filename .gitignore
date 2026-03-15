@@ -1,0 +1,15 @@
+# Observation data and correction products (large, downloadable)
+data/
+
+# Credentials
+ntrip.conf
+*.secrets
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Binary dumps
+*.rtcm
+*.bin

@@ -1,0 +1,23 @@
+[ntrip]
+# IGS-IP observation streams (confirmed working)
+caster = igs-ip.net
+port = 2101
+mount = ALGO00CAN0
+user = bobvan
+password = CHANGEME
+tls = false
+
+# IGS RTS SSR corrections on BKG products caster (pending access)
+# caster = products.igs-ip.net
+# port = 2101
+# mount = IGS03
+# user = bobvan
+# password = CHANGEME
+
+# NASA CDDIS mirror (pending app authorization propagation)
+# caster = caster.cddis.eosdis.nasa.gov
+# port = 443
+# mount = SSRA03IGS0
+# user = bobvan
+# password = CHANGEME
+# tls = true
