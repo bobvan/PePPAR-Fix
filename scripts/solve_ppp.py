@@ -523,8 +523,14 @@ class FixedPosFilter:
                              f"elev={el:.1f}° resid={res:.1f}m")
             if len(residuals) >= 4:
                 self.x[0] = float(np.median(residuals))
+                # Reset P[0,0] to reflect post-seed uncertainty (~50m)
+                # Without this, P[0,0]=1e18 makes S matrix near-singular
+                # (condition number ~1e16), causing Kalman gain to fail
+                spread = np.std(residuals) if len(residuals) > 1 else 100.0
+                self.P[0, 0] = max(spread, 50.0) ** 2
                 log.info(f"Clock seeded from {len(residuals)} PRs: "
-                         f"{self.x[0]/C*1e6:.1f} µs")
+                         f"{self.x[0]/C*1e6:.1f} µs "
+                         f"(P[0,0] reset to {self.P[0,0]:.0f} m²)")
                 self.initialized = True
 
         for obs in observations:
