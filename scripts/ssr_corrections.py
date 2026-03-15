@@ -57,34 +57,51 @@ _IGS_SSR_SYSTEMS = {
 _RTCM_SSR = {
     '1057': ('G', 'orbit'),   '1058': ('G', 'clock'),
     '1059': ('G', 'code_bias'), '1060': ('G', 'combined'),
-    '1062': ('G', 'hr_clock'),
+    '1062': ('G', 'hr_clock'), '1265': ('G', 'phase_bias'),
+    '1063': ('R', 'orbit'),   '1064': ('R', 'clock'),
+    '1065': ('R', 'code_bias'), '1066': ('R', 'combined'),
+    '1067': ('R', 'phase_bias'),
     '1240': ('E', 'orbit'),   '1241': ('E', 'clock'),
     '1242': ('E', 'code_bias'), '1243': ('E', 'combined'),
-    '1245': ('E', 'hr_clock'),
+    '1245': ('E', 'hr_clock'), '1267': ('E', 'phase_bias'),
     '1258': ('C', 'orbit'),   '1259': ('C', 'clock'),
     '1260': ('C', 'code_bias'), '1261': ('C', 'combined'),
-    '1263': ('C', 'hr_clock'),
+    '1263': ('C', 'hr_clock'), '1270': ('C', 'phase_bias'),
 }
 
-# IGS SSR signal tracking mode ID → RINEX observation code
-# This mapping covers the signals we use for IF combination
+# SSR signal tracking mode ID → RINEX observation code
+# This mapping covers both IGS SSR and standard RTCM SSR signal IDs.
+# Standard RTCM SSR uses the same GNSS Signal and Tracking Mode Indicator
+# table as defined in RTCM 3.x (Table 3.5-91 for GPS, etc.)
 _SSR_SIGNAL_MAP = {
-    # GPS
+    # GPS (RTCM SSR signal IDs)
     ('G', 0): 'C1C',   # L1 C/A
+    ('G', 2): 'C1P',   # L1 P
     ('G', 5): 'C1W',   # L1 Z-tracking (P(Y))
-    ('G', 11): 'C2W',  # L2 Z-tracking
+    ('G', 7): 'C2C',   # L2 C/A
+    ('G', 8): 'C2P',   # L2 P
+    ('G', 9): 'C2W',   # L2 Z-tracking
+    ('G', 11): 'C2W',  # L2 Z-tracking (alt)
     ('G', 14): 'C5Q',  # L5 Q
     ('G', 15): 'C5I',  # L5 I
     ('G', 16): 'L1C',  # L1 C/A phase
+    ('G', 19): 'C1L',  # L1C (data+pilot)
     ('G', 21): 'L1W',  # L1 P(Y) phase
     ('G', 27): 'L2W',  # L2 P(Y) phase
     ('G', 30): 'L5Q',  # L5 Q phase
     ('G', 31): 'L5I',  # L5 I phase
+    # GLONASS
+    ('R', 0): 'C1C',   # G1 C/A
+    ('R', 2): 'C1P',   # G1 P
+    ('R', 3): 'C2C',   # G2 C/A
+    ('R', 5): 'C2P',   # G2 P
     # Galileo
     ('E', 0): 'C1C',   # E1 C
     ('E', 1): 'C1B',   # E1 B
     ('E', 5): 'C5Q',   # E5a Q
     ('E', 6): 'C5I',   # E5a I
+    ('E', 8): 'C7Q',   # E5b Q
+    ('E', 9): 'C7I',   # E5b I
     ('E', 16): 'L1C',  # E1 C phase
     ('E', 17): 'L1B',  # E1 B phase
     ('E', 21): 'L5Q',  # E5a Q phase
@@ -92,6 +109,7 @@ _SSR_SIGNAL_MAP = {
     # BDS
     ('C', 0): 'C2I',   # B1I
     ('C', 5): 'C5I',   # B2a I
+    ('C', 9): 'C7I',   # B2b I
     ('C', 16): 'L2I',  # B1I phase
     ('C', 21): 'L5I',  # B2a I phase
 }
@@ -213,25 +231,61 @@ class SSRState:
         self._update_counts[subtype] += 1
         return subtype
 
+    @staticmethod
+    def _get_sat_id(msg, i):
+        """Get satellite ID from message, trying both IGS and standard RTCM fields."""
+        for field in (f'IDF011_{i:02d}', f'DF068_{i:02d}', f'DF384_{i:02d}'):
+            val = getattr(msg, field, None)
+            if val is not None:
+                return int(val)
+        return None
+
+    @staticmethod
+    def _get_iod(msg, i):
+        """Get IOD from message."""
+        for field in (f'IDF012_{i:02d}', f'DF071_{i:02d}', f'DF392_{i:02d}'):
+            val = getattr(msg, field, None)
+            if val is not None:
+                return int(val)
+        return 0
+
     def _parse_orbit(self, msg, sys_prefix, epoch_s, n_sats):
-        """Extract per-satellite orbit corrections from an SSR message."""
+        """Extract per-satellite orbit corrections from an SSR message.
+
+        Supports both IGS SSR (IDF fields) and standard RTCM SSR (DF fields).
+        Standard RTCM SSR orbit fields (pyrtcm):
+          DF365 = radial (mm), DF366 = along-track (mm), DF367 = cross-track (mm)
+          DF368/369/370 = velocity corrections (mm/s)
+        IGS SSR fields: IDF013-018
+        """
         for i in range(1, n_sats + 1):
-            sat_id = getattr(msg, f'IDF011_{i:02d}', None)
-            if sat_id is None:
-                sat_id = getattr(msg, f'DF384_{i:02d}', None)
+            sat_id = self._get_sat_id(msg, i)
             if sat_id is None:
                 continue
-            prn = f"{sys_prefix}{int(sat_id):02d}"
+            prn = f"{sys_prefix}{sat_id:02d}"
 
-            iod = getattr(msg, f'IDF012_{i:02d}', None) or getattr(msg, f'DF392_{i:02d}', 0)
-            radial = getattr(msg, f'IDF013_{i:02d}', 0.0)
-            along = getattr(msg, f'IDF014_{i:02d}', 0.0)
-            cross = getattr(msg, f'IDF016_{i:02d}',
-                            getattr(msg, f'IDF015_{i:02d}', 0.0))
-            dot_r = getattr(msg, f'IDF015_{i:02d}',
-                            getattr(msg, f'IDF016_{i:02d}', 0.0))
-            dot_a = getattr(msg, f'IDF017_{i:02d}', 0.0)
-            dot_c = getattr(msg, f'IDF018_{i:02d}', 0.0)
+            iod = self._get_iod(msg, i)
+
+            # Try IGS SSR fields first, then standard RTCM SSR
+            radial = getattr(msg, f'IDF013_{i:02d}', None)
+            if radial is None:
+                # Standard RTCM SSR: DF365-370 are in mm, convert to meters
+                radial_mm = getattr(msg, f'DF365_{i:02d}', None)
+                if radial_mm is not None:
+                    radial = radial_mm / 1000.0
+                    along = getattr(msg, f'DF366_{i:02d}', 0.0) / 1000.0
+                    cross = getattr(msg, f'DF367_{i:02d}', 0.0) / 1000.0
+                    dot_r = getattr(msg, f'DF368_{i:02d}', 0.0) / 1000.0
+                    dot_a = getattr(msg, f'DF369_{i:02d}', 0.0) / 1000.0
+                    dot_c = getattr(msg, f'DF370_{i:02d}', 0.0) / 1000.0
+                else:
+                    continue
+            else:
+                along = getattr(msg, f'IDF014_{i:02d}', 0.0)
+                cross = getattr(msg, f'IDF015_{i:02d}', 0.0)
+                dot_r = getattr(msg, f'IDF016_{i:02d}', 0.0)
+                dot_a = getattr(msg, f'IDF017_{i:02d}', 0.0)
+                dot_c = getattr(msg, f'IDF018_{i:02d}', 0.0)
 
             self._orbit[prn] = OrbitCorrection(
                 iod=iod, epoch_s=epoch_s,
@@ -240,56 +294,95 @@ class SSRState:
             )
 
     def _parse_clock(self, msg, sys_prefix, epoch_s, n_sats):
-        """Extract per-satellite clock corrections from an SSR message."""
+        """Extract per-satellite clock corrections from an SSR message.
+
+        Standard RTCM SSR clock fields (pyrtcm):
+          DF376 = C0 (mm), DF377 = C1 (mm/s), DF378 = C2 (mm/s²)
+        IGS SSR fields: IDF019-021
+        """
         for i in range(1, n_sats + 1):
-            sat_id = getattr(msg, f'IDF011_{i:02d}', None)
-            if sat_id is None:
-                sat_id = getattr(msg, f'DF384_{i:02d}', None)
+            sat_id = self._get_sat_id(msg, i)
             if sat_id is None:
                 continue
-            prn = f"{sys_prefix}{int(sat_id):02d}"
+            prn = f"{sys_prefix}{sat_id:02d}"
 
-            c0 = getattr(msg, f'IDF019_{i:02d}', 0.0)
-            c1 = getattr(msg, f'IDF020_{i:02d}', 0.0)
-            c2 = getattr(msg, f'IDF021_{i:02d}', 0.0)
+            # Try IGS SSR fields first, then standard RTCM SSR
+            c0 = getattr(msg, f'IDF019_{i:02d}', None)
+            if c0 is None:
+                c0_mm = getattr(msg, f'DF376_{i:02d}', None)
+                if c0_mm is not None:
+                    c0 = c0_mm / 1000.0
+                    c1 = getattr(msg, f'DF377_{i:02d}', 0.0) / 1000.0
+                    c2 = getattr(msg, f'DF378_{i:02d}', 0.0) / 1000.0
+                else:
+                    continue
+            else:
+                c1 = getattr(msg, f'IDF020_{i:02d}', 0.0)
+                c2 = getattr(msg, f'IDF021_{i:02d}', 0.0)
 
             self._clock[prn] = ClockCorrection(
                 epoch_s=epoch_s, c0=c0, c1=c1, c2=c2,
             )
 
     def _parse_code_bias(self, msg, sys_prefix, n_sats):
-        """Extract per-satellite code bias corrections."""
+        """Extract per-satellite code bias corrections.
+
+        Standard RTCM SSR code bias fields (pyrtcm):
+          DF379 = num biases, DF380 = signal ID, DF383 = bias (m)
+        IGS SSR fields: IDF023/024/025
+        """
         for i in range(1, n_sats + 1):
-            sat_id = getattr(msg, f'IDF011_{i:02d}', None)
+            sat_id = self._get_sat_id(msg, i)
             if sat_id is None:
                 continue
-            prn = f"{sys_prefix}{int(sat_id):02d}"
+            prn = f"{sys_prefix}{sat_id:02d}"
 
-            n_biases = getattr(msg, f'IDF023_{i:02d}', 0)
+            # Try IGS then standard
+            n_biases = getattr(msg, f'IDF023_{i:02d}', None)
+            if n_biases is None:
+                n_biases = getattr(msg, f'DF379_{i:02d}', 0)
+            n_biases = int(n_biases)
+
             for j in range(1, n_biases + 1):
                 sig_id = getattr(msg, f'IDF024_{i:02d}_{j:02d}', None)
+                if sig_id is None:
+                    sig_id = getattr(msg, f'DF380_{i:02d}_{j:02d}', None)
                 bias_m = getattr(msg, f'IDF025_{i:02d}_{j:02d}', None)
+                if bias_m is None:
+                    bias_m = getattr(msg, f'DF383_{i:02d}_{j:02d}', None)
                 if sig_id is None or bias_m is None:
                     continue
                 rinex_code = _SSR_SIGNAL_MAP.get((sys_prefix, int(sig_id)))
                 if rinex_code is None:
                     continue
                 self._code_bias[prn][rinex_code] = BiasCorrection(
-                    signal_code=rinex_code, bias_m=bias_m, is_phase=False,
+                    signal_code=rinex_code, bias_m=float(bias_m), is_phase=False,
                 )
 
     def _parse_phase_bias(self, msg, sys_prefix, n_sats):
-        """Extract per-satellite phase bias corrections."""
+        """Extract per-satellite phase bias corrections.
+
+        Standard RTCM SSR uses 1265/1267/1270 for GPS/GAL/BDS phase biases.
+        IGS SSR uses IDF fields.
+        """
         for i in range(1, n_sats + 1):
-            sat_id = getattr(msg, f'IDF011_{i:02d}', None)
+            sat_id = self._get_sat_id(msg, i)
             if sat_id is None:
                 continue
-            prn = f"{sys_prefix}{int(sat_id):02d}"
+            prn = f"{sys_prefix}{sat_id:02d}"
 
-            n_biases = getattr(msg, f'IDF023_{i:02d}', 0)
+            n_biases = getattr(msg, f'IDF023_{i:02d}', None)
+            if n_biases is None:
+                n_biases = getattr(msg, f'DF379_{i:02d}', 0)
+            n_biases = int(n_biases)
+
             for j in range(1, n_biases + 1):
                 sig_id = getattr(msg, f'IDF024_{i:02d}_{j:02d}', None)
+                if sig_id is None:
+                    sig_id = getattr(msg, f'DF380_{i:02d}_{j:02d}', None)
                 bias_m = getattr(msg, f'IDF028_{i:02d}_{j:02d}', None)
+                if bias_m is None:
+                    bias_m = getattr(msg, f'DF383_{i:02d}_{j:02d}', None)
                 if sig_id is None or bias_m is None:
                     continue
                 rinex_code = _SSR_SIGNAL_MAP.get((sys_prefix, int(sig_id)))
@@ -299,7 +392,7 @@ class SSRState:
                 wl_ind = getattr(msg, f'IDF030_{i:02d}_{j:02d}', 0)
                 disc = getattr(msg, f'IDF031_{i:02d}_{j:02d}', 0)
                 self._phase_bias[prn][rinex_code] = BiasCorrection(
-                    signal_code=rinex_code, bias_m=bias_m, is_phase=True,
+                    signal_code=rinex_code, bias_m=float(bias_m), is_phase=True,
                     integer_indicator=int_ind, wl_indicator=wl_ind,
                     disc_counter=disc,
                 )
