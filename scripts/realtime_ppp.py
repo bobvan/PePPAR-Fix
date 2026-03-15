@@ -232,13 +232,15 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                         if rinex_f1 and rinex_f2:
                             cb_f1 = ssr.get_code_bias(sv, rinex_f1[0])
                             cb_f2 = ssr.get_code_bias(sv, rinex_f2[0])
+                            if n_epochs < 1:
+                                avail = list(ssr._code_bias.get(sv, {}).keys())
+                                log.info(f"    BIAS-LOOKUP {sv}: "
+                                         f"want={rinex_f1[0]},{rinex_f2[0]} "
+                                         f"have={avail} "
+                                         f"cb_f1={cb_f1} cb_f2={cb_f2}")
                             if cb_f1 is not None and cb_f2 is not None:
                                 pr_f1 -= cb_f1
                                 pr_f2 -= cb_f2
-                                if n_epochs < 2:
-                                    log.info(f"    BIAS {sv}: {rinex_f1[0]}={cb_f1:.3f}m "
-                                             f"{rinex_f2[0]}={cb_f2:.3f}m "
-                                             f"IF_delta={(a1*cb_f1 - a2*cb_f2):.3f}m")
 
                     pr_if = a1 * pr_f1 - a2 * pr_f2
                     wl_f1, wl_f2, _, _ = IF_WL[prefix]
