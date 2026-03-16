@@ -515,7 +515,8 @@ def run_servo(args):
                 continue
 
             dt_rx_ns = filt.x[filt.IDX_CLK] / C * 1e9
-            dt_rx_sigma = math.sqrt(filt.P[filt.IDX_CLK, filt.IDX_CLK]) / C * 1e9
+            p_clk = filt.P[filt.IDX_CLK, filt.IDX_CLK]
+            dt_rx_sigma = math.sqrt(max(0, p_clk)) / C * 1e9
             n_epochs += 1
 
             # Get the PPS event for this epoch (1:1 pairing)
