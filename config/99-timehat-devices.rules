@@ -1,0 +1,31 @@
+# Stable symlinks for GNSS receiver and TICC on TimeHat (Raspberry Pi 5).
+#
+# Install: sudo cp 99-timehat-devices.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# To discover IDs after plugging in a new device:
+#   udevadm info /dev/ttyACMx | grep -E 'ID_PATH|ID_VENDOR_ID|ID_SERIAL_SHORT'
+#
+# Pattern copied from testAnt rig (99-ublox-gnss.rules) — see shared_files.toml.
+
+# u-blox ZED-F9T NEW (EVK-F9T-20-00) — matched by USB physical path
+# because all F9T EVKs share VID:PID 1546:01a9 and identical serial descriptors.
+# To re-identify: watch `ls /dev/serial/by-path/` while unplugging.
+SUBSYSTEM=="tty", \
+  ENV{ID_VENDOR_ID}=="1546", \
+  ENV{ID_MODEL_ID}=="01a9", \
+  ENV{ID_PATH}=="platform-xhci-hcd.0-usb-0:2:1.0", \
+  SYMLINK+="gnss-top", \
+  MODE="0664", \
+  GROUP="dialout"
+
+# TAPR TICC #3 time interval counter (Arduino Mega, matched by serial number)
+# chA = TimeHAT PHC PPS OUT (SDP0, SMA1 J4, disciplined)
+# chB = F9T-3RD PPS (raw GPS reference)
+# ref = 10 MHz from SV1AFN distribution amp (fed by Geppetto GPSDO)
+SUBSYSTEM=="tty", \
+  ENV{ID_VENDOR_ID}=="2341", \
+  ENV{ID_SERIAL_SHORT}=="44236313835351B0A091", \
+  SYMLINK+="ticc", \
+  MODE="0664", \
+  GROUP="dialout"

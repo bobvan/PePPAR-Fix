@@ -1,0 +1,14 @@
+# shared_files.toml — files copied verbatim from another rig.
+#
+# check_shared.py (and the Deacon plugin) compare these files against the
+# source rig's Gas Town clone.  When they diverge, a bead is created so
+# the discrepancy gets reviewed and either synced or intentionally forked.
+#
+# source_rig  : Gas Town rig name (directory under ~/gt/)
+# source_path : path within that rig's repo
+# local       : path within this repo
+
+[[shared]]
+local       = "scripts/ticc.py"
+source_rig  = "testAnt"
+source_path = "src/testant/ticc.py"

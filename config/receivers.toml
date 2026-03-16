@@ -1,0 +1,14 @@
+# Device configuration for PePPAR Fix on TimeHat.
+#
+# udev rules: config/99-timehat-devices.rules
+# Pattern shared with testAnt rig (see shared_files.toml).
+
+[receiver.3RD]
+port = "/dev/gnss-top"          # udev symlink, stable across reboots (matched by USB ID_PATH)
+baud = 115200
+note = "F9T-3RD (EVK-F9T-20-00, ZED-F9T-20B); Patch2 antenna; no GLONASS (-20B variant)"
+
+[ticc]
+port = "/dev/ticc"              # udev symlink, matched by Arduino serial number
+baud = 115200
+note = "TAPR TICC #3; chA = TimeHAT PHC PPS OUT (SDP0, disciplined), chB = F9T-3RD PPS (raw GPS)"
