@@ -589,8 +589,13 @@ def run_servo(args):
                 mode = ServoMode.CONVERGING
                 servo = PIServo(CONVERGE_KP, CONVERGE_KI,
                                 max_ppb=caps['max_adj'])
-                # Skip a few samples for the step to settle
+                # Wait for step to settle, then flush stale PPS events
                 time.sleep(2)
+                while not pps_queue.empty():
+                    try:
+                        pps_queue.get_nowait()
+                    except queue.Empty:
+                        break
                 continue
 
             elif mode == ServoMode.CONVERGING:
