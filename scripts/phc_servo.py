@@ -305,9 +305,16 @@ def run_servo(args):
     log.info(f"PHC: {args.ptp_dev}, max_adj={caps['max_adj']} ppb, "
              f"n_extts={caps['n_ext_ts']}, n_pins={caps['n_pins']}")
 
+    # Reset adjfine to 0 (clear stale settings from previous runs)
+    ptp.adjfine(0.0)
+    log.info("PHC adjfine reset to 0")
+
     # Configure SDP pin for extts
     extts_channel = 0  # extts channel (not the pin index)
-    ptp.set_pin_function(args.extts_pin, PTP_PF_EXTTS, extts_channel)
+    try:
+        ptp.set_pin_function(args.extts_pin, PTP_PF_EXTTS, extts_channel)
+    except OSError:
+        log.info("Pin config not supported by driver (igc uses implicit mapping)")
     ptp.enable_extts(extts_channel, rising_edge=True)
     log.info(f"EXTTS enabled: pin={args.extts_pin}, channel={extts_channel}")
 
@@ -415,9 +422,8 @@ def run_servo(args):
     n_epochs = 0
     warmup_epochs = 20  # let filter converge before steering
 
-    # Extts state: ring buffer of recent PPS timestamps
-    extts_lock = threading.Lock()
-    extts_events = []  # list of (phc_sec, phc_nsec, monotonic_time)
+    # PPS event queue: extts reader puts events, main loop consumes 1:1
+    pps_queue = queue.Queue(maxsize=10)
 
     def extts_reader():
         """Background thread reading PPS timestamps from PHC."""
@@ -426,23 +432,20 @@ def run_servo(args):
             if event is None:
                 continue
             phc_sec, phc_nsec, _idx = event
-            mono = time.monotonic()
-            with extts_lock:
-                extts_events.append((phc_sec, phc_nsec, mono))
-                # Keep only last 30 events
-                if len(extts_events) > 30:
-                    extts_events.pop(0)
+            try:
+                pps_queue.put_nowait((phc_sec, phc_nsec))
+            except queue.Full:
+                # Drain stale events and put the new one
+                while not pps_queue.empty():
+                    try:
+                        pps_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                pps_queue.put_nowait((phc_sec, phc_nsec))
 
     t_extts = threading.Thread(target=extts_reader, daemon=True)
     t_extts.start()
     log.info("EXTTS reader started")
-
-    def get_latest_pps():
-        """Get the most recent PPS event."""
-        with extts_lock:
-            if not extts_events:
-                return None
-            return extts_events[-1]
 
     def pps_fractional_error(phc_sec, phc_nsec):
         """Compute PHC error from PPS fractional second.
@@ -515,13 +518,13 @@ def run_servo(args):
             dt_rx_sigma = math.sqrt(filt.P[filt.IDX_CLK, filt.IDX_CLK]) / C * 1e9
             n_epochs += 1
 
-            # Get latest PPS event
-            pps = get_latest_pps()
-            if pps is None:
+            # Get the PPS event for this epoch (1:1 pairing)
+            try:
+                phc_sec, phc_nsec = pps_queue.get(timeout=0.5)
+            except queue.Empty:
                 if n_epochs % 10 == 0:
-                    log.info(f"  [{n_epochs}] No PPS events yet")
+                    log.info(f"  [{n_epochs}] No PPS event for this epoch")
                 continue
-            phc_sec, phc_nsec, _mono = pps
 
             # GPS integer second for this PPS
             gps_unix_sec = int(round(gps_time.timestamp()))
@@ -567,17 +570,19 @@ def run_servo(args):
                          f"frac_err={phc_error_ns:+.0f}ns, "
                          f"total={total_offset_ns:+.0f}ns")
 
-                # Use phc_ctl adj for the step (more reliable than ADJ_SETOFFSET)
+                # Use phc_ctl adj for the step (reliable, uses clock_settime)
                 import subprocess
                 adj_ns = -total_offset_ns
                 result = subprocess.run(
-                    ['phc_ctl', args.ptp_dev, 'adj', str(int(adj_ns))],
+                    ['/usr/sbin/phc_ctl', args.ptp_dev, '--',
+                     'adj', str(int(adj_ns))],
                     capture_output=True, text=True,
                 )
                 if result.returncode == 0:
-                    log.info(f"  phc_ctl adj {adj_ns}ns: OK")
+                    log.info(f"  phc_ctl adj {adj_ns}ns: {result.stdout.strip()}")
                 else:
-                    log.error(f"  phc_ctl adj failed: {result.stderr.strip()}")
+                    log.error(f"  phc_ctl adj failed (rc={result.returncode}): "
+                              f"{result.stderr.strip()} {result.stdout.strip()}")
                 stepped = True
                 mode = ServoMode.CONVERGING
                 servo = PIServo(CONVERGE_KP, CONVERGE_KI,
@@ -640,6 +645,10 @@ def run_servo(args):
         log.info("Interrupted")
     finally:
         stop_event.set()
+        try:
+            ptp.adjfine(0.0)  # Don't leave PHC at non-zero rate
+        except Exception:
+            pass
         ptp.disable_extts(extts_channel)
         ptp.close()
         if log_f:
