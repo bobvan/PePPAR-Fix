@@ -550,7 +550,7 @@ def run_servo(args):
             ts_str = gps_time.strftime('%Y-%m-%d %H:%M:%S')
 
             if mode == ServoMode.WARMUP:
-                if n_epochs >= warmup_epochs and dt_rx_sigma < 50.0:
+                if n_epochs >= warmup_epochs:
                     log.info(f"  Warmup complete ({n_epochs} epochs, "
                              f"σ={dt_rx_sigma:.1f}ns, "
                              f"phc_frac_err={phc_error_ns:+.0f}ns, "
