@@ -69,35 +69,35 @@ log = logging.getLogger("phc_servo")
 
 PTP_CLK_MAGIC = ord('=')
 
-# ioctl numbers (computed from _IOWR/_IOW macros)
-def _IOC(direction, typ, nr, size):
-    return (direction << 30) | (typ << 8) | nr | (size << 16)
-
+# ioctl number encoding (Linux _IOC macro)
 _IOC_WRITE = 1
 _IOC_READ = 2
 
-def _IOWR(typ, nr, size):
-    return _IOC(_IOC_READ | _IOC_WRITE, typ, nr, size)
+def _IOC(direction, typ, nr, size):
+    return (direction << 30) | (size << 16) | (typ << 8) | nr
+
+def _IOR(typ, nr, size):
+    return _IOC(_IOC_READ, typ, nr, size)
 
 def _IOW(typ, nr, size):
     return _IOC(_IOC_WRITE, typ, nr, size)
 
 # struct ptp_extts_request { unsigned int index; unsigned int flags; unsigned int rsv[2]; }
-PTP_EXTTS_REQUEST_SIZE = 16
-PTP_EXTTS_REQUEST = _IOW(PTP_CLK_MAGIC, 2, PTP_EXTTS_REQUEST_SIZE)
-PTP_EXTTS_REQUEST2 = _IOW(PTP_CLK_MAGIC, 11, PTP_EXTTS_REQUEST_SIZE)
+PTP_EXTTS_REQUEST = _IOW(PTP_CLK_MAGIC, 2, 16)
+PTP_EXTTS_REQUEST2 = _IOW(PTP_CLK_MAGIC, 11, 16)
 
-# struct ptp_extts_event { struct ptp_clock_time t; unsigned int index; unsigned int flags; }
-# ptp_clock_time = { __s64 sec; __u32 nsec; __u32 reserved; }
-PTP_EXTTS_EVENT_SIZE = 16  # 8 + 4 + 4 (sec, nsec, index_or_reserved)
+# struct ptp_extts_event { ptp_clock_time t; unsigned int index; unsigned int flags; }
+# ptp_clock_time = { __s64 sec; __u32 nsec; __u32 reserved; } = 16 bytes
+# Full event = 16 + 4 + 4 = 24? No — kernel ptp_extts_event is:
+#   struct ptp_clock_time t (16 bytes) + unsigned int index (4) + unsigned int flags (4) = 24
+# But older kernels: t(16) + index(4) = 20, no flags field. Read 32 to be safe.
+PTP_EXTTS_EVENT_SIZE = 32
 
-# struct ptp_clock_caps
-PTP_CLOCK_GETCAPS_SIZE = 80
-PTP_CLOCK_GETCAPS = _IOWR(PTP_CLK_MAGIC, 1, PTP_CLOCK_GETCAPS_SIZE)
+# struct ptp_clock_caps (80 bytes)
+PTP_CLOCK_GETCAPS = _IOR(PTP_CLK_MAGIC, 1, 80)
 
-# struct ptp_pin_desc { char name[64]; unsigned int index; unsigned int func; unsigned int chan; unsigned int rsv[5]; }
-PTP_PIN_SETFUNC_SIZE = 96
-PTP_PIN_SETFUNC = _IOW(PTP_CLK_MAGIC, 7, PTP_PIN_SETFUNC_SIZE)
+# struct ptp_pin_desc { char name[64]; unsigned int index, func, chan; unsigned int rsv[5]; } = 96 bytes
+PTP_PIN_SETFUNC = _IOW(PTP_CLK_MAGIC, 7, 96)
 
 PTP_ENABLE_FEATURE = (1 << 0)
 PTP_RISING_EDGE = (1 << 1)
@@ -180,9 +180,11 @@ class PtpDevice:
         if not r:
             return None
         data = os.read(self.fd, PTP_EXTTS_EVENT_SIZE)
-        if len(data) < PTP_EXTTS_EVENT_SIZE:
+        if len(data) < 20:  # minimum: ptp_clock_time(16) + index(4)
             return None
-        sec, nsec, index = struct.unpack('<qII', data)
+        # ptp_clock_time: s64 sec (8) + u32 nsec (4) + u32 reserved (4) = 16 bytes
+        # then: u32 index (4)
+        sec, nsec, _reserved, index = struct.unpack_from('<qIII', data, 0)
         return (sec, nsec, index)
 
     def adjfine(self, ppb):
