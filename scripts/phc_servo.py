@@ -412,8 +412,15 @@ def run_servo(args):
     # PI gains (from SatPulse, adapted)
     CONVERGE_KP = 0.7
     CONVERGE_KI = 0.3
-    TRACK_KP = 0.3
-    TRACK_KI = 0.1
+    TRACK_KP = args.track_kp
+    TRACK_KI = args.track_ki
+
+    # EMA smoothing of phc_error before feeding to PI (reduces servo noise)
+    ema_alpha = args.ema_alpha  # 0 = no smoothing, 1 = raw sample
+    ema_error = None  # initialized on first tracking sample
+
+    # Adaptive gain scaling based on filter confidence
+    adaptive = args.adaptive_gains
 
     servo = PIServo(CONVERGE_KP, CONVERGE_KI, max_ppb=caps['max_adj'])
     mode = ServoMode.WARMUP
@@ -630,15 +637,40 @@ def run_servo(args):
                     consecutive_good = 0
                     continue
 
-                adjfine_ppb = -servo.update(phc_error_ns)
+                # EMA smoothing: reduces servo noise from PPS measurement jitter
+                if ema_alpha < 1.0:
+                    if ema_error is None:
+                        ema_error = phc_error_ns
+                    else:
+                        ema_error = ema_alpha * phc_error_ns + (1 - ema_alpha) * ema_error
+                    servo_input = ema_error
+                else:
+                    servo_input = phc_error_ns
+
+                # Adaptive gain scaling: scale PI gains by filter confidence.
+                # When filter sigma is small (high confidence), use tighter gains.
+                # When sigma is large (low confidence), use looser gains.
+                if adaptive and dt_rx_sigma > 0:
+                    # Scale factor: 1.0 at sigma=1ns, smaller at lower sigma
+                    # Clamp between 0.1 (very confident) and 2.0 (uncertain)
+                    gain_scale = max(0.1, min(2.0, dt_rx_sigma / 1.0))
+                    servo.kp = TRACK_KP * gain_scale
+                    servo.ki = TRACK_KI * gain_scale
+
+                adjfine_ppb = -servo.update(servo_input)
                 ptp.adjfine(adjfine_ppb)
 
                 if n_epochs % 10 == 0:
+                    extra = ""
+                    if ema_alpha < 1.0:
+                        extra += f" ema={ema_error:+.0f}"
+                    if adaptive:
+                        extra += f" kp={servo.kp:.3f} ki={servo.ki:.3f}"
                     log.info(f"  [{n_epochs}] TRACK: "
                              f"phc_err={phc_error_ns:+.0f}ns "
                              f"adj={adjfine_ppb:+.1f}ppb "
                              f"σ={dt_rx_sigma:.1f}ns "
-                             f"n={n_used}")
+                             f"n={n_used}{extra}")
 
             # Log
             if log_w:
@@ -715,6 +747,15 @@ def main():
                     help="Warmup epochs before steering (default: 20)")
     ap.add_argument("--step-threshold", type=float, default=10000,
                     help="Step clock if offset > this (ns, default: 10000)")
+    ap.add_argument("--track-kp", type=float, default=0.3,
+                    help="Tracking mode Kp gain (default: 0.3)")
+    ap.add_argument("--track-ki", type=float, default=0.1,
+                    help="Tracking mode Ki gain (default: 0.1)")
+    ap.add_argument("--ema-alpha", type=float, default=1.0,
+                    help="EMA smoothing alpha for phc_error (1.0=no smoothing, "
+                         "0.3=heavy smoothing, default: 1.0)")
+    ap.add_argument("--adaptive-gains", action="store_true",
+                    help="Scale PI gains by PPP filter confidence (sigma)")
 
     # Output
     ap.add_argument("--log", default=None,
