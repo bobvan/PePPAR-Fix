@@ -312,8 +312,18 @@ class PIServo:
         """Process one sample. Returns frequency adjustment in ppb.
 
         Args:
-            offset_ns: measured offset in nanoseconds
-            dt: seconds since last correction (scales integral contribution)
+            offset_ns: measured offset in nanoseconds (averaged over dt)
+            dt: seconds since last correction. Scales the integral
+                contribution so that a 2ns mean offset sustained for
+                10s accumulates 10× more integral than 2ns for 1s.
+                The proportional term is NOT scaled — it responds
+                to the current average error magnitude only.
+
+        With M7 accumulate-then-correct:
+            offset_ns = mean of N error samples
+            dt = N (the discipline interval)
+            Proportional: kp * avg_error (instantaneous response)
+            Integral: ki * avg_error * dt ≈ ki * sum_of_errors
         """
         output = self.kp * offset_ns + self.ki * (self.integral + offset_ns * dt)
 
@@ -454,8 +464,10 @@ class DisciplineScheduler:
         if n >= self.interval:
             return True
 
-        # Convergence override: large error → force immediate correction
-        if abs(self._errors[-1]) > self._converge_threshold:
+        # Convergence override: if the AVERAGE so far is large, correct
+        # early.  Don't trigger on a single noisy sample — that causes
+        # oscillation when the servo is still settling after a step.
+        if n >= 3 and abs(sum(self._errors) / n) > self._converge_threshold:
             return True
 
         # Source transition mid-interval
