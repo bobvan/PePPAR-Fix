@@ -652,7 +652,7 @@ def run_servo(args):
             # Example: PHC on GPS time, receiver 9ms behind (dt_rx = -9e6 ns)
             #   PPS arrives 9ms late → pps_error = +9e6 ns
             #   corrected = +9e6 + (-9e6) = 0  ✓
-            if dt_rx_sigma < 10.0 and mode == ServoMode.TRACKING:
+            if dt_rx_sigma < 10.0:
                 phc_error_ns = pps_error_ns + dt_rx_ns
             else:
                 phc_error_ns = pps_error_ns
