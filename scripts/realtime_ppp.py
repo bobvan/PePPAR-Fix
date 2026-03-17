@@ -114,7 +114,7 @@ class QErrStore:
 
 
 def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
-                   ssr=None, qerr_store=None):
+                   ssr=None, qerr_store=None, config_queue=None):
     """Read UBX messages from F9T serial port.
 
     Puts (timestamp, observations_list) tuples onto obs_queue for each
@@ -128,6 +128,8 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
              If provided, biases are applied to raw pseudoranges before
              IF combination (same as OSB in the file-based pipeline).
         qerr_store: QErrStore instance for TIM-TP qErr extraction.
+        config_queue: optional queue.Queue of bytes to write to the serial
+             port (e.g. UBX CFG-VALSET messages from the main thread).
     """
     try:
         from pyubx2 import UBXReader
@@ -166,6 +168,16 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
     n_epochs = 0
 
     while not stop_event.is_set():
+        # Drain config queue: write pending UBX messages to the receiver
+        if config_queue is not None:
+            while not config_queue.empty():
+                try:
+                    cfg_bytes = config_queue.get_nowait()
+                    ser.write(cfg_bytes)
+                    log.info(f"Config sent to receiver ({len(cfg_bytes)} bytes)")
+                except queue.Empty:
+                    break
+
         try:
             raw, parsed = ubr.read()
             if parsed is None:

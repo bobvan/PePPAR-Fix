@@ -672,6 +672,51 @@ def load_position(path):
         return None
 
 
+# ── F9T timing mode switch ──────────────────────────────────────────────── #
+
+def build_tmode_fixed_msg(ecef):
+    """Build UBX CFG-VALSET bytes to switch F9T to fixed-position timing mode.
+
+    Sets TMODE=2 (fixed ECEF) with the given position. This gives the F9T's
+    timing engine the precise position so PPS phase accuracy improves to
+    timing-grade (important for PPS-only and PPS+qErr fallback modes).
+
+    Args:
+        ecef: numpy array [x, y, z] in meters (ECEF)
+
+    Returns:
+        bytes ready to write to the serial port, or None if pyubx2 unavailable.
+    """
+    try:
+        from pyubx2 import UBXMessage, SET
+    except ImportError:
+        return None
+
+    # CFG-TMODE uses cm + 0.1mm high-precision split:
+    #   ECEF_X = integer cm
+    #   ECEF_X_HP = residual in 0.1 mm (-99..99)
+    x_cm = int(ecef[0] * 100)
+    y_cm = int(ecef[1] * 100)
+    z_cm = int(ecef[2] * 100)
+    x_hp = int(round((ecef[0] * 100 - x_cm) * 100))  # 0.1 mm
+    y_hp = int(round((ecef[1] * 100 - y_cm) * 100))
+    z_hp = int(round((ecef[2] * 100 - z_cm) * 100))
+
+    cfg_data = [
+        ("CFG_TMODE_MODE", 2),              # 2 = Fixed ECEF
+        ("CFG_TMODE_POS_TYPE", 0),          # 0 = ECEF
+        ("CFG_TMODE_ECEF_X", x_cm),
+        ("CFG_TMODE_ECEF_Y", y_cm),
+        ("CFG_TMODE_ECEF_Z", z_cm),
+        ("CFG_TMODE_ECEF_X_HP", x_hp),
+        ("CFG_TMODE_ECEF_Y_HP", y_hp),
+        ("CFG_TMODE_ECEF_Z_HP", z_hp),
+        ("CFG_TMODE_FIXED_POS_ACC", 100),   # 10 mm accuracy (0.1 mm units)
+    ]
+    msg = UBXMessage.config_set(7, 0, cfg_data)  # layers: RAM + BBR + Flash
+    return msg.serialize()
+
+
 # ── Main servo loop ──────────────────────────────────────────────────────── #
 
 def run_servo(args):
@@ -816,11 +861,14 @@ def run_servo(args):
     # Parse systems filter
     systems = set(args.systems.split(',')) if args.systems else None
 
+    # Config queue: main thread can send UBX config to receiver via serial_reader
+    config_queue = queue.Queue(maxsize=10)
+
     # Start serial reader (with qerr_store for TIM-TP extraction)
     t_serial = threading.Thread(
         target=serial_reader,
         args=(args.serial, args.baud, obs_queue, stop_event, beph, systems, ssr),
-        kwargs={'qerr_store': qerr_store},
+        kwargs={'qerr_store': qerr_store, 'config_queue': config_queue},
         daemon=True,
     )
     t_serial.start()
@@ -905,6 +953,7 @@ def run_servo(args):
     warmup_epochs = args.warmup    # default 20
     prev_source = None
     position_saved = False  # track whether we've saved position to file
+    tmode_set = False       # track whether F9T has been switched to timing mode
 
     # PPS event queue: extts reader puts events, main loop consumes 1:1
     pps_queue = queue.Queue(maxsize=10)
@@ -1010,14 +1059,12 @@ def run_servo(args):
             dt_rx_sigma = math.sqrt(max(0, p_clk)) / C * 1e9
             n_epochs += 1
 
-            # Save position to file once filter has converged
-            # FixedPosFilter uses fixed known_ecef (doesn't estimate position),
-            # so we save known_ecef with dt_rx_sigma as convergence quality proxy.
-            if (args.position_file and not position_saved
-                    and n_epochs >= 300
-                    and dt_rx_sigma < 100.0):  # 100 ns ~ 0.03 m
+            # Once filter converges: save position and switch F9T to timing mode
+            if n_epochs >= 300 and dt_rx_sigma < 100.0:
                 sigma_m = dt_rx_sigma * 1e-9 * C  # convert ns to meters
-                if sigma_m < 0.1:
+
+                # Save position to file
+                if args.position_file and not position_saved and sigma_m < 0.1:
                     save_position(
                         args.position_file, known_ecef,
                         sigma_m=sigma_m,
@@ -1027,6 +1074,19 @@ def run_servo(args):
                     position_saved = True
                     log.info(f"Position saved to {args.position_file} "
                              f"(sigma={sigma_m:.4f}m after {n_epochs} epochs)")
+
+                # Switch F9T to fixed-position timing mode for better PPS+qErr
+                # fallback.  Only done once.  Uses the known position so the
+                # F9T's timing engine optimizes PPS alignment.
+                if not tmode_set and sigma_m < 0.1:
+                    tmode_msg = build_tmode_fixed_msg(known_ecef)
+                    if tmode_msg is not None:
+                        config_queue.put(tmode_msg)
+                        tmode_set = True
+                        lat, lon, alt = ecef_to_lla(
+                            known_ecef[0], known_ecef[1], known_ecef[2])
+                        log.info(f"F9T → fixed-position timing mode "
+                                 f"({lat:.6f}, {lon:.6f}, {alt:.1f}m)")
 
             # Get the PPS event for this epoch (1:1 pairing)
             try:
