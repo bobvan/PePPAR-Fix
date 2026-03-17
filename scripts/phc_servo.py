@@ -569,7 +569,7 @@ def run_servo(args):
         log_w = csv.writer(log_f)
         log_w.writerow([
             'timestamp', 'gps_second', 'phc_sec', 'phc_nsec',
-            'dt_rx_ns', 'dt_rx_sigma_ns', 'phc_error_ns',
+            'dt_rx_ns', 'dt_rx_sigma_ns', 'pps_error_ns', 'phc_error_ns',
             'adjfine_ppb', 'mode', 'n_meas',
         ])
 
@@ -621,10 +621,41 @@ def run_servo(args):
             # GPS integer second for this PPS
             gps_unix_sec = int(round(gps_time.timestamp()))
 
-            # PHC fractional-second error (standard PPS discipline)
-            # This works regardless of PHC epoch, as long as PPS fires at
-            # GPS second boundaries (which it does for timing receivers).
-            phc_error_ns = pps_fractional_error(phc_sec, phc_nsec)
+            # PHC error computation:
+            #
+            # PPS-only mode (warmup, step, early convergence):
+            #   phc_error = pps_fractional_error(phc_nsec)
+            #   Assumes PPS fires at the GPS second boundary. Accuracy limited
+            #   by the receiver's PPS alignment (~5-20 ns qErr).
+            #
+            # Carrier-phase mode (tracking with converged filter):
+            #   dt_rx from the PPP filter tells us the receiver clock's offset
+            #   from true GPS time to ~0.1 ns. The PPS fires at the receiver's
+            #   second boundary, which is (GPS_second + dt_rx/c), NOT exactly
+            #   at the GPS second. We use dt_rx to compute the PHC's offset
+            #   from true GPS time rather than from the PPS edge.
+            #
+            #   Once the PHC is stepped to true GPS time, the PPS arrives at
+            #   a fractional offset equal to dt_rx. The servo then tracks the
+            #   drift of dt_rx (the receiver clock rate) and keeps the PHC
+            #   aligned to true GPS time rather than to the drifting PPS.
+            #
+            # PPS-only error (always computed — used for step and fallback)
+            pps_error_ns = pps_fractional_error(phc_sec, phc_nsec)
+
+            # Carrier-phase corrected error (used in tracking when filter converged)
+            # dt_rx is the receiver clock offset: positive = receiver ahead of GPS.
+            # If receiver is behind (dt_rx < 0), PPS fires LATE — phc_nsec reads
+            # a positive value equal to |dt_rx| when the PHC is on true GPS time.
+            # Correction: phc_error = pps_error + dt_rx (cancels the PPS timing error)
+            #
+            # Example: PHC on GPS time, receiver 9ms behind (dt_rx = -9e6 ns)
+            #   PPS arrives 9ms late → pps_error = +9e6 ns
+            #   corrected = +9e6 + (-9e6) = 0  ✓
+            if dt_rx_sigma < 10.0 and mode == ServoMode.TRACKING:
+                phc_error_ns = pps_error_ns + dt_rx_ns
+            else:
+                phc_error_ns = pps_error_ns
 
             # Check if PHC integer seconds match GPS (needed for step)
             epoch_offset = phc_gps_offset_s(phc_sec, phc_nsec, gps_unix_sec)
@@ -655,11 +686,18 @@ def run_servo(args):
                              f"epoch_off={epoch_offset}s")
 
             elif mode == ServoMode.STEP:
-                # Use phc_ctl for reliable clock stepping
-                # Total offset = epoch_offset (whole seconds) + fractional error
-                total_offset_ns = epoch_offset * 1_000_000_000 + phc_error_ns
+                # Step PHC to true GPS time.
+                # Total offset = epoch_offset (whole seconds) + PPS fractional error
+                # Include dt_rx if filter is converged so we land on GPS time,
+                # not PPS time. This means the PPS will arrive at nsec ≈ |dt_rx|
+                # after the step, which the tracking loop corrects for.
+                step_frac = pps_error_ns
+                if dt_rx_sigma < 10.0:
+                    step_frac = pps_error_ns + dt_rx_ns
+                total_offset_ns = epoch_offset * 1_000_000_000 + step_frac
                 log.info(f"  STEP: epoch_offset={epoch_offset}s, "
-                         f"frac_err={phc_error_ns:+.0f}ns, "
+                         f"pps_err={pps_error_ns:+.0f}ns, "
+                         f"dt_rx={dt_rx_ns:+.0f}ns (σ={dt_rx_sigma:.1f}), "
                          f"total={total_offset_ns:+.0f}ns")
 
                 # Use phc_ctl adj for the step (reliable, uses clock_settime)
@@ -746,12 +784,17 @@ def run_servo(args):
 
                 if n_epochs % 10 == 0:
                     extra = ""
+                    if dt_rx_sigma < 10.0:
+                        extra += f" dt_rx={dt_rx_ns:+.1f}"
+                    else:
+                        extra += " PPS-only"
                     if ema_alpha < 1.0:
                         extra += f" ema={ema_error:+.0f}"
                     if adaptive:
                         extra += f" kp={servo.kp:.3f} ki={servo.ki:.3f}"
                     log.info(f"  [{n_epochs}] TRACK: "
                              f"phc_err={phc_error_ns:+.0f}ns "
+                             f"pps={pps_error_ns:+.0f}ns "
                              f"adj={adjfine_ppb:+.1f}ppb "
                              f"σ={dt_rx_sigma:.1f}ns "
                              f"n={n_used}{extra}")
@@ -761,7 +804,7 @@ def run_servo(args):
                 log_w.writerow([
                     ts_str, gps_unix_sec, phc_sec, phc_nsec,
                     f'{dt_rx_ns:.3f}', f'{dt_rx_sigma:.3f}',
-                    f'{phc_error_ns:.1f}',
+                    f'{pps_error_ns:.1f}', f'{phc_error_ns:.1f}',
                     f'{adjfine_ppb:.3f}', mode, n_used,
                 ])
 
