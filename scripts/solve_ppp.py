@@ -496,28 +496,49 @@ class FixedPosFilter:
         n_td = 0
         current_geo = {}
 
-        # Seed clock from first epoch's GPS pseudorange residuals
+        # Seed clock from first epoch's pseudorange residuals.
+        # Prefer GPS (no ISB), but fall back to Galileo if GPS unavailable.
+        # When seeding from Galileo, also seed the ISB estimate.
         if not self.initialized:
-            residuals = []
+            gps_resid = []
+            gal_resid = []
             for obs in observations:
-                if obs.get('sys') != 'gps':
-                    continue  # Seed from GPS only to avoid ISB
                 sv = obs['sv']
                 geo = self.compute_geometry(sv, sp3, t, clk_file)
                 if geo is None:
                     continue
                 rho_corr = geo['rho'] - geo['sat_clk_m'] + geo['tropo']
-                residuals.append(obs['pr_if'] - rho_corr)
-            if len(residuals) >= 3:
-                self.x[0] = float(np.median(residuals))
-                # Reset P[0,0] to reflect post-seed uncertainty (~50m)
-                # Without this, P[0,0]=1e18 makes S matrix near-singular
-                # (condition number ~1e16), causing Kalman gain to fail
-                spread = np.std(residuals) if len(residuals) > 1 else 100.0
+                r = obs['pr_if'] - rho_corr
+                if obs.get('sys') == 'gps':
+                    gps_resid.append(r)
+                elif obs.get('sys') == 'gal':
+                    gal_resid.append(r)
+
+            if len(gps_resid) >= 3:
+                # Seed from GPS (no ISB needed)
+                self.x[0] = float(np.median(gps_resid))
+                spread = np.std(gps_resid) if len(gps_resid) > 1 else 100.0
                 self.P[0, 0] = max(spread, 50.0) ** 2
-                log.info(f"Clock seeded from {len(residuals)} PRs: "
+                log.info(f"Clock seeded from {len(gps_resid)} GPS PRs: "
                          f"{self.x[0]/C*1e6:.1f} µs "
                          f"(P[0,0] reset to {self.P[0,0]:.0f} m²)")
+                self.initialized = True
+            elif len(gal_resid) >= 3:
+                # Seed from Galileo — need to estimate ISB simultaneously.
+                # GAL PR residual = rx_clk + ISB_GAL, so we can't separate
+                # them from GAL alone. Set rx_clk = median(GAL residuals)
+                # and ISB = 0 initially; the filter will resolve the ISB
+                # from the PR measurements within a few epochs.
+                self.x[0] = float(np.median(gal_resid))
+                self.x[self.IDX_ISB_GAL] = 0.0
+                spread = np.std(gal_resid) if len(gal_resid) > 1 else 100.0
+                self.P[0, 0] = max(spread, 50.0) ** 2
+                # ISB is unresolved — keep its uncertainty large
+                self.P[self.IDX_ISB_GAL, self.IDX_ISB_GAL] = 1e8
+                log.info(f"Clock seeded from {len(gal_resid)} GAL PRs: "
+                         f"{self.x[0]/C*1e6:.1f} µs "
+                         f"(P[0,0] reset to {self.P[0,0]:.0f} m², "
+                         f"ISB unresolved)")
                 self.initialized = True
 
         for obs in observations:
@@ -555,7 +576,11 @@ class FixedPosFilter:
             n_pr += 1
 
             # --- Time-differenced carrier phase ---
-            if (obs.get('phi_if_m') is not None and
+            # Only include TD observations after clock is seeded from PRs.
+            # Before seeding, prev_clock is 0 (meaningless), causing huge
+            # residuals that blow up the covariance matrix.
+            if (self.initialized and
+                    obs.get('phi_if_m') is not None and
                     sv in self.prev_geo and
                     self.prev_geo[sv]['phi_if_m'] is not None):
                 prev = self.prev_geo[sv]
