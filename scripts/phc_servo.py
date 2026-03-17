@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
-phc_servo.py — PHC discipline loop for PePPAR Fix M6.
+phc_servo.py — PHC discipline loop for PePPAR Fix M7.
 
 Disciplines the TimeHAT i226 PHC (/dev/ptp0) using competitive
 error source selection: PPS-only, PPS+qErr, and carrier-phase
 estimates compete at every epoch based on confidence.
+
+M7 adds adaptive discipline interval: instead of calling adjfine every
+second (which injects ~7.5 ppb of correction jitter), the servo
+accumulates error samples over N epochs and applies one averaged
+correction.  This reduces TDEV at short tau while preserving tracking
+bandwidth.  Use --discipline-interval N for fixed interval or
+--adaptive-interval to let the scheduler choose based on drift rate
+vs measurement noise.
 
 Architecture:
     F9T PPS → SDP1 → extts event (PHC timestamp of PPS edge)
@@ -17,6 +25,7 @@ Architecture:
       3. Carrier-phase: error = pps_frac(phc) + dt_rx  ±0.1 ns
 
     PI servo → adjfine() on /dev/ptp0, gains scaled by confidence
+    DisciplineScheduler → accumulates samples, decides when to correct
 
     Output: SDP0 → disciplined PPS (SMA J4 → TICC chA for measurement)
 
@@ -299,13 +308,18 @@ class PIServo:
             self.integral = 0.0
         self.freq = initial_freq
 
-    def update(self, offset_ns):
-        """Process one sample. Returns frequency adjustment in ppb."""
-        output = self.kp * offset_ns + self.ki * (self.integral + offset_ns)
+    def update(self, offset_ns, dt=1.0):
+        """Process one sample. Returns frequency adjustment in ppb.
+
+        Args:
+            offset_ns: measured offset in nanoseconds
+            dt: seconds since last correction (scales integral contribution)
+        """
+        output = self.kp * offset_ns + self.ki * (self.integral + offset_ns * dt)
 
         # Anti-windup: only integrate if output stays in bounds
         if abs(output) < self.max_ppb:
-            self.integral += offset_ns
+            self.integral += offset_ns * dt
 
         self.freq = max(-self.max_ppb, min(self.max_ppb, output))
         return self.freq
@@ -372,6 +386,143 @@ def compute_error_sources(pps_error_ns, qerr_ns, dt_rx_ns, dt_rx_sigma_ns,
 
     sources.sort(key=lambda s: s.confidence_ns)
     return sources
+
+
+# ── Discipline scheduler (M7) ─────────────────────────────────────────── #
+
+class DisciplineScheduler:
+    """Accumulates error samples and decides when to apply a correction.
+
+    M7: instead of correcting every epoch, buffer N samples and apply one
+    averaged correction.  This reduces correction jitter while preserving
+    tracking bandwidth.
+
+    Supports fixed interval (--discipline-interval N) or adaptive mode
+    (--adaptive-interval) where the interval is chosen based on TCXO drift
+    rate vs measurement noise.
+    """
+
+    def __init__(self, base_interval=1, adaptive=False,
+                 min_interval=1, max_interval=120):
+        self.base_interval = base_interval
+        self.adaptive = adaptive
+        self.min_interval = min_interval
+        self.max_interval = max_interval
+
+        # Current discipline interval (may change in adaptive mode)
+        self.interval = base_interval
+
+        # Sample buffer for current interval
+        self._errors = []
+        self._confidences = []
+        self._sources = []
+
+        # Drift rate EMA for adaptive mode
+        self._drift_rate = 0.1  # ppb/s — conservative startup default
+        self._drift_alpha = 0.05  # EMA smoothing factor
+        self._prev_adjfine = None
+        self._prev_adjfine_t = None
+        self._adjfine_history_s = 0.0  # seconds of adjfine history
+
+        # Convergence override threshold (ns)
+        self._converge_threshold = 500.0
+
+    @property
+    def n_accumulated(self):
+        """Number of samples in the current buffer."""
+        return len(self._errors)
+
+    def accumulate(self, error_ns, confidence_ns, source_name):
+        """Buffer one error sample."""
+        self._errors.append(error_ns)
+        self._confidences.append(confidence_ns)
+        self._sources.append(source_name)
+
+    def should_correct(self):
+        """True when it's time to flush the buffer and correct.
+
+        Triggers:
+          1. Buffer is full (n_accumulated >= interval)
+          2. Convergence override: large error needs immediate correction
+          3. Source transition mid-interval (different source than first sample)
+        """
+        n = len(self._errors)
+        if n == 0:
+            return False
+
+        # Buffer full
+        if n >= self.interval:
+            return True
+
+        # Convergence override: large error → force immediate correction
+        if abs(self._errors[-1]) > self._converge_threshold:
+            return True
+
+        # Source transition mid-interval
+        if n > 1 and self._sources[-1] != self._sources[0]:
+            return True
+
+        return False
+
+    def flush(self):
+        """Return averaged error, confidence, and sample count; reset buffer.
+
+        Returns:
+            (avg_error_ns, avg_confidence_ns, n_samples)
+        """
+        if not self._errors:
+            return (0.0, 0.0, 0)
+
+        n = len(self._errors)
+        avg_error = sum(self._errors) / n
+        avg_confidence = sum(self._confidences) / n
+        self._errors.clear()
+        self._confidences.clear()
+        self._sources.clear()
+        return (avg_error, avg_confidence, n)
+
+    def update_drift_rate(self, timestamp, adjfine_ppb):
+        """Update EMA of |delta_adjfine / delta_t| for adaptive scheduling.
+
+        Args:
+            timestamp: monotonic time in seconds
+            adjfine_ppb: current adjfine value
+        """
+        if self._prev_adjfine is not None and self._prev_adjfine_t is not None:
+            dt = timestamp - self._prev_adjfine_t
+            if dt > 0:
+                rate = abs(adjfine_ppb - self._prev_adjfine) / dt
+                self._drift_rate = (self._drift_alpha * rate +
+                                    (1.0 - self._drift_alpha) * self._drift_rate)
+                self._adjfine_history_s += dt
+
+        self._prev_adjfine = adjfine_ppb
+        self._prev_adjfine_t = timestamp
+
+    def compute_adaptive_interval(self, measurement_sigma_ns):
+        """Compute optimal discipline interval from drift rate and noise.
+
+        Uses tau = (2 * sigma / drift_rate)^(2/5), clamped to [min, max].
+        The 2/5 exponent comes from the crossover between white noise
+        averaging (tau^-1/2) and random-walk frequency drift (tau^1/2).
+
+        Only adapts after 60s of adjfine history; uses base_interval before.
+        """
+        if not self.adaptive:
+            return self.base_interval
+
+        # Need enough history for a meaningful drift estimate
+        if self._adjfine_history_s < 60.0:
+            return self.base_interval
+
+        # Guard against zero drift rate
+        if self._drift_rate < 1e-6:
+            return self.max_interval
+
+        tau = (2.0 * measurement_sigma_ns / self._drift_rate) ** 0.4
+        tau = max(self.min_interval, min(self.max_interval, int(round(tau))))
+        self.interval = tau
+        return tau
 
 
 # ── Main servo loop ──────────────────────────────────────────────────────── #
@@ -569,6 +720,12 @@ def run_servo(args):
     CONVERGE_MIN_SCALE = 2.0       # minimum gain scale during convergence
 
     servo = PIServo(BASE_KP, BASE_KI, max_ppb=caps['max_adj'])
+    scheduler = DisciplineScheduler(
+        base_interval=args.discipline_interval,
+        adaptive=args.adaptive_interval,
+        min_interval=args.min_interval,
+        max_interval=args.max_interval,
+    )
     phase = 'warmup'
     prev_t = None
     n_epochs = 0
@@ -626,6 +783,7 @@ def run_servo(args):
             'dt_rx_ns', 'dt_rx_sigma_ns', 'pps_error_ns', 'qerr_ns',
             'source', 'source_error_ns', 'source_confidence_ns',
             'adjfine_ppb', 'phase', 'n_meas', 'gain_scale',
+            'discipline_interval', 'n_accumulated',
         ])
 
     start_time = time.time()
@@ -709,6 +867,7 @@ def run_servo(args):
                         f'{pps_error_ns:.1f}', f'{qerr_ns:.3f}' if qerr_ns is not None else '',
                         best.name, f'{best.error_ns:.3f}', f'{best.confidence_ns:.3f}',
                         f'{adjfine_ppb:.3f}', phase, n_used, f'{gain_scale:.3f}',
+                        scheduler.interval, 0,
                     ])
                 continue
 
@@ -733,8 +892,14 @@ def run_servo(args):
                     log.error(f"  phc_ctl adj failed (rc={result.returncode}): "
                               f"{result.stderr.strip()} {result.stdout.strip()}")
 
-                # Reset servo for clean start after step
+                # Reset servo and scheduler for clean start after step
                 servo = PIServo(BASE_KP, BASE_KI, max_ppb=caps['max_adj'])
+                scheduler = DisciplineScheduler(
+                    base_interval=args.discipline_interval,
+                    adaptive=args.adaptive_interval,
+                    min_interval=args.min_interval,
+                    max_interval=args.max_interval,
+                )
                 phase = 'tracking'
                 # Flush stale PPS events
                 time.sleep(2)
@@ -751,21 +916,8 @@ def run_servo(args):
                 log.warning(f"  Outlier: {best}, skipping")
                 continue
 
-            # Gain scaling by error source confidence
-            gain_scale = max(GAIN_MIN_SCALE, min(GAIN_MAX_SCALE,
-                             GAIN_REF_SIGMA / best.confidence_ns))
-
-            # Boost gains during convergence (large error) to ensure
-            # pull-in doesn't stall when using low-confidence sources
-            if abs(best.error_ns) > CONVERGE_ERROR_NS:
-                gain_scale = max(gain_scale, CONVERGE_MIN_SCALE)
-
-            servo.kp = BASE_KP * gain_scale
-            servo.ki = BASE_KI * gain_scale
-
-            # Negate: positive error (PHC ahead) → negative adjfine (slow down)
-            adjfine_ppb = -servo.update(best.error_ns)
-            ptp.adjfine(adjfine_ppb)
+            # Accumulate sample into discipline scheduler (M7)
+            scheduler.accumulate(best.error_ns, best.confidence_ns, best.name)
 
             # Log source transitions
             if prev_source != best.name:
@@ -774,15 +926,53 @@ def run_servo(args):
                              f"(confidence {best.confidence_ns:.1f}ns)")
                 prev_source = best.name
 
-            if n_epochs % 10 == 0:
-                src_summary = ' '.join(f'{s.name}={s.error_ns:+.1f}' for s in sources)
-                log.info(f"  [{n_epochs}] {best.name}: "
-                         f"err={best.error_ns:+.1f}ns "
-                         f"adj={adjfine_ppb:+.1f}ppb "
-                         f"gain={gain_scale:.2f}x "
-                         f"[{src_summary}]")
+            if scheduler.should_correct():
+                # Flush buffer: get averaged error and confidence
+                avg_error, avg_confidence, n_samples = scheduler.flush()
 
-            # CSV log
+                # Gain scaling by averaged confidence
+                gain_scale = max(GAIN_MIN_SCALE, min(GAIN_MAX_SCALE,
+                                 GAIN_REF_SIGMA / avg_confidence))
+
+                # Boost gains during convergence (large error) to ensure
+                # pull-in doesn't stall when using low-confidence sources
+                if abs(avg_error) > CONVERGE_ERROR_NS:
+                    gain_scale = max(gain_scale, CONVERGE_MIN_SCALE)
+
+                servo.kp = BASE_KP * gain_scale
+                servo.ki = BASE_KI * gain_scale
+
+                # Negate: positive error (PHC ahead) → negative adjfine (slow down)
+                # dt = n_samples seconds since last correction
+                adjfine_ppb = -servo.update(avg_error, dt=float(n_samples))
+                ptp.adjfine(adjfine_ppb)
+
+                # Update drift rate tracker for adaptive mode
+                scheduler.update_drift_rate(time.monotonic(), adjfine_ppb)
+
+                # Adapt interval for next cycle
+                scheduler.compute_adaptive_interval(avg_confidence)
+
+                if n_epochs % 10 == 0:
+                    src_summary = ' '.join(f'{s.name}={s.error_ns:+.1f}' for s in sources)
+                    log.info(f"  [{n_epochs}] {best.name}: "
+                             f"err={avg_error:+.1f}ns (avg {n_samples}) "
+                             f"adj={adjfine_ppb:+.1f}ppb "
+                             f"gain={gain_scale:.2f}x "
+                             f"interval={scheduler.interval} "
+                             f"[{src_summary}]")
+            else:
+                # Coast epoch: don't call adjfine, just log
+                n_samples = 0
+                if n_epochs % 10 == 0:
+                    src_summary = ' '.join(f'{s.name}={s.error_ns:+.1f}' for s in sources)
+                    log.info(f"  [{n_epochs}] {best.name}: "
+                             f"err={best.error_ns:+.1f}ns "
+                             f"coast ({scheduler.n_accumulated}/{scheduler.interval}) "
+                             f"adj={adjfine_ppb:+.1f}ppb "
+                             f"[{src_summary}]")
+
+            # CSV log (every epoch, including coast)
             if log_w:
                 log_w.writerow([
                     ts_str, gps_unix_sec, phc_sec, phc_nsec,
@@ -790,6 +980,7 @@ def run_servo(args):
                     f'{pps_error_ns:.1f}', f'{qerr_ns:.3f}' if qerr_ns is not None else '',
                     best.name, f'{best.error_ns:.3f}', f'{best.confidence_ns:.3f}',
                     f'{adjfine_ppb:.3f}', phase, n_used, f'{gain_scale:.3f}',
+                    scheduler.interval, scheduler.n_accumulated,
                 ])
 
     except KeyboardInterrupt:
@@ -807,7 +998,7 @@ def run_servo(args):
 
     elapsed = time.time() - start_time
     log.info(f"\n{'='*60}")
-    log.info(f"  PHC servo complete (M6 competitive error sources)")
+    log.info(f"  PHC servo complete (M7 adaptive discipline interval)")
     log.info(f"  Duration: {elapsed:.0f}s, Epochs: {n_epochs}")
     log.info(f"  Last source: {prev_source}, adjfine: {adjfine_ppb:+.3f} ppb")
     log.info(f"{'='*60}")
@@ -817,7 +1008,7 @@ def run_servo(args):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="PHC discipline loop with competitive error sources (M6)",
+        description="PHC discipline loop with competitive error sources and adaptive discipline interval (M7)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -864,6 +1055,16 @@ def main():
                     help="Tracking mode Ki gain (default: 0.1)")
     ap.add_argument("--gain-ref-sigma", type=float, default=2.0,
                     help="Reference confidence (ns) for gain scale=1.0 (default: 2.0)")
+
+    # Discipline interval (M7)
+    ap.add_argument("--discipline-interval", type=int, default=1,
+                    help="Fixed discipline interval in epochs (default: 1 = M6 behavior)")
+    ap.add_argument("--adaptive-interval", action="store_true",
+                    help="Enable adaptive discipline interval based on drift rate")
+    ap.add_argument("--max-interval", type=int, default=120,
+                    help="Maximum discipline interval in epochs (default: 120)")
+    ap.add_argument("--min-interval", type=int, default=1,
+                    help="Minimum discipline interval in epochs (default: 1)")
 
     # Output
     ap.add_argument("--log", default=None,
