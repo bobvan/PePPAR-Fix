@@ -434,8 +434,11 @@ class DisciplineScheduler:
         self._prev_adjfine_t = None
         self._adjfine_history_s = 0.0  # seconds of adjfine history
 
-        # Convergence override threshold (ns)
-        self._converge_threshold = 500.0
+        # Convergence tracking: force interval=1 until errors settle
+        self._converge_threshold = 100.0  # ns — must stay below this to ramp up
+        self._settled_count = 0           # consecutive corrections below threshold
+        self._settle_window = 10          # corrections needed before ramping up
+        self._converging = True           # start in convergence mode
 
     @property
     def n_accumulated(self):
@@ -452,22 +455,22 @@ class DisciplineScheduler:
         """True when it's time to flush the buffer and correct.
 
         Triggers:
-          1. Buffer is full (n_accumulated >= interval)
-          2. Convergence override: large error needs immediate correction
-          3. Source transition mid-interval (different source than first sample)
+          1. Buffer is full (n_accumulated >= effective interval)
+          2. Source transition mid-interval (different source than first sample)
+
+        During convergence (_converging=True), the effective interval is 1
+        (correct every epoch, M6 behavior).  Once errors settle below
+        threshold for _settle_window consecutive corrections, the scheduler
+        ramps up to the configured interval.
         """
         n = len(self._errors)
         if n == 0:
             return False
 
-        # Buffer full
-        if n >= self.interval:
-            return True
+        effective_interval = 1 if self._converging else self.interval
 
-        # Convergence override: if the AVERAGE so far is large, correct
-        # early.  Don't trigger on a single noisy sample — that causes
-        # oscillation when the servo is still settling after a step.
-        if n >= 3 and abs(sum(self._errors) / n) > self._converge_threshold:
+        # Buffer full (1 during convergence, base_interval when settled)
+        if n >= effective_interval:
             return True
 
         # Source transition mid-interval
@@ -478,6 +481,10 @@ class DisciplineScheduler:
 
     def flush(self):
         """Return averaged error, confidence, and sample count; reset buffer.
+
+        Also tracks convergence state: once the averaged error stays below
+        threshold for _settle_window consecutive corrections, switches from
+        per-epoch (interval=1) to the configured M7 interval.
 
         Returns:
             (avg_error_ns, avg_confidence_ns, n_samples)
@@ -491,6 +498,24 @@ class DisciplineScheduler:
         self._errors.clear()
         self._confidences.clear()
         self._sources.clear()
+
+        # Track convergence settling
+        if self._converging:
+            if abs(avg_error) < self._converge_threshold:
+                self._settled_count += 1
+                if self._settled_count >= self._settle_window:
+                    self._converging = False
+                    log.info(f"  M7: settled after {self._settled_count} corrections, "
+                             f"interval → {self.base_interval}")
+            else:
+                self._settled_count = 0
+        else:
+            # If errors blow up again, drop back to convergence mode
+            if abs(avg_error) > self._converge_threshold * 5:
+                self._converging = True
+                self._settled_count = 0
+                log.info(f"  M7: error {avg_error:+.0f}ns, back to convergence mode")
+
         return (avg_error, avg_confidence, n)
 
     def update_drift_rate(self, timestamp, adjfine_ppb):
