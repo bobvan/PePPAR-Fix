@@ -334,7 +334,33 @@ def main():
 
     # Step 2: Configure signals + GPS L5 health override
     configure_signals(ser, ubr)
-    configure_gps_l5_health(ser, ubr)
+    l5_ok = configure_gps_l5_health(ser, ubr)
+
+    # The L5 health override and signal config are saved to flash but
+    # require a warm restart to take effect.  Without this, GPS L5
+    # will not be tracked even though the config is accepted.
+    if l5_ok:
+        print("  Warm restart for L5 health override...", end=" ", flush=True)
+        msg = UBXMessage(
+            "CFG", "CFG-RST", SET,
+            navBbrMask=0x0001,  # hot start (keep ephemeris)
+            resetMode=1,        # controlled software reset
+            reserved0=0,
+        )
+        ser.write(msg.serialize())
+        ser.close()
+        time.sleep(10)
+        post_baud = probe_baud(args.port)
+        if post_baud is None:
+            time.sleep(5)
+            post_baud = probe_baud(args.port)
+        if post_baud is None:
+            print("ERROR: receiver not found after L5 restart", file=sys.stderr)
+            sys.exit(1)
+        ser = Serial(args.port, baudrate=post_baud, timeout=1)
+        ser.reset_input_buffer()
+        ubr = UBXReader(ser, protfilter=2)
+        print(f"OK (found at {post_baud} baud)")
 
     # Step 3: Set measurement rate
     configure_rate(ser, ubr, args.rate)
