@@ -87,12 +87,33 @@ for _mt in range(1240, 1264):
 
 # ── Serial observation reader ──────────────────────────────────────────────── #
 
+class QErrStore:
+    """Thread-safe container for the latest TIM-TP quantization error."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._qerr_ns = None
+        self._tow_ms = None
+
+    def update(self, qerr_ps, tow_ms):
+        """Store new qErr (picoseconds from TIM-TP) as nanoseconds."""
+        with self._lock:
+            self._qerr_ns = qerr_ps / 1000.0
+            self._tow_ms = tow_ms
+
+    def get(self):
+        """Return (qerr_ns, tow_ms) or (None, None) if not yet available."""
+        with self._lock:
+            return self._qerr_ns, self._tow_ms
+
+
 def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
-                   ssr=None):
+                   ssr=None, qerr_store=None):
     """Read UBX messages from F9T serial port.
 
     Puts (timestamp, observations_list) tuples onto obs_queue for each
     RXM-RAWX epoch. Also feeds RXM-SFRBX to broadcast ephemeris.
+    If qerr_store is provided, extracts TIM-TP qErr and stores it.
 
     Args:
         systems: set of system names to include (e.g. {'gps', 'gal', 'bds'}).
@@ -100,6 +121,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
         ssr: SSRState instance for real-time code bias corrections.
              If provided, biases are applied to raw pseudoranges before
              IF combination (same as OSB in the file-based pipeline).
+        qerr_store: QErrStore instance for TIM-TP qErr extraction.
     """
     try:
         from pyubx2 import UBXReader
@@ -147,6 +169,13 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
 
             # Broadcast ephemeris from SFRBX
             # (We'll rely on NTRIP for ephemeris; SFRBX decoding is complex)
+
+            # TIM-TP: extract PPS quantization error (qErr)
+            if msg_id == 'TIM-TP' and qerr_store is not None:
+                qerr_ps = getattr(parsed, 'qErr', None)
+                tow_ms = getattr(parsed, 'towMS', None)
+                if qerr_ps is not None:
+                    qerr_store.update(qerr_ps, tow_ms)
 
             if msg_id == 'RXM-RAWX':
                 # New RAWX epoch — process and enqueue

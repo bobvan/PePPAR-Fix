@@ -94,7 +94,7 @@ from solve_ppp import FixedPosFilter
 from ntrip_client import NtripStream
 from broadcast_eph import BroadcastEphemeris
 from ssr_corrections import SSRState, RealtimeCorrections
-from realtime_ppp import serial_reader, ntrip_reader
+from realtime_ppp import serial_reader, ntrip_reader, QErrStore
 
 log = logging.getLogger("phc_servo")
 
@@ -310,13 +310,61 @@ class PIServo:
         self.freq = current_freq
 
 
-# ── Servo modes ──────────────────────────────────────────────────────────── #
+# ── Error source competition (M6) ────────────────────────────────────────── #
 
-class ServoMode:
-    WARMUP = "warmup"          # Waiting for PPP filter to converge
-    STEP = "step"              # Large offset → step clock, then converge
-    CONVERGING = "converging"  # Aggressive PI gains
-    TRACKING = "tracking"      # Stable, low gains
+class ErrorSource:
+    """One candidate error estimate with its confidence."""
+    __slots__ = ('name', 'error_ns', 'confidence_ns')
+
+    def __init__(self, name, error_ns, confidence_ns):
+        self.name = name
+        self.error_ns = error_ns
+        self.confidence_ns = confidence_ns
+
+    def __repr__(self):
+        return f"{self.name}({self.error_ns:+.1f}ns ±{self.confidence_ns:.1f})"
+
+
+def compute_error_sources(pps_error_ns, qerr_ns, dt_rx_ns, dt_rx_sigma_ns,
+                          pps_confidence=20.0, qerr_confidence=3.0,
+                          carrier_max_sigma=50.0):
+    """Compute all available error sources and return sorted by confidence.
+
+    Args:
+        pps_error_ns: fractional-second PHC error from PPS timestamp
+        qerr_ns: quantization error from TIM-TP (None if unavailable)
+        dt_rx_ns: receiver clock offset from carrier-phase filter
+        dt_rx_sigma_ns: filter's confidence in dt_rx (None if unavailable)
+        pps_confidence: assumed PPS-only confidence (ns)
+        qerr_confidence: assumed PPS+qErr confidence (ns)
+        carrier_max_sigma: max sigma to accept carrier-phase (ns)
+
+    Returns:
+        List of ErrorSource, sorted by confidence (best first).
+    """
+    sources = []
+
+    # 1. PPS-only: always available
+    sources.append(ErrorSource('pps', pps_error_ns, pps_confidence))
+
+    # 2. PPS + qErr: available when TIM-TP has been received
+    if qerr_ns is not None:
+        # qErr is the PPS timing error: positive = PPS fired late
+        # Correction: subtract qErr to get the true GPS second alignment
+        sources.append(ErrorSource('pps+qerr',
+                                   pps_error_ns - qerr_ns,
+                                   qerr_confidence))
+
+    # 3. Carrier-phase: available when filter has converged
+    if dt_rx_sigma_ns is not None and dt_rx_sigma_ns < carrier_max_sigma:
+        # dt_rx is the receiver clock offset: positive = receiver ahead
+        # PPS fires early by dt_rx; add it to get PHC error vs true GPS time
+        sources.append(ErrorSource('carrier',
+                                   pps_error_ns + dt_rx_ns,
+                                   dt_rx_sigma_ns))
+
+    sources.sort(key=lambda s: s.confidence_ns)
+    return sources
 
 
 # ── Main servo loop ──────────────────────────────────────────────────────── #
