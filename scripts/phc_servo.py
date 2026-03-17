@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-phc_servo.py — PHC discipline loop for PePPAR Fix M7.
+phc_servo.py — PePPAR Fix software GPSDO.
 
-Disciplines the TimeHAT i226 PHC (/dev/ptp0) using competitive
-error source selection: PPS-only, PPS+qErr, and carrier-phase
-estimates compete at every epoch based on confidence.
+Disciplines a PTP Hardware Clock using progressively better
+corrections to the GNSS PPS signal:
+  PPS → PPS+qErr → PPS+PPP (→ PPS+PPP-AR, future)
+
+Each correction layer improves absolute UTC phase accuracy.
+The servo selects the best available correction at each epoch.
 
 M7 adds adaptive discipline interval: instead of calling adjfine every
 second (which injects ~7.5 ppb of correction jitter), the servo
@@ -376,22 +379,22 @@ def compute_error_sources(pps_error_ns, qerr_ns, dt_rx_ns, dt_rx_sigma_ns,
     """
     sources = []
 
-    # 1. PPS-only: always available
-    sources.append(ErrorSource('pps', pps_error_ns, pps_confidence))
+    # 1. PPS: raw PPS edge, no correction applied
+    sources.append(ErrorSource('PPS', pps_error_ns, pps_confidence))
 
-    # 2. PPS + qErr: available when TIM-TP has been received
+    # 2. PPS+qErr: PPS corrected for receiver quantization error
     if qerr_ns is not None:
         # Validated sign convention (testAnt): corrected = raw + qerr
         # Positive qErr means PPS fired early; adding qErr compensates.
-        sources.append(ErrorSource('pps+qerr',
+        sources.append(ErrorSource('PPS+qErr',
                                    pps_error_ns + qerr_ns,
                                    qerr_confidence))
 
-    # 3. Carrier-phase: available when filter has converged
+    # 3. PPS+PPP: PPS corrected by carrier-phase clock estimate
     if dt_rx_sigma_ns is not None and dt_rx_sigma_ns < carrier_max_sigma:
-        # dt_rx is the receiver clock offset: positive = receiver ahead
-        # PPS fires early by dt_rx; add it to get PHC error vs true GPS time
-        sources.append(ErrorSource('carrier',
+        # dt_rx is the receiver clock offset from PPP filter.
+        # Corrects PPS for the receiver's clock offset from GPS time.
+        sources.append(ErrorSource('PPS+PPP',
                                    pps_error_ns + dt_rx_ns,
                                    dt_rx_sigma_ns))
 
@@ -1221,23 +1224,19 @@ def run_servo(args):
                 scheduler.compute_adaptive_interval(avg_confidence)
 
                 if n_epochs % 10 == 0:
-                    src_summary = ' '.join(f'{s.name}={s.error_ns:+.1f}' for s in sources)
                     log.info(f"  [{n_epochs}] {best.name}: "
                              f"err={avg_error:+.1f}ns (avg {n_samples}) "
                              f"adj={adjfine_ppb:+.1f}ppb "
                              f"gain={gain_scale:.2f}x "
-                             f"interval={scheduler.interval} "
-                             f"[{src_summary}]")
+                             f"interval={scheduler.interval}")
             else:
                 # Coast epoch: don't call adjfine, just log
                 n_samples = 0
                 if n_epochs % 10 == 0:
-                    src_summary = ' '.join(f'{s.name}={s.error_ns:+.1f}' for s in sources)
                     log.info(f"  [{n_epochs}] {best.name}: "
                              f"err={best.error_ns:+.1f}ns "
                              f"coast ({scheduler.n_accumulated}/{scheduler.interval}) "
-                             f"adj={adjfine_ppb:+.1f}ppb "
-                             f"[{src_summary}]")
+                             f"adj={adjfine_ppb:+.1f}ppb")
 
             # CSV log (every epoch, including coast)
             if log_w:
