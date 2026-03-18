@@ -213,6 +213,13 @@ def run_find_position(args):
             filt.predict(dt)
             prev_t = gps_time
 
+            # Strip BDS carrier phase — BDS pseudorange is fine but carrier
+            # phase causes divergence (suspected IF wavelength or cycle
+            # conversion issue). GPS+GAL carrier phase works correctly.
+            for obs in observations:
+                if obs['sys'] == 'bds':
+                    obs['phi_if_m'] = None
+
             # Manage ambiguities — add new SVs, remove cycle-slipped
             current_svs = {o['sv'] for o in observations}
             if filt.prev_obs:
