@@ -33,6 +33,7 @@ GAL_EPOCH = datetime(1999, 8, 22, tzinfo=timezone.utc)  # GST epoch = GPS epoch 
 
 SECONDS_PER_WEEK = 604800
 HALF_WEEK = 302400
+BDT_GPST_OFFSET = 14.0  # BDT = GPST - 14 seconds (constant, no new leap seconds since BDS epoch)
 
 
 def _check_week_crossover(dt):
@@ -346,6 +347,13 @@ class BroadcastEphemeris:
 
         # Satellite clock
         clk = _sat_clock(eph, dt_clk, Ek)
+
+        # BDS time system correction: broadcast ephemeris clock is relative
+        # to BDT, but the filter operates in GPST.  GPST = BDT + 14 s, so
+        # dt_sv(GPST) = dt_sv(BDT) - 14 s.  Without this, the ~14 s offset
+        # leaks into the ISB_BDS estimate and overwhelms the filter.
+        if sys == 'C':
+            clk -= BDT_GPST_OFFSET
 
         return pos, clk
 
