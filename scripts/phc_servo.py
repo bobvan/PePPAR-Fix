@@ -1302,7 +1302,7 @@ def main():
                     help="Position watchdog threshold in meters (default: 0.5)")
     ap.add_argument("--leap", type=int, default=18,
                     help="UTC-GPS leap seconds (default: 18)")
-    ap.add_argument("--systems", default="gps,gal,bds",
+    ap.add_argument("--systems", default="gps,gal",
                     help="GNSS systems to use (default: gps,gal)")
 
     # Serial
