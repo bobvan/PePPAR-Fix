@@ -311,8 +311,14 @@ class BroadcastEphemeris:
         return week, sow
 
     def _bds_seconds_of_week(self, t):
-        """Convert datetime to BDS seconds-of-week."""
-        bds_delta = (t - BDS_EPOCH).total_seconds()
+        """Convert GPS-time datetime to BDS seconds-of-week.
+
+        The input t is in GPST, but BDS toe/toc are in BDT.
+        BDT = GPST - 14 s, so we subtract the offset before computing
+        BDS week and second-of-week.
+        """
+        t_bdt = t - timedelta(seconds=BDT_GPST_OFFSET)
+        bds_delta = (t_bdt - BDS_EPOCH).total_seconds()
         week = int(bds_delta // SECONDS_PER_WEEK)
         sow = bds_delta - week * SECONDS_PER_WEEK
         return week, sow
