@@ -222,7 +222,7 @@ def run_find_position(args):
                     if sat_pos is not None:
                         dx = sat_pos - filt.x[:3]
                         rho = np.linalg.norm(dx)
-                        N_init = obs['pr_if'] - obs['phi_if_m']
+                        N_init = obs['phi_if_m'] - obs['pr_if']
                         filt.add_ambiguity(sv, N_init)
 
             # Store for cycle slip detection
