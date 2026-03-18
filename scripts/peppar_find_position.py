@@ -148,6 +148,7 @@ def run_find_position(args):
 
     # Main loop
     prev_t = None
+    prev_pos_ecef = None
     n_epochs = 0
     n_empty = 0
     converged = False
@@ -256,8 +257,8 @@ def run_find_position(args):
                     len(filt.sv_to_idx),
                 ])
 
-            # Status every 10 epochs
-            if n_epochs % 10 == 0:
+            # Status every 5 epochs
+            if n_epochs % 5 == 0:
                 log.info(
                     f"  [{n_epochs}] σ={sigma_3d:.3f}m "
                     f"pos=({lat:.6f}, {lon:.6f}, {alt:.1f}) "
@@ -265,15 +266,22 @@ def run_find_position(args):
                     f"rms={rms:.3f}m [{elapsed:.0f}s]"
                 )
 
-            # Convergence check
-            if sigma_3d < args.sigma:
+            # Convergence check: sigma below threshold AND position stable
+            # Position stability: 3D movement < sigma between epochs
+            pos_stable = True
+            if prev_pos_ecef is not None:
+                pos_delta = np.linalg.norm(pos_ecef - prev_pos_ecef)
+                pos_stable = pos_delta < args.sigma
+            prev_pos_ecef = pos_ecef.copy()
+
+            if sigma_3d < args.sigma and pos_stable and rms < 10.0:
                 if converged_at is None:
                     converged_at = n_epochs
-                # Require convergence to hold for 10 consecutive epochs
-                if n_epochs - converged_at >= 10:
+                # Require convergence to hold for 30 consecutive epochs
+                if n_epochs - converged_at >= 30:
                     converged = True
                     log.info(f"CONVERGED at epoch {n_epochs} "
-                             f"(σ={sigma_3d:.4f}m < {args.sigma}m)")
+                             f"(σ={sigma_3d:.4f}m, rms={rms:.3f}m)")
                     break
             else:
                 converged_at = None
