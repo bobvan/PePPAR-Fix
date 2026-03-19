@@ -1,0 +1,206 @@
+{
+  "$schema": "timelab-resources-v1",
+  "description": "Machine-readable inventory of lab hosts, GNSS receivers, TICCs, and wiring. Source of truth for topology patrol.",
+  "updated": "2026-03-19",
+  "hosts": {
+    "TimeHat": {
+      "access": "ssh TimeHat",
+      "ip": "10.168.60.0/24",
+      "hardware": "Raspberry Pi 5",
+      "expected_devices": {
+        "gnss": ["/dev/gnss-top"],
+        "ticc": ["/dev/ticc"],
+        "ptp": ["/dev/ptp0"]
+      },
+      "receivers": ["F9T-3RD"],
+      "ticcs": ["TICC-3"],
+      "notes": "SatPulse GPSDO + PePPAR Fix development"
+    },
+    "PiPuss": {
+      "access": "ssh pipuss.local",
+      "ip": "10.168.60.242",
+      "hardware": "Raspberry Pi 5",
+      "expected_devices": {
+        "gnss": ["/dev/gnss-top", "/dev/gnss-bot"],
+        "ticc": ["/dev/ticc"],
+        "ptp": ["/dev/ptp0"]
+      },
+      "receivers": ["F9T-TOP", "F9T-BOT"],
+      "ticcs": ["TICC-1"],
+      "notes": "testAnt data collection, PePPAR Fix observations"
+    },
+    "Onocoy": {
+      "access": "ssh onocoy.local",
+      "ip": "10.168.60.143",
+      "hardware": "Raspberry Pi 4",
+      "expected_devices": {
+        "gnss": [],
+        "ticc": ["/dev/ttyUSB0"],
+        "ptp": []
+      },
+      "receivers": ["F10T", "PX1125T"],
+      "ticcs": ["TICC-2"],
+      "notes": "Onocoy GNSS mining, PX1125T eval. TICC on /dev/ttyUSB0 (not udev symlink)."
+    },
+    "otcBob1": {
+      "access": "ssh otcBob1",
+      "ip": "10.168.13.16",
+      "hardware": "Timebeat OTC SBC",
+      "expected_devices": {
+        "gnss": [],
+        "ticc": [],
+        "ptp": ["/dev/ptp0"]
+      },
+      "receivers": ["F9T-OTC"],
+      "ticcs": [],
+      "notes": "PTP GM domain 40, OCXO. GNSS on /dev/ttyAMA0 (not /dev/gnss*)."
+    },
+    "ptBoat": {
+      "access": "ssh ptBoat",
+      "ip": "10.168.13.15",
+      "hardware": "Timebeat OTC Mini PT",
+      "expected_devices": {
+        "gnss": [],
+        "ticc": [],
+        "ptp": ["/dev/ptp0"]
+      },
+      "receivers": ["F9T-ptBoat"],
+      "ticcs": [],
+      "notes": "PTP GM domain 10. GNSS on /dev/ttyAMA0 (not /dev/gnss*). Weatherproof, PoE."
+    },
+    "bbb": {
+      "access": "ssh bbb",
+      "ip": "10.168.13.14",
+      "hardware": "BeagleBone Black",
+      "expected_devices": {
+        "gnss": ["/dev/gps0"],
+        "ticc": [],
+        "ptp": ["/dev/ptp0"]
+      },
+      "receivers": ["Adafruit-GPS"],
+      "ticcs": [],
+      "notes": "chrony stratum 1, PTP GM domain 20. GPS on /dev/gps0."
+    }
+  },
+  "receivers": {
+    "F9T-3RD": {
+      "model": "ZED-F9T-20B",
+      "evk": "EVK-F9T-20-00",
+      "firmware": "TIM 2.25",
+      "host": "TimeHat",
+      "port": "/dev/gnss-top",
+      "baud": 115200,
+      "antenna": "UFO",
+      "splitter": "GUS-1"
+    },
+    "F9T-TOP": {
+      "model": "ZED-F9T",
+      "evk": "EVK-F9T-10-00",
+      "firmware": "TIM 2.20",
+      "host": "PiPuss",
+      "port": "/dev/gnss-top",
+      "baud": 115200,
+      "antenna": "TBD",
+      "splitter": "TBD"
+    },
+    "F9T-BOT": {
+      "model": "ZED-F9T-20B",
+      "evk": "EVK-F9T-20-00",
+      "firmware": "TIM 2.25",
+      "host": "PiPuss",
+      "port": "/dev/gnss-bot",
+      "baud": 115200,
+      "antenna": "Patch3",
+      "splitter": "GUS-2"
+    },
+    "F10T": {
+      "model": "ZED-F10T",
+      "host": "Onocoy",
+      "port": "/dev/ttyACM0",
+      "antenna": "Patch3",
+      "splitter": "GUS-2"
+    },
+    "PX1125T": {
+      "model": "SkyTraq PX1125T",
+      "host": "Onocoy",
+      "port": "/dev/ttyUSB1",
+      "antenna": "UFO",
+      "splitter": "GUS-1"
+    },
+    "F9T-OTC": {
+      "model": "ZED-F9T",
+      "host": "otcBob1",
+      "port": "/dev/ttyAMA0",
+      "baud": 460800,
+      "antenna": "UFO",
+      "splitter": "GUS-1"
+    },
+    "F9T-ptBoat": {
+      "model": "ZED-F9T",
+      "host": "ptBoat",
+      "port": "/dev/ttyAMA0",
+      "baud": 115200,
+      "antenna": "SPK6618H-ptBoat",
+      "splitter": null
+    },
+    "Adafruit-GPS": {
+      "model": "MTK-3301",
+      "host": "bbb",
+      "port": "/dev/gps0",
+      "baud": 9600,
+      "antenna": "Patch1",
+      "splitter": "SV1AFN-L1"
+    }
+  },
+  "ticcs": {
+    "TICC-1": {
+      "host": "PiPuss",
+      "port": "/dev/ticc",
+      "baud": 115200,
+      "chA": "TimeHAT PHC PPS OUT (SDP0)",
+      "chB": "F9T-BOT PPS",
+      "ref": "10 MHz from SV1AFN dist amp"
+    },
+    "TICC-2": {
+      "host": "Onocoy",
+      "port": "/dev/ttyUSB0",
+      "baud": 115200,
+      "chA": "F10T PPS",
+      "chB": "PX1125T PPS",
+      "ref": "10 MHz from SV1AFN dist amp"
+    },
+    "TICC-3": {
+      "host": "TimeHat",
+      "port": "/dev/ticc",
+      "baud": 115200,
+      "chA": "TimeHAT PHC PPS OUT (SDP0, disciplined)",
+      "chB": "F9T-3RD PPS (raw GPS)",
+      "ref": "10 MHz from SV1AFN dist amp"
+    }
+  },
+  "antennas": {
+    "UFO": {"type": "SparkFun SPK6618H", "mount": "West roof slope"},
+    "Patch3": {"type": "Patch (unknown mfr)", "mount": "East roof slope"},
+    "Patch2": {"type": "Patch (Quectel)", "mount": "East roof slope"},
+    "Patch1": {"type": "Patch (unknown mfr)", "mount": "East roof slope"},
+    "SPK6618H-ptBoat": {"type": "SparkFun SPK6618H", "mount": "West roof slope"},
+    "Choke": {"type": "Choke ring with radome", "mount": "Indoors (desk)"}
+  },
+  "splitters": {
+    "GUS-1": {
+      "model": "TAPR GUS Active Splitter",
+      "input": "UFO",
+      "outputs": ["otcBob1 F9T", "Onocoy PX1125T", "TimeHat F9T-3RD"]
+    },
+    "GUS-2": {
+      "model": "TAPR GUS Active Splitter",
+      "input": "Patch3",
+      "outputs": ["PiPuss F9T-BOT", "Onocoy F10T"]
+    },
+    "SV1AFN-L1": {
+      "model": "SV1AFN L1 GPS Antenna Splitter",
+      "input": "Patch1",
+      "outputs": ["bbb Adafruit GPS"]
+    }
+  }
+}
