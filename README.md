@@ -333,7 +333,10 @@ Key mountpoints on `products.igs-ip.net:2101`:
 │   ├── 99-timehat-devices.rules  # udev rules for F9T + TICC
 │   └── receivers.toml            # Device configuration
 ├── docs/
+│   ├── hw-labels.md          # hw: bead label convention for hardware scheduling
 │   └── nic-survey.md         # PHC hardware survey (PPS IN+OUT qualified)
+├── timelab/
+│   └── resources.json        # Lab hardware inventory (hosts, NICs, receivers, TICCs, antennas, wiring)
 ├── data/                     # Observation runs + correction products
 ├── requirements.txt          # Python dependencies
 └── README.md
