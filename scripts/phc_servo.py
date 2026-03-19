@@ -118,49 +118,26 @@ log = logging.getLogger("phc_servo")
 
 
 
-# ── F9T timing mode switch ──────────────────────────────────────────────── #
+# ── Timing mode switch (delegates to receiver driver) ──────────────────── #
 
-def build_tmode_fixed_msg(ecef):
-    """Build UBX CFG-VALSET bytes to switch F9T to fixed-position timing mode.
+def build_tmode_fixed_msg(ecef, driver=None):
+    """Build UBX CFG-VALSET bytes to switch to fixed-position timing mode.
 
-    Sets TMODE=2 (fixed ECEF) with the given position. This gives the F9T's
-    timing engine the precise position so PPS phase accuracy improves to
-    timing-grade (important for PPS-only and PPS+qErr fallback modes).
+    Delegates to the receiver driver's implementation. Only timing-grade
+    receivers (e.g. ZED-F9T) support this; navigation receivers (e.g.
+    NEO-F10T) return None.
 
     Args:
         ecef: numpy array [x, y, z] in meters (ECEF)
+        driver: ReceiverDriver instance. Defaults to F9TDriver.
 
     Returns:
-        bytes ready to write to the serial port, or None if pyubx2 unavailable.
+        bytes ready to write to the serial port, or None if unsupported.
     """
-    try:
-        from pyubx2 import UBXMessage, SET
-    except ImportError:
-        return None
-
-    # CFG-TMODE uses cm + 0.1mm high-precision split:
-    #   ECEF_X = integer cm
-    #   ECEF_X_HP = residual in 0.1 mm (-99..99)
-    x_cm = int(ecef[0] * 100)
-    y_cm = int(ecef[1] * 100)
-    z_cm = int(ecef[2] * 100)
-    x_hp = int(round((ecef[0] * 100 - x_cm) * 100))  # 0.1 mm
-    y_hp = int(round((ecef[1] * 100 - y_cm) * 100))
-    z_hp = int(round((ecef[2] * 100 - z_cm) * 100))
-
-    cfg_data = [
-        ("CFG_TMODE_MODE", 2),              # 2 = Fixed ECEF
-        ("CFG_TMODE_POS_TYPE", 0),          # 0 = ECEF
-        ("CFG_TMODE_ECEF_X", x_cm),
-        ("CFG_TMODE_ECEF_Y", y_cm),
-        ("CFG_TMODE_ECEF_Z", z_cm),
-        ("CFG_TMODE_ECEF_X_HP", x_hp),
-        ("CFG_TMODE_ECEF_Y_HP", y_hp),
-        ("CFG_TMODE_ECEF_Z_HP", z_hp),
-        ("CFG_TMODE_FIXED_POS_ACC", 100),   # 10 mm accuracy (0.1 mm units)
-    ]
-    msg = UBXMessage.config_set(7, 0, cfg_data)  # layers: RAM + BBR + Flash
-    return msg.serialize()
+    if driver is None:
+        from peppar_fix.receiver import F9TDriver
+        driver = F9TDriver()
+    return driver.build_tmode_fixed_msg(ecef)
 
 
 # ── Main servo loop ──────────────────────────────────────────────────────── #
@@ -182,6 +159,11 @@ def run_servo(args):
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+
+    # ── Receiver driver ──────────────────────────────────────────────────
+    from peppar_fix.receiver import get_driver
+    driver = get_driver(args.receiver)
+    log.info(f"Receiver: {driver.name} (PROTVER {driver.protver})")
 
     # ── Resolve position: --known-pos > position file > error ────────────
     position_source = None  # tracks where the position came from
@@ -314,7 +296,8 @@ def run_servo(args):
     t_serial = threading.Thread(
         target=serial_reader,
         args=(args.serial, args.baud, obs_queue, stop_event, beph, systems, ssr),
-        kwargs={'qerr_store': qerr_store, 'config_queue': config_queue},
+        kwargs={'qerr_store': qerr_store, 'config_queue': config_queue,
+                'driver': driver},
         daemon=True,
     )
     t_serial.start()
@@ -530,17 +513,17 @@ def run_servo(args):
                     log.info(f"Position saved to {args.position_file} "
                              f"(sigma={sigma_m:.4f}m after {n_epochs} epochs)")
 
-                # Switch F9T to fixed-position timing mode for better PPS+qErr
-                # fallback.  Only done once.  Uses the known position so the
-                # F9T's timing engine optimizes PPS alignment.
+                # Switch receiver to fixed-position timing mode for better
+                # PPS+qErr fallback.  Only done once, and only for timing
+                # receivers (F9T).  Navigation receivers (F10T) return None.
                 if not tmode_set and sigma_m < 0.1:
-                    tmode_msg = build_tmode_fixed_msg(known_ecef)
+                    tmode_msg = build_tmode_fixed_msg(known_ecef, driver=driver)
                     if tmode_msg is not None:
                         config_queue.put(tmode_msg)
                         tmode_set = True
                         lat, lon, alt = ecef_to_lla(
                             known_ecef[0], known_ecef[1], known_ecef[2])
-                        log.info(f"F9T → fixed-position timing mode "
+                        log.info(f"{driver.name} → fixed-position timing mode "
                                  f"({lat:.6f}, {lon:.6f}, {alt:.1f}m)")
 
             # Get the PPS event for this epoch (1:1 pairing)
@@ -748,9 +731,11 @@ def main():
     ap.add_argument("--systems", default="gps,gal,bds",
                     help="GNSS systems to use (default: gps,gal)")
 
-    # Serial
+    # Serial / Receiver
     ap.add_argument("--serial", required=True,
-                    help="F9T serial port (e.g. /dev/gnss-top)")
+                    help="Receiver serial port (e.g. /dev/gnss-top)")
+    ap.add_argument("--receiver", default="f9t",
+                    help="Receiver model: f9t, f10t (default: f9t)")
     ap.add_argument("--baud", type=int, default=9600,
                     help="Serial baud rate (default: 9600)")
 

@@ -56,14 +56,24 @@ def sv_label(gnss_id, sv_id):
     return f"{p}{sv_id:02d}"
 
 
-def signal_name(gnss_id, sig_id):
-    """Map gnssId + sigId to human-readable signal name."""
+def signal_name(gnss_id, sig_id, driver=None):
+    """Map gnssId + sigId to human-readable signal name.
+
+    Uses the receiver driver's signal mapping when provided,
+    falling back to the F9T mapping for backward compatibility.
+    """
+    if driver is not None:
+        name = driver.signal_name(gnss_id, sig_id)
+        if name is not None:
+            return name
+    # Fallback: static table (F9T-compatible, covers both F9T and F10T
+    # for signals that share the same sigId)
     table = {
         (0, 0): "GPS-L1CA", (0, 3): "GPS-L2CL", (0, 4): "GPS-L2CM",
         (0, 6): "GPS-L5I", (0, 7): "GPS-L5Q",
         (2, 0): "GAL-E1C", (2, 1): "GAL-E1B",
-        (2, 5): "GAL-E5aI", (2, 6): "GAL-E5aQ",
-        (2, 3): "GAL-E5bI", (2, 4): "GAL-E5bQ",
+        (2, 3): "GAL-E5aI", (2, 4): "GAL-E5aQ",
+        (2, 5): "GAL-E5bI", (2, 6): "GAL-E5bQ",
         (3, 0): "BDS-B1I", (3, 5): "BDS-B2aI",
         (3, 1): "BDS-B1C", (3, 7): "BDS-B2I",
     }

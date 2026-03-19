@@ -114,8 +114,8 @@ class QErrStore:
 
 
 def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
-                   ssr=None, qerr_store=None, config_queue=None):
-    """Read UBX messages from F9T serial port.
+                   ssr=None, qerr_store=None, config_queue=None, driver=None):
+    """Read UBX messages from a u-blox serial port.
 
     Puts (timestamp, observations_list) tuples onto obs_queue for each
     RXM-RAWX epoch. Also feeds RXM-SFRBX to broadcast ephemeris.
@@ -130,6 +130,8 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
         qerr_store: QErrStore instance for TIM-TP qErr extraction.
         config_queue: optional queue.Queue of bytes to write to the serial
              port (e.g. UBX CFG-VALSET messages from the main thread).
+        driver: ReceiverDriver instance for signal ID mapping.
+             Defaults to F9TDriver for backward compatibility.
     """
     try:
         from pyubx2 import UBXReader
@@ -139,24 +141,18 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
         stop_event.set()
         return
 
-    log.info(f"Opening serial {port} at {baud} baud")
+    # Default to F9T for backward compatibility
+    if driver is None:
+        from peppar_fix.receiver import F9TDriver
+        driver = F9TDriver()
+
+    log.info(f"Opening serial {port} at {baud} baud (driver: {driver.name})")
     ser = pyserial.Serial(port, baud, timeout=2)
     ubr = UBXReader(ser, protfilter=2)  # UBX only
 
-    # Signal name mapping (same as log_observations.py)
-    # u-blox F9T signal IDs (PROTVER 29.x)
-    # Note: Galileo E5a sigIds differ between u-blox generations.
-    # F9T-BOT (TIM 2.25) outputs sigId=4 for E5aQ, not sigId=6.
-    SIG_NAMES = {
-        (0, 0): 'GPS-L1CA', (0, 3): 'GPS-L2CL', (0, 4): 'GPS-L2CM',
-        (0, 6): 'GPS-L5I', (0, 7): 'GPS-L5Q',
-        (2, 0): 'GAL-E1C', (2, 1): 'GAL-E1B',
-        (2, 3): 'GAL-E5aI', (2, 4): 'GAL-E5aQ',
-        (2, 5): 'GAL-E5bI', (2, 6): 'GAL-E5bQ',
-        (3, 0): 'BDS-B1I', (3, 1): 'BDS-B1C',
-        (3, 5): 'BDS-B2aI', (3, 7): 'BDS-B2I',
-    }
-    SYS_MAP = {0: 'G', 2: 'E', 3: 'C'}
+    # Signal name mapping from receiver driver
+    SIG_NAMES = driver.signal_names
+    SYS_MAP = driver.sys_map
 
     sig_lookup = {}
     for gnss_id, sig_f1, sig_f2, prefix, a1, a2 in IF_PAIRS:
@@ -469,8 +465,10 @@ def run_replay(args):
 # ── Real-time mode ──────────────────────────────────────────────────────────── #
 
 def run_realtime(args):
-    """Run in real-time mode with serial F9T + NTRIP corrections."""
-    log.info("=== Real-time mode ===")
+    """Run in real-time mode with serial u-blox receiver + NTRIP corrections."""
+    from peppar_fix.receiver import get_driver
+    driver = get_driver(args.receiver)
+    log.info(f"=== Real-time mode ({driver.name}) ===")
 
     lat, lon, alt = [float(v) for v in args.known_pos.split(',')]
     known_ecef = lla_to_ecef(lat, lon, alt)
@@ -538,6 +536,7 @@ def run_realtime(args):
     t_serial = threading.Thread(
         target=serial_reader,
         args=(args.serial, args.baud, obs_queue, stop_event, beph, systems, ssr),
+        kwargs={'driver': driver},
         daemon=True,
     )
     t_serial.start()
@@ -651,7 +650,9 @@ def main():
 
     # Serial (real-time mode)
     serial = ap.add_argument_group("Serial (real-time)")
-    serial.add_argument("--serial", help="Serial port for F9T (e.g. /dev/gnss-bot)")
+    serial.add_argument("--serial", help="Serial port (e.g. /dev/gnss-bot)")
+    serial.add_argument("--receiver", default="f9t",
+                        help="Receiver model: f9t, f10t (default: f9t)")
     serial.add_argument("--baud", type=int, default=115200)
 
     # NTRIP (real-time mode)

@@ -45,30 +45,9 @@ except ImportError:
 
 
 # ── Signal configuration ──────────────────────────────────────────────────── #
-# CFG-SIGNAL keys: enable dual-frequency GPS, Galileo, BDS
-# Disable GLONASS (FDMA complicates PPP-AR ambiguity resolution)
-SIGNAL_CONFIG = {
-    # GPS
-    "CFG_SIGNAL_GPS_ENA": 1,
-    "CFG_SIGNAL_GPS_L1CA_ENA": 1,
-    "CFG_SIGNAL_GPS_L5_ENA": 1,
-    "CFG_SIGNAL_GPS_L2C_ENA": 0,        # not needed for iono-free L1+L5
-    # Galileo
-    "CFG_SIGNAL_GAL_ENA": 1,
-    "CFG_SIGNAL_GAL_E1_ENA": 1,
-    "CFG_SIGNAL_GAL_E5A_ENA": 1,
-    "CFG_SIGNAL_GAL_E5B_ENA": 0,
-    # BeiDou
-    "CFG_SIGNAL_BDS_ENA": 1,
-    "CFG_SIGNAL_BDS_B1_ENA": 1,
-    "CFG_SIGNAL_BDS_B2A_ENA": 1,
-    "CFG_SIGNAL_BDS_B2_ENA": 0,
-    # GLONASS off (FDMA)
-    "CFG_SIGNAL_GLO_ENA": 0,
-    # SBAS/QZSS off (not useful for PPP-AR)
-    "CFG_SIGNAL_SBAS_ENA": 0,
-    "CFG_SIGNAL_QZSS_ENA": 0,
-}
+# Receiver-specific signal config from the driver abstraction.
+# The driver knows which signals to enable for each receiver model.
+from peppar_fix.receiver import get_driver, F9TDriver
 
 
 def probe_baud(port):
@@ -147,10 +126,12 @@ def configure_rate(ser, ubr, rate_hz):
     }, f"Measurement rate = {rate_hz} Hz ({meas_ms} ms)")
 
 
-def configure_signals(ser, ubr):
+def configure_signals(ser, ubr, driver=None):
     """Enable dual-frequency signals for PPP-AR."""
-    return send_cfg(ser, ubr, SIGNAL_CONFIG,
-                    "Signals: GPS L1+L5, GAL E1+E5a, BDS B1+B2a")
+    if driver is None:
+        driver = F9TDriver()
+    return send_cfg(ser, ubr, driver.signal_config,
+                    f"Signals: GPS L1+L5, GAL E1+E5a, BDS B1+B2a ({driver.name})")
 
 
 def configure_messages(ser, ubr, port_id):
@@ -278,12 +259,14 @@ def verify_messages(ubr, timeout=10):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Configure u-blox ZED-F9T for PPP-AR observations")
+        description="Configure a u-blox receiver for PPP-AR observations")
     ap.add_argument("port", help="Serial port (e.g. /dev/ttyF9T, /dev/ttyUSB0)")
+    ap.add_argument("--receiver", default="f9t",
+                    help="Receiver model: f9t, f10t (default: f9t)")
     ap.add_argument("--baud", type=int, default=9600,
                     help="Current baud rate (default 9600 after factory reset)")
-    ap.add_argument("--target-baud", type=int, default=460800,
-                    help="Target UART baud rate (default 460800). Ignored for USB.")
+    ap.add_argument("--target-baud", type=int, default=None,
+                    help="Target UART baud rate (default: from driver). Ignored for USB.")
     ap.add_argument("--rate", type=int, default=1, choices=range(1, 11),
                     help="Measurement rate in Hz (default 1, max 10)")
     ap.add_argument("--survey-dur", type=int, default=300,
@@ -300,12 +283,20 @@ def main():
                     help="Skip message verification")
     args = ap.parse_args()
 
+    driver = get_driver(args.receiver)
+    if args.target_baud is None:
+        args.target_baud = driver.default_baud
+
     port_id = 1 if args.port_type == "UART" else 3
 
-    print(f"PePPAR Fix — F9T Configuration")
+    print(f"PePPAR Fix — {driver.name} Configuration")
     print(f"  Port: {args.port} ({args.port_type})")
+    print(f"  Receiver: {driver.name} (PROTVER {driver.protver})")
     print(f"  Rate: {args.rate} Hz")
-    print(f"  Survey-in: {args.survey_dur}s, {args.survey_acc}m")
+    if driver.supports_timing_mode:
+        print(f"  Survey-in: {args.survey_dur}s, {args.survey_acc}m")
+    else:
+        print(f"  Survey-in: N/A (no timing mode on {driver.name})")
     print()
 
     ser = Serial(args.port, baudrate=args.baud, timeout=1)
@@ -333,8 +324,12 @@ def main():
         ubr = UBXReader(ser, protfilter=2)
 
     # Step 2: Configure signals + GPS L5 health override
-    configure_signals(ser, ubr)
-    l5_ok = configure_gps_l5_health(ser, ubr)
+    configure_signals(ser, ubr, driver=driver)
+    l5_ok = False
+    if driver.supports_l5_health_override:
+        l5_ok = configure_gps_l5_health(ser, ubr)
+    else:
+        print(f"  GPS L5 health override: N/A for {driver.name}")
 
     # The L5 health override and signal config are saved to flash but
     # require a warm restart to take effect.  Without this, GPS L5
@@ -369,8 +364,11 @@ def main():
     configure_messages(ser, ubr, port_id)
     configure_nmea_off(ser, ubr, port_id)
 
-    # Step 5: Survey-in for Time Mode
-    configure_tmode(ser, ubr, args.survey_dur, args.survey_acc)
+    # Step 5: Survey-in for Time Mode (timing receivers only)
+    if driver.supports_timing_mode:
+        configure_tmode(ser, ubr, args.survey_dur, args.survey_acc)
+    else:
+        print(f"  Survey-in: skipped ({driver.name} has no timing mode)")
 
     # Step 6: UART baud rate (skip for USB)
     if args.port_type == "UART" and args.target_baud != 9600:
@@ -386,7 +384,7 @@ def main():
             print(f"\nWARNING: Missing messages: {missing}", file=sys.stderr)
             sys.exit(1)
 
-    print("\nF9T configured for PPP-AR observations.")
+    print(f"\n{driver.name} configured for PPP-AR observations.")
     print(f"  Next: python scripts/log_observations.py {args.port}"
           f" --baud {args.target_baud if args.port_type == 'UART' else args.baud}")
     ser.close()

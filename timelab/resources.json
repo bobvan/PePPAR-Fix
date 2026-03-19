@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Time lab hardware inventory. Machine-readable resource list for Mayor scheduling of hardware-dependent work. See docs/hw-labels.md for the hw: bead label convention.",
+  "updated": "2026-03-19",
+
+  "hosts": {
+    "TimeHat": {
+      "description": "Raspberry Pi 5 with TimeHAT v5 — primary PePPAR Fix dev platform",
+      "hw_label": "hw:TimeHat",
+      "hostname": "timehat",
+      "platform": "Raspberry Pi 5",
+      "os": "Raspberry Pi OS (Debian)",
+      "interfaces": ["eth0 (igc, i226, 2.5G)"],
+      "location": "lab rack",
+      "status": "active"
+    }
+  },
+
+  "nics": {
+    "TimeHAT-v5": {
+      "description": "TimeHAT v5 — i226 + TCXO on Pi 5 HAT",
+      "hw_label": "hw:TimeHat",
+      "model": "TimeHAT v5 (Intel i226)",
+      "host": "TimeHat",
+      "oscillator": "TCXO ±280 ppb",
+      "phc_resolution": "1 ns",
+      "adjfine_ppb_per_lsb": 0.12,
+      "max_adj_ppm": 62.5,
+      "pps_io": ["SDP0 (SMA1 J4, PPS OUT)", "SDP1 (SMA2 J5, PPS IN)", "SDP2 (U.FL)", "SDP3 (strapping)"],
+      "driver": "igc",
+      "ptp_device": "/dev/ptp0",
+      "udev_rule": "config/99-timehat-devices.rules",
+      "status": "installed"
+    },
+    "E810-XXVDA4T": {
+      "description": "Intel E810-XXVDA4T — OCXO, sub-ns timestamping, onboard F9T",
+      "hw_label": "hw:E810",
+      "model": "Intel E810-XXVDA4T",
+      "host": null,
+      "oscillator": "OCXO (4h holdover)",
+      "phc_resolution": "sub-ns (7-bit)",
+      "pps_io": ["2 SMA", "U.FL"],
+      "driver": "ice (out-of-tree DKMS required for PPS)",
+      "gnss": "/dev/gnss0 (onboard ZED-F9T via I2C)",
+      "interface": "PCIe 4.0 x16, 4x25G SFP28",
+      "status": "on_order",
+      "ordered": "2026-03-17"
+    },
+    "SFN6322F-1": {
+      "description": "Solarflare SFN6322F #1 — 10G, PTP standard (no license needed)",
+      "hw_label": "hw:SFN6322F-1",
+      "model": "Solarflare SFN6322F",
+      "host": null,
+      "oscillator": "Stratum 3 (<0.37 PPM/day)",
+      "pps_io": ["u.FL on PCB (needs u.FL→SMA pigtail)"],
+      "driver": "sfc + sfptpd",
+      "hw_timestamp": "PTP packets only, single port",
+      "interface": "PCIe 2.0/3.0, 2x10G SFP+",
+      "status": "inventory",
+      "notes": "PTP is standard — no license required"
+    },
+    "SFN6322F-2": {
+      "description": "Solarflare SFN6322F #2 — 10G, PTP standard (no license needed)",
+      "hw_label": "hw:SFN6322F-2",
+      "model": "Solarflare SFN6322F",
+      "host": null,
+      "oscillator": "Stratum 3 (<0.37 PPM/day)",
+      "pps_io": ["u.FL on PCB (needs u.FL→SMA pigtail)"],
+      "driver": "sfc + sfptpd",
+      "hw_timestamp": "PTP packets only, single port",
+      "interface": "PCIe 2.0/3.0, 2x10G SFP+",
+      "status": "inventory",
+      "notes": "PTP is standard — no license required"
+    },
+    "SFN8522-1": {
+      "description": "Solarflare SFN8522 #1 — 10G, PTP license status unknown",
+      "hw_label": "hw:SFN8522-1",
+      "model": "Solarflare SFN8522",
+      "host": null,
+      "oscillator": "Stratum 3 (<0.37 PPM/day)",
+      "pps_io": ["u.FL on PCB (needs u.FL→SMA pigtail)"],
+      "driver": "sfc + sfptpd",
+      "hw_timestamp": "all packets (if licensed)",
+      "interface": "PCIe 3.1 x8, 2x10G SFP+",
+      "status": "inventory",
+      "notes": "Needs AppFlex PTP license — run ethtool -T to verify"
+    },
+    "SFN8522-2": {
+      "description": "Solarflare SFN8522 #2",
+      "hw_label": "hw:SFN8522-2",
+      "model": "Solarflare SFN8522",
+      "host": null,
+      "status": "inventory",
+      "notes": "Same as SFN8522-1 — license status unknown"
+    },
+    "SFN8522-3": {
+      "description": "Solarflare SFN8522 #3",
+      "hw_label": "hw:SFN8522-3",
+      "model": "Solarflare SFN8522",
+      "host": null,
+      "status": "inventory",
+      "notes": "Same as SFN8522-1 — license status unknown"
+    },
+    "SFN8522-4": {
+      "description": "Solarflare SFN8522 #4",
+      "hw_label": "hw:SFN8522-4",
+      "model": "Solarflare SFN8522",
+      "host": null,
+      "status": "inventory",
+      "notes": "Same as SFN8522-1 — license status unknown"
+    }
+  },
+
+  "receivers": {
+    "F9T-3RD": {
+      "description": "u-blox ZED-F9T (EVK-F9T-20-00, ZED-F9T-20B) — primary GNSS receiver",
+      "hw_label": "hw:F9T-3RD",
+      "model": "u-blox ZED-F9T-20B",
+      "host": "TimeHat",
+      "port": "/dev/gnss-top",
+      "baud": 115200,
+      "bands": ["L1C/A", "L5 (GPS)", "E1", "E5a (Galileo)", "B1", "B2a (BeiDou)"],
+      "constellations": ["GPS", "Galileo", "BeiDou"],
+      "notes": "-20B variant: no GLONASS. Connected via USB.",
+      "antenna": "Patch2",
+      "status": "installed"
+    },
+    "E810-F9T": {
+      "description": "Onboard ZED-F9T on E810-XXVDA4T (via ice driver I2C)",
+      "hw_label": "hw:E810",
+      "model": "u-blox ZED-F9T",
+      "host": null,
+      "port": "/dev/gnss0",
+      "notes": "Onboard receiver accessed via ice driver. On order with E810.",
+      "status": "on_order"
+    }
+  },
+
+  "ticcs": {
+    "TICC-3": {
+      "description": "TAPR TICC #3 — time interval counter for validation",
+      "hw_label": "hw:TICC-3",
+      "model": "TAPR TICC",
+      "host": "TimeHat",
+      "port": "/dev/ticc",
+      "baud": 115200,
+      "serial": "95037323535351803130",
+      "channels": {
+        "chA": "TimeHAT PHC PPS OUT (SDP0, disciplined)",
+        "chB": "F9T-3RD PPS (raw GPS reference)"
+      },
+      "reference": "10 MHz from SV1AFN distribution amp (fed by Geppetto GPSDO)",
+      "status": "installed"
+    }
+  },
+
+  "antennas": {
+    "Patch2": {
+      "description": "Active dual-band patch antenna — roof-mounted",
+      "hw_label": "hw:Patch2",
+      "model": "Patch2",
+      "type": "active patch",
+      "bands": ["L1", "L5"],
+      "location": "roof",
+      "connected_to": "F9T-3RD",
+      "status": "installed"
+    }
+  },
+
+  "wiring": [
+    {
+      "from": "Patch2 (roof)",
+      "to": "F9T-3RD (antenna in)",
+      "cable": "coax",
+      "signal": "L1/L5 RF + DC bias"
+    },
+    {
+      "from": "F9T-3RD (PPS out)",
+      "to": "TimeHAT SDP1 (SMA2 J5)",
+      "cable": "SMA",
+      "signal": "1PPS (raw GPS, closes discipline loop)"
+    },
+    {
+      "from": "TimeHAT SDP0 (SMA1 J4)",
+      "to": "TICC-3 chA",
+      "cable": "SMA",
+      "signal": "1PPS (disciplined PHC output)"
+    },
+    {
+      "from": "F9T-3RD (PPS out)",
+      "to": "TICC-3 chB",
+      "cable": "SMA (tee or split)",
+      "signal": "1PPS (raw GPS reference)"
+    },
+    {
+      "from": "SV1AFN distribution amp",
+      "to": "TICC-3 ref",
+      "cable": "SMA",
+      "signal": "10 MHz (from Geppetto GPSDO)"
+    },
+    {
+      "from": "F9T-3RD (USB)",
+      "to": "TimeHat (USB port)",
+      "cable": "USB",
+      "signal": "UBX serial data (RAWX, PVT, TIM-TP)"
+    },
+    {
+      "from": "TICC-3 (USB)",
+      "to": "TimeHat (USB port)",
+      "cable": "USB",
+      "signal": "serial data (time interval measurements)"
+    }
+  ]
+}
