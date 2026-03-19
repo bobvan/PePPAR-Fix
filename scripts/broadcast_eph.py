@@ -33,6 +33,7 @@ GAL_EPOCH = datetime(1999, 8, 22, tzinfo=timezone.utc)  # GST epoch = GPS epoch 
 
 SECONDS_PER_WEEK = 604800
 HALF_WEEK = 302400
+BDT_GPST_OFFSET = 14.0              # BDT = GPST - 14s (BDS ICD)
 
 
 def _check_week_crossover(dt):
@@ -320,11 +321,14 @@ class BroadcastEphemeris:
     def _bds_seconds_of_week(self, t):
         """Convert GPS-time datetime to BDS seconds-of-week.
 
-        BDS_EPOCH - GPS_EPOCH is an exact multiple of weeks (1356 weeks),
-        so GPS and BDS seconds-of-week are identical.  We delegate to
-        _gps_seconds_of_week for clarity.
+        BDT = GPST - 14s.  RTCM 1042 toe/toc are in BDT, so we must
+        compute SOW in the BDS time system to get correct tk values.
         """
-        return self._gps_seconds_of_week(t)
+        gps_delta = (t - GPS_EPOCH).total_seconds()
+        bdt_delta = gps_delta - BDT_GPST_OFFSET
+        week = int(bdt_delta // SECONDS_PER_WEEK)
+        sow = bdt_delta - week * SECONDS_PER_WEEK
+        return week, sow
 
     def sat_position(self, prn, t):
         """Compute satellite position and clock at time t.
