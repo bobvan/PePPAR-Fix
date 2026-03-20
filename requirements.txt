@@ -4,6 +4,9 @@ pyubx2>=1.2.55
 pyserial
 pyrtcm>=1.1.0
 
+# Timebeat OTC hardware: Renesas 8A34002 TDC readout
+smbus2
+
 # Analysis: TDEV/ADEV plots, servo log analysis
 allantools
 matplotlib
