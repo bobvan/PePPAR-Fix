@@ -113,6 +113,7 @@ from peppar_fix import (
     PtpDevice, PIServo, ErrorSource, compute_error_sources,
     DisciplineScheduler, PositionWatchdog, save_position, load_position,
 )
+from ntrip_caster import NtripCasterServer, rawx_to_caster_obs
 
 log = logging.getLogger("phc_servo")
 
@@ -292,12 +293,37 @@ def run_servo(args):
     # Config queue: main thread can send UBX config to receiver via serial_reader
     config_queue = queue.Queue(maxsize=10)
 
+    # ── NTRIP caster (serve corrections to peers) ─────────────────────
+    caster_server = None
+    raw_callback = None
+    if args.serve_caster:
+        bind_parts = args.serve_caster.rsplit(':', 1)
+        if len(bind_parts) == 2:
+            caster_bind_addr = bind_parts[0]
+            caster_bind_port = int(bind_parts[1])
+        else:
+            caster_bind_addr = ""
+            caster_bind_port = int(bind_parts[0])
+        caster_server = NtripCasterServer(
+            bind_addr=caster_bind_addr, bind_port=caster_bind_port,
+            station_id=args.caster_station_id)
+        caster_server.start()
+
+        # Callback: feed raw RAWX observations to the caster
+        _ref_ecef = known_ecef  # reference position for RTCM 1005
+        def _caster_raw_callback(parsed_msg):
+            gps_time, obs = rawx_to_caster_obs(parsed_msg)
+            if gps_time is not None and len(obs) >= 4:
+                caster_server.broadcast_epoch(obs, gps_time,
+                                              ref_ecef=_ref_ecef)
+        raw_callback = _caster_raw_callback
+
     # Start serial reader (with qerr_store for TIM-TP extraction)
     t_serial = threading.Thread(
         target=serial_reader,
         args=(args.serial, args.baud, obs_queue, stop_event, beph, systems, ssr),
         kwargs={'qerr_store': qerr_store, 'config_queue': config_queue,
-                'driver': driver},
+                'driver': driver, 'raw_callback': raw_callback},
         daemon=True,
     )
     t_serial.start()
@@ -694,6 +720,8 @@ def run_servo(args):
         log.info("Interrupted")
     finally:
         stop_event.set()
+        if caster_server is not None:
+            caster_server.stop()
         try:
             ptp.adjfine(0.0)
         except Exception:
@@ -778,6 +806,13 @@ def main():
                     help="Maximum discipline interval in epochs (default: 120)")
     ap.add_argument("--min-interval", type=int, default=1,
                     help="Minimum discipline interval in epochs (default: 1)")
+
+    # NTRIP caster (serve corrections to peers)
+    ap.add_argument("--serve-caster", default=None, metavar="[ADDR]:PORT",
+                    help="Start NTRIP caster on this bind address "
+                    "(e.g. :2102 or 0.0.0.0:2102)")
+    ap.add_argument("--caster-station-id", type=int, default=0,
+                    help="RTCM station ID for caster (0-4095, default: 0)")
 
     # Output
     ap.add_argument("--log", default=None,

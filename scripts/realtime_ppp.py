@@ -114,7 +114,8 @@ class QErrStore:
 
 
 def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
-                   ssr=None, qerr_store=None, config_queue=None, driver=None):
+                   ssr=None, qerr_store=None, config_queue=None, driver=None,
+                   raw_callback=None):
     """Read UBX messages from a u-blox serial port.
 
     Puts (timestamp, observations_list) tuples onto obs_queue for each
@@ -132,6 +133,8 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
              port (e.g. UBX CFG-VALSET messages from the main thread).
         driver: ReceiverDriver instance for signal ID mapping.
              Defaults to F9TDriver for backward compatibility.
+        raw_callback: optional callable(parsed_msg) called with each
+             RXM-RAWX message for raw observation access (e.g. NTRIP caster).
     """
     try:
         from pyubx2 import UBXReader
@@ -195,6 +198,13 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                     qerr_store.update(qerr_ps, tow_ms)
 
             if msg_id == 'RXM-RAWX':
+                # Fire raw callback before IF processing (for NTRIP caster)
+                if raw_callback is not None:
+                    try:
+                        raw_callback(parsed)
+                    except Exception as e:
+                        log.debug(f"raw_callback error: {e}")
+
                 # New RAWX epoch — process and enqueue
                 ts = datetime.now(timezone.utc)  # Use wall clock for now
                 rcvTow = parsed.rcvTow
