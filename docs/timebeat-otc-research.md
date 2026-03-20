@@ -232,3 +232,35 @@ The simplest path: ask Timebeat (the company) if they expose the
 ClockMatrix phase error via API. Their binary has Go functions like
 `ShowOpentimecardClockgenDpllStatus` that may be accessible via CLI
 or HTTP endpoint.
+
+### Clock tree dump breakthrough (2026-03-20)
+
+**Timebeat uses pll_mode=3 (write_phase_set), NOT pll_mode=0 (PLL).**
+
+The hardware DPLL loop is completely open. Timebeat is the loop:
+1. Reads TDC phase error (CLK14=PPS vs CLK12=OCXO)
+2. Runs software loop filter (freq_rho strategy)
+3. Writes phase corrections to DPLL_CTRL_0.PHASE_OFFSET
+
+For peppar-fix to replace Timebeat, we replay the captured clock tree
+config (data/clocktree_ptboat.json), then:
+- Read TDC phase from STATUS.DPLL0_PHASE_STATUS (coarse, 340ps)
+  or STATUS.DPLL0_FILTER_STATUS (fine, 340/128 = 2.7ps)
+- Run our PI servo
+- Write corrections to DPLL_CTRL_0.PHASE_OFFSET
+
+Key register values from ptBoat (Timebeat running):
+- DPLL_0.MODE: 0x93 0xB0, pll_mode=3 (write_phase_set)
+- DPLL_0.PHASE_MEAS_CFG: ref=CLK14 fb=CLK12
+- INPUT_TDC.FBD_CTRL: fbd_int_mode_en=1, fbd_integer=92
+- ITDC_UI = 1/(32 × 92MHz) ≈ 340 ps
+- Fine resolution: 340/128 ≈ 2.7 ps
+
+Full config captured in data/clocktree_ptboat.json.
+
+### Bus numbers
+
+| Host | I2C Bus | Address | Notes |
+|---|---|---|---|
+| otcBob1 | 15 | 0x58 | OTC SBC, OCXO |
+| ptBoat | 16 | 0x58 | OTC Mini PT, weatherproof |
