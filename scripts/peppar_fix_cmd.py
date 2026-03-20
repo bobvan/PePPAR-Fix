@@ -557,7 +557,7 @@ def _servo_epoch(ctx, args, filt, gps_time, n_epochs,
     BASE_KI = args.track_ki
     GAIN_REF_SIGMA = args.gain_ref_sigma
     GAIN_MIN_SCALE = 0.1
-    GAIN_MAX_SCALE = 3.0
+    GAIN_MAX_SCALE = 1.0
     CONVERGE_ERROR_NS = 500
     CONVERGE_MIN_SCALE = 2.0
 
@@ -671,7 +671,7 @@ def _servo_epoch(ctx, args, filt, gps_time, n_epochs,
         return
 
     # Tracking phase
-    if abs(best.error_ns) > 5000 and not scheduler._converging:
+    if abs(best.error_ns) > 500 and not scheduler._converging:
         log.warning(f"  Outlier: {best}, skipping")
         return
 
@@ -695,6 +695,11 @@ def _servo_epoch(ctx, args, filt, gps_time, n_epochs,
         servo.ki = BASE_KI * gain_scale
 
         adjfine_ppb = -servo.update(avg_error, dt=float(n_samples))
+        # Anti-windup: if adjfine is at the rail, reset integral
+        # to prevent windup-driven oscillation
+        if abs(adjfine_ppb) >= ctx['caps']['max_adj'] * 0.95:
+            servo.integral = -adjfine_ppb / servo.ki if servo.ki != 0 else 0
+            log.warning(f'  Anti-windup: adj={adjfine_ppb:+.0f}ppb at rail, integral reset')
         ptp.adjfine(adjfine_ppb)
         ctx['adjfine_ppb'] = adjfine_ppb
         ctx['gain_scale'] = gain_scale
