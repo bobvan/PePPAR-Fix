@@ -264,3 +264,34 @@ Full config captured in data/clocktree_ptboat.json.
 |---|---|---|---|
 | otcBob1 | 15 | 0x58 | OTC SBC, OCXO |
 | ptBoat | 16 | 0x58 | OTC Mini PT, weatherproof |
+
+### Register write behavior (2026-03-20)
+
+Writes to DPLL_MODE don't stick — writing 0x05 (phase_meas) reads back
+as 0x93 (the EEPROM-loaded value). The chip appears to protect its
+configuration from runtime register writes, at least for the DPLL mode
+register. This is likely by design — the 8A34002 loads its full config
+from EEPROM on power-up and may only allow certain fields to be
+modified at runtime (like PHASE_OFFSET for steering).
+
+**Implication**: We can't just flip pll_mode to change the DPLL
+behavior. We would need to either:
+1. Program a custom EEPROM image with our desired mode
+2. Use the Renesas Timing Commander GUI to create a new config
+3. Work within the EEPROM-loaded framework — Timebeat's config already
+   sets pll_mode=3 (write_phase_set) which IS what we want for steering
+
+**The good news**: pll_mode=3 is the right mode for peppar-fix. We
+don't need phase_meas mode (5) — we need to READ the TDC phase error
+and WRITE corrections back. The question is how to get the TDC to
+produce live readings without Timebeat's software loop running.
+
+The TDC phase register may need periodic polling/triggering that
+Timebeat's runLoop provides. When Timebeat stops, the TDC output
+freezes. This is likely a firmware-level behavior, not a register
+config issue.
+
+**Next step**: Use Renesas Timing Commander (Windows GUI) to examine
+the full chip configuration and understand which registers the TDC
+uses internally. Or: ask Timebeat support how their software reads
+the TDC phase error — they've already solved this problem.
