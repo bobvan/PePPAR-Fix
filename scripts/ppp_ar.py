@@ -27,6 +27,11 @@ from solve_pseudorange import C
 from solve_ppp import N_BASE
 from lambda_ar import lambda_resolve, lambda_decorrelate, bootstrap_success_rate
 
+# Per-SV state machine — the AR paths drive transitions on fix / unfix
+# / reset.  Tracker is optional (callers can pass None) so tests and
+# legacy code paths keep working without wiring one up.
+from peppar_fix.sv_state import SvAmbState, SvStateTracker
+
 log = logging.getLogger(__name__)
 
 
@@ -53,11 +58,19 @@ class MelbourneWubbenaTracker:
     # that moves WL also moves GF by >1 cm.
     _SIGMA_FLOOR_CYC = 0.50
 
-    def __init__(self, tau_s=60.0, fix_threshold=0.15, min_epochs=60):
+    def __init__(self, tau_s=60.0, fix_threshold=0.15, min_epochs=60,
+                 sv_state: SvStateTracker | None = None):
         self.tau_s = tau_s              # exponential averaging time constant
         self.fix_threshold = fix_threshold  # |frac| < this to fix
         self.min_epochs = min_epochs    # minimum epochs before fixing
         self._state = {}   # sv -> {mw_avg, n_epochs, n_wl, fixed, f1, f2, ...}
+        # Optional tracker — when supplied, MW fix drives FLOAT → WL_FIXED
+        # and reset drives WL_FIXED → FLOAT.
+        self._sv_state = sv_state
+        # External callers write to this before calling update(); the
+        # tracker's transition log line includes the current epoch.  None
+        # is fine — transitions are still legal, just logged with epoch=0.
+        self._current_epoch = 0
 
     @staticmethod
     def _mw_meters(phi1_cyc, phi2_cyc, pr1_m, pr2_m, f1, f2):
@@ -131,6 +144,20 @@ class MelbourneWubbenaTracker:
                 s['fix_n_epochs'] = int(s['n_epochs'])
                 log.info("WL fixed: %s N_WL=%d (frac=%.3f, %d epochs)",
                          sv, s['n_wl'], frac, s['n_epochs'])
+                # Per-SV state: FLOAT → WL_FIXED on MW convergence.  On
+                # re-fix after a slip-induced reset the state is already
+                # FLOAT, so this is the right edge.  BLACKLISTED SVs are
+                # skipped by caller (they shouldn't reach here), but if
+                # they do, the transition is illegal and will raise —
+                # caught loudly in tests, benign in production.
+                if self._sv_state is not None:
+                    cur = self._sv_state.state(sv)
+                    if cur is SvAmbState.FLOAT:
+                        self._sv_state.transition(
+                            sv, SvAmbState.WL_FIXED,
+                            epoch=self._current_epoch,
+                            reason=f"MW converged (frac={frac:.3f}, {s['n_epochs']} ep)",
+                        )
 
     def get_wl(self, sv):
         """Return fixed N_WL for satellite, or None if not yet fixed."""
@@ -147,7 +174,13 @@ class MelbourneWubbenaTracker:
         return None
 
     def reset(self, sv):
-        """Reset state for a satellite (e.g. after cycle slip)."""
+        """Reset state for a satellite (e.g. after cycle slip).
+
+        The per-SV state-machine transition is NOT driven from here —
+        slip-induced transitions come from CycleSlipMonitor so that the
+        slip confidence (HIGH → BLACKLISTED, LOW → FLOAT) reaches the
+        tracker correctly.  reset() just drops MW internal state.
+        """
         self._state.pop(sv, None)
 
     def detect_jump(self, obs, n_sigma=3.0):
@@ -208,7 +241,8 @@ class NarrowLaneResolver:
 
     def __init__(self, frac_threshold=0.10, sigma_threshold=0.12,
                  corner_margin_sum=1.6, blacklist_epochs=60,
-                 ar_elev_mask_deg=20.0):
+                 ar_elev_mask_deg=20.0,
+                 sv_state: SvStateTracker | None = None):
         self.frac_threshold = frac_threshold    # |N1_frac| < this to fix
         self.sigma_threshold = sigma_threshold  # sigma_N1 < this to fix
         # AR-specific elevation mask.  Separate from the PPP measurement
@@ -242,6 +276,9 @@ class NarrowLaneResolver:
         self._blacklist_epochs = int(blacklist_epochs)
         self._blacklist = {}  # sv -> epoch_until
         self._epoch = 0
+        # Optional tracker.  NL fix → WL_FIXED → NL_PROVISIONAL.
+        # NL unfix → any NL state → FLOAT.
+        self._sv_state = sv_state
 
     def tick(self):
         """Advance the resolver's epoch counter — call once per observation epoch.
@@ -391,6 +428,8 @@ class NarrowLaneResolver:
                          "sigma_N1=%.3f, A_IF: %.4f → %.4f m)",
                          sv, n1_int, n1_frac, sigma_n1,
                          a_if_float, a_if_fixed)
+                self._note_nl_fix(sv, az_deg=None, elev_deg=None,
+                                  reason=f"rounding (frac={n1_frac:.3f}, σ={sigma_n1:.3f})")
 
         return newly_fixed
 
@@ -510,6 +549,10 @@ class NarrowLaneResolver:
                      sv, n1_int, ratio, self.last_success_rate,
                      displacement_m, n_fixed, n_amb,
                      filt.x[si], a_if_fixed)
+            self._note_nl_fix(
+                sv, az_deg=None, elev_deg=None,
+                reason=f"LAMBDA ratio={ratio:.1f} P={self.last_success_rate:.3f}",
+            )
 
         return {sv: info[0] for sv, info in newly_fixed.items()}
 
@@ -537,9 +580,47 @@ class NarrowLaneResolver:
     def is_fixed(self, sv):
         return sv in self._fixed
 
+    def _note_nl_fix(self, sv, *, az_deg=None, elev_deg=None, reason=""):
+        """Drive the per-SV tracker on a successful NL fix.
+
+        Called by both LAMBDA and rounding fix paths.  Transitions
+        WL_FIXED → NL_PROVISIONAL.  If the SV isn't in WL_FIXED (e.g.
+        we re-fixed an SV that was still in NL_PROVISIONAL because the
+        filter constraint drifted and re-converged), the transition
+        is a no-op at the tracker (self-edge).
+        """
+        if self._sv_state is None:
+            return
+        cur = self._sv_state.state(sv)
+        if cur is SvAmbState.NL_PROVISIONAL or cur is SvAmbState.NL_VALIDATED:
+            return  # already counted; don't re-log per-epoch reconstraints
+        if cur is SvAmbState.WL_FIXED:
+            self._sv_state.transition(
+                sv, SvAmbState.NL_PROVISIONAL,
+                epoch=self._epoch, reason="nl_fix: " + reason,
+                az_deg=az_deg, elev_deg=elev_deg,
+            )
+
     def unfix(self, sv):
-        """Remove a fix (e.g. after cycle slip detected)."""
+        """Remove a fix (e.g. after cycle slip detected).
+
+        Drives tracker back to FLOAT when an SV is actively unfixed
+        here (e.g. by PFR L1 or a future Job-A caller that wants the
+        NL resolver to forget the integer).  Job A itself transitions
+        the tracker directly, so it should call unfix() after; the
+        no-op-on-self-edge rule keeps the log line count correct.
+        """
         self._fixed.pop(sv, None)
+        if self._sv_state is not None:
+            cur = self._sv_state.state(sv)
+            if cur in (SvAmbState.NL_PROVISIONAL, SvAmbState.NL_VALIDATED):
+                self._sv_state.transition(
+                    sv, SvAmbState.FLOAT,
+                    epoch=self._epoch, reason="nl_resolver.unfix",
+                )
+            # If cur is already FLOAT (e.g. Job A got here first), nothing
+            # to do.  If WL_FIXED/RETIRING/BLACKLISTED: also nothing; unfix
+            # doesn't imply an MW reset.
 
     def unfix_all(self, filt, inflate_sigma_m=100.0):
         """Unfix every NL-fixed ambiguity and inflate its covariance.
@@ -554,6 +635,14 @@ class NarrowLaneResolver:
         for sv in svs:
             filt.inflate_ambiguity(sv, sigma_m=inflate_sigma_m)
         self._fixed.clear()
+        if self._sv_state is not None:
+            for sv in svs:
+                cur = self._sv_state.state(sv)
+                if cur in (SvAmbState.NL_PROVISIONAL, SvAmbState.NL_VALIDATED):
+                    self._sv_state.transition(
+                        sv, SvAmbState.FLOAT,
+                        epoch=self._epoch, reason="nl_resolver.unfix_all",
+                    )
         return svs
 
     def integrality(self, filt, mw_tracker):

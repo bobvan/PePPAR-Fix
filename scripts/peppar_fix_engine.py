@@ -52,6 +52,10 @@ from broadcast_eph import BroadcastEphemeris
 from ssr_corrections import SSRState, RealtimeCorrections
 from ppp_ar import MelbourneWubbenaTracker, NarrowLaneResolver
 from peppar_fix.cycle_slip import CycleSlipMonitor, SlipEvent, flush_sv_phase
+from peppar_fix.sv_state import SvAmbState, SvStateTracker
+from peppar_fix.provisional_validator import ProvisionalValidator
+from peppar_fix.retirement_gate import RetirementGate
+from peppar_fix.host_rms_alarm import HostRmsAlarm
 
 
 # Cycle-slip CSV sink, shared between Phase-1 (run_bootstrap) and Phase-2
@@ -1222,211 +1226,6 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
     return None
 
 
-# ── Post-fix residual monitor ───────────────────────────────────────── #
-
-
-class PostFixResidualMonitor:
-    """Detect wrong NL integer fixes via sustained post-fit PR residual growth.
-
-    Rationale: a wrong NL integer shifts the filter's position to absorb
-    the ambiguity error.  The filter then reports tight σ (it *is*
-    self-consistent with its own integers) but the pseudorange post-fit
-    residuals grow as satellite geometry changes — the wrong integer
-    can't stay consistent forever.  σ-vs-NAV2 drift already shows this
-    at the host level; per-SV PR residuals attribute it to a specific
-    satellite.
-
-    Three escalation levels:
-      1. surgical  — unfix the SV with the worst sustained residual
-      2. partial   — inflate all NL ambiguity covariances (keep WL+MW)
-      3. full      — re-initialize PPPFilter at current AR position
-
-    Each action triggers a cooldown.  If the next action doesn't
-    improve PR RMS within `patience` monitored epochs, escalate.
-    If RMS stays healthy for `recovery` monitored epochs, reset the
-    escalation level back to 0.
-    """
-
-    # Defaults tuned for the lab setup (CNES SSR PPP-AR, ~30 SV at 1 Hz).
-    # The monitor runs once per `eval_every` AntPosEst epochs so that a
-    # single spike doesn't trigger; we want sustained misfit.
-    def __init__(self,
-                 eval_every=10,
-                 window=30,
-                 per_sv_threshold_m=3.0,
-                 rms_threshold_m=3.0,
-                 patience=3,
-                 recovery=6,
-                 action_cooldown=30):
-        self._eval_every = eval_every
-        self._window = window
-        self._per_sv_threshold = per_sv_threshold_m
-        self._rms_threshold = rms_threshold_m
-        self._patience = patience
-        self._recovery = recovery
-        self._cooldown = action_cooldown
-
-        # Per-SV deque of recent |PR post-fit residual| values.
-        from collections import deque
-        self._per_sv = {}      # sv -> deque of |PR resid| m (drives escalation)
-        self._per_sv_phi = {}  # sv -> deque of |phi resid| m (NL-fix diagnostic)
-        self._deque_factory = lambda: deque(maxlen=window)
-
-        # RMS history (same cadence as eval).
-        self._rms_hist = deque(maxlen=max(window, patience + recovery))
-
-        # Escalation state.
-        self._level = 0                # 0=normal, 1/2/3=last action level
-        self._level_set_epoch = 0      # AntPosEst epoch when last action fired
-        self._cooldown_until = 0       # suppress evals until this epoch
-        self._eval_count_since_action = 0
-        self._healthy_evals = 0
-
-    def ingest(self, epoch, resid, labels, nl_fixed):
-        """Absorb one epoch of measurements.
-
-        Args:
-            epoch: AntPosEst epoch counter (int).
-            resid: np.ndarray of post-fit residuals (in meters).
-            labels: list of (sv, 'pr'|'phi', elev_deg) aligned with resid.
-            nl_fixed: set of SVs currently NL-fixed.
-        """
-        if resid is None or len(resid) == 0:
-            return
-        # Accept both legacy 2-tuple labels and new 3-tuples (with elev).
-        def _unpack(lab):
-            if len(lab) == 3:
-                return lab[0], lab[1], lab[2]
-            return lab[0], lab[1], None
-        for lab, r in zip(labels, resid):
-            sv, kind, elev = _unpack(lab)
-            if sv not in nl_fixed:
-                continue
-            if kind == 'pr':
-                dq = self._per_sv.setdefault(sv, self._deque_factory())
-                dq.append(abs(float(r)))
-                # Track latest elevation per SV so the L1 unfix log can include it.
-                self._per_sv_last_elev = getattr(self, '_per_sv_last_elev', {})
-                if elev is not None:
-                    self._per_sv_last_elev[sv] = float(elev)
-            elif kind == 'phi':
-                # NL-fix diagnostic: a correct NL fix produces near-zero
-                # phi residual (cm-level); a wrong-integer fix shows a
-                # fractional cycle that's stable and per-satellite.
-                dqp = self._per_sv_phi.setdefault(sv, self._deque_factory())
-                dqp.append(abs(float(r)))
-        # Overall PR RMS across all fixed SVs (latest epoch only).
-        fixed_resids = [abs(float(r))
-                        for lab, r in zip(labels, resid)
-                        if _unpack(lab)[1] == 'pr' and _unpack(lab)[0] in nl_fixed]
-        if fixed_resids:
-            import math as _math
-            rms = _math.sqrt(sum(r*r for r in fixed_resids) / len(fixed_resids))
-            self._rms_hist.append(rms)
-
-    def evaluate(self, epoch):
-        """Decide whether to act.  Returns an action dict or None.
-
-        Action dict: {'level': 1|2|3, 'sv': optional, 'reason': str}
-        The caller executes the action and calls `record_action`.
-        """
-        if epoch < self._cooldown_until:
-            return None
-        if epoch % self._eval_every != 0:
-            return None
-
-        # Need enough samples to trust the averages.
-        if not self._per_sv or len(self._rms_hist) < self._patience:
-            return None
-
-        # Per-SV mean |residual| over the window.
-        means = {sv: (sum(dq) / len(dq)) for sv, dq in self._per_sv.items()
-                 if len(dq) >= self._window // 2}
-        if not means:
-            return None
-
-        rms_recent = sum(self._rms_hist) / len(self._rms_hist)
-        worst_sv, worst_mean = max(means.items(), key=lambda kv: kv[1])
-
-        # Healthy? Reset the escalation ladder after sustained calm.
-        misfit = (worst_mean > self._per_sv_threshold
-                  or rms_recent > self._rms_threshold)
-        if not misfit:
-            if self._level > 0:
-                self._healthy_evals += 1
-                if self._healthy_evals >= self._recovery:
-                    self._level = 0
-                    self._healthy_evals = 0
-            return None
-        self._healthy_evals = 0
-
-        # Misfit detected.  If we've been at this level long enough without
-        # improvement, escalate.  Otherwise take the first action at level 1.
-        if self._level == 0:
-            elev = getattr(self, '_per_sv_last_elev', {}).get(worst_sv)
-            elev_str = f", elev={elev:.0f}°" if elev is not None else ""
-            return {'level': 1, 'sv': worst_sv,
-                    'reason': f"PR resid {worst_sv}={worst_mean:.1f}m "
-                              f"(rms={rms_recent:.1f}m{elev_str})"}
-        self._eval_count_since_action += 1
-        if self._eval_count_since_action < self._patience:
-            return None
-        # Time to escalate.
-        next_level = min(self._level + 1, 3)
-        if next_level == 2:
-            return {'level': 2, 'sv': None,
-                    'reason': f"L1 didn't clear misfit "
-                              f"(rms={rms_recent:.1f}m, worst={worst_mean:.1f}m)"}
-        return {'level': 3, 'sv': None,
-                'reason': f"L2 didn't clear misfit "
-                          f"(rms={rms_recent:.1f}m, worst={worst_mean:.1f}m)"}
-
-    def record_action(self, epoch, action):
-        """Caller calls this after executing the action."""
-        self._level = action['level']
-        self._level_set_epoch = epoch
-        self._cooldown_until = epoch + self._cooldown
-        self._eval_count_since_action = 0
-        self._healthy_evals = 0
-        # Clear per-SV history — after any action the residuals change.
-        # For L1 (surgical), only clear the unfixed SV; for L2/L3, clear all.
-        if action['level'] == 1 and action.get('sv'):
-            self._per_sv.pop(action['sv'], None)
-        else:
-            self._per_sv.clear()
-        self._rms_hist.clear()
-
-    def summary(self):
-        n_tracked = len(self._per_sv)
-        if self._rms_hist:
-            rms = sum(self._rms_hist) / len(self._rms_hist)
-            return f"PFR level={self._level} n={n_tracked} rms={rms:.2f}m"
-        return f"PFR level={self._level} n={n_tracked} (warming)"
-
-    def per_sv_breakdown(self):
-        """Per-SV residual summary for offline analysis of NL fix quality.
-
-        Distinguishes two failure modes:
-          - fractional-cycle phi bias (L5I/L5Q or similar sub-cycle mismatch)
-            → phi |resid| near a consistent sub-cm value per satellite.
-          - multi-cycle phi bias (wrong NL integer, e.g., TGD/ISC or
-            code-bias-derived)
-            → phi |resid| at integer multiples of λ_NL / 2.
-
-        Returns a list of (sv, pr_mean_m, phi_mean_m, elev_deg).
-        """
-        elev_map = getattr(self, '_per_sv_last_elev', {})
-        rows = []
-        svs = set(self._per_sv.keys()) | set(self._per_sv_phi.keys())
-        for sv in sorted(svs):
-            pr_dq = self._per_sv.get(sv)
-            phi_dq = self._per_sv_phi.get(sv)
-            pr_mean = sum(pr_dq) / len(pr_dq) if pr_dq else float('nan')
-            phi_mean = sum(phi_dq) / len(phi_dq) if phi_dq else float('nan')
-            elev = elev_map.get(sv, float('nan'))
-            rows.append((sv, pr_mean, phi_mean, elev))
-        return rows
-
 
 # ── AntPosEst background thread ─────────────────────────────────────── #
 
@@ -1482,7 +1281,26 @@ class AntPosEstThread(threading.Thread):
         self._best_sigma = position_sigma_3d(self._filt.P)
         self._nav2_tension_streak = 0  # consecutive high-tension checks
         self._nav2_cooldown_until = 0  # epoch number: skip checks until this
-        self._pfr_monitor = PostFixResidualMonitor()
+        # Per-SV ambiguity state machine + the three monitors that
+        # replace the old PostFixResidualMonitor's L1/L2/L3 ladder.
+        # See docs/sv-lifecycle-and-pfr-split.md.
+        self._sv_state = SvStateTracker()
+        # MW / NL may be inherited from bootstrap — attach the tracker
+        # so their fix-time and unfix-time hooks drive transitions.  For
+        # any pre-existing fixes carried over, pre-populate the tracker
+        # so downstream monitors see the right state on epoch 0.
+        self._mw._sv_state = self._sv_state
+        self._nl._sv_state = self._sv_state
+        for sv, st in self._mw._state.items():
+            if st.get('fixed'):
+                rec = self._sv_state.get(sv)
+                rec.state = SvAmbState.WL_FIXED
+        for sv in self._nl._fixed:
+            rec = self._sv_state.get(sv)
+            rec.state = SvAmbState.NL_PROVISIONAL
+        self._job_a = ProvisionalValidator(self._sv_state)
+        self._job_b = RetirementGate(self._sv_state)
+        self._host_alarm = HostRmsAlarm(self._sv_state)
         self._slip_monitor = CycleSlipMonitor(
             mw_tracker=self._mw, csv_writer=_slip_csv_writer())
 
@@ -1621,83 +1439,101 @@ class AntPosEstThread(threading.Thread):
                 f"antenna moved (horiz={disp_h:.0f}m)",
             )
 
-    def _apply_pfr_action(self, filt, mw, nl, action):
-        """Execute a PostFixResidualMonitor escalation step.
-
-        Level 1: unfix the single worst-residual SV, inflate its ambiguity
-                 covariance, and reset its MW tracking so the WL/NL
-                 resolver can re-attempt it cleanly.
-        Level 2: inflate all NL ambiguity covariances (soft-unfix) while
-                 preserving PPPFilter position and MW tracker history.
-        Level 3: re-initialize the PPPFilter at the current AR position;
-                 full MW+NL re-convergence.  Transition state machine
-                 back to CONVERGING.
+    def _apply_job_a(self, filt, mw, nl, ev):
+        """Job A fired on one SV — the provisional validator rejected
+        the NL integer.  The tracker already moved the SV to FLOAT;
+        tear down the filter-side state (NL unfix + ambiguity inflate
+        + blacklist + MW reset) so the AR pipeline re-attempts cleanly.
         """
-        level = action['level']
-        reason = action.get('reason', '')
-        if level == 1:
-            sv = action.get('sv')
-            if sv is None:
-                return
-            # Retrospective: what were the WL and NL fix-time quality for
-            # this SV?  A marginal WL (frac near 0.5, low n_epochs) or a
-            # low LAMBDA ratio would suggest this SV was fixed prematurely
-            # rather than being "bad" in some intrinsic sense.
-            nl_info = nl._fixed.get(sv, {})
-            mw_info = mw._state.get(sv, {})
-            provenance = []
-            if 'fix_ratio' in nl_info:
-                provenance.append(f"NL LAMBDA ratio={nl_info['fix_ratio']:.1f} "
-                                  f"P={nl_info.get('fix_success_rate', 0):.3f}")
-            elif 'fix_n1_frac' in nl_info:
-                provenance.append(
-                    f"NL rounding frac={nl_info['fix_n1_frac']:.3f} "
-                    f"σ={nl_info.get('fix_sigma_n1', 0):.3f}")
-            if 'fix_frac' in mw_info:
-                provenance.append(
-                    f"WL frac={mw_info['fix_frac']:.3f} "
-                    f"n={mw_info.get('fix_n_epochs', 0)}")
-            prov_str = (" {" + "; ".join(provenance) + "}") if provenance else ""
-            log.warning("PFR L1: unfixing %s (%s)%s", sv, reason, prov_str)
+        sv = ev['sv']
+        # Provenance: what was this SV's fix-time quality?  Helps spot
+        # marginal LAMBDA ratios or corner-margin rounding fixes.
+        nl_info = nl._fixed.get(sv, {})
+        mw_info = mw._state.get(sv, {})
+        provenance = []
+        if 'fix_ratio' in nl_info:
+            provenance.append(f"NL LAMBDA ratio={nl_info['fix_ratio']:.1f}"
+                              f" P={nl_info.get('fix_success_rate', 0):.3f}")
+        elif 'fix_n1_frac' in nl_info:
+            provenance.append(
+                f"NL rounding frac={nl_info['fix_n1_frac']:.3f}"
+                f" σ={nl_info.get('fix_sigma_n1', 0):.3f}")
+        if 'fix_frac' in mw_info:
+            provenance.append(
+                f"WL frac={mw_info['fix_frac']:.3f}"
+                f" n={mw_info.get('fix_n_epochs', 0)}")
+        prov_str = (" {" + "; ".join(provenance) + "}") if provenance else ""
+        log.warning(
+            "Job A: %s |PR|=%.2fm > %.2fm (n=%d, elev=%s)%s",
+            sv, ev['mean_resid_m'], ev['threshold_m'], ev['n'],
+            f"{ev['elev_deg']:.0f}°" if ev['elev_deg'] is not None else "?",
+            prov_str,
+        )
+        # NL.unfix would re-transition the tracker FLOAT→FLOAT which is a
+        # no-op; but the tracker is already FLOAT from Job A's transition,
+        # so unfix() just drops the NL integer.
+        nl.unfix(sv)
+        nl.blacklist(sv)      # anti-lock-in: don't immediately re-fix
+        filt.inflate_ambiguity(sv)
+        mw.reset(sv)
+
+    def _apply_job_b(self, filt, mw, nl, ev):
+        """Job B fired — retire an SV gracefully.  Tracker already
+        moved to RETIRING.  Release the NL integer with gentle covariance
+        growth; keep MW state so the SV can be re-acquired if it rises
+        again (e.g., different arc).
+        """
+        sv = ev['sv']
+        reason_frag = (
+            f"elev={ev['elev_deg']:.0f}°"
+            if ev['reason'] == 'elev_mask' else
+            f"|PR|={ev['mean_resid_m']:.2f}m>{ev['threshold_m']:.2f}m"
+            f" at elev={ev['elev_deg']:.0f}°"
+        )
+        log.info("Job B: retiring %s (%s)", sv, reason_frag)
+        nl.unfix(sv)
+        # Preserve MW state — retirement is "this integer is done," not
+        # "this SV is bad."  Next arc or re-acquisition re-uses it.
+
+    def _apply_host_alarm(self, filt, mw, nl, ev):
+        """Host RMS alarm fired — systemic failure.  Full filter re-init
+        at current AR position.  Transitions host back to CONVERGING.
+        """
+        pos_ecef = filt.x[:3].copy()
+        log.warning(
+            "[HOST_ALARM] re-initialising PPPFilter at %s"
+            " (window RMS=%.2fm, latest=%.2fm, n=%d)",
+            pos_ecef.tolist(), ev['window_rms_m'], ev['rms_m'], ev['n_samples'],
+        )
+        # Drop all NL fixes (tracker → FLOAT for each via resolver hook),
+        # clear MW state entirely (big reset), re-seed filter.
+        for sv in list(nl._fixed.keys()):
             nl.unfix(sv)
-            # Anti-lock-in: prevent this SV from being re-proposed for NL
-            # fixing for the next N epochs.  Without this, the resolver
-            # immediately re-fixes to the same wrong integer because the
-            # underlying float state hasn't changed enough to flip it.
-            nl.blacklist(sv)
-            filt.inflate_ambiguity(sv)
+        for sv in list(mw._state.keys()):
             mw.reset(sv)
-        elif level == 2:
-            unfixed = nl.unfix_all(filt)
-            log.warning("PFR L2: unfixed %d NL ambiguities (%s)",
-                        len(unfixed), reason)
-            # MW history retained; the resolver will re-try NL as the
-            # PPPFilter re-converges the float ambiguities.
-            if self._ape_sm.state == AntPosEstState.RESOLVED:
-                self._ape_sm.transition(
-                    AntPosEstState.CONVERGING,
-                    f"PFR L2 soft-unfix ({len(unfixed)} NL dropped)",
-                )
-        elif level == 3:
-            pos_ecef = filt.x[:3].copy()
-            log.warning("PFR L3: re-initialising PPPFilter at %s (%s)",
-                        pos_ecef.tolist(), reason)
-            # Drop all NL fixes, MW history, and re-seed PPPFilter at
-            # the current AR position.  Equivalent to a NAV2 reset but
-            # triggered by residual analysis, not NAV2 disagreement.
-            for sv in list(nl._fixed.keys()):
-                nl.unfix(sv)
-            for sv in list(mw._state.keys()):
-                mw.reset(sv)
-            filt.initialize(pos_ecef, 0.0, systems=self._systems)
-            self._prev_t = None
-            self._best_sigma = 999.0
-            if self._ape_sm.state == AntPosEstState.RESOLVED:
-                self._ape_sm.transition(
-                    AntPosEstState.CONVERGING,
-                    "PFR L3 full re-bootstrap",
-                )
-        self._pfr_monitor.record_action(self._n_epochs, action)
+            # MW.reset() intentionally doesn't touch the tracker; after a
+            # host-level re-init every SV's state is meaningless, so
+            # flatten to FLOAT explicitly.
+            cur = self._sv_state.state(sv)
+            if cur is not SvAmbState.FLOAT:
+                try:
+                    self._sv_state.transition(
+                        sv, SvAmbState.FLOAT,
+                        epoch=self._n_epochs, reason="host_alarm:reinit",
+                    )
+                except Exception:
+                    # BLACKLISTED → FLOAT isn't always in the legal set
+                    # depending on cooldown; safe to skip if disallowed.
+                    pass
+        filt.initialize(pos_ecef, 0.0, systems=self._systems)
+        self._prev_t = None
+        self._best_sigma = 999.0
+        if self._ape_sm.state == AntPosEstState.RESOLVED:
+            self._ape_sm.transition(
+                AntPosEstState.CONVERGING,
+                "host RMS alarm — re-bootstrap",
+            )
+        self._host_alarm.record_fire(self._n_epochs)
 
     def run(self):
         log.info("AntPosEstThread started (resolved_decimation=%d, resolve_threshold=%d)",
@@ -1774,8 +1610,10 @@ class AntPosEstThread(threading.Thread):
             for ev in slip_events:
                 flush_sv_phase(
                     ev.sv, filt=filt, mw_tracker=mw,
-                    nl_resolver=nl, pfr_monitor=self._pfr_monitor,
+                    nl_resolver=nl,
                     slip_monitor=self._slip_monitor,
+                    sv_state=self._sv_state,
+                    confidence=ev.confidence,
                     reason="|".join(ev.reasons), epoch=self._n_epochs)
                 log.info("slip: sv=%s reasons=%s conf=%s lock=%.0fms"
                          " cno=%.1f elev=%s gap=%s gf=%s mw=%s",
@@ -1807,7 +1645,11 @@ class AntPosEstThread(threading.Thread):
 
             self._n_epochs += 1
 
-            # MW wide-lane update
+            # MW wide-lane update.  Tell MW the current epoch so its
+            # tracker-driven transitions (FLOAT → WL_FIXED on fix) log
+            # with a meaningful epoch field.
+            mw._current_epoch = self._n_epochs
+            nl._epoch = self._n_epochs  # resolver also uses _epoch for logs
             for obs in observations:
                 sv = obs['sv']
                 phi1 = obs.get('phi1_cyc')
@@ -1828,17 +1670,21 @@ class AntPosEstThread(threading.Thread):
             if self._n_epochs >= 5:
                 nl.attempt(filt, mw, elevations=elevations)
 
-            # Post-fix residual monitor: watch for wrong integer fixes
-            # showing up as sustained post-fit residual growth on
-            # NL-fixed satellites.  See PostFixResidualMonitor docstring.
-            nl_fixed_set = set(nl._fixed.keys())
-            if nl_fixed_set:
-                labels = getattr(filt, 'last_residual_labels', [])
-                self._pfr_monitor.ingest(self._n_epochs, resid, labels,
-                                         nl_fixed_set)
-                action = self._pfr_monitor.evaluate(self._n_epochs)
-                if action is not None:
-                    self._apply_pfr_action(filt, mw, nl, action)
+            # Per-SV state machine: stream PR residuals into Jobs A/B
+            # and the host RMS alarm.  Each monitor is stateless per-eval
+            # (no cascade) and drives SvStateTracker transitions directly.
+            # See docs/sv-lifecycle-and-pfr-split.md.
+            labels = getattr(filt, 'last_residual_labels', [])
+            self._job_a.ingest(self._n_epochs, resid, labels)
+            self._job_b.ingest(self._n_epochs, resid, labels)
+            self._host_alarm.ingest(self._n_epochs, resid, labels)
+            for ev in self._job_a.evaluate(self._n_epochs):
+                self._apply_job_a(filt, mw, nl, ev)
+            for ev in self._job_b.evaluate(self._n_epochs):
+                self._apply_job_b(filt, mw, nl, ev)
+            host_ev = self._host_alarm.evaluate(self._n_epochs)
+            if host_ev is not None:
+                self._apply_host_alarm(filt, mw, nl, host_ev)
 
             # Position quality
             sigma_3d = position_sigma_3d(filt.P)
@@ -1898,18 +1744,12 @@ class AntPosEstThread(threading.Thread):
                     mw.summary(), nl.summary(), nav2_tag,
                 )
 
-            # Per-SV residual breakdown every 60 epochs — diagnostic for
-            # distinguishing fractional-cycle (L5I/L5Q) from multi-cycle
-            # (code-bias / TGD / ISC) wrong-integer mechanisms.
+            # Periodic SV-state summary (replaces the old PFR per-SV
+            # residual dump).  Emits a one-line histogram of states at
+            # the same cadence; per-SV residual detail lives in the
+            # [SV_STATE] transition log and the Job A/B event logs.
             if self._n_epochs % 60 == 0 and self._n_epochs > 0:
-                rows = self._pfr_monitor.per_sv_breakdown()
-                if rows:
-                    parts = [
-                        f"{sv}:PR={pr:.2f}m,phi={phi*100:.1f}cm@elev{elev:.0f}°"
-                        for sv, pr, phi, elev in rows
-                    ]
-                    log.info("  NL residuals @%d: %s",
-                             self._n_epochs, " ".join(parts))
+                log.info("  %s", self._sv_state.summary())
 
         log.info("AntPosEstThread stopped after %d epochs", self._n_epochs)
 

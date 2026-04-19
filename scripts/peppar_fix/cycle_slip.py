@@ -328,6 +328,8 @@ def flush_sv_phase(sv: str,
                    pfr_monitor=None,
                    fixed_pos_filter=None,
                    slip_monitor=None,
+                   sv_state=None,
+                   confidence: str = "LOW",
                    reason: str = "",
                    epoch: int = 0) -> None:
     """Erase every per-SV phase-like state associated with sv.
@@ -335,7 +337,35 @@ def flush_sv_phase(sv: str,
     Each holder may be None (skip).  Frequency-like state elsewhere in
     the system (receiver clock family, TCXO, DO drift, noise floor) is
     intentionally untouched — see module docstring.
+
+    Per-SV state machine (new, per docs/sv-lifecycle-and-pfr-split.md):
+      - confidence=="HIGH" → any state → BLACKLISTED
+      - confidence=="LOW"  → any state → FLOAT
+    The tracker's transition is called BEFORE the downstream resets so
+    the [SV_STATE] log line is coherent with the post-reset state.
+    When sv_state is None the transition is skipped (legacy callers).
     """
+    # Per-SV state transition runs first so downstream resets
+    # (mw_tracker.reset, nl_resolver.unfix) don't re-fire their own
+    # tracker transitions and produce duplicate log lines.
+    if sv_state is not None:
+        # Lazy import to avoid a circular dep between cycle_slip.py and
+        # sv_state.py's future imports.
+        from peppar_fix.sv_state import SvAmbState, InvalidTransition
+        target = SvAmbState.BLACKLISTED if confidence == "HIGH" else SvAmbState.FLOAT
+        try:
+            sv_state.transition(
+                sv, target, epoch=epoch,
+                reason=f"slip:{reason or '?'} conf={confidence}",
+            )
+        except InvalidTransition:
+            # The only illegal cycle-slip target is "already in target" —
+            # which transition() treats as a no-op.  Anything else
+            # (BLACKLISTED → FLOAT implied by slip during cooldown) is
+            # a design question; for now, log and continue.
+            log.debug("slip transition noop for %s (already in %s)",
+                      sv, sv_state.state(sv).value)
+
     if filt is not None:
         # Removes x[N_BASE + si], P row/col, sv_to_idx[sv].  The caller's
         # normal ambiguity-management loop will call add_ambiguity() on
