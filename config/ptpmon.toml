@@ -7,10 +7,19 @@
 # Reports TIM 2.20 like TimeHat's F9T-TOP, but MON-HW3 vpManager_07=0
 # on this unit (=1 on TimeHat) — the L5 RF front-end is absent.  Factory
 # reset + CFG-SIGNAL-GPS_L5_HEALTH override still NAKs all three 1176.45
-# MHz signals (L5/E5a/B2a).  Locked to L2 profile: GPS L1+L2C, GAL E1+E5a,
-# BDS B1+B2.  GAL dual-band AR still works with CNES (E1C+E5aQ biases
-# match F9T's tracking); GPS AR on L2 needs a phase-bias source with L2L
-# (F9T tracks L2CL, CNES publishes L2W — mismatch).
+# MHz signals (L5/E5a/B2a).  Locked to L2 profile: GPS L1+L2C, GAL E1+E5b,
+# BDS B1+B2.
+#
+# Systems: "gps,gal".  GPS is NOT AR-eligible here (F9T tracks L2CL;
+# CNES publishes L2W; no matching phase bias) — GPS contributes
+# geometry only.  But that geometry is load-bearing: Task-3 experiment
+# on 2026-04-19 (project_ptpmon_gpsgal_result_20260419.md) showed that
+# GPS-GAL brings LAMBDA candidate count from n=4 (GAL-only, bootstrap
+# P stuck ≈ 0.99) to a spread across n=4–11 with 45 % of batches
+# hitting P=1.00, landing 12 NL fixes (all via rounding path — LAMBDA
+# FFRT still strict at n=4).  GAL-only on this host never reaches
+# Phase 2 convergence in 50 min runs.  Flipping systems back to
+# "gal" is a regression.
 serial = "/dev/gnss0"
 baud = 9600
 ubx_port = "I2C"
@@ -18,4 +27,4 @@ receiver = "f9t-l2-e5b"
 ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
 ssr_ntrip_conf = "ntrip-cnes.conf"
-systems = "gal"
+systems = "gps,gal"
