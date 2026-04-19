@@ -31,6 +31,14 @@ from lambda_ar import lambda_resolve, lambda_decorrelate, bootstrap_success_rate
 # / reset.  Tracker is optional (callers can pass None) so tests and
 # legacy code paths keep working without wiring one up.
 from peppar_fix.sv_state import SvAmbState, SvStateTracker
+from peppar_fix.nl_diag import (
+    NlDiagLogger,
+    RESULT_CAND, RESULT_FIXED_LAMBDA, RESULT_FIXED_ROUNDING,
+    RESULT_SKIP_ELEV, RESULT_SKIP_BLACKLIST, RESULT_SKIP_NO_WL,
+    RESULT_SKIP_NO_FREQS, RESULT_SKIP_PRESCREEN,
+    RESULT_REJ_LAMBDA_RATIO, RESULT_REJ_LAMBDA_BOOTSTRAP,
+    RESULT_REJ_LAMBDA_DISPLACEMENT, RESULT_REJ_CORNER, RESULT_REJ_RECT,
+)
 
 log = logging.getLogger(__name__)
 
@@ -242,7 +250,8 @@ class NarrowLaneResolver:
     def __init__(self, frac_threshold=0.10, sigma_threshold=0.12,
                  corner_margin_sum=1.6, blacklist_epochs=60,
                  ar_elev_mask_deg=20.0,
-                 sv_state: SvStateTracker | None = None):
+                 sv_state: SvStateTracker | None = None,
+                 nl_diag: NlDiagLogger | None = None):
         self.frac_threshold = frac_threshold    # |N1_frac| < this to fix
         self.sigma_threshold = sigma_threshold  # sigma_N1 < this to fix
         # AR-specific elevation mask.  Separate from the PPP measurement
@@ -279,6 +288,10 @@ class NarrowLaneResolver:
         # Optional tracker.  NL fix → WL_FIXED → NL_PROVISIONAL.
         # NL unfix → any NL state → FLOAT.
         self._sv_state = sv_state
+        # Optional per-attempt diagnostic.  When present, emits one
+        # [NL_DIAG] line per SV per attempt + a [NL_DIAG_BATCH] line
+        # per LAMBDA attempt.  Caller toggles via --nl-diag.
+        self._nl_diag = nl_diag
 
     def tick(self):
         """Advance the resolver's epoch counter — call once per observation epoch.
@@ -321,6 +334,13 @@ class NarrowLaneResolver:
         """
         newly_fixed = {}
         elevations = elevations or {}
+        elevations_for_diag = elevations  # alias for clarity below
+        diag = self._nl_diag
+        if diag is not None:
+            diag.begin(self._epoch)
+            wl_fixed_count = mw_tracker.n_fixed
+        else:
+            wl_fixed_count = None
 
         # Re-constrain already-fixed ambiguities every epoch.  Note:
         # the elevation gate intentionally does NOT apply here — a
@@ -341,18 +361,37 @@ class NarrowLaneResolver:
         for sv, amb_idx in list(filt.sv_to_idx.items()):
             if sv in self._fixed:
                 continue
-            if self.is_blacklisted(sv):
-                continue
             elev = elevations.get(sv)
+            if self.is_blacklisted(sv):
+                if diag is not None:
+                    bl_rem = max(0, (self._blacklist.get(sv) or self._epoch) - self._epoch)
+                    diag.record(sv=sv, elev_deg=elev,
+                                wl_fixed_count=wl_fixed_count,
+                                blacklist_remaining=bl_rem,
+                                result=RESULT_SKIP_BLACKLIST)
+                continue
             if (self.ar_elev_mask_deg > 0 and elev is not None
                     and elev < self.ar_elev_mask_deg):
                 skipped_by_elev += 1
+                if diag is not None:
+                    diag.record(sv=sv, elev_deg=elev,
+                                wl_fixed_count=wl_fixed_count,
+                                result=RESULT_SKIP_ELEV,
+                                reason=f"below {self.ar_elev_mask_deg:.0f}° AR mask")
                 continue
             n_wl = mw_tracker.get_wl(sv)
             if n_wl is None:
+                if diag is not None:
+                    diag.record(sv=sv, elev_deg=elev,
+                                wl_fixed_count=wl_fixed_count,
+                                result=RESULT_SKIP_NO_WL)
                 continue
             freqs = mw_tracker.get_freqs(sv)
             if freqs is None:
+                if diag is not None:
+                    diag.record(sv=sv, elev_deg=elev,
+                                wl_fixed_count=wl_fixed_count,
+                                result=RESULT_SKIP_NO_FREQS)
                 continue
             f1, f2 = freqs
             lambda_wl = C / (f1 - f2)
@@ -375,13 +414,24 @@ class NarrowLaneResolver:
             n1_float = (a_if_float - alpha2 * lambda_wl * n_wl) / lambda_nl
             n1_frac = abs(n1_float - round(n1_float))
             sigma_n1 = sigma_a / lambda_nl
+            if diag is not None:
+                diag.record(sv=sv, elev_deg=elevations_for_diag.get(sv),
+                            wl_fixed_count=wl_fixed_count,
+                            n1_frac=n1_frac, sigma_n1_cyc=sigma_n1,
+                            result=RESULT_CAND)
             if n1_frac < 0.25 and sigma_n1 < 1.0:
                 screened.append(c)
+            elif diag is not None:
+                # Pre-screen rejection: overwrite the CAND result.
+                diag.update(sv, result=RESULT_SKIP_PRESCREEN,
+                            reason=f"frac={n1_frac:.3f} sigma={sigma_n1:.3f}")
 
         # Try LAMBDA when >= 4 candidates pass pre-screen
         if len(screened) >= 4:
             newly_fixed = self._attempt_lambda(filt, screened)
             if newly_fixed:
+                if diag is not None:
+                    diag.emit()
                 return newly_fixed
 
         # Fallback: per-satellite rounding for < 4 or if LAMBDA failed
@@ -409,6 +459,15 @@ class NarrowLaneResolver:
                 + (sigma_n1 / max(self.sigma_threshold, 1e-9))
                 < self.corner_margin_sum
             )
+            if diag is not None:
+                # Corner-margin sum is reported regardless of accept/reject;
+                # useful for spotting marginal fixes that landed just inside
+                # the envelope (common precursor to Job A rejection later).
+                corner_sum = (
+                    (n1_frac / max(self.frac_threshold, 1e-9))
+                    + (sigma_n1 / max(self.sigma_threshold, 1e-9))
+                )
+                diag.update(sv, corner_margin_sum=corner_sum)
             if in_rect and corner_ok:
                 n1_int = round(n1_float)
                 a_if_fixed = lambda_nl * n1_int + alpha2 * lambda_wl * n_wl
@@ -430,7 +489,17 @@ class NarrowLaneResolver:
                          a_if_float, a_if_fixed)
                 self._note_nl_fix(sv, az_deg=None, elev_deg=None,
                                   reason=f"rounding (frac={n1_frac:.3f}, σ={sigma_n1:.3f})")
+                if diag is not None:
+                    diag.update(sv, result=RESULT_FIXED_ROUNDING)
+            elif diag is not None:
+                diag.update(
+                    sv,
+                    result=RESULT_REJ_CORNER if in_rect else RESULT_REJ_RECT,
+                    reason=("corner" if in_rect else f"frac={n1_frac:.3f} sigma={sigma_n1:.3f}"),
+                )
 
+        if diag is not None:
+            diag.emit()
         return newly_fixed
 
     def _attempt_lambda(self, filt, screened):
@@ -495,6 +564,25 @@ class NarrowLaneResolver:
             if self.last_success_rate < 0.999:
                 log.debug("LAMBDA skipped: bootstrap P=%.4f (need 0.999), "
                           "%d candidates", self.last_success_rate, n_amb)
+                if self._nl_diag is not None:
+                    self._nl_diag.set_lambda_batch_result(
+                        svs, ratio=ratio, p_bootstrap=self.last_success_rate,
+                        result=RESULT_REJ_LAMBDA_BOOTSTRAP,
+                    )
+                    self._nl_diag.set_lambda_batch_summary(
+                        n=n_amb, ratio=ratio, p_bootstrap=self.last_success_rate,
+                        result=RESULT_REJ_LAMBDA_BOOTSTRAP,
+                    )
+            else:
+                if self._nl_diag is not None:
+                    self._nl_diag.set_lambda_batch_result(
+                        svs, ratio=ratio, p_bootstrap=self.last_success_rate,
+                        result=RESULT_REJ_LAMBDA_RATIO,
+                    )
+                    self._nl_diag.set_lambda_batch_summary(
+                        n=n_amb, ratio=ratio, p_bootstrap=self.last_success_rate,
+                        result=RESULT_REJ_LAMBDA_RATIO,
+                    )
             return {}
 
         self.last_ratio = ratio
@@ -532,6 +620,15 @@ class NarrowLaneResolver:
                         3.0 * float_sigma, len(newly_fixed))
             filt.x = saved_x
             filt.P = saved_P
+            if self._nl_diag is not None:
+                self._nl_diag.set_lambda_batch_result(
+                    svs, ratio=ratio, p_bootstrap=self.last_success_rate,
+                    result=RESULT_REJ_LAMBDA_DISPLACEMENT,
+                )
+                self._nl_diag.set_lambda_batch_summary(
+                    n=n_amb, ratio=ratio, p_bootstrap=self.last_success_rate,
+                    result=RESULT_REJ_LAMBDA_DISPLACEMENT,
+                )
             return {}
 
         # Commit the fixes (store fix-time quality for PFR diagnostics)
@@ -552,6 +649,20 @@ class NarrowLaneResolver:
             self._note_nl_fix(
                 sv, az_deg=None, elev_deg=None,
                 reason=f"LAMBDA ratio={ratio:.1f} P={self.last_success_rate:.3f}",
+            )
+
+        if self._nl_diag is not None:
+            # Mark fixed SVs as FIXED_LAMBDA; any SVs in the batch that
+            # weren't fixed (partial-AR mask bit=0) stay at their current
+            # record (CAND).  Batch summary captures the ratio/P/outcome.
+            self._nl_diag.set_lambda_batch_result(
+                list(newly_fixed.keys()),
+                ratio=ratio, p_bootstrap=self.last_success_rate,
+                result=RESULT_FIXED_LAMBDA,
+            )
+            self._nl_diag.set_lambda_batch_summary(
+                n=n_amb, ratio=ratio, p_bootstrap=self.last_success_rate,
+                result=RESULT_FIXED_LAMBDA,
             )
 
         return {sv: info[0] for sv, info in newly_fixed.items()}

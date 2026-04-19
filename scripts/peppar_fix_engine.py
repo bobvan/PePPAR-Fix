@@ -56,6 +56,7 @@ from peppar_fix.sv_state import SvAmbState, SvStateTracker
 from peppar_fix.provisional_validator import ProvisionalValidator
 from peppar_fix.retirement_gate import RetirementGate
 from peppar_fix.host_rms_alarm import HostRmsAlarm
+from peppar_fix.nl_diag import NlDiagLogger
 
 
 # Cycle-slip CSV sink, shared between Phase-1 (run_bootstrap) and Phase-2
@@ -932,7 +933,14 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
 
     # PPP-AR: Melbourne-Wubbena wide-lane + narrow-lane resolver
     mw_tracker = MelbourneWubbenaTracker()
-    nl_resolver = NarrowLaneResolver(ar_elev_mask_deg=args.ar_elev_mask)
+    # Optional per-attempt NL diagnostic.  Off unless --nl-diag is set.
+    # Shared across bootstrap and AntPosEst so the inherited resolver
+    # keeps the same logger (otherwise an NL fix during bootstrap would
+    # log to one and steady-state to another, breaking grep/awk).
+    nl_diag = NlDiagLogger(enabled=bool(getattr(args, "nl_diag", False)))
+    nl_resolver = NarrowLaneResolver(
+        ar_elev_mask_deg=args.ar_elev_mask, nl_diag=nl_diag,
+    )
     slip_monitor = CycleSlipMonitor(
         mw_tracker=mw_tracker, csv_writer=_slip_csv_writer())
 
@@ -1247,7 +1255,8 @@ class AntPosEstThread(threading.Thread):
                  resolved_decimation=10, resolve_threshold=4,
                  ar_elev_mask_deg=20.0,
                  nav2_store=None, nav2_tension_threshold=5.0,
-                 nav2_alarm_count=3, systems=None):
+                 nav2_alarm_count=3, systems=None,
+                 nl_diag_enabled=False):
         super().__init__(daemon=True, name="AntPosEst")
         self.obs_queue = queue.Queue(maxsize=50)
         self._corrections = corrections
@@ -1267,13 +1276,23 @@ class AntPosEstThread(threading.Thread):
             self._mw = bootstrap_result.mw_tracker or MelbourneWubbenaTracker()
             self._nl = (bootstrap_result.nl_resolver
                         or NarrowLaneResolver(ar_elev_mask_deg=ar_elev_mask_deg))
+            # Inherit diag logger from bootstrap NL; if missing, attach one.
+            if getattr(self._nl, "_nl_diag", None) is None:
+                self._nl._nl_diag = NlDiagLogger(enabled=bool(nl_diag_enabled))
+            elif nl_diag_enabled:
+                # CLI requested on — honour it even if bootstrap's logger
+                # was disabled (shouldn't happen, but be forgiving).
+                self._nl._nl_diag.enabled = True
             log.info("AntPosEstThread: continuing from bootstrap PPPFilter "
                      "(amb=%d, %s)", len(self._filt.sv_to_idx), self._mw.summary())
         else:
             self._filt = PPPFilter()
             self._filt.initialize(known_ecef, 0.0, systems=self._systems)
             self._mw = MelbourneWubbenaTracker()
-            self._nl = NarrowLaneResolver(ar_elev_mask_deg=ar_elev_mask_deg)
+            self._nl = NarrowLaneResolver(
+                ar_elev_mask_deg=ar_elev_mask_deg,
+                nl_diag=NlDiagLogger(enabled=bool(nl_diag_enabled)),
+            )
             log.info("AntPosEstThread: fresh PPPFilter at known position (warm start)")
 
         self._n_epochs = 0
@@ -4968,6 +4987,7 @@ def run(args):
             nav2_store=nav2_store,
             systems=set(args.systems.split(',')) if args.systems else None,
             ar_elev_mask_deg=args.ar_elev_mask,
+            nl_diag_enabled=bool(getattr(args, "nl_diag", False)),
         )
         ape_thread.start()
 
@@ -5171,6 +5191,13 @@ Two-phase operation:
                           "can go lower — override via host TOML "
                           "ar_elev_mask_deg or this CLI flag).  Set to 0 "
                           "to disable and let every WL-fixed SV attempt NL.")
+    pos.add_argument("--nl-diag", action="store_true",
+                     help="Enable per-SV NL-attempt diagnostic logging.  "
+                          "Emits one [NL_DIAG] line per SV per attempt and "
+                          "one [NL_DIAG_BATCH] line per LAMBDA attempt.  "
+                          "Off by default to keep long runs clean.  Use to "
+                          "diagnose NL-doesn't-land situations — see "
+                          "scripts/peppar_fix/nl_diag.py for field semantics.")
     pos.add_argument("--timeout", type=int, default=3600,
                      help="Bootstrap timeout in seconds (default: 3600)")
     pos.add_argument("--watchdog-threshold", type=float, default=0.5,
