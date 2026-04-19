@@ -362,6 +362,39 @@ class PPPFilter:
         sin_elev = np.dot(e, up)
         return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
 
+    def compute_azimuth(self, receiver_pos, sat_pos):
+        """Azimuth of the satellite from the receiver, degrees clockwise
+        from geodetic north.  0 = north, 90 = east, 180 = south.
+
+        Used by the Bead 4 validation promoter to measure how much
+        satellite geometry has changed since the NL fix — a wrong
+        integer that passes LAMBDA at one az can reveal itself once the
+        SV has moved ~15°.
+        """
+        dx = sat_pos - receiver_pos
+        r = np.linalg.norm(dx)
+        if r < 1.0:
+            return 0.0
+        e = dx / r
+        x, y, z = receiver_pos
+        rho = math.sqrt(x * x + y * y)
+        if rho < 1.0:
+            # Over a pole; any azimuth convention collapses.  Return 0.
+            return 0.0
+        # ENU basis at receiver (geocentric approximation — fine for
+        # Δaz applications at the ~degree scale we care about here).
+        east = np.array([-y / rho, x / rho, 0.0])
+        lat = math.atan2(z, rho)
+        sin_lat = math.sin(lat)
+        cos_lat = math.cos(lat)
+        north = np.array([-sin_lat * x / rho,
+                          -sin_lat * y / rho,
+                          cos_lat])
+        az = math.degrees(math.atan2(np.dot(e, east), np.dot(e, north)))
+        if az < 0:
+            az += 360.0
+        return az
+
     def tropo_delay(self, elevation_deg):
         if elevation_deg < 5.0:
             elevation_deg = 5.0

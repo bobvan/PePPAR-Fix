@@ -56,6 +56,7 @@ from peppar_fix.sv_state import SvAmbState, SvStateTracker
 from peppar_fix.provisional_validator import ProvisionalValidator
 from peppar_fix.retirement_gate import RetirementGate
 from peppar_fix.host_rms_alarm import HostRmsAlarm
+from peppar_fix.validation_promoter import ValidationPromoter
 from peppar_fix.nl_diag import NlDiagLogger
 
 
@@ -106,6 +107,27 @@ def _compute_sv_elevations(filt, corrections, observations, gps_time):
         if sat_pos is None:
             continue
         out[sv] = filt.compute_elevation(pos, sat_pos)
+    return out
+
+
+def _compute_sv_azimuths(filt, corrections, observations, gps_time):
+    """Per-SV azimuth in degrees (clockwise from geodetic north).
+
+    Same return-contract as _compute_sv_elevations: empty dict if
+    filter has no position or corrections can't provide satellite
+    positions.  Used by the Bead 4 ValidationPromoter to measure
+    accumulated sky motion since NL fix.
+    """
+    if filt is None or not hasattr(filt, 'x') or len(filt.x) < 3:
+        return {}
+    pos = filt.x[:3]
+    out = {}
+    for obs in observations:
+        sv = obs['sv']
+        sat_pos, _ = corrections.sat_position(sv, gps_time)
+        if sat_pos is None:
+            continue
+        out[sv] = filt.compute_azimuth(pos, sat_pos)
     return out
 from ntrip_client import NtripStream
 from realtime_ppp import serial_reader, ntrip_reader, QErrStore, Nav2PositionStore
@@ -1320,6 +1342,10 @@ class AntPosEstThread(threading.Thread):
         self._job_a = ProvisionalValidator(self._sv_state)
         self._job_b = RetirementGate(self._sv_state)
         self._host_alarm = HostRmsAlarm(self._sv_state)
+        # Bead 4 — promotes NL_PROVISIONAL → NL_VALIDATED after Δaz ≥ 15°
+        # with a clean Job A window.  Host RESOLVED count (below) reads
+        # NL_VALIDATED from the tracker instead of raw NL-fix count.
+        self._promoter = ValidationPromoter(self._sv_state)
         self._slip_monitor = CycleSlipMonitor(
             mw_tracker=self._mw, csv_writer=_slip_csv_writer())
 
@@ -1495,6 +1521,9 @@ class AntPosEstThread(threading.Thread):
         nl.blacklist(sv)      # anti-lock-in: don't immediately re-fix
         filt.inflate_ambiguity(sv)
         mw.reset(sv)
+        # Bead 4: note the rejection so any subsequent re-fix has to
+        # stay clean for clean_window_epochs before being promoted.
+        self._promoter.note_job_a_rejection(sv, self._n_epochs)
 
     def _apply_job_b(self, filt, mw, nl, ev):
         """Job B fired — retire an SV gracefully.  Tracker already
@@ -1697,6 +1726,17 @@ class AntPosEstThread(threading.Thread):
             self._job_a.ingest(self._n_epochs, resid, labels)
             self._job_b.ingest(self._n_epochs, resid, labels)
             self._host_alarm.ingest(self._n_epochs, resid, labels)
+            # Bead 4: stream azimuths for NL_PROVISIONAL SVs so the
+            # promoter can accumulate Δaz toward the 15° threshold.  We
+            # compute azimuths only when there's at least one SV in
+            # NL_PROVISIONAL — avoids the per-epoch sat_position call
+            # on hosts that haven't fixed anything yet.
+            prov_count = self._sv_state.count_in(SvAmbState.NL_PROVISIONAL)
+            if prov_count > 0:
+                azimuths = _compute_sv_azimuths(
+                    filt, corrections, observations, gps_time)
+                for sv, az in azimuths.items():
+                    self._promoter.ingest_az(sv, az)
             for ev in self._job_a.evaluate(self._n_epochs):
                 self._apply_job_a(filt, mw, nl, ev)
             for ev in self._job_b.evaluate(self._n_epochs):
@@ -1704,32 +1744,56 @@ class AntPosEstThread(threading.Thread):
             host_ev = self._host_alarm.evaluate(self._n_epochs)
             if host_ev is not None:
                 self._apply_host_alarm(filt, mw, nl, host_ev)
+            for ev in self._promoter.evaluate(self._n_epochs):
+                log.info(
+                    "Promoted %s → NL_VALIDATED (Δaz=%.1f°, first=%s, now=%.0f°)",
+                    ev['sv'], ev['accumulated_dphi_deg'],
+                    f"{ev['first_fix_az_deg']:.0f}°"
+                    if ev['first_fix_az_deg'] is not None else "?",
+                    ev['latest_az_deg'] or 0.0,
+                )
 
             # Position quality
             sigma_3d = position_sigma_3d(filt.P)
             pos_ecef = filt.x[:3].copy()
+            # Host RESOLVED keys off NL_VALIDATED count (Bead 4): a fresh
+            # NL_PROVISIONAL fix doesn't count toward RESOLVED until
+            # geometry has shifted enough to validate it.  Falls back to
+            # the old raw NL-fix count when the tracker has no validated
+            # SVs yet — preserves old behavior during the ramp-up before
+            # any promotion lands.
+            n_nl_validated = self._sv_state.count_in(SvAmbState.NL_VALIDATED)
             n_nl_fixed = sum(1 for sv in filt.sv_to_idx if nl.is_fixed(sv))
+            n_resolved_count = (
+                n_nl_validated if n_nl_validated > 0 else n_nl_fixed
+            )
 
-            # Update state machine metrics
+            # Update state machine metrics — n_nl reports the count
+            # actually driving RESOLVED, which may be NL_VALIDATED or
+            # the raw fall-back.
             self._ape_sm.update_metrics(
                 sigma_m=sigma_3d,
                 n_wl=mw.n_fixed,
-                n_nl=n_nl_fixed,
+                n_nl=n_resolved_count,
                 n_sv=len(filt.sv_to_idx),
             )
 
-            # State transitions
+            # State transitions — uses Bead 4 validated count when
+            # available.  Message includes both numbers so operators
+            # can see the ramp-up: "5 validated (8 fixed)" vs "8 fixed".
+            tag = (f"{n_nl_validated} validated ({n_nl_fixed} fixed)"
+                   if n_nl_validated > 0 else f"{n_nl_fixed} NL fixed")
             if (self._ape_sm.state == AntPosEstState.CONVERGING
-                    and n_nl_fixed >= self._resolve_threshold):
+                    and n_resolved_count >= self._resolve_threshold):
                 self._ape_sm.transition(
                     AntPosEstState.RESOLVED,
-                    f"{n_nl_fixed} NL fixed, σ={sigma_3d:.3f}m",
+                    f"{tag}, σ={sigma_3d:.3f}m",
                 )
             elif (self._ape_sm.state == AntPosEstState.RESOLVED
-                    and n_nl_fixed < self._resolve_threshold):
+                    and n_resolved_count < self._resolve_threshold):
                 self._ape_sm.transition(
                     AntPosEstState.CONVERGING,
-                    f"NL fixes dropped to {n_nl_fixed}",
+                    f"resolved count dropped to {n_resolved_count} ({tag})",
                 )
 
             # NAV2 position sanity check (every 10 epochs ≈ 10s)
