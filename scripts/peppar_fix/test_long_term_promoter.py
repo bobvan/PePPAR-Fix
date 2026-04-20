@@ -1,4 +1,4 @@
-"""Unit tests for the ValidationPromoter (short-term → long-term promotion).
+"""Unit tests for the LongTermPromoter (short-term → long-term promotion).
 
 Covers Δaz accumulation, the 15° threshold, clean-window enforcement
 against prior false-fix rejections, eligibility (NL_SHORT_FIXED only),
@@ -10,7 +10,7 @@ from __future__ import annotations
 import unittest
 
 from peppar_fix.sv_state import SvAmbState, SvStateTracker
-from peppar_fix.validation_promoter import ValidationPromoter, _az_delta
+from peppar_fix.long_term_promoter import LongTermPromoter, _az_delta
 
 
 class AzDeltaTest(unittest.TestCase):
@@ -31,7 +31,7 @@ class AzDeltaTest(unittest.TestCase):
 class PromoterEligibilityTest(unittest.TestCase):
     def setUp(self):
         self.t = SvStateTracker()
-        self.p = ValidationPromoter(
+        self.p = LongTermPromoter(
             self.t,
             dphi_threshold_deg=15.0,
             clean_window_epochs=30,
@@ -88,7 +88,7 @@ class PromoterEligibilityTest(unittest.TestCase):
 class PromoterCleanWindowTest(unittest.TestCase):
     def setUp(self):
         self.t = SvStateTracker()
-        self.p = ValidationPromoter(
+        self.p = LongTermPromoter(
             self.t,
             dphi_threshold_deg=15.0,
             clean_window_epochs=30,
@@ -149,7 +149,7 @@ class PromoterCleanWindowTest(unittest.TestCase):
 class PromoterInteractionTest(unittest.TestCase):
     def test_forgets_candidate_when_sv_leaves_short(self):
         t = SvStateTracker()
-        p = ValidationPromoter(t, dphi_threshold_deg=15.0,
+        p = LongTermPromoter(t, dphi_threshold_deg=15.0,
                                clean_window_epochs=30, eval_every=10)
         t.transition("E20", SvAmbState.FLOAT, epoch=0)
         t.transition("E20", SvAmbState.WL_FIXED, epoch=1)

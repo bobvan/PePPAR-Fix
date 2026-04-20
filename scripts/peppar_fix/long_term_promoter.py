@@ -11,7 +11,7 @@ are filtered out.
 
 Shape:
 
-    ValidationPromoter(tracker, ...)
+    LongTermPromoter(tracker, ...)
     .ingest_az(sv, az_deg)          per epoch, for every NL-state SV
     .note_false_fix_rejection(sv, ep)   called by the false-fix apply hook
     .evaluate(epoch)                at eval_every cadence
@@ -52,7 +52,7 @@ def _az_delta(a: float, b: float) -> float:
     return d
 
 
-class ValidationPromoter:
+class LongTermPromoter:
     """Promotes NL_SHORT_FIXED SVs to NL_LONG_FIXED once geometry has
     changed enough to trust the integer.
 

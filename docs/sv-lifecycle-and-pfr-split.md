@@ -103,42 +103,66 @@ not permanent.  "Squelched" is radio-receiver terminology and was
 chosen over "blacklisted" because the latter connotes permanence;
 an SV is squelched until signal quality recovers.
 
-## What the states mean in one sentence each
+## The self-consistent integer set
 
-The states are easier to read once you see the unifying concept:
-**self-consistency of the integer set**.
+The unifying concept behind all six states and three monitors is
+**self-consistency of the integer set** — the group of per-SV
+integer ambiguities that jointly fit the observed dual-frequency
+phase data.  Each component of the design has a specific role
+relative to that set:
 
-- **LAMBDA's job** is to *identify a candidate self-consistent
-  integer set* from the float ambiguity covariance.  It does not
-  pick integers per-SV — it does a joint-MAP search that finds
-  the set of integers most consistent with each other given the
-  covariance structure.  The output is an internally-consistent
-  set as of that epoch's geometry.
-- **An `NL_SHORT_FIXED` member** is part of a set that *was*
-  self-consistent at promotion time.  Whether it remains
-  self-consistent as geometry evolves is unproven — it's on
-  probation.
-- **An `NL_LONG_FIXED` member** is part of a set that has *proven*
-  self-consistent across ≥ 15° of satellite-azimuth motion.
-  Temporal + geometric validation.
-- **The false-fix monitor's job** is to detect breakdown of
-  self-consistency — the set that fit epoch T no longer fits the
-  accumulating evidence by epoch T + 15°.  It removes the offending
-  integer, and the remaining long-term members continue to drive
-  the solution.
-- **The setting-SV drop monitor's job** is to remove a member
-  whose observations are no longer trustworthy enough to
-  participate in the self-consistency check, before that
-  untrustworthy input can pull the set out of consistency.
-- **The fix-set integrity alarm's job** is to catch the rare case
-  where *many* members fail self-consistency at once — which
-  almost always means the input (SSR stream, datum, ephemeris) is
-  broken, not the integers.
+### Two promoters
 
-Viewed this way, every transition in the state machine is either
-*adding* a candidate to the self-consistent set, *validating* that
-the set remains self-consistent, or *removing* a member whose
-inclusion would break self-consistency.
+- **Short-term promoter** (WL_FIXED → NL_SHORT_FIXED): lives in
+  `NarrowLaneResolver.attempt` (LAMBDA + rounding).  Its job is to
+  **identify** a candidate self-consistent integer set from the
+  float ambiguity covariance.  LAMBDA does a joint-MAP search: it
+  picks integers that are mutually consistent with each other, not
+  independently per-SV.  The output is internally consistent at
+  that epoch's geometry.  Rounding is a per-SV fallback for
+  single-SV additions that meet tighter frac/σ gates.
+- **Long-term promoter** (NL_SHORT_FIXED → NL_LONG_FIXED): class
+  `LongTermPromoter`.  Its job is to **validate** that the
+  self-consistency identified by the short-term promoter survives
+  ≥ 15° of satellite-azimuth motion without triggering a false-fix
+  rejection.  Short-term members that survive this geometric-
+  diversity test graduate to long-term.
+
+### What each NL state tells you
+
+- **`NL_SHORT_FIXED` member**: *was* consistent with the integer
+  set at promotion time.  Whether it remains consistent as
+  geometry evolves is unproven — on probation.
+- **`NL_LONG_FIXED` member**: *has proven* consistent across
+  temporal + geometric variation.  Drives the position solution's
+  RESOLVED declaration.
+
+### Three monitors, three scopes
+
+- **False-fix monitor** — per-SV, operates on short-term members.
+  Detects short-term integers that **cannot** be consistent with
+  the already-established long-term set.  A short-term member's
+  PR residuals growing against the filter state (which the
+  long-term members built) is the signature.  Action: transition
+  the offender back to FLOAT.  The long-term set continues
+  unaffected.
+- **Setting-SV drop monitor** — per-SV, operates on all NL members.
+  Removes a member whose observations are becoming too noisy to
+  *participate* in the self-consistency check, before that degraded
+  input can pull the set off.
+- **Fix-set integrity alarm** — whole-set.  Detects breakdown of
+  self-consistency of the set **itself** — many members failing
+  simultaneously.  That signature almost always means the input
+  (SSR stream, datum, ephemeris) is broken, not that one SV's
+  integer is wrong.  Action: full filter re-init.
+
+Viewed this way, every transition in the state machine is either:
+*adding* a candidate to the set (short-term promoter), *validating*
+that the set remains self-consistent through geometry change
+(long-term promoter), *removing* a single member whose integer
+doesn't fit (false-fix monitor or setting-SV drop), or *scrapping
+the set entirely* because its input assumptions are broken
+(fix-set integrity alarm).
 
 ## The fix set
 
@@ -295,7 +319,7 @@ rolling window.  Not in scope of this state machine.
   `SettingSvDropMonitor`, `FixSetIntegrityAlarm`, elev-weighted
   thresholds): merged as PR #6 (commit `040c1b0`), renamed for
   clarity 2026-04-20.
-- **Bead 4** (`ValidationPromoter`: Δaz-based NL_SHORT_FIXED →
+- **Bead 4** (`LongTermPromoter`: Δaz-based NL_SHORT_FIXED →
   NL_LONG_FIXED promotion): merged as PR #8 (commit `7ca17c9`).
 - **LAMBDA tuning** (P_bootstrap 0.999 → 0.97, PAR min_fixed 4 → 3):
   commits `d08e956` and `0395dff`.
@@ -308,7 +332,7 @@ All code lives in `scripts/peppar_fix/`:
 | `false_fix_monitor.py` | `FalseFixMonitor` | wrong-integer detection on short-term |
 | `setting_sv_drop_monitor.py` | `SettingSvDropMonitor` | graceful drop on elev/resid |
 | `fix_set_integrity_alarm.py` | `FixSetIntegrityAlarm` | fix-set-wide systemic alarm |
-| `validation_promoter.py` | `ValidationPromoter` | Δaz promotion short→long |
+| `long_term_promoter.py` | `LongTermPromoter` | Δaz promotion short→long |
 
 49 unit tests cover every legal edge, one illegal edge per
 originating state, the elev-weighting formula, each monitor's

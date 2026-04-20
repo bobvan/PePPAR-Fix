@@ -56,7 +56,7 @@ from peppar_fix.sv_state import SvAmbState, SvStateTracker
 from peppar_fix.false_fix_monitor import FalseFixMonitor
 from peppar_fix.setting_sv_drop_monitor import SettingSvDropMonitor
 from peppar_fix.fix_set_integrity_alarm import FixSetIntegrityAlarm
-from peppar_fix.validation_promoter import ValidationPromoter
+from peppar_fix.long_term_promoter import LongTermPromoter
 from peppar_fix.nl_diag import NlDiagLogger
 
 
@@ -115,7 +115,7 @@ def _compute_sv_azimuths(filt, corrections, observations, gps_time):
 
     Same return-contract as _compute_sv_elevations: empty dict if
     filter has no position or corrections can't provide satellite
-    positions.  Used by the Bead 4 ValidationPromoter to measure
+    positions.  Used by the Bead 4 LongTermPromoter to measure
     accumulated sky motion since NL fix.
     """
     if filt is None or not hasattr(filt, 'x') or len(filt.x) < 3:
@@ -1345,7 +1345,7 @@ class AntPosEstThread(threading.Thread):
         # Bead 4 — promotes NL_SHORT_FIXED → NL_LONG_FIXED after Δaz ≥ 15°
         # with a clean false-fix window.  Solution-state RESOLVED count (below) reads
         # NL_LONG_FIXED from the tracker instead of raw NL-fix count.
-        self._promoter = ValidationPromoter(self._sv_state)
+        self._promoter = LongTermPromoter(self._sv_state)
         self._slip_monitor = CycleSlipMonitor(
             mw_tracker=self._mw, csv_writer=_slip_csv_writer())
 
