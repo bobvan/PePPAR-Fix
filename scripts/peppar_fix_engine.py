@@ -1729,7 +1729,15 @@ class AntPosEstThread(threading.Thread):
             # AR elevation mask can gate candidates.
             nl.tick()  # advance blacklist expiry
             if self._n_epochs >= 5:
-                nl.attempt(filt, mw, elevations=elevations)
+                # Per-SV phase-bias availability for the short-term
+                # promoter's candidate gate.  See Phase 1 call site
+                # above for the rationale.
+                ar_phase_bias_ok = {
+                    o['sv']: o.get('ar_phase_bias_ok', True)
+                    for o in observations
+                }
+                nl.attempt(filt, mw, elevations=elevations,
+                           ar_phase_bias_ok=ar_phase_bias_ok)
 
             # Per-SV state machine: stream PR residuals into the monitors
             # and the host RMS alarm.  Each monitor is stateless per-eval
