@@ -8,7 +8,7 @@ position trustworthy?".
 
 Six states form this lifecycle:
 
-    TRACKING ──admit──► FLOAT ──MW──► WL_FIXED ──LAMBDA──► NL_SHORT_FIXED ──Δaz≥15°──► NL_LONG_FIXED
+    TRACKING ──admit──► FLOAT ──MW──► WL_FIXED ──LAMBDA──► NL_SHORT_FIXED ──Δaz≥8°──► NL_LONG_FIXED
                          ▲              ▲                      │ ▲                          │
                          │              │                      │ │  false-fix rejection     │
                          │              │                      │ │  or setting-SV drop      │
@@ -28,7 +28,7 @@ Key names:
   * NL_SHORT_FIXED — integer NL fix accepted; short-term member of the fix
                      set; contributes to the position solution but does NOT
                      count toward the solution's RESOLVED declaration.
-  * NL_LONG_FIXED  — integer NL fix has survived ≥15° of satellite azimuth
+  * NL_LONG_FIXED  — integer NL fix has survived ≥8° of satellite azimuth
                      motion without a false-fix rejection; long-term member
                      of the fix set; counts toward RESOLVED.
   * SQUELCHED      — temporarily excluded from fix attempts after a high-
@@ -119,6 +119,21 @@ class SvRecord:
     # memory doesn't grow unbounded on long runs.  Useful for offline
     # forensics of cascading transitions.
     history: list[tuple[int, SvAmbState, SvAmbState, str]] = field(default_factory=list)
+    # Epoch at which this SV's current SQUELCHED state expires.  None
+    # when not squelched.  The tracker's check_squelch_cooldowns()
+    # sweeps records and transitions expired ones to FLOAT.
+    squelch_expires_epoch: Optional[int] = None
+    # Count of unexpected false-fix events this arc (events at
+    # elev ≥ reliable_elev_deg, defined in the false-fix monitor).
+    # Drives the false-fix monitor's cooldown escalation: 1st → short,
+    # 2nd → longer, 3rd+ → effectively rest-of-arc.  Resets when the
+    # record is forgotten (tracking loss).
+    unexpected_ff_this_arc: int = 0
+    # Last epoch at which this SV was observed (MW update or any
+    # external observation).  Engine uses this to forget records
+    # after an arc-gap threshold, which implicitly resets the
+    # unexpected_ff_this_arc counter.
+    last_seen_epoch: int = 0
 
     _HISTORY_CAP: int = 16
 
@@ -190,6 +205,7 @@ class SvStateTracker:
         reason: str = "",
         az_deg: Optional[float] = None,
         elev_deg: Optional[float] = None,
+        cooldown_epochs: Optional[int] = None,
     ) -> None:
         """Move SV into `to` state, enforcing the legal-edge set.
 
@@ -197,6 +213,11 @@ class SvStateTracker:
         without triggering a log line or history entry).  Illegal moves
         raise InvalidTransition — the caller decides whether to catch
         or let it crash tests.
+
+        When `to` is SQUELCHED, `cooldown_epochs` sets the per-SV
+        duration until `check_squelch_cooldowns` transitions it back
+        to FLOAT.  Callers that don't pass this value get the legacy
+        60-epoch default.  Logged in the reason frag as `squelch=<N>s`.
         """
         rec = self.get(sv)
         if elev_deg is not None:
@@ -214,16 +235,82 @@ class SvStateTracker:
         rec.state_entered_epoch = int(epoch)
         if to is SvAmbState.NL_SHORT_FIXED and az_deg is not None:
             rec.first_fix_az_deg = float(az_deg)
+        # Per-SV squelch cooldown: set the expiry epoch on entry to
+        # SQUELCHED; clear it on any other transition.
+        if to is SvAmbState.SQUELCHED:
+            dur = int(cooldown_epochs) if cooldown_epochs is not None else 60
+            rec.squelch_expires_epoch = int(epoch) + dur
+        else:
+            rec.squelch_expires_epoch = None
         if len(rec.history) >= rec._HISTORY_CAP:
             rec.history.pop(0)
         rec.history.append((int(epoch), from_state, to, reason))
         elev_frag = (
             f"elev={rec.last_elev_deg:.0f}°" if rec.last_elev_deg is not None else "elev=?"
         )
+        dur_frag = ""
+        if to is SvAmbState.SQUELCHED and cooldown_epochs is not None:
+            dur_frag = f", squelch={int(cooldown_epochs)}s"
         log.info(
-            "[SV_STATE] %s: %s → %s (epoch=%d, %s, reason=%s)",
-            sv, from_state.value, to.value, epoch, elev_frag, reason or "?",
+            "[SV_STATE] %s: %s → %s (epoch=%d, %s%s, reason=%s)",
+            sv, from_state.value, to.value, epoch, elev_frag,
+            dur_frag, reason or "?",
         )
+
+    def check_squelch_cooldowns(self, epoch: int) -> list[str]:
+        """Sweep SQUELCHED records; transition those whose cooldown
+        has expired back to FLOAT.
+
+        Returns the list of SVs that transitioned.  Called each eval
+        cycle from the engine main loop.
+        """
+        recovered: list[str] = []
+        for sv, rec in list(self._records.items()):
+            if rec.state is not SvAmbState.SQUELCHED:
+                continue
+            if rec.squelch_expires_epoch is None:
+                continue
+            if epoch < rec.squelch_expires_epoch:
+                continue
+            try:
+                self.transition(sv, SvAmbState.FLOAT,
+                                epoch=epoch, reason="squelch cooldown expired")
+                recovered.append(sv)
+            except InvalidTransition:
+                pass
+        return recovered
+
+    def mark_seen(self, sv: str, epoch: int) -> None:
+        """Record that the receiver observed this SV at `epoch`.
+
+        Engine calls this from the observation ingest path.  Used by
+        `forget_stale(...)` to identify records whose SVs haven't been
+        seen in a while (arc-gap → drop the record so the next arc
+        starts with a zeroed unexpected-false-fix counter).
+        """
+        rec = self.get(sv)
+        rec.last_seen_epoch = int(epoch)
+
+    def forget_stale(self, epoch: int, stale_after_epochs: int) -> list[str]:
+        """Forget records whose `last_seen_epoch` is older than
+        `stale_after_epochs` ago.
+
+        Returns the list of forgotten SVs.  Implements arc-boundary
+        detection: when an SV hasn't been observed for long enough
+        that it's probably set, drop its record so the next arc
+        starts clean.
+        """
+        stale_cutoff = int(epoch) - int(stale_after_epochs)
+        dropped = []
+        for sv, rec in list(self._records.items()):
+            # Records with last_seen_epoch == 0 were never observed
+            # (TRACKING records created by monitor lookups).  Leave them.
+            if rec.last_seen_epoch <= 0:
+                continue
+            if rec.last_seen_epoch < stale_cutoff:
+                dropped.append(sv)
+                self._records.pop(sv, None)
+        return dropped
 
     def update_elev(self, sv: str, elev_deg: float) -> None:
         """Record the most recent elevation for this SV.

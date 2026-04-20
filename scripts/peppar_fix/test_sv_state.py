@@ -230,8 +230,12 @@ class FalseFixMonitorTest(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]['sv'], "G02")
         self.assertAlmostEqual(events[0]['mean_resid_m'], 3.0)
-        # Tracker moved the SV back to FLOAT.
-        self.assertIs(self.t.state("G02"), SvAmbState.FLOAT)
+        # Tracker moved the SV to SQUELCHED (not FLOAT) with a per-SV
+        # cooldown chosen by elev — high-elev (90°) is unexpected #1.
+        self.assertIs(self.t.state("G02"), SvAmbState.SQUELCHED)
+        self.assertEqual(events[0]['tag'], "unexpected #1")
+        # First unexpected → progression[0] = 120 epochs default.
+        self.assertEqual(events[0]['squelch_epochs'], 120)
 
     def test_does_not_fire_below_threshold(self):
         self._to_short("G03")
@@ -257,6 +261,130 @@ class FalseFixMonitorTest(unittest.TestCase):
         for e in range(3, 13):
             self.m.ingest(e, [3.0], labels)
         self.assertEqual(self.m.evaluate(10), [])
+
+
+class FalseFixStratifiedSquelchTest(unittest.TestCase):
+    """Elevation-stratified squelch: low-elev gets short cooldown,
+    high-elev escalates through the progression."""
+
+    def setUp(self):
+        self.t = SvStateTracker()
+        self.m = FalseFixMonitor(
+            self.t, base_threshold_m=2.0, min_samples=5, eval_every=10,
+            reliable_elev_deg=45.0,
+            low_elev_squelch_epochs=60,
+            unexpected_squelch_progression=(120, 300, 86400),
+        )
+
+    def _to_short(self, sv):
+        self.t.transition(sv, SvAmbState.FLOAT, epoch=0)
+        self.t.transition(sv, SvAmbState.WL_FIXED, epoch=1)
+        self.t.transition(sv, SvAmbState.NL_SHORT_FIXED, epoch=2)
+
+    def test_low_elev_false_fix_is_expected(self):
+        self._to_short("G01")
+        labels = [("G01", 'pr', 30.0)]   # below 45° → expected
+        # base 2.0 m elev-weighted at 30°: 2.0 * sin(45)/sin(30) = 2.83
+        # Push mean to 3.5 m to exceed.
+        for e in range(3, 13):
+            self.m.ingest(e, [3.5], labels)
+        events = self.m.evaluate(10)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['tag'], "expected")
+        self.assertEqual(events[0]['squelch_epochs'], 60)
+        # Counter should NOT have incremented (low-elev).
+        rec = self.t.get("G01")
+        self.assertEqual(rec.unexpected_ff_this_arc, 0)
+
+    def test_high_elev_escalates_progression(self):
+        # Simulate three successive unexpected false-fixes on the same
+        # SV by manually driving the state machine through each cycle.
+        sv = "G02"
+        for cycle in range(3):
+            # Put SV into NL_SHORT_FIXED for the next cycle.
+            if cycle == 0:
+                self._to_short(sv)
+            else:
+                # After a SQUELCHED → put back through the happy path.
+                # Manually transition back to FLOAT and up to NL_SHORT_FIXED.
+                self.t.transition(sv, SvAmbState.FLOAT,
+                                  epoch=1000 * cycle,
+                                  reason="test:reset for cycle")
+                self.t.transition(sv, SvAmbState.WL_FIXED,
+                                  epoch=1000 * cycle + 1)
+                self.t.transition(sv, SvAmbState.NL_SHORT_FIXED,
+                                  epoch=1000 * cycle + 2)
+                # Clear false-fix window for the monitor.
+                self.m.forget(sv)
+            # Feed high-elev residuals to trigger false-fix.
+            labels = [(sv, 'pr', 60.0)]   # 60° ≥ 45°
+            base_epoch = 1000 * cycle + 3
+            for e in range(base_epoch, base_epoch + 10):
+                self.m.ingest(e, [3.0], labels)
+            eval_epoch = 1000 * cycle + 10  # % 10 == 0
+            events = self.m.evaluate(eval_epoch)
+            self.assertEqual(len(events), 1)
+            expected_duration = (120, 300, 86400)[cycle]
+            expected_tag = ("unexpected #1", "unexpected #2",
+                            "unexpected #3 arc-squelched")[cycle]
+            self.assertEqual(events[0]['squelch_epochs'], expected_duration,
+                             f"cycle {cycle}: expected {expected_duration}")
+            self.assertEqual(events[0]['tag'], expected_tag)
+            # Counter should have incremented.
+            self.assertEqual(self.t.get(sv).unexpected_ff_this_arc, cycle + 1)
+
+
+class SquelchCooldownSweepTest(unittest.TestCase):
+    """check_squelch_cooldowns sweeps records whose expiry has passed."""
+
+    def setUp(self):
+        self.t = SvStateTracker()
+
+    def test_sweeps_expired(self):
+        self.t.transition("G01", SvAmbState.FLOAT, epoch=0)
+        self.t.transition("G01", SvAmbState.SQUELCHED, epoch=10,
+                          cooldown_epochs=50)
+        # Not yet expired.
+        recovered = self.t.check_squelch_cooldowns(epoch=30)
+        self.assertEqual(recovered, [])
+        self.assertIs(self.t.state("G01"), SvAmbState.SQUELCHED)
+        # Expired.
+        recovered = self.t.check_squelch_cooldowns(epoch=61)
+        self.assertEqual(recovered, ["G01"])
+        self.assertIs(self.t.state("G01"), SvAmbState.FLOAT)
+
+    def test_ignores_non_squelched(self):
+        self.t.transition("G02", SvAmbState.FLOAT, epoch=0)
+        recovered = self.t.check_squelch_cooldowns(epoch=1000)
+        self.assertEqual(recovered, [])
+
+
+class ForgetStaleTest(unittest.TestCase):
+    """forget_stale drops records not seen in the stale window.
+
+    Implements arc-boundary detection: an SV that hasn't been observed
+    for ≥ N epochs is presumed set; its record is forgotten so the
+    next arc starts fresh (unexpected_ff_this_arc=0).
+    """
+
+    def test_drops_stale(self):
+        t = SvStateTracker()
+        t.transition("G01", SvAmbState.FLOAT, epoch=0)
+        t.mark_seen("G01", epoch=100)
+        # At epoch 1000 with stale_after=600, SV last seen 900 epochs
+        # ago → forget.
+        dropped = t.forget_stale(epoch=1000, stale_after_epochs=600)
+        self.assertEqual(dropped, ["G01"])
+        # Tracker no longer has the record; a fresh get() creates a
+        # new one in TRACKING state.
+        self.assertIs(t.state("G01"), SvAmbState.TRACKING)
+
+    def test_keeps_fresh(self):
+        t = SvStateTracker()
+        t.transition("G02", SvAmbState.FLOAT, epoch=0)
+        t.mark_seen("G02", epoch=900)
+        dropped = t.forget_stale(epoch=1000, stale_after_epochs=600)
+        self.assertEqual(dropped, [])
 
 
 class SettingSvDropMonitorTest(unittest.TestCase):

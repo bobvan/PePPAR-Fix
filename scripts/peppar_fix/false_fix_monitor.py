@@ -79,13 +79,33 @@ class FalseFixMonitor:
         for ev in events:
             # caller unfixes the SV in NL resolver, inflates filter
             # ambiguity, squelches, etc.; tracker has already moved
-            # the SV to FLOAT and logged [SV_STATE].
+            # the SV to SQUELCHED with a per-SV cooldown (ev['squelch_epochs']).
             ...
 
     Stateless between evals — no ladder, no cooldown that outlives
     the residual window.  If a transition fires, the caller handles
     the downstream effects (unfix, inflate, squelch) — this monitor
     only decides WHICH SVs to transition and updates the tracker.
+
+    ### Elevation-stratified squelch
+
+    The cooldown chosen for the SQUELCHED transition depends on the
+    elevation at which the false-fix fired:
+
+      * **elev < reliable_elev_deg** (default 45°): false-fix is
+        *expected* for an SV in the multipath-prone band.  Short
+        cooldown (`low_elev_squelch_epochs`, default 60 ≈ 1 min).
+        Doesn't count toward the unexpected-FF counter.
+
+      * **elev ≥ reliable_elev_deg**, count 1, 2, 3+: *unexpected*
+        false-fix — the SV should have been able to stabilize.
+        Cooldown escalates via `unexpected_squelch_progression`
+        (default (120, 300, 86400) epochs).  Third+ is effectively
+        rest-of-arc: the 86400 s (24 h) duration outlasts any
+        visible arc; the record is normally forgotten by the engine
+        on tracking loss before the cooldown would expire.
+
+    Counter resets when the SV's record is forgotten (arc boundary).
     """
 
     def __init__(
@@ -97,6 +117,9 @@ class FalseFixMonitor:
         window_epochs: int = 30,
         min_samples: int = 10,
         eval_every: int = 10,
+        reliable_elev_deg: float = 45.0,
+        low_elev_squelch_epochs: int = 60,
+        unexpected_squelch_progression: tuple[int, ...] = (120, 300, 86400),
     ) -> None:
         self._tracker = tracker
         self._base = float(base_threshold_m)
@@ -104,6 +127,10 @@ class FalseFixMonitor:
         self._window = int(window_epochs)
         self._min_samples = int(min_samples)
         self._eval_every = int(eval_every)
+        self._reliable_elev = float(reliable_elev_deg)
+        self._low_elev_squelch = int(low_elev_squelch_epochs)
+        self._unexpected_progression = tuple(
+            int(x) for x in unexpected_squelch_progression)
         self._per_sv: dict[str, _SvResidWindow] = {}
 
     # ── Data intake ─────────────────────────────────────────────── #
@@ -176,24 +203,54 @@ class FalseFixMonitor:
                 self._base, w.last_elev_deg, clamp_deg=self._elev_clamp,
             )
             if mean > thr:
+                # Elevation-stratified squelch duration.  Expected
+                # false-fixes (elev < reliable) get a short cooldown
+                # and don't count toward the unexpected counter.
+                # Unexpected false-fixes escalate per
+                # `_unexpected_progression`; after the last slot, the
+                # effect is "rest of arc" because the cooldown
+                # outlasts the arc.
+                rec = self._tracker.get(sv)
+                elev = w.last_elev_deg
+                is_unexpected = (
+                    elev is not None and elev >= self._reliable_elev
+                )
+                if is_unexpected:
+                    rec.unexpected_ff_this_arc += 1
+                    idx = min(rec.unexpected_ff_this_arc,
+                              len(self._unexpected_progression)) - 1
+                    cooldown = self._unexpected_progression[idx]
+                    count = rec.unexpected_ff_this_arc
+                    if count >= len(self._unexpected_progression):
+                        tag = f"unexpected #{count} arc-squelched"
+                    else:
+                        tag = f"unexpected #{count}"
+                else:
+                    cooldown = self._low_elev_squelch
+                    tag = "expected"
+
                 events.append({
                     'sv': sv,
                     'mean_resid_m': mean,
                     'threshold_m': thr,
-                    'elev_deg': w.last_elev_deg,
+                    'elev_deg': elev,
                     'n': n,
+                    'squelch_epochs': cooldown,
+                    'tag': tag,
                 })
                 reason = (
-                    f"|PR resid|={mean:.2f}m > {thr:.2f}m"
+                    f"{tag} |PR resid|={mean:.2f}m > {thr:.2f}m"
                     f" (base {self._base:.1f}m, n={n})"
                 )
                 self._tracker.transition(
-                    sv, SvAmbState.FLOAT,
+                    sv, SvAmbState.SQUELCHED,
                     epoch=epoch, reason="false_fix:" + reason,
-                    elev_deg=w.last_elev_deg,
+                    elev_deg=elev,
+                    cooldown_epochs=cooldown,
                 )
-                # Drop the window so the SV's re-fix starts with fresh
-                # residual history rather than absorbing the old misfit.
+                # Drop the window so the SV's re-fix (after cooldown)
+                # starts with fresh residual history rather than
+                # absorbing the old misfit.
                 self._per_sv.pop(sv, None)
         return events
 

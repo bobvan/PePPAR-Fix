@@ -1,7 +1,7 @@
 """Bead 4 — NL_SHORT_FIXED → NL_LONG_FIXED promotion.
 
 Per `docs/sv-lifecycle-and-pfr-split.md`: an NL fix that has survived
-≥ 15° of satellite-azimuth motion without triggering false-fix
+≥ 8° of satellite-azimuth motion without triggering false-fix
 rejection has demonstrated its integer is correct across enough
 distinct geometry to graduate from probation — from short-term
 member of the fix set to long-term.  The position solution declares
@@ -56,7 +56,7 @@ class LongTermPromoter:
     """Promotes NL_SHORT_FIXED SVs to NL_LONG_FIXED once geometry has
     changed enough to trust the integer.
 
-    Defaults: Δaz ≥ 15°, clean-window = 180 epochs (≈3 min @ 1 Hz,
+    Defaults: Δaz ≥ 8°, clean-window = 180 epochs (≈3 min @ 1 Hz,
     matches false-fix's residual window).  eval_every=10 matches the
     other monitors.
     """
@@ -65,7 +65,7 @@ class LongTermPromoter:
         self,
         tracker: SvStateTracker,
         *,
-        dphi_threshold_deg: float = 15.0,
+        dphi_threshold_deg: float = 8.0,
         clean_window_epochs: int = 180,
         eval_every: int = 10,
     ) -> None:
@@ -115,7 +115,7 @@ class LongTermPromoter:
             return
         # Accumulate the per-epoch |Δaz|.  We use incremental
         # accumulation rather than |current − first| so a slowly-moving
-        # SV that eventually traces ≥ 15° wins, even if the direct
+        # SV that eventually traces ≥ 8° wins, even if the direct
         # angular distance drops back temporarily (e.g. a GEO-adjacent
         # SV with small net motion but real local changes).
         if c.latest_az_deg is not None:

@@ -53,7 +53,7 @@ independent fix sets and solutions — no shared-state confusion.
                 (receiver loses tracking → record forgotten)
                               ▲
 (receiver                     │
- acquires)   TRACKING ── admit ──► FLOAT ── WL fix ──► WL_FIXED ── NL fix ──► NL_SHORT_FIXED ── Δaz ≥ 15° ──► NL_LONG_FIXED
+ acquires)   TRACKING ── admit ──► FLOAT ── WL fix ──► WL_FIXED ── NL fix ──► NL_SHORT_FIXED ── Δaz ≥ 8° ──► NL_LONG_FIXED
                                     ▲                    │                        │   ▲                          │
                                     │                    │                        │   │                          │
                                     │     false-fix rejection (monitor)           │   │                          │
@@ -93,9 +93,11 @@ the fix set: contributes its integer to the position solution but
 does not count toward the solution-state RESOLVED declaration — the
 integer has not yet been validated across geometry change.
 
-**NL_LONG_FIXED** — the integer fix has survived ≥ 15° of satellite
+**NL_LONG_FIXED** — the integer fix has survived ≥ 8° of satellite
 azimuth motion without triggering a false-fix rejection.  Long-term
-member of the fix set: counts toward RESOLVED.
+member of the fix set: counts toward RESOLVED.  (The 8° threshold,
+reduced from 15° based on day0419h overnight data, matches the
+observed stable-window length of 30-60 min.)
 
 **SQUELCHED** — temporarily excluded from integer-fix attempts after
 a high-confidence cycle slip.  Cooldown-bound (default 60 epochs),
@@ -124,7 +126,7 @@ relative to that set:
 - **Long-term promoter** (NL_SHORT_FIXED → NL_LONG_FIXED): class
   `LongTermPromoter`.  Its job is to **validate** that the
   self-consistency identified by the short-term promoter survives
-  ≥ 15° of satellite-azimuth motion without triggering a false-fix
+  ≥ 8° of satellite-azimuth motion without triggering a false-fix
   rejection.  Short-term members that survive this geometric-
   diversity test graduate to long-term.
 
@@ -194,7 +196,7 @@ geometry-change test.  They drive the RESOLVED transition.
 | admit | TRACKING | FLOAT | elevation + health + constellation gate passes |
 | WL fix | FLOAT | WL_FIXED | MW tracker converges |
 | NL fix | WL_FIXED | NL_SHORT_FIXED | LAMBDA accepts integer (or rounding-path success) |
-| **promote** | NL_SHORT_FIXED | NL_LONG_FIXED | Δaz ≥ 15° accumulated with clean false-fix window |
+| **promote** | NL_SHORT_FIXED | NL_LONG_FIXED | Δaz ≥ 8° accumulated with clean false-fix window |
 | **false-fix rejection** | NL_SHORT_FIXED | FLOAT | false-fix monitor detects wrong-integer signature |
 | **setting-SV drop** | NL_SHORT_FIXED / NL_LONG_FIXED | FLOAT | setting-SV drop monitor (elev-weighted residual or below drop mask) |
 | slip (LOW) | any integer state | FLOAT | cycle-slip monitor, single-detector evidence |
@@ -220,13 +222,43 @@ for wrong-integer signature (residuals grow as geometry shifts after
 fix).
 
 **Threshold**: elev-weighted `base * (sin(45°) / sin(elev))` with
-45° clamp.  Base default 2.0 m at zenith — tighter than the old
-monolithic 3 m gate because newly-fixed SVs should be nearly perfect
-in residuals if the integer is correct.
+45° clamp.  Base default 2.0 m at zenith.
 
-**Action**: transition the SV to FLOAT (false-fix rejection).  The
-filter unfixes the NL integer, inflates the ambiguity covariance,
-and squelches the SV briefly so the next attempt has new evidence.
+**Action**: transition the SV to SQUELCHED with an
+elevation-stratified cooldown.  The `_LEGAL_EDGES` SQUELCHED → FLOAT
+transition is driven by `SvStateTracker.check_squelch_cooldowns()`,
+called from the engine main loop — each SV comes back to FLOAT on
+its own schedule.
+
+**Elevation-stratified squelch duration**:
+
+| Event | Tag | Squelch duration |
+|---|---|---|
+| false-fix at `elev < reliable_elev_deg` (45°) | **expected** | 60 epochs |
+| 1st false-fix at `elev ≥ 45°` this arc | **unexpected #1** | 120 epochs |
+| 2nd false-fix at `elev ≥ 45°` this arc | **unexpected #2** | 300 epochs |
+| 3rd+ false-fix at `elev ≥ 45°` this arc | **unexpected #3 arc-squelched** | 86400 epochs |
+
+The 86400-epoch (24 h) final duration outlasts any visible arc.  The
+SV stays SQUELCHED until tracking is lost (`SvStateTracker.forget_stale`
+drops the record, resetting the `unexpected_ff_this_arc` counter on
+the next rise).  No separate "permanently squelched for this arc"
+state — the effect is implemented purely via the cooldown value.
+
+**Rationale**: a false-fix at elevation 28° is expected — the SV is
+in the multipath-prone band near the AR mask.  A false-fix at 60° is
+unexpected — the physics says integers at that elevation should
+produce clean residuals.  Counting only unexpected false-fixes gives
+us a clean signal about *this specific SV's* integer reliability
+without penalizing SVs that only rise briefly above the mask.
+
+Per-event log line shows the tag and duration:
+```
+[SV_STATE] E34: NL_SHORT_FIXED → SQUELCHED (epoch=1234, elev=58°, squelch=300s, reason=false_fix: unexpected #2 |PR resid|=...)
+```
+
+Grep for `unexpected` gives just the anomalous events; `arc-squelched`
+shows the hard drops.
 
 **Scope**: NL_SHORT_FIXED only.  Long-term fixes by definition have
 survived geometry-change validation; the setting-SV drop is the

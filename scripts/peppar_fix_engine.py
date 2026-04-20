@@ -1509,17 +1509,20 @@ class AntPosEstThread(threading.Thread):
                 f"WL frac={mw_info['fix_frac']:.3f}"
                 f" n={mw_info.get('fix_n_epochs', 0)}")
         prov_str = (" {" + "; ".join(provenance) + "}") if provenance else ""
+        tag = ev.get('tag', 'false-fix')
+        squelch = ev.get('squelch_epochs', 60)
         log.warning(
-            "false-fix rejection: %s |PR|=%.2fm > %.2fm (n=%d, elev=%s)%s",
+            "false-fix rejection: %s |PR|=%.2fm > %.2fm (n=%d, elev=%s, %s, squelch=%ds)%s",
             sv, ev['mean_resid_m'], ev['threshold_m'], ev['n'],
             f"{ev['elev_deg']:.0f}°" if ev['elev_deg'] is not None else "?",
-            prov_str,
+            tag, squelch, prov_str,
         )
-        # NL.unfix would re-transition the tracker FLOAT→FLOAT which is a
-        # no-op; but the tracker is already FLOAT from the false-fix transition,
-        # so unfix() just drops the NL integer.
+        # Tracker already moved the SV to SQUELCHED with cooldown=squelch.
+        # NL-side: unfix the integer and blacklist it for the same duration
+        # so the resolver's eligibility check stays in sync with the
+        # tracker state.
         nl.unfix(sv)
-        nl.blacklist(sv)      # anti-lock-in: don't immediately re-fix
+        nl.blacklist(sv, epochs=squelch)
         filt.inflate_ambiguity(sv)
         mw.reset(sv)
         # Bead 4: note the rejection so any subsequent re-fix has to
@@ -1746,6 +1749,20 @@ class AntPosEstThread(threading.Thread):
             host_ev = self._fix_set_alarm.evaluate(self._n_epochs)
             if host_ev is not None:
                 self._apply_fix_set_alarm(filt, mw, nl, host_ev)
+            # Elevation-stratified squelch: sweep SQUELCHED records
+            # whose per-SV cooldown has expired and return them to FLOAT.
+            # Also drop records for SVs that haven't been observed in
+            # STALE_AFTER_EPOCHS — arc boundary, resets the unexpected-
+            # false-fix counter on the next rise.
+            self._sv_state.check_squelch_cooldowns(self._n_epochs)
+            # Mark SVs we saw this epoch; forget those we haven't seen
+            # for a while.  600 epochs ≈ 10 min at 1 Hz: long enough to
+            # survive brief tracking gaps without clobbering state,
+            # short enough to distinguish one arc from the next.
+            for obs in observations:
+                self._sv_state.mark_seen(obs['sv'], self._n_epochs)
+            if self._n_epochs % 60 == 0:  # sweep every ~1 min
+                self._sv_state.forget_stale(self._n_epochs, 600)
             for ev in self._promoter.evaluate(self._n_epochs):
                 log.info(
                     "Promoted %s → NL_LONG_FIXED (Δaz=%.1f°, first=%s, now=%.0f°)",
