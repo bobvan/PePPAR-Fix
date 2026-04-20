@@ -854,6 +854,14 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                     # no phase biases (bias = 0, no effect).
                     wl_f1 = SIG_WAVELENGTH[f1['sig_name']]
                     wl_f2 = SIG_WAVELENGTH[f2['sig_name']]
+                    # AR phase-bias availability: only true when BOTH signals
+                    # of the IF combination have matched phase biases in the
+                    # active SSR stream(s).  A single-signal match produces
+                    # a biased IF ambiguity — the short-term promoter in
+                    # ppp_ar.py uses this flag to exclude such SVs from
+                    # integer-fix candidacy (they still contribute PR for
+                    # geometry).  Defaults False when ssr is absent.
+                    ar_phase_bias_ok = False
                     if ssr is not None and rinex_f1 and rinex_f2:
                         # Phase biases are indexed by code signal identifier
                         # in SSR (e.g., 'C1C' not 'L1C') — try both
@@ -865,6 +873,8 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                             cp_f1 -= pb_f1 / wl_f1  # meters → cycles
                         if pb_f2 is not None:
                             cp_f2 -= pb_f2 / wl_f2
+                        ar_phase_bias_ok = (pb_f1 is not None
+                                            and pb_f2 is not None)
                         # Phase B diagnostic: log lookup misses
                         if not hasattr(ssr, '_pb_lookup_logged'):
                             ssr._pb_lookup_logged = set()
@@ -960,6 +970,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                         'f2_lock_ms': f2['lock_ms'],
                         'f1_sig_name': f1['sig_name'],
                         'f2_sig_name': f2['sig_name'],
+                        'ar_phase_bias_ok': ar_phase_bias_ok,
                     })
 
                 # Diagnostic dump (first 3 epochs, then every 60)

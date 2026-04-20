@@ -35,7 +35,7 @@ from peppar_fix.nl_diag import (
     NlDiagLogger,
     RESULT_CAND, RESULT_FIXED_LAMBDA, RESULT_FIXED_ROUNDING,
     RESULT_SKIP_ELEV, RESULT_SKIP_BLACKLIST, RESULT_SKIP_NO_WL,
-    RESULT_SKIP_NO_FREQS, RESULT_SKIP_PRESCREEN,
+    RESULT_SKIP_NO_FREQS, RESULT_SKIP_NO_PHASE_BIAS, RESULT_SKIP_PRESCREEN,
     RESULT_REJ_LAMBDA_RATIO, RESULT_REJ_LAMBDA_BOOTSTRAP,
     RESULT_REJ_LAMBDA_DISPLACEMENT, RESULT_REJ_CORNER, RESULT_REJ_RECT,
 )
@@ -337,7 +337,8 @@ class NarrowLaneResolver:
             return False
         return True
 
-    def attempt(self, filt, mw_tracker, elevations=None):
+    def attempt(self, filt, mw_tracker, elevations=None,
+                ar_phase_bias_ok=None):
         """Try to fix ambiguities in the PPPFilter.
 
         Also re-constrains already-fixed ambiguities every epoch to prevent
@@ -351,6 +352,15 @@ class NarrowLaneResolver:
                 candidacy (they remain in the float filter for
                 pseudorange/phase observations).  If None, the gate
                 is skipped — same as ar_elev_mask_deg=0.
+            ar_phase_bias_ok: optional dict {sv: bool}.  True iff the
+                active SSR stream(s) provide matched phase biases for
+                both signals of this SV's IF combination.  SVs flagged
+                False are excluded from integer-fix candidacy (their
+                float IF ambiguity carries an unknown phase-bias offset,
+                so any "integer" fix lands on a biased value and
+                poisons the position solution — most often as altitude
+                bias).  They still contribute PR to the EKF.  If None,
+                the gate is skipped — legacy callers unaffected.
 
         Returns:
             dict of newly fixed satellites: {sv: n1_int}
@@ -408,6 +418,13 @@ class NarrowLaneResolver:
                     diag.record(sv=sv, elev_deg=elev,
                                 wl_fixed_count=wl_fixed_count,
                                 result=RESULT_SKIP_NO_WL)
+                continue
+            if (ar_phase_bias_ok is not None
+                    and not ar_phase_bias_ok.get(sv, True)):
+                if diag is not None:
+                    diag.record(sv=sv, elev_deg=elev,
+                                wl_fixed_count=wl_fixed_count,
+                                result=RESULT_SKIP_NO_PHASE_BIAS)
                 continue
             freqs = mw_tracker.get_freqs(sv)
             if freqs is None:

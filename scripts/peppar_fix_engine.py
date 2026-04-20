@@ -1132,7 +1132,15 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
         # reuse it so the AR elevation mask excludes low-elev SVs from
         # integer fixing without recomputing sat positions.
         if n_epochs >= 30:
-            nl_resolver.attempt(filt, mw_tracker, elevations=elevations)
+            # Per-SV phase-bias availability for the short-term promoter's
+            # candidate gate.  Computed at obs-pack time in realtime_ppp.py;
+            # default True keeps legacy/replay paths (no SSR stream) unchanged.
+            ar_phase_bias_ok = {
+                o['sv']: o.get('ar_phase_bias_ok', True)
+                for o in observations
+            }
+            nl_resolver.attempt(filt, mw_tracker, elevations=elevations,
+                                ar_phase_bias_ok=ar_phase_bias_ok)
 
         if n_epochs % 5 == 0:
             log.info(
