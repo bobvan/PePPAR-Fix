@@ -103,6 +103,43 @@ not permanent.  "Squelched" is radio-receiver terminology and was
 chosen over "blacklisted" because the latter connotes permanence;
 an SV is squelched until signal quality recovers.
 
+## What the states mean in one sentence each
+
+The states are easier to read once you see the unifying concept:
+**self-consistency of the integer set**.
+
+- **LAMBDA's job** is to *identify a candidate self-consistent
+  integer set* from the float ambiguity covariance.  It does not
+  pick integers per-SV — it does a joint-MAP search that finds
+  the set of integers most consistent with each other given the
+  covariance structure.  The output is an internally-consistent
+  set as of that epoch's geometry.
+- **An `NL_SHORT_FIXED` member** is part of a set that *was*
+  self-consistent at promotion time.  Whether it remains
+  self-consistent as geometry evolves is unproven — it's on
+  probation.
+- **An `NL_LONG_FIXED` member** is part of a set that has *proven*
+  self-consistent across ≥ 15° of satellite-azimuth motion.
+  Temporal + geometric validation.
+- **The false-fix monitor's job** is to detect breakdown of
+  self-consistency — the set that fit epoch T no longer fits the
+  accumulating evidence by epoch T + 15°.  It removes the offending
+  integer, and the remaining long-term members continue to drive
+  the solution.
+- **The setting-SV drop monitor's job** is to remove a member
+  whose observations are no longer trustworthy enough to
+  participate in the self-consistency check, before that
+  untrustworthy input can pull the set out of consistency.
+- **The fix-set integrity alarm's job** is to catch the rare case
+  where *many* members fail self-consistency at once — which
+  almost always means the input (SSR stream, datum, ephemeris) is
+  broken, not the integers.
+
+Viewed this way, every transition in the state machine is either
+*adding* a candidate to the self-consistent set, *validating* that
+the set remains self-consistent, or *removing* a member whose
+inclusion would break self-consistency.
+
 ## The fix set
 
 **Fix set** — the collection of SVs whose integer ambiguities contribute
