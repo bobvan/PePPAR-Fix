@@ -53,9 +53,9 @@ from ssr_corrections import SSRState, RealtimeCorrections
 from ppp_ar import MelbourneWubbenaTracker, NarrowLaneResolver
 from peppar_fix.cycle_slip import CycleSlipMonitor, SlipEvent, flush_sv_phase
 from peppar_fix.sv_state import SvAmbState, SvStateTracker
-from peppar_fix.provisional_validator import ProvisionalValidator
-from peppar_fix.retirement_gate import RetirementGate
-from peppar_fix.host_rms_alarm import HostRmsAlarm
+from peppar_fix.false_fix_monitor import FalseFixMonitor
+from peppar_fix.setting_sv_drop_monitor import SettingSvDropMonitor
+from peppar_fix.fix_set_integrity_alarm import FixSetIntegrityAlarm
 from peppar_fix.validation_promoter import ValidationPromoter
 from peppar_fix.nl_diag import NlDiagLogger
 
@@ -1338,13 +1338,13 @@ class AntPosEstThread(threading.Thread):
                 rec.state = SvAmbState.WL_FIXED
         for sv in self._nl._fixed:
             rec = self._sv_state.get(sv)
-            rec.state = SvAmbState.NL_PROVISIONAL
-        self._job_a = ProvisionalValidator(self._sv_state)
-        self._job_b = RetirementGate(self._sv_state)
-        self._host_alarm = HostRmsAlarm(self._sv_state)
-        # Bead 4 — promotes NL_PROVISIONAL → NL_VALIDATED after Δaz ≥ 15°
-        # with a clean Job A window.  Host RESOLVED count (below) reads
-        # NL_VALIDATED from the tracker instead of raw NL-fix count.
+            rec.state = SvAmbState.NL_SHORT_FIXED
+        self._false_fix = FalseFixMonitor(self._sv_state)
+        self._setting_drop = SettingSvDropMonitor(self._sv_state)
+        self._fix_set_alarm = FixSetIntegrityAlarm(self._sv_state)
+        # Bead 4 — promotes NL_SHORT_FIXED → NL_LONG_FIXED after Δaz ≥ 15°
+        # with a clean false-fix window.  Solution-state RESOLVED count (below) reads
+        # NL_LONG_FIXED from the tracker instead of raw NL-fix count.
         self._promoter = ValidationPromoter(self._sv_state)
         self._slip_monitor = CycleSlipMonitor(
             mw_tracker=self._mw, csv_writer=_slip_csv_writer())
@@ -1484,11 +1484,12 @@ class AntPosEstThread(threading.Thread):
                 f"antenna moved (horiz={disp_h:.0f}m)",
             )
 
-    def _apply_job_a(self, filt, mw, nl, ev):
-        """Job A fired on one SV — the provisional validator rejected
-        the NL integer.  The tracker already moved the SV to FLOAT;
-        tear down the filter-side state (NL unfix + ambiguity inflate
-        + blacklist + MW reset) so the AR pipeline re-attempts cleanly.
+    def _apply_false_fix(self, filt, mw, nl, ev):
+        """False-fix monitor fired on one SV — the short-term integer
+        was rejected as wrong.  The tracker already moved the SV to
+        FLOAT; tear down the filter-side state (NL unfix + ambiguity
+        inflate + squelch + MW reset) so the AR pipeline re-attempts
+        cleanly.
         """
         sv = ev['sv']
         # Provenance: what was this SV's fix-time quality?  Helps spot
@@ -1509,13 +1510,13 @@ class AntPosEstThread(threading.Thread):
                 f" n={mw_info.get('fix_n_epochs', 0)}")
         prov_str = (" {" + "; ".join(provenance) + "}") if provenance else ""
         log.warning(
-            "Job A: %s |PR|=%.2fm > %.2fm (n=%d, elev=%s)%s",
+            "false-fix rejection: %s |PR|=%.2fm > %.2fm (n=%d, elev=%s)%s",
             sv, ev['mean_resid_m'], ev['threshold_m'], ev['n'],
             f"{ev['elev_deg']:.0f}°" if ev['elev_deg'] is not None else "?",
             prov_str,
         )
         # NL.unfix would re-transition the tracker FLOAT→FLOAT which is a
-        # no-op; but the tracker is already FLOAT from Job A's transition,
+        # no-op; but the tracker is already FLOAT from the false-fix transition,
         # so unfix() just drops the NL integer.
         nl.unfix(sv)
         nl.blacklist(sv)      # anti-lock-in: don't immediately re-fix
@@ -1523,13 +1524,13 @@ class AntPosEstThread(threading.Thread):
         mw.reset(sv)
         # Bead 4: note the rejection so any subsequent re-fix has to
         # stay clean for clean_window_epochs before being promoted.
-        self._promoter.note_job_a_rejection(sv, self._n_epochs)
+        self._promoter.note_false_fix_rejection(sv, self._n_epochs)
 
-    def _apply_job_b(self, filt, mw, nl, ev):
-        """Job B fired — retire an SV gracefully.  Tracker already
-        moved to RETIRING.  Release the NL integer with gentle covariance
-        growth; keep MW state so the SV can be re-acquired if it rises
-        again (e.g., different arc).
+    def _apply_setting_sv_drop(self, filt, mw, nl, ev):
+        """Setting-SV drop fired — transition the SV out of the fix set
+        gracefully.  Tracker has already moved it back to FLOAT.  Release
+        the NL integer with gentle covariance growth; keep MW state so
+        the SV can be re-acquired if it rises again (a different arc).
         """
         sv = ev['sv']
         reason_frag = (
@@ -1538,18 +1539,19 @@ class AntPosEstThread(threading.Thread):
             f"|PR|={ev['mean_resid_m']:.2f}m>{ev['threshold_m']:.2f}m"
             f" at elev={ev['elev_deg']:.0f}°"
         )
-        log.info("Job B: retiring %s (%s)", sv, reason_frag)
+        log.info("setting-SV drop: %s (%s)", sv, reason_frag)
         nl.unfix(sv)
-        # Preserve MW state — retirement is "this integer is done," not
+        # Preserve MW state — a drop is "this integer is done," not
         # "this SV is bad."  Next arc or re-acquisition re-uses it.
 
-    def _apply_host_alarm(self, filt, mw, nl, ev):
-        """Host RMS alarm fired — systemic failure.  Full filter re-init
-        at current AR position.  Transitions host back to CONVERGING.
+    def _apply_fix_set_alarm(self, filt, mw, nl, ev):
+        """Fix-set integrity alarm fired — systemic failure.  Full
+        filter re-init at current AR position.  Transitions the position
+        solution back to CONVERGING.
         """
         pos_ecef = filt.x[:3].copy()
         log.warning(
-            "[HOST_ALARM] re-initialising PPPFilter at %s"
+            "[FIX_SET_ALARM] re-initialising PPPFilter at %s"
             " (window RMS=%.2fm, latest=%.2fm, n=%d)",
             pos_ecef.tolist(), ev['window_rms_m'], ev['rms_m'], ev['n_samples'],
         )
@@ -1559,19 +1561,19 @@ class AntPosEstThread(threading.Thread):
             nl.unfix(sv)
         for sv in list(mw._state.keys()):
             mw.reset(sv)
-            # MW.reset() intentionally doesn't touch the tracker; after a
-            # host-level re-init every SV's state is meaningless, so
-            # flatten to FLOAT explicitly.
+            # MW.reset() intentionally doesn't touch the tracker; after
+            # a fix-set-wide re-init every SV's state is meaningless,
+            # so flatten to FLOAT explicitly.
             cur = self._sv_state.state(sv)
             if cur is not SvAmbState.FLOAT:
                 try:
                     self._sv_state.transition(
                         sv, SvAmbState.FLOAT,
-                        epoch=self._n_epochs, reason="host_alarm:reinit",
+                        epoch=self._n_epochs, reason="fix_set_alarm:reinit",
                     )
                 except Exception:
-                    # BLACKLISTED → FLOAT isn't always in the legal set
-                    # depending on cooldown; safe to skip if disallowed.
+                    # SQUELCHED → FLOAT is legal per the edge set, but
+                    # defensive coding keeps the re-init path robust.
                     pass
         filt.initialize(pos_ecef, 0.0, systems=self._systems)
         self._prev_t = None
@@ -1579,9 +1581,9 @@ class AntPosEstThread(threading.Thread):
         if self._ape_sm.state == AntPosEstState.RESOLVED:
             self._ape_sm.transition(
                 AntPosEstState.CONVERGING,
-                "host RMS alarm — re-bootstrap",
+                "fix-set integrity alarm — re-bootstrap",
             )
-        self._host_alarm.record_fire(self._n_epochs)
+        self._fix_set_alarm.record_fire(self._n_epochs)
 
     def run(self):
         log.info("AntPosEstThread started (resolved_decimation=%d, resolve_threshold=%d)",
@@ -1718,35 +1720,35 @@ class AntPosEstThread(threading.Thread):
             if self._n_epochs >= 5:
                 nl.attempt(filt, mw, elevations=elevations)
 
-            # Per-SV state machine: stream PR residuals into Jobs A/B
+            # Per-SV state machine: stream PR residuals into the monitors
             # and the host RMS alarm.  Each monitor is stateless per-eval
             # (no cascade) and drives SvStateTracker transitions directly.
             # See docs/sv-lifecycle-and-pfr-split.md.
             labels = getattr(filt, 'last_residual_labels', [])
-            self._job_a.ingest(self._n_epochs, resid, labels)
-            self._job_b.ingest(self._n_epochs, resid, labels)
-            self._host_alarm.ingest(self._n_epochs, resid, labels)
-            # Bead 4: stream azimuths for NL_PROVISIONAL SVs so the
+            self._false_fix.ingest(self._n_epochs, resid, labels)
+            self._setting_drop.ingest(self._n_epochs, resid, labels)
+            self._fix_set_alarm.ingest(self._n_epochs, resid, labels)
+            # Bead 4: stream azimuths for NL_SHORT_FIXED SVs so the
             # promoter can accumulate Δaz toward the 15° threshold.  We
             # compute azimuths only when there's at least one SV in
-            # NL_PROVISIONAL — avoids the per-epoch sat_position call
+            # NL_SHORT_FIXED — avoids the per-epoch sat_position call
             # on hosts that haven't fixed anything yet.
-            prov_count = self._sv_state.count_in(SvAmbState.NL_PROVISIONAL)
+            prov_count = self._sv_state.count_in(SvAmbState.NL_SHORT_FIXED)
             if prov_count > 0:
                 azimuths = _compute_sv_azimuths(
                     filt, corrections, observations, gps_time)
                 for sv, az in azimuths.items():
                     self._promoter.ingest_az(sv, az)
-            for ev in self._job_a.evaluate(self._n_epochs):
-                self._apply_job_a(filt, mw, nl, ev)
-            for ev in self._job_b.evaluate(self._n_epochs):
-                self._apply_job_b(filt, mw, nl, ev)
-            host_ev = self._host_alarm.evaluate(self._n_epochs)
+            for ev in self._false_fix.evaluate(self._n_epochs):
+                self._apply_false_fix(filt, mw, nl, ev)
+            for ev in self._setting_drop.evaluate(self._n_epochs):
+                self._apply_setting_sv_drop(filt, mw, nl, ev)
+            host_ev = self._fix_set_alarm.evaluate(self._n_epochs)
             if host_ev is not None:
-                self._apply_host_alarm(filt, mw, nl, host_ev)
+                self._apply_fix_set_alarm(filt, mw, nl, host_ev)
             for ev in self._promoter.evaluate(self._n_epochs):
                 log.info(
-                    "Promoted %s → NL_VALIDATED (Δaz=%.1f°, first=%s, now=%.0f°)",
+                    "Promoted %s → NL_LONG_FIXED (Δaz=%.1f°, first=%s, now=%.0f°)",
                     ev['sv'], ev['accumulated_dphi_deg'],
                     f"{ev['first_fix_az_deg']:.0f}°"
                     if ev['first_fix_az_deg'] is not None else "?",
@@ -1756,20 +1758,20 @@ class AntPosEstThread(threading.Thread):
             # Position quality
             sigma_3d = position_sigma_3d(filt.P)
             pos_ecef = filt.x[:3].copy()
-            # Host RESOLVED keys off NL_VALIDATED count (Bead 4): a fresh
-            # NL_PROVISIONAL fix doesn't count toward RESOLVED until
+            # Host RESOLVED keys off NL_LONG_FIXED count (Bead 4): a fresh
+            # NL_SHORT_FIXED fix doesn't count toward RESOLVED until
             # geometry has shifted enough to validate it.  Falls back to
             # the old raw NL-fix count when the tracker has no validated
             # SVs yet — preserves old behavior during the ramp-up before
             # any promotion lands.
-            n_nl_validated = self._sv_state.count_in(SvAmbState.NL_VALIDATED)
+            n_nl_validated = self._sv_state.count_in(SvAmbState.NL_LONG_FIXED)
             n_nl_fixed = sum(1 for sv in filt.sv_to_idx if nl.is_fixed(sv))
             n_resolved_count = (
                 n_nl_validated if n_nl_validated > 0 else n_nl_fixed
             )
 
             # Update state machine metrics — n_nl reports the count
-            # actually driving RESOLVED, which may be NL_VALIDATED or
+            # actually driving RESOLVED, which may be NL_LONG_FIXED or
             # the raw fall-back.
             self._ape_sm.update_metrics(
                 sigma_m=sigma_3d,
@@ -1830,7 +1832,7 @@ class AntPosEstThread(threading.Thread):
             # Periodic SV-state summary (replaces the old PFR per-SV
             # residual dump).  Emits a one-line histogram of states at
             # the same cadence; per-SV residual detail lives in the
-            # [SV_STATE] transition log and the Job A/B event logs.
+            # [SV_STATE] transition log and the monitor event logs.
             if self._n_epochs % 60 == 0 and self._n_epochs > 0:
                 log.info("  %s", self._sv_state.summary())
 

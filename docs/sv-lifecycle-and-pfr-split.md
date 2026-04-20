@@ -1,401 +1,288 @@
-# Per-SV Lifecycle and the PFR Split
+# Per-SV Lifecycle, the Fix Set, and the PFR Split
 
-*Design doc 2026-04-19 — introduces a per-SV state machine to
-separate "is this SV's integer correct?" (Job A) from "is this SV
-still useful as it sets?" (Job B).  Supplements, does not replace,
-the host-level `AntPosEstState` machine documented in
-`docs/state-machine-refactor-plan.md`.*
+*Design doc 2026-04-19, rewritten 2026-04-20 with final terminology.
+Introduces a per-SV state machine, a named three-way partition of the
+"fix set", and replaces the old monolithic PFR L1/L2/L3 cascade with
+three stateless per-eval monitors.*
 
-> **Data update 2026-04-19 evening** — analysis of day0419c/d
-> PFR events (see `project_pfr_event_analysis_20260419.md`)
-> changed the priority ordering.  **Job A (wrong-integer
-> detection) dominates, not Job B.**  62% of observed L1 events
-> are recent-fix high-elev, only 31% are low-elev setting SVs.
-> Also uncovered a level-persistence bug causing L3 to re-fire
-> without fresh L1 precursors (0/16 L3 events had an L1 within
-> 10 min).  **Beads 1 and 2 should ship together — Bead 1 alone
-> doesn't help.**  Revised bead plan at the end of this doc.
+## What this replaces
 
-## Why this exists
+- **`PostFixResidualMonitor`** — single class that fired L1 surgical,
+  L2 soft-unfix, or L3 full re-bootstrap from one 3 m threshold.
+  Empirically (day0419c/d data) its `_level` state got stuck at 3,
+  re-firing L3 on every subsequent misfit and burning ~10 min of
+  convergence per re-fire.  See `project_pfr_event_analysis_20260419`.
+- **Ambiguity bookkeeping scattered across MW tracker, NL resolver,
+  filter, and slip monitor** — each had its own implicit notion of
+  "is this SV fixed?" with no shared vocabulary or ordering.
 
-Two clean observations from day0419c/d test runs drove this:
+## What this adds
 
-1. **Post-Fix-Residual monitor (PFR) is doing two structurally
-   different jobs with one threshold.**  Both "did LAMBDA pick a
-   wrong integer 5 min ago?" and "has this SV degraded as it
-   descends through 20°?" share the same 3 m per-SV gate.  Neither
-   is well-served: wrong-integer detection needs a time-of-flight
-   probation that scales with geometry change, not wall-clock;
-   retirement needs elevation-weighted slack.
+- An explicit **per-SV state machine** with six named states.
+- A named three-way **fix-set membership** partition derived from
+  those states.
+- Three stateless monitors, each with one job.
+- Consistent vocabulary: `integer fix` (per-SV) vs `position solution`
+  (the whole thing the AntPosEst computes) — never overloaded.
 
-2. **Nothing today distinguishes a new-fix ambiguity from a
-   weeks-old validated one.**  The filter treats every NL-fixed
-   SV as equally trustworthy.  That's why a single wrong-integer
-   event propagates into host-wide RMS drift, trips PFR L1, fails
-   to clear, escalates L2→L3, and loses ~10 min of convergence —
-   **even when the other NL-fixed SVs have been correct and stable
-   for 45 min.**
+## Scope and related state machines
 
-See `project_pfr_too_aggressive_20260419.md` for the observational
-evidence and `project_bds_ar_first_success_20260419.md` for the
-baseline multi-constellation AR performance this design targets.
+Per-SV ambiguity state (`SvAmbState`) is **orthogonal** to the
+position-solution state (`AntPosEstState`) documented in
+`docs/state-machine-refactor-plan.md`.  Don't conflate them:
 
-## Two state machines, two scopes
-
-The system has two orthogonal state machines.  They interact but
-are not nested.
-
-| Scope | Name | States | Where |
-|---|---|---|---|
-| **Host** | `AntPosEstState` | UNSURVEYED, VERIFYING, VERIFIED, CONVERGING, RESOLVED, MOVED | `docs/state-machine-refactor-plan.md` — unchanged |
-| **Per-SV** | `SvAmbState` (new) | FLOAT, WL_FIXED, NL_PROVISIONAL, NL_VALIDATED, RETIRING, BLACKLISTED | **This document** |
-
-**Host state answers**: is the receiver's *position* trustworthy
-right now?  Does the DOFreqEst thread have permission to servo?
-Does NAV2 agree we haven't moved?  One value for the whole host.
-
-**Per-SV state answers**: is the ambiguity for *this specific
-satellite* integer-fixed, and how confident are we?  One value per
-(system, PRN).  The host has a fleet of these.
-
-They interact via a simple rule: **the host is RESOLVED iff ≥ N
-SVs are in NL_VALIDATED (where N is something like 4).**  SVs in
-NL_PROVISIONAL count internally for position tightening but don't
-contribute to the host-level RESOLVED declaration.  This prevents
-a lucky-noise fix from pulling the host into RESOLVED prematurely.
-
-## The per-SV state machine
-
-```
-                    ┌─────────────┐
-                    │ BLACKLISTED │
-                    └──────┬──────┘
-                           │ cooldown expires
-                           ▼
-     ┌──────────┐   MW      ┌───────────┐   LAMBDA    ┌────────────────┐
-     │          │  converge │           │  ratio > τ  │                │
-     │  FLOAT   ├──────────►│ WL_FIXED  ├────────────►│ NL_PROVISIONAL │
-     │          │           │           │             │                │
-     └──────▲───┘           └──────▲────┘             └─────────┬──────┘
-            │                      │                            │
-            │    cycle slip        │       Δaz < 15°,           │ Δaz ≥ 15°
-            │    or Job A reject   │       recent-fix residual  │ AND PR resid
-            │                      │       exceeded             │ clean over
-            │    ┌─────────────────┘                            │ validation
-            └────┤                                              ▼ window
-                 │                                    ┌──────────────────┐
-                 │                                    │   NL_VALIDATED   │
-                 │                                    │                  │
-                 │                                    └────────┬─────────┘
-                 │                                             │
-                 │         elev-weighted PR resid              │
-                 │         > retirement threshold              │
-                 │                   OR                        │
-                 │         elev < retirement mask              │
-                 │                                             ▼
-                 │                                    ┌─────────────────┐
-                 │         elev < AR mask             │    RETIRING     │
-                 └────────────────────────────────────┤                 │
-                                                      └─────────────────┘
-```
-
-### States
-
-**FLOAT** — Ambiguity is being estimated.  Contributes to filter
-geometry but not to AR.  Default state for a newly-seen SV.
-
-**WL_FIXED** — Melbourne-Wübbena wide-lane integer has converged.
-NL float remains; SV still in "float geometry" for host purposes.
-
-**NL_PROVISIONAL** — LAMBDA has declared an NL integer that passed
-the ratio test.  The filter uses the integer internally (tighter
-σ), but the host does not count this SV toward its RESOLVED
-quorum.  This is the probation window.
-
-**NL_VALIDATED** — The NL integer has survived sufficient geometry
-change (e.g., ≥15° satellite azimuth motion) with post-fit
-residuals staying within the elevation-weighted gate.  Now counts
-toward host RESOLVED.
-
-**RETIRING** — The SV is descending through the retirement
-elevation band (say 20°-mask).  Its residuals are inflating as
-expected from physics; the retirement logic releases the integer
-gracefully.  Does not count toward host RESOLVED once in this
-state.
-
-**BLACKLISTED** — Temporarily excluded from AR.  Entered via cycle
-slip detection, repeated LAMBDA failures, or Job A rejection.
-Cooldown (currently `blacklist_epochs = 60`) then FLOAT re-entry.
-
-### Transitions
-
-| From | To | Trigger |
+| Scope | Name | What it answers |
 |---|---|---|
-| FLOAT | WL_FIXED | MW tracker converges (frac < 0.1, n ≥ 60 epochs) |
-| WL_FIXED | NL_PROVISIONAL | LAMBDA ratio > τ_ratio, σ_N1 < threshold |
-| NL_PROVISIONAL | NL_VALIDATED | Δaz ≥ 15° AND PR residual stayed in elev-weighted gate for full window |
-| NL_PROVISIONAL | FLOAT | Job A: PR residual exceeded gate during probation (likely wrong integer) |
-| NL_VALIDATED | RETIRING | elev < retirement_mask (e.g., 20°) OR elev-weighted PR gate exceeded |
-| RETIRING | FLOAT | elev < AR mask (25°); WL/MW state preserved |
-| any NL state | FLOAT | CycleSlipMonitor fires (slip flushes phase only; WL may survive) |
-| any state | BLACKLISTED | Job A rejection repeatedly on same SV, or cycle slip in recent window |
-| BLACKLISTED | FLOAT | `blacklist_epochs` elapsed without signal degradation |
+| Per-SV | `SvAmbState` | Does this satellite's integer ambiguity contribute to the fix set? |
+| Position solution | `AntPosEstState` | Is the antenna position the AntPosEst instance has computed trustworthy? |
 
-## PFR Split: Job A and Job B
+They interact at exactly one point: the position solution transitions
+CONVERGING → RESOLVED when the **long-term member count** in the
+fix set reaches a threshold.  Routine sky motion (short-term fixes
+arriving, long-term fixes being dropped as SVs set) does not flip
+solution state.
 
-PFR today evaluates one condition: `worst_sv_mean > 3m OR rms > 3m`.
-Both conditions feed the same escalation ladder.  We split this
-into two independent monitors.
+The word **host** deliberately does not appear in this model.  Each
+AntPosEst instance owns one fix set and one solution.  A deployment
+with multiple antennas has multiple AntPosEst instances, each with
+independent fix sets and solutions — no shared-state confusion.
 
-### Job A — Wrong-integer detection (acts on NL_PROVISIONAL)
-
-**Purpose**: catch statistically-unlucky or systematically-biased
-fixes before they corrupt the host position.
-
-**What it measures**: PR post-fit residuals **on SVs currently in
-NL_PROVISIONAL state**, tracked individually.
-
-**Trigger**: per-SV mean |PR resid| over a geometry-change window
-(not wall-clock).  A SV moving 5° in az has seen all the geometry
-dependence exposed; if the integer is wrong, the position-shift
-signature is fully revealed.  Threshold ~2 m per-SV — tighter than
-today's 3 m because the target is NEW fixes, which should show
-essentially zero residual if correct.
-
-**Action**: demote the SV to FLOAT.  Do **not** touch other SVs,
-do not touch the filter covariance broadly.  Re-enable AR after
-the SV accumulates new MW/WL evidence.
-
-**Cadence**: every 10 epochs.  Applies only to SVs whose
-provisional age is shorter than `validation_window`.
-
-### Job B — Setting-SV retirement (acts on NL_VALIDATED)
-
-**Purpose**: release setting SVs gracefully before their multipath-
-inflated residuals pollute the filter.
-
-**What it measures**: PR post-fit residuals on SVs currently in
-NL_VALIDATED state, with threshold scaled by 1/sin(elev).
-
-**Trigger**: per-SV mean |PR resid| > `base_threshold / sin(elev)`.
-A SV at 25° tolerates ~2.4× the zenith noise; at 10° ~5.8×.  Also
-absolute floor when elev < `retirement_mask` (e.g., 20°) —
-triggers retirement regardless of residual magnitude.
-
-**Action**: transition SV to RETIRING.  Preserve WL/MW state in
-case the SV rises again at a later arc.  Remove integer from
-filter with gentle covariance growth (not a slam-to-FLOAT).
-
-**Cadence**: every 10 epochs.
-
-### Host-level monitor (replaces today's L3)
-
-**Purpose**: catch the rare case where *many* SVs misbehave at
-once — genuine systemic failure (bad SSR correction, clock datum
-change, etc.).
-
-**What it measures**: host PR RMS across all NL_VALIDATED SVs.
-
-**Trigger**: RMS > much larger threshold (say 5 m) sustained over
-multiple evals AND Job A hasn't fired on individual SVs.
-
-**Action**: full filter re-init at current known_ecef — similar
-to today's L3 but only as last resort.  Expected rate: < 1/day in
-good conditions.  If firing more than ~1/hr, something is broken
-at the correction-source level, not at the AR level.
-
-### What happens to today's L1/L2/L3
-
-| Today | In new design |
-|---|---|
-| PFR L1 (surgical unfix worst SV) | Job B retirement for descending SVs; Job A for mid-probation SVs.  Per-SV threshold, two different gates by state. |
-| PFR L2 (partial soft-unfix all NL) | **Deleted.**  No structural role: if many SVs are bad simultaneously, that's a host-level event (go to L3-equivalent); if only one is bad, handle it per-SV. |
-| PFR L3 (full re-bootstrap) | Host-level monitor, much rarer.  Expected < 1/day. |
-
-## Elevation-weighted thresholds
-
-All per-SV PR residual thresholds scale with `1/sin(elev)`:
+## The six per-SV states
 
 ```
-threshold(elev) = threshold_zenith * max(1.0, csc_elev / csc_45°)
-                = threshold_zenith * max(1.0, sqrt(2) / sin(elev))
+                (receiver loses tracking → record forgotten)
+                              ▲
+(receiver                     │
+ acquires)   TRACKING ── admit ──► FLOAT ── WL fix ──► WL_FIXED ── NL fix ──► NL_SHORT_FIXED ── Δaz ≥ 15° ──► NL_LONG_FIXED
+                                    ▲                    │                        │   ▲                          │
+                                    │                    │                        │   │                          │
+                                    │     false-fix rejection (monitor)           │   │                          │
+                                    ◄────────────────────────────────────────────┘   │                          │
+                                    │                                                 │                          │
+                                    │     setting-SV drop (monitor)                   │                          │
+                                    ◄─────────────────────────────────────────────────┴──────────────────────────┘
+                                    │
+                                    │     cycle slip (HIGH — ≥2 detectors or locktime=0)
+                                    ▼
+                              SQUELCHED ── cooldown expires ──► FLOAT
+                                    ▲
+                                    │     cycle slip (LOW — single detector, outlier-ish)
+                         (any integer state) ──► FLOAT  (keeps WL/MW state for fast re-fix)
 ```
 
-So zenith (90°) uses `threshold_zenith`; 45° uses the same; 30°
-gets 1.41×; 25° gets 1.67×; 15° gets 2.73×.  The clamp at 45°
-prevents unrealistically-tight thresholds on near-zenith SVs where
-multipath is actually lower than the "nominal" model.
+### State definitions
 
-`threshold_zenith` is a new host TOML parameter, default ~1.5 m
-(vs today's flat 3 m).  Justification: at zenith a healthy PR
-post-fit residual should be well under a meter; 1.5 m is
-per-satellite multipath + receiver noise budget.
+**TRACKING** — the receiver reports the SV via RXM-RAWX, but we have
+not yet decided to process it.  Elevation, health, or constellation
+gate has not passed.  Transient — typically lasts one epoch before
+admit.
 
-## Relationship to host state
+**FLOAT** — admitted into processing.  MW tracker is accumulating
+phase history; no integer fix yet.  Pseudorange + float-phase
+observations contribute to the filter, but nothing about this SV's
+ambiguity is integer-constrained.  Not a member of the fix set.
 
-The host's `AntPosEstState` machine is untouched by this doc.
-The per-SV states feed into it via the RESOLVED transition:
+**WL_FIXED** — Melbourne-Wübbena wide-lane integer fix has converged
+(ambiguity `N_WL = N1 − N2` is integer).  NL is still float in the
+filter.  Not yet a member of the fix set — waiting for LAMBDA to
+accept the narrow-lane integer.
 
-```
-Host CONVERGING → RESOLVED: ≥ N SVs in NL_VALIDATED
-                             (N = 4 default, configurable)
+**NL_SHORT_FIXED** — LAMBDA (or rounding) has accepted the narrow-lane
+integer.  Both N1 and N2 are implied integer.  Short-term member of
+the fix set: contributes its integer to the position solution but
+does not count toward the solution-state RESOLVED declaration — the
+integer has not yet been validated across geometry change.
 
-Host RESOLVED → CONVERGING: NL_VALIDATED count drops below N
-                             (many SVs retired, few new validations)
+**NL_LONG_FIXED** — the integer fix has survived ≥ 15° of satellite
+azimuth motion without triggering a false-fix rejection.  Long-term
+member of the fix set: counts toward RESOLVED.
 
-Host RESOLVED → (stays RESOLVED): individual SVs cycling through
-                                  RETIRING → FLOAT → WL_FIXED →
-                                  NL_PROVISIONAL → NL_VALIDATED in
-                                  the background is routine
-```
+**SQUELCHED** — temporarily excluded from integer-fix attempts after
+a high-confidence cycle slip.  Cooldown-bound (default 60 epochs),
+not permanent.  "Squelched" is radio-receiver terminology and was
+chosen over "blacklisted" because the latter connotes permanence;
+an SV is squelched until signal quality recovers.
 
-This means **SV retirement does not flip host state**.  A setting
-SV retiring is not a reason to re-bootstrap; it's normal sky
-motion.  The host stays RESOLVED throughout.  That's a structural
-change — today any PFR L3 event drags the host from RESOLVED →
-CONVERGING, and we measured that costs ~10 min/event.
+## The fix set
 
-## Expected rates (steady state, GAL+BDS, 25° mask)
+**Fix set** — the collection of SVs whose integer ambiguities contribute
+to the current position solution.  A three-way partition:
 
-- SVs rising through AR mask: ~5/hr
-- SVs setting through retirement mask: ~5/hr
-- NL_VALIDATED count: 8-14 steady
-- Job A rejections (wrong integers): target < 1/hr
-- Job B retirements: ~5/hr (one per descending SV)
-- Host-level monitor fires: < 1/day
+| State | Fix-set role | Counts toward RESOLVED? |
+|---|---|---|
+| TRACKING | outside | no |
+| FLOAT | outside (contributes pseudorange + float phase only) | no |
+| WL_FIXED | outside (still float in the IF ambiguity) | no |
+| **NL_SHORT_FIXED** | **short-term member** | **no** |
+| **NL_LONG_FIXED** | **long-term member** | **yes** |
+| SQUELCHED | outside | no |
 
-If Job B is firing much above 5/hr, the per-SV thresholds are too
-tight.  If Job A is firing above 1/hr, either the LAMBDA ratio
-test is too loose or there's a correction-source bias.
+**Short-term members** have an integer fix that has not yet
+demonstrated consistency with long-term members' fixes as geometry
+evolved.  They still contribute their integer to the solution — we
+use them.  We just don't declare RESOLVED based on their count.
+
+**Long-term members** are integer fixes that have survived the
+geometry-change test.  They drive the RESOLVED transition.
+
+## Events (transitions)
+
+| Event | From | To | Trigger |
+|---|---|---|---|
+| observe | (nil) | TRACKING | receiver reports RXM-RAWX for this SV |
+| admit | TRACKING | FLOAT | elevation + health + constellation gate passes |
+| WL fix | FLOAT | WL_FIXED | MW tracker converges |
+| NL fix | WL_FIXED | NL_SHORT_FIXED | LAMBDA accepts integer (or rounding-path success) |
+| **promote** | NL_SHORT_FIXED | NL_LONG_FIXED | Δaz ≥ 15° accumulated with clean false-fix window |
+| **false-fix rejection** | NL_SHORT_FIXED | FLOAT | false-fix monitor detects wrong-integer signature |
+| **setting-SV drop** | NL_SHORT_FIXED / NL_LONG_FIXED | FLOAT | setting-SV drop monitor (elev-weighted residual or below drop mask) |
+| slip (LOW) | any integer state | FLOAT | cycle-slip monitor, single-detector evidence |
+| slip (HIGH) | any processing state | SQUELCHED | cycle-slip monitor, ≥2 detectors or locktime=0 |
+| cooldown expire | SQUELCHED | FLOAT | elapsed cooldown time |
+| forget | any | (record removed) | receiver stops tracking |
+
+Transitions not listed are illegal and raise `InvalidTransition`.
+The tracker logs every legal transition as one
+`[SV_STATE] <sv>: <from> → <to> (epoch=N, elev=X°, reason=...)` line.
+
+## The three monitors
+
+All three are **stateless between evaluations**.  Each eval looks at
+current tracker/residual data and decides independently.  None carry
+an escalation ladder or persistent "last action" state — that's the
+explicit fix for the old PostFixResidualMonitor cascade bug.
+
+### False-fix monitor (`FalseFixMonitor`)
+
+**What**: per-SV stateless monitor that watches short-term members
+for wrong-integer signature (residuals grow as geometry shifts after
+fix).
+
+**Threshold**: elev-weighted `base * (sin(45°) / sin(elev))` with
+45° clamp.  Base default 2.0 m at zenith — tighter than the old
+monolithic 3 m gate because newly-fixed SVs should be nearly perfect
+in residuals if the integer is correct.
+
+**Action**: transition the SV to FLOAT (false-fix rejection).  The
+filter unfixes the NL integer, inflates the ambiguity covariance,
+and squelches the SV briefly so the next attempt has new evidence.
+
+**Scope**: NL_SHORT_FIXED only.  Long-term fixes by definition have
+survived geometry-change validation; the setting-SV drop is the
+right gate for them.
+
+### Setting-SV drop monitor (`SettingSvDropMonitor`)
+
+**What**: per-SV stateless monitor that watches for elevation-driven
+quality loss on any NL member of the fix set.
+
+**Triggers** (either fires):
+- **Elev-weighted PR residual exceeds threshold.**  Base 3.0 m at
+  zenith (looser than the false-fix monitor — the SV's integer is
+  still likely correct, just noisier).
+- **Elev below absolute drop mask.**  Default 18°.  Fires regardless
+  of residual quality — sub-mask integers aren't worth the risk.
+
+**Action**: transition the SV to FLOAT (setting-SV drop).  The
+filter unfixes the NL integer with gentle covariance growth; MW
+state is preserved so the SV can be re-acquired cleanly if it
+rises again in a different arc.
+
+**Scope**: both NL_SHORT_FIXED and NL_LONG_FIXED.  Setting is setting.
+
+### Fix-set integrity alarm (`FixSetIntegrityAlarm`)
+
+**What**: fix-set-wide stateless alarm that watches for systemic
+failures no single-SV monitor can attribute to one satellite —
+genuine catastrophes like a bad SSR correction batch, clock-datum
+shift, or reference-frame change.
+
+**Threshold**: window-averaged PR RMS across all NL members
+> 5.0 m sustained.
+
+**Suppression**: if any SV transitioned to FLOAT within the
+suppression window (default 60 epochs), the alarm stays silent —
+the per-SV monitors are already handling it.  This prevents
+double-counting routine churn as systemic failure.
+
+**Action**: full PPPFilter re-init at `known_ecef`.  All NL fixes
+released, MW state cleared, tracker flattened to FLOAT.  Solution
+state returns to CONVERGING.
+
+**Expected rate**: < 1/day in steady state.  If firing more often,
+something is broken at the correction-source level — dig into SSR
+feed or datum, not into AR tuning.
 
 ## Validation targets
 
-This design is validated when a 24 h run shows:
+A 24-hour steady-state run should show:
 
-- Host state stays RESOLVED for ≥ 95% of the run (excluding first
-  30 min convergence)
-- Per-SV retirements happen at the expected sky-motion rate,
-  quietly, without host state flipping
-- Wrong-integer events (Job A rejections) < 1/hr, each resolved
-  surgically without cascading
-- Host-level monitor doesn't fire at all, or fires < 1/day on a
-  specific debuggable cause (captured in logs)
+- Position solution stays RESOLVED for ≥ 95% of the run (excluding
+  initial convergence).
+- False-fix rejection rate < 1/hr in stable conditions.
+- Setting-SV drops at approximately the natural sky-motion rate
+  (~5/hr per host for GAL+BDS).
+- Fix-set integrity alarm fires < 1/day.
 
-Compare against today's ~2 PFR L3/hr with ~35% time resolved (see
-day0419d 2 h data, 2026-04-19 ~11:30-13:30).
+Compare against pre-redesign day0419c/d: ~2 PFR L3 events/hr,
+~35% time RESOLVED.  Day0419e (post-Beads-1+2+3) achieved 0–1
+alarm events per host over 9 hours — design target met structurally;
+remaining work is the wrong-integer *source* identification, not
+the cascade bug.
 
-## Implementation plan (bead-sized, revised 2026-04-19 evening)
+## Known open problem: persistent-trouble SVs
 
-Revision summary: beads 1 and 2 should ship together because Bead 1
-alone doesn't address the dominant failure mode (Job-A-shaped wrong
-integers on high-elev recent fixes).  Bead 3 (elev-weighted
-thresholds) remains valuable but second-order — the data shows
-only 31% of L1 events are Job-B-shaped.  Bead 2 also explicitly
-removes the level-persistence bug: Job A and Job B monitors must
-be **stateless** (per-SV transitions, not an escalation ladder on
-the host).
+Day0419h overnight data (clkPoC3 ~9 h) shows a fraction of SVs
+cycling FLOAT ↔ NL_SHORT_FIXED ↔ SQUELCHED repeatedly without ever
+contributing as long-term members:
 
-### Bead 1+2 (shipped together) — per-SV states + split monitors
+- C48: 7 SQUELCHED entries + 10 false-fix rejections
+- E32: 6 SQUELCHED + 16 false-fix rejections
+- E08: 5 SQUELCHED + 9 false-fix rejections
 
-`scripts/peppar_fix/sv_state.py`:
-- `SvAmbState` enum with FLOAT, WL_FIXED, NL_PROVISIONAL,
-  NL_VALIDATED, RETIRING, BLACKLISTED
-- `SvStateTracker` class, consulted by AR monitors
+These SVs appear to have a persistent per-SV bias (multipath,
+systematic clock offset, or undocumented AC issue) that produces
+internally-consistent wrong integers on every fix attempt.  Today's
+60-epoch squelch cooldown is too short to break the loop — the SV
+re-fixes the same wrong integer, false-fix monitor catches it,
+squelch again, repeat.
 
-Hooks in `scripts/ppp_ar.py`:
-- `MelbourneWubbenaTracker.commit_wl_fix` → transition to WL_FIXED
-- `NarrowLaneResolver.attempt()` success → transition to NL_PROVISIONAL
-- `CycleSlipMonitor` HIGH-conf → BLACKLISTED; LOW-conf → FLOAT
-- Cycle slip frequency-retained per
-  `feedback_slip_retain_freq_flush_phase` — MW state survives
-  slip-induced FLOAT transition
+**Proposed follow-up** (separate from this design): count false-fix
+rejections per SV, extend squelch duration exponentially, or drop
+the SV from AR attempts entirely after N rejections within a
+rolling window.  Not in scope of this state machine.
 
-New `scripts/peppar_fix/provisional_validator.py` (Job A):
-- Monitors PR residuals per NL_PROVISIONAL SV
-- Threshold: tighter than current PFR (2.0 m zenith, elev-weighted)
-- Action: transition SV back to FLOAT (not host-level escalation)
-- No escalation ladder, no persistent level state
+## Implementation status
 
-New `scripts/peppar_fix/retirement_gate.py` (Job B):
-- Monitors PR residuals per NL_VALIDATED SV
-- Threshold: `base / sin(elev)` with clamp at 45°
-- Action: transition SV to RETIRING
-- No escalation ladder
+- **Beads 1 + 2 + 3** (per-SV state machine, `FalseFixMonitor`,
+  `SettingSvDropMonitor`, `FixSetIntegrityAlarm`, elev-weighted
+  thresholds): merged as PR #6 (commit `040c1b0`), renamed for
+  clarity 2026-04-20.
+- **Bead 4** (`ValidationPromoter`: Δaz-based NL_SHORT_FIXED →
+  NL_LONG_FIXED promotion): merged as PR #8 (commit `7ca17c9`).
+- **LAMBDA tuning** (P_bootstrap 0.999 → 0.97, PAR min_fixed 4 → 3):
+  commits `d08e956` and `0395dff`.
 
-New `scripts/peppar_fix/host_rms_alarm.py`:
-- Fires only when host PR RMS > 5 m sustained AND neither Job A
-  nor Job B has fired recently
-- Stateless: evaluates current conditions, decides, acts
-- Action: re-init filter at known_ecef (L3-equivalent, rare)
+All code lives in `scripts/peppar_fix/`:
 
-Structured log: `[SV_STATE] G17: FLOAT → WL_FIXED (epoch=1234,
-az=147°)` one line per transition.
+| Module | Class | Role |
+|---|---|---|
+| `sv_state.py` | `SvAmbState`, `SvStateTracker` | state enum + per-SV records |
+| `false_fix_monitor.py` | `FalseFixMonitor` | wrong-integer detection on short-term |
+| `setting_sv_drop_monitor.py` | `SettingSvDropMonitor` | graceful drop on elev/resid |
+| `fix_set_integrity_alarm.py` | `FixSetIntegrityAlarm` | fix-set-wide systemic alarm |
+| `validation_promoter.py` | `ValidationPromoter` | Δaz promotion short→long |
 
-Target validation: L1-equivalent rate (Job A + Job B transitions)
-should match observed 4-9/hr on day0419c/d; host-RMS alarm rate
-should drop to < 1/day in good conditions, vs today's 2-4/hr.
+49 unit tests cover every legal edge, one illegal edge per
+originating state, the elev-weighting formula, each monitor's
+eligibility and threshold behavior, and the promoter's Δaz
+accumulator + clean-window logic.  All pass.
 
-Unit tests for every legal transition, one of each illegal.
+## What's deferred
 
-### Bead 3 — Elevation-weighted base thresholds (already needed in Bead 2)
-
-Add `pr_threshold_zenith_m` and `rms_threshold_m` to host TOML.
-Defaults: 1.5 m zenith per-SV, 5 m host RMS.  Elev weighting
-per the formula above.
-
-(Moved into the Bead 1+2 scope rather than separate bead;
-makes no sense to ship Job A without elev-weighting.)
-
-### Bead 4 — Provisional → Validated promotion
-
-- Track first-fix epoch per SV, starting az
-- Check az delta each eval, promote when ≥ 15° accumulated
-- Host RESOLVED recomputed from NL_VALIDATED count
-
-Deferrable.  Without Bead 4, NL_VALIDATED is indistinguishable
-from NL_PROVISIONAL in the state machine — which is fine for
-initial deployment (Job A still fires on recent fixes either way).
-
-### Bead 5 — Migration and backwards-compat
-
-- Default parameters preserve existing behavior where possible
-- Old PFR L1/L2/L3 log format deprecated, replaced with
-  `[SV_STATE]` and `[HOST_ALARM]`
-- No shim layer — old `PostFixResidualMonitor` deleted entirely
-  when Bead 1+2 merges.  Tests updated.
-
-## Stop points
-
-1. After **Bead 1+2+3** (minimum viable): Job A and Job B working
-   per-SV, elev-weighted, no cascade.  Expected outcome:
-   L3-equivalent rate < 1/day on steady-state runs.  If that
-   target is met, Bead 4 is optional.
-2. After **Bead 4**: full NL_VALIDATED gating on host RESOLVED.
-   Host stops flipping CONVERGING↔RESOLVED on routine sky motion.
-3. After **Bead 5**: old code and log format gone.  Only then is
-   the refactor complete.
-
-## Open questions
-
-1. **Validation window units**: wall-clock minutes vs azimuth
-   degrees vs "residuals stayed in gate for N evals" — which is
-   the cleanest trigger for NL_PROVISIONAL → NL_VALIDATED?  This
-   doc proposes azimuth degrees because it's the direct signal
-   (different geometry can catch wrong integers that wall-clock
-   can't); subject to revision once we measure.
-
-2. **WL_FIXED tenure cap**: should a stale WL_FIXED (no NL attempt
-   for 30 min despite passing the ratio) be demoted to FLOAT as
-   a health check?  Probably yes; open on threshold.
-
-3. **Cross-constellation coupling in Job A**: if BDS and GAL are
-   simultaneously tripping Job A, is that a Constellation-level
-   problem (ISB drift) rather than per-SV?  Could warrant a new
-   Job-A-Bravo for constellation-wide patterns.
-
-4. **ptpmon integration**: this design doesn't address ptpmon's
-   current NL-never-lands problem (see
-   `project_ptpmon_cnes_only_result_20260419.md`).  That's a
-   separate debugging track — likely ZTD-ambiguity coupling on
-   single-constellation L2-profile — and beads above should not
-   block on it.
+- **Host TOML parameters** for the three thresholds and Δaz
+  promotion threshold.  Sensible defaults ship; TOML wiring later.
+- **`FalseFixMonitor` extension to long-term members.**  Today only
+  short-term; arguable but conservative.  Could add if long-term
+  drift is observed.
+- **Persistent-trouble SV handling** (see above).

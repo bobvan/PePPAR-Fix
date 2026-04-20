@@ -338,8 +338,8 @@ def flush_sv_phase(sv: str,
     the system (receiver clock family, TCXO, DO drift, noise floor) is
     intentionally untouched — see module docstring.
 
-    Per-SV state machine (new, per docs/sv-lifecycle-and-pfr-split.md):
-      - confidence=="HIGH" → any state → BLACKLISTED
+    Per-SV state machine (per docs/sv-lifecycle-and-pfr-split.md):
+      - confidence=="HIGH" → any state → SQUELCHED
       - confidence=="LOW"  → any state → FLOAT
     The tracker's transition is called BEFORE the downstream resets so
     the [SV_STATE] log line is coherent with the post-reset state.
@@ -352,7 +352,7 @@ def flush_sv_phase(sv: str,
         # Lazy import to avoid a circular dep between cycle_slip.py and
         # sv_state.py's future imports.
         from peppar_fix.sv_state import SvAmbState, InvalidTransition
-        target = SvAmbState.BLACKLISTED if confidence == "HIGH" else SvAmbState.FLOAT
+        target = SvAmbState.SQUELCHED if confidence == "HIGH" else SvAmbState.FLOAT
         try:
             sv_state.transition(
                 sv, target, epoch=epoch,
@@ -361,7 +361,7 @@ def flush_sv_phase(sv: str,
         except InvalidTransition:
             # The only illegal cycle-slip target is "already in target" —
             # which transition() treats as a no-op.  Anything else
-            # (BLACKLISTED → FLOAT implied by slip during cooldown) is
+            # (SQUELCHED → FLOAT implied by slip during cooldown) is
             # a design question; for now, log and continue.
             log.debug("slip transition noop for %s (already in %s)",
                       sv, sv_state.state(sv).value)

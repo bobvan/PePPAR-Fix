@@ -1,40 +1,43 @@
-"""Per-SV ambiguity lifecycle state machine.
+"""Per-SV integer-fix lifecycle state machine.
 
 Implements the per-SV state machine specified in
-`docs/sv-lifecycle-and-pfr-split.md`.  Orthogonal to the host-level
-`AntPosEstState`; answers "is this specific satellite's integer
-ambiguity trustworthy?" rather than "is the host's position
-trustworthy?".
+`docs/sv-lifecycle-and-pfr-split.md`.  Orthogonal to the AntPosEst
+solution state; answers "does this specific satellite's integer
+ambiguity contribute to the fix set?" rather than "is the antenna
+position trustworthy?".
 
-The six states form this lifecycle:
+Six states form this lifecycle:
 
-    FLOAT ──MW──► WL_FIXED ──LAMBDA──► NL_PROVISIONAL ──Δaz──► NL_VALIDATED
-      ▲              ▲                      │                      │
-      │              │                      │ Job A reject         │ Job B
-      │              │                      │ or elev < AR mask    │ retirement
-      │              └──────────────────────┤                      ▼
-      │                                     ▼             ┌──────────────┐
-      │                                     │             │   RETIRING   │
-      │                                     │             └──────┬───────┘
-      └──────────── FLOAT ◄──────slip (LOW conf)───────────┘
-      │
-      │
-      BLACKLISTED ◄────── slip (HIGH conf) or repeated Job A rejection
-         │
-         │ cooldown expires
-         ▼
-        FLOAT
+    TRACKING ──admit──► FLOAT ──MW──► WL_FIXED ──LAMBDA──► NL_SHORT_FIXED ──Δaz≥15°──► NL_LONG_FIXED
+                         ▲              ▲                      │ ▲                          │
+                         │              │                      │ │  false-fix rejection     │
+                         │              │                      │ │  or setting-SV drop      │
+                         │              │                      │ │  or slip (LOW)           │
+                         │              │ slip (LOW)           │ └──────────────────────────┘
+                         │              ◄──────────────────────┤
+                         │                                     ▼
+                         │               slip (HIGH)   ┌──────────────┐  cooldown expires
+                         └───────────────────◄─────────┤   SQUELCHED  ├────────► FLOAT
+                                                       └──────────────┘
 
-Transitions that aren't in this diagram are illegal and raise
-`InvalidTransition`.  The tracker logs every legal transition as
-one `[SV_STATE] <sv>: <from> → <to> (epoch=N, elev=X°, reason=...)`
-line — grep-friendly.
+Key names:
+  * TRACKING       — receiver sees the SV but no observations have yet
+                     passed the admit gate (elevation + health + constellation).
+  * FLOAT          — admitted; MW tracker accumulating; no integer fix.
+  * WL_FIXED       — integer wide-lane fix landed; NL still float.
+  * NL_SHORT_FIXED — integer NL fix accepted; short-term member of the fix
+                     set; contributes to the position solution but does NOT
+                     count toward the solution's RESOLVED declaration.
+  * NL_LONG_FIXED  — integer NL fix has survived ≥15° of satellite azimuth
+                     motion without a false-fix rejection; long-term member
+                     of the fix set; counts toward RESOLVED.
+  * SQUELCHED      — temporarily excluded from fix attempts after a high-
+                     confidence cycle slip; cooldown-bound, not permanent.
 
-Bead 4 (NL_PROVISIONAL → NL_VALIDATED promotion based on azimuth
-change) is deferred.  Until it lands, every NL fix stays in
-NL_PROVISIONAL indefinitely; the Job A monitor still operates on it
-and Job B's retirement logic treats PROVISIONAL and VALIDATED
-identically.
+Transitions not in this diagram are illegal and raise `InvalidTransition`.
+The tracker logs every legal transition as one
+`[SV_STATE] <sv>: <from> → <to> (epoch=N, elev=X°, reason=...)` line —
+grep-friendly.
 """
 
 from __future__ import annotations
@@ -48,32 +51,42 @@ log = logging.getLogger(__name__)
 
 
 class SvAmbState(Enum):
-    """Per-SV ambiguity state — one value per (system, PRN)."""
+    """Per-SV integer-fix state — one value per (system, PRN)."""
+    TRACKING = "TRACKING"
     FLOAT = "FLOAT"
     WL_FIXED = "WL_FIXED"
-    NL_PROVISIONAL = "NL_PROVISIONAL"
-    NL_VALIDATED = "NL_VALIDATED"
-    RETIRING = "RETIRING"
-    BLACKLISTED = "BLACKLISTED"
+    NL_SHORT_FIXED = "NL_SHORT_FIXED"
+    NL_LONG_FIXED = "NL_LONG_FIXED"
+    SQUELCHED = "SQUELCHED"
 
 
 # Legal directed edges.  Built once at import; `transition()` consults it.
 _LEGAL_EDGES: frozenset[tuple[SvAmbState, SvAmbState]] = frozenset({
+    # Admit: receiver-tracked SV passes the elevation/health/constellation
+    # gate and enters processing.
+    (SvAmbState.TRACKING,        SvAmbState.FLOAT),
+
+    # Normal progression.
     (SvAmbState.FLOAT,           SvAmbState.WL_FIXED),
-    (SvAmbState.FLOAT,           SvAmbState.BLACKLISTED),
-    (SvAmbState.WL_FIXED,        SvAmbState.NL_PROVISIONAL),
+    (SvAmbState.WL_FIXED,        SvAmbState.NL_SHORT_FIXED),
+    (SvAmbState.NL_SHORT_FIXED,  SvAmbState.NL_LONG_FIXED),
+
+    # False-fix rejection, setting-SV drop, or slip (LOW-confidence)
+    # demotes back toward FLOAT.
     (SvAmbState.WL_FIXED,        SvAmbState.FLOAT),
-    (SvAmbState.WL_FIXED,        SvAmbState.BLACKLISTED),
-    (SvAmbState.NL_PROVISIONAL,  SvAmbState.NL_VALIDATED),
-    (SvAmbState.NL_PROVISIONAL,  SvAmbState.FLOAT),
-    (SvAmbState.NL_PROVISIONAL,  SvAmbState.RETIRING),
-    (SvAmbState.NL_PROVISIONAL,  SvAmbState.BLACKLISTED),
-    (SvAmbState.NL_VALIDATED,    SvAmbState.RETIRING),
-    (SvAmbState.NL_VALIDATED,    SvAmbState.FLOAT),
-    (SvAmbState.NL_VALIDATED,    SvAmbState.BLACKLISTED),
-    (SvAmbState.RETIRING,        SvAmbState.FLOAT),
-    (SvAmbState.RETIRING,        SvAmbState.BLACKLISTED),
-    (SvAmbState.BLACKLISTED,     SvAmbState.FLOAT),
+    (SvAmbState.NL_SHORT_FIXED,  SvAmbState.FLOAT),
+    (SvAmbState.NL_LONG_FIXED,   SvAmbState.FLOAT),
+
+    # Squelch: HIGH-confidence cycle slip from any processing state.
+    # TRACKING is pre-processing, so no squelch there — a slip before
+    # admit is not meaningful (no integer state to protect).
+    (SvAmbState.FLOAT,           SvAmbState.SQUELCHED),
+    (SvAmbState.WL_FIXED,        SvAmbState.SQUELCHED),
+    (SvAmbState.NL_SHORT_FIXED,  SvAmbState.SQUELCHED),
+    (SvAmbState.NL_LONG_FIXED,   SvAmbState.SQUELCHED),
+
+    # Squelch cooldown expires: re-enter at FLOAT (MW must reconverge).
+    (SvAmbState.SQUELCHED,       SvAmbState.FLOAT),
 })
 
 
@@ -90,17 +103,17 @@ class SvRecord:
     the state machine itself needs plus enough context for log lines.
     """
     sv: str
-    state: SvAmbState = SvAmbState.FLOAT
-    # Epoch at which the current state was entered.  Used by the Job A
-    # validator to scope "recent fix" residual windows.
+    state: SvAmbState = SvAmbState.TRACKING
+    # Epoch at which the current state was entered.  Used by the false-fix
+    # monitor to scope "recent fix" residual windows.
     state_entered_epoch: int = 0
-    # Azimuth at first NL fix.  Bead 4 will diff current az against
-    # this to promote to NL_VALIDATED.  Populated when transitioning
-    # into NL_PROVISIONAL; None otherwise.
+    # Azimuth at first NL fix.  The validation promoter diffs current az
+    # against this to promote NL_SHORT_FIXED → NL_LONG_FIXED.  Populated
+    # when transitioning into NL_SHORT_FIXED; None otherwise.
     first_fix_az_deg: Optional[float] = None
     # Most recent observed elevation.  Updated externally (the monitors
     # already have `elevations` per epoch).  Used for log lines and for
-    # the retirement gate.
+    # the setting-SV drop monitor.
     last_elev_deg: Optional[float] = None
     # Short history of (epoch, from_state, to_state, reason) — cap so
     # memory doesn't grow unbounded on long runs.  Useful for offline
@@ -114,9 +127,9 @@ class SvStateTracker:
     """Maintains one SvRecord per (system, PRN).
 
     Threading model: the tracker is *not* thread-safe.  Call from the
-    AntPosEst / AR thread only.  The monitors (provisional_validator,
-    retirement_gate, host_rms_alarm) and the AR paths (MW, NL, slip)
-    all run in that single thread.
+    AntPosEst / AR thread only.  The monitors (false-fix monitor,
+    setting-SV drop monitor, fix-set integrity alarm) and the AR paths
+    (MW, NL, slip) all run in that single thread.
 
     The tracker is authoritative for state transitions — it refuses
     illegal moves.  Callers pass a free-form `reason` that lands in
@@ -129,7 +142,7 @@ class SvStateTracker:
     # ── Lookup / iteration ──────────────────────────────────────── #
 
     def get(self, sv: str) -> SvRecord:
-        """Return the record for this SV, creating a FLOAT record if new."""
+        """Return the record for this SV, creating a TRACKING record if new."""
         rec = self._records.get(sv)
         if rec is None:
             rec = SvRecord(sv=sv)
@@ -137,7 +150,7 @@ class SvStateTracker:
         return rec
 
     def state(self, sv: str) -> SvAmbState:
-        """Current state of this SV (creates FLOAT record on first query)."""
+        """Current state of this SV (creates TRACKING record on first query)."""
         return self.get(sv).state
 
     def svs_in(self, *states: SvAmbState) -> list[str]:
@@ -151,6 +164,20 @@ class SvStateTracker:
     def all_records(self):
         """Iterable view of (sv, record) pairs — read-only intent."""
         return self._records.items()
+
+    # ── Fix-set membership helpers ───────────────────────────────── #
+
+    def short_term_members(self) -> list[str]:
+        """SVs whose integer fix is a short-term member of the fix set."""
+        return self.svs_in(SvAmbState.NL_SHORT_FIXED)
+
+    def long_term_members(self) -> list[str]:
+        """SVs whose integer fix is a long-term member of the fix set."""
+        return self.svs_in(SvAmbState.NL_LONG_FIXED)
+
+    def fix_set_members(self) -> list[str]:
+        """All SVs currently contributing an integer fix to the position solution."""
+        return self.svs_in(SvAmbState.NL_SHORT_FIXED, SvAmbState.NL_LONG_FIXED)
 
     # ── State mutations ─────────────────────────────────────────── #
 
@@ -185,7 +212,7 @@ class SvStateTracker:
         from_state = rec.state
         rec.state = to
         rec.state_entered_epoch = int(epoch)
-        if to is SvAmbState.NL_PROVISIONAL and az_deg is not None:
+        if to is SvAmbState.NL_SHORT_FIXED and az_deg is not None:
             rec.first_fix_az_deg = float(az_deg)
         if len(rec.history) >= rec._HISTORY_CAP:
             rec.history.pop(0)
@@ -209,10 +236,12 @@ class SvStateTracker:
     def forget(self, sv: str) -> None:
         """Drop this SV's record entirely.
 
-        Used when an SV leaves the sky for long enough that re-initialising
-        its state on re-acquisition is cleaner than resuming from stale
-        history.  Cycle slips should use `transition(..., to=FLOAT)`
-        instead; `forget` is for true disappearance.
+        Used when the receiver loses tracking for long enough that
+        re-initialising state on re-acquisition is cleaner than resuming
+        from stale history.  Cycle slips should use
+        `transition(..., to=FLOAT)` (LOW-conf) or
+        `transition(..., to=SQUELCHED)` (HIGH-conf) instead; `forget` is
+        for true disappearance.
         """
         self._records.pop(sv, None)
 

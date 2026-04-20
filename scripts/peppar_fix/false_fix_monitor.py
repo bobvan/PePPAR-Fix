@@ -1,11 +1,13 @@
-"""Job A — wrong-integer detection on NL_PROVISIONAL SVs.
+"""False-fix monitor — detects wrong integer NL fixes on short-term members.
 
 Per `docs/sv-lifecycle-and-pfr-split.md` and the data-driven revision
 in `project_pfr_event_analysis_20260419.md`: 62% of today's PFR L1
-events are "Job A shaped" — a recently-NL-fixed high-elev SV starts
-showing 3–4 m PR residuals within minutes of fix.  LAMBDA believed
-the integer; reality disagrees.  Action: demote the SV back to FLOAT
-so it re-accumulates MW/WL evidence.
+events are wrong-integer fixes — a recently-NL-fixed high-elev SV
+starts showing 3–4 m PR residuals within minutes of the fix.  LAMBDA
+believed the integer; reality disagrees.  Action: demote the SV back
+to FLOAT so it re-accumulates MW/WL evidence.
+
+Called a "false fix": an integer fix that was later shown to be wrong.
 
 This monitor is deliberately **stateless** between evals.  The
 previous `PostFixResidualMonitor` had a level-persistence bug: once
@@ -19,6 +21,11 @@ Threshold is per-SV and elevation-weighted.  At zenith the bar is
 `base_m` (default 2.0 m — tighter than the old monolithic 3.0 m);
 at low elev the bar relaxes by 1/sin(elev) to match physics
 (troposphere and multipath scale that way).
+
+Scope: watches NL_SHORT_FIXED only.  Long-term members (NL_LONG_FIXED)
+have, by definition, already survived geometry-change validation;
+the setting-SV drop monitor is the right gate for them as they
+descend into multipath.
 """
 
 from __future__ import annotations
@@ -61,23 +68,23 @@ class _SvResidWindow:
     last_elev_deg: Optional[float] = None
 
 
-class ProvisionalValidator:
-    """Job A monitor — rejects bad NL_PROVISIONAL fixes.
+class FalseFixMonitor:
+    """Detects wrong integer NL fixes on short-term members of the fix set.
 
     Usage:
 
-        v = ProvisionalValidator(tracker, ...)
-        v.ingest(epoch, resid, labels)   # every epoch with filter residuals
-        events = v.evaluate(epoch)       # every `eval_every` epochs
+        m = FalseFixMonitor(tracker, ...)
+        m.ingest(epoch, resid, labels)   # every epoch with filter residuals
+        events = m.evaluate(epoch)       # every `eval_every` epochs
         for ev in events:
             # caller unfixes the SV in NL resolver, inflates filter
-            # ambiguity, blacklists, etc.; tracker has already moved
+            # ambiguity, squelches, etc.; tracker has already moved
             # the SV to FLOAT and logged [SV_STATE].
             ...
 
     Stateless between evals — no ladder, no cooldown that outlives
     the residual window.  If a transition fires, the caller handles
-    the downstream effects (unfix, inflate, blacklist) — this monitor
+    the downstream effects (unfix, inflate, squelch) — this monitor
     only decides WHICH SVs to transition and updates the tracker.
     """
 
@@ -111,7 +118,7 @@ class ProvisionalValidator:
             labels: iterable aligned with `resid`; each entry is
                 ``(sv, 'pr'|'phi', elev_deg_or_None)``.
 
-        Only PR residuals for SVs currently in NL_PROVISIONAL land in
+        Only PR residuals for SVs currently in NL_SHORT_FIXED land in
         the window.  Other entries are ignored — the caller doesn't
         have to pre-filter.
         """
@@ -122,7 +129,7 @@ class ProvisionalValidator:
             elev = lab[2] if len(lab) > 2 else None
             if kind != 'pr':
                 continue
-            if self._tracker.state(sv) is not SvAmbState.NL_PROVISIONAL:
+            if self._tracker.state(sv) is not SvAmbState.NL_SHORT_FIXED:
                 continue
             w = self._per_sv.get(sv)
             if w is None:
@@ -136,15 +143,16 @@ class ProvisionalValidator:
     # ── Evaluation ──────────────────────────────────────────────── #
 
     def evaluate(self, epoch: int) -> list[dict]:
-        """Check each NL_PROVISIONAL SV with enough samples.
+        """Check each NL_SHORT_FIXED SV with enough samples.
 
         Returns a list of action dicts, one per SV that failed the
         gate:  ``{'sv': str, 'mean_resid_m': float, 'threshold_m': float,
         'elev_deg': float|None, 'n': int}``.
 
         Side effect: for each firing SV the tracker transitions
-        NL_PROVISIONAL → FLOAT.  The caller is responsible for the
-        downstream teardown (NL unfix, ambiguity inflation, blacklist).
+        NL_SHORT_FIXED → FLOAT (false-fix rejection).  The caller is
+        responsible for the downstream teardown (NL unfix, ambiguity
+        inflation, squelch).
 
         Returns an empty list on non-eval epochs.
         """
@@ -152,11 +160,12 @@ class ProvisionalValidator:
             return []
         events: list[dict] = []
         # Iterate over a snapshot — we mutate the tracker (and thus the
-        # "which SVs are NL_PROVISIONAL" set) as we go.
+        # "which SVs are NL_SHORT_FIXED" set) as we go.
         for sv, w in list(self._per_sv.items()):
-            if self._tracker.state(sv) is not SvAmbState.NL_PROVISIONAL:
-                # SV left NL_PROVISIONAL by some other path (cycle slip,
-                # retirement).  Drop its window so a future fix starts clean.
+            if self._tracker.state(sv) is not SvAmbState.NL_SHORT_FIXED:
+                # SV left NL_SHORT_FIXED by some other path (cycle slip,
+                # setting-SV drop, promotion to long-term).  Drop its
+                # window so a future fix starts clean.
                 self._per_sv.pop(sv, None)
                 continue
             n = len(w.resids)
@@ -180,7 +189,7 @@ class ProvisionalValidator:
                 )
                 self._tracker.transition(
                     sv, SvAmbState.FLOAT,
-                    epoch=epoch, reason="job_a:" + reason,
+                    epoch=epoch, reason="false_fix:" + reason,
                     elev_deg=w.last_elev_deg,
                 )
                 # Drop the window so the SV's re-fix starts with fresh
@@ -195,4 +204,4 @@ class ProvisionalValidator:
         self._per_sv.pop(sv, None)
 
     def summary(self) -> str:
-        return f"job_a: tracking {len(self._per_sv)} NL_PROVISIONAL SVs"
+        return f"false_fix: tracking {len(self._per_sv)} NL_SHORT_FIXED SVs"

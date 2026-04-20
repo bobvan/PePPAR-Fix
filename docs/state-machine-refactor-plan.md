@@ -10,19 +10,21 @@ This document covers the **host-level** state machines for
 host answers "is *the receiver's* position / clock trustworthy?"
 — one state per scope for the whole host.
 
-A **per-SV ambiguity state machine** (`SvAmbState`: FLOAT →
-WL_FIXED → NL_PROVISIONAL → NL_VALIDATED → RETIRING, plus
-BLACKLISTED) is defined separately in
-`docs/sv-lifecycle-and-pfr-split.md`.  That machine answers "is
-*this specific satellite's* integer trustworthy?" — one state
-per (system, PRN).  The two machines are orthogonal; they
-interact only via the RESOLVED transition (host CONVERGING →
-RESOLVED requires ≥ N SVs in NL_VALIDATED).
+A **per-SV integer-fix state machine** (`SvAmbState`: TRACKING →
+FLOAT → WL_FIXED → NL_SHORT_FIXED → NL_LONG_FIXED, plus
+SQUELCHED) is defined separately in
+`docs/sv-lifecycle-and-pfr-split.md`.  That machine answers "does
+*this specific satellite's* integer ambiguity contribute to the
+fix set?" — one state per (system, PRN).  The two machines are
+orthogonal; they interact only via the RESOLVED transition
+(position-solution CONVERGING → RESOLVED requires ≥ N SVs as
+long-term members in NL_LONG_FIXED).
 
-Don't confuse them.  Routine sky motion (SVs setting, retiring,
-new SVs rising, validating) does not flip host state.  Host
-transitions are for position/antenna-movement events, not for
-per-satellite bookkeeping.
+Don't confuse them.  Routine sky motion (SVs dropping out of the
+fix set, new SVs rising, short-term members promoting to long-term)
+does not flip position-solution state.  Solution transitions are
+for antenna-position and antenna-movement events, not for per-
+satellite bookkeeping.
 
 ## Goal
 
@@ -72,15 +74,15 @@ VERIFIED      Position accepted. DOFreqEst may start.
 
 CONVERGING    Background PPPFilter running with decimated observations.
               MW+NL accumulating. Position refining.
-              → RESOLVED when ≥ N SVs reach NL_VALIDATED (per-SV state)
+              → RESOLVED when ≥ N SVs reach NL_LONG_FIXED (per-SV state)
                 and host sigma < threshold
 
-RESOLVED      AR-fixed position at cm level.
+RESOLVED      AR-fixed antenna position at cm level.
               Phase bias to GPS < 100 ps.
-              Individual SVs cycle FLOAT ↔ WL_FIXED ↔ NL_PROVISIONAL ↔
-              NL_VALIDATED ↔ RETIRING constantly — that's routine and
-              does not flip host state.
-              → CONVERGING only if NL_VALIDATED count drops below N
+              Individual SVs cycle FLOAT ↔ WL_FIXED ↔ NL_SHORT_FIXED ↔
+              NL_LONG_FIXED constantly as geometry evolves — that's
+              routine and does not flip solution state.
+              → CONVERGING only if NL_LONG_FIXED count drops below N
               → MOVED if consensus detects displacement
 
 MOVED         Antenna displacement detected (NAV2 consensus).

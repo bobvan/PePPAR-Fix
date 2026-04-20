@@ -380,7 +380,7 @@ VERIFIED    → live LS fix agrees with seed within threshold.
 CONVERGING  → float PPP running, position improving.
                DOFreqEst: running.  clockClass: 6 (once locked).
 
-RESOLVED    → AR fixed at cm level (≥ N SVs NL_VALIDATED).
+RESOLVED    → AR fixed at cm level (≥ N SVs NL_LONG_FIXED).
                Phase bias < 100 ps.  clockClass: 6.
                Per-SV churn (new fixes, retirements) happens in
                the background without flipping host state.
@@ -395,7 +395,7 @@ trustworthy.  A separate **per-SV state machine** (`SvAmbState`)
 tracks each satellite's ambiguity independently — see
 `docs/sv-lifecycle-and-pfr-split.md`.  The two machines are
 orthogonal; the host stays RESOLVED while individual SVs cycle
-through WL_FIXED → NL_PROVISIONAL → NL_VALIDATED → RETIRING as
+through WL_FIXED → NL_SHORT_FIXED → NL_LONG_FIXED → FLOAT as
 sky geometry evolves.
 
 ### DOFreqEst states

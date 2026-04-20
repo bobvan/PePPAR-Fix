@@ -1,21 +1,22 @@
-"""Bead 4 — NL_PROVISIONAL → NL_VALIDATED promotion.
+"""Bead 4 — NL_SHORT_FIXED → NL_LONG_FIXED promotion.
 
 Per `docs/sv-lifecycle-and-pfr-split.md`: an NL fix that has survived
-≥ 15° of satellite-azimuth motion without triggering Job A (wrong-
-integer rejection) has demonstrated its integer is correct across
-enough distinct geometry to graduate from probation.  Host RESOLVED
-then keys off `NL_VALIDATED` count instead of raw NL-fix count —
-lucky-noise fixes that would flip the host state prematurely are
-filtered out.
+≥ 15° of satellite-azimuth motion without triggering false-fix
+rejection has demonstrated its integer is correct across enough
+distinct geometry to graduate from probation — from short-term
+member of the fix set to long-term.  The position solution declares
+RESOLVED based on long-term member count, not raw NL-fix count, so
+lucky-noise fixes that would flip the solution state prematurely
+are filtered out.
 
 Shape:
 
     ValidationPromoter(tracker, ...)
     .ingest_az(sv, az_deg)          per epoch, for every NL-state SV
-    .note_job_a_rejection(sv, ep)   called by the Job A apply hook
+    .note_false_fix_rejection(sv, ep)   called by the false-fix apply hook
     .evaluate(epoch)                at eval_every cadence
         → list of dicts describing promotions, tracker transitions
-          NL_PROVISIONAL → NL_VALIDATED already done.
+          NL_SHORT_FIXED → NL_LONG_FIXED already done.
 
 The promoter is stateless between evals except for the Job-A-rejection
 memory (per-SV last-rejection epoch), which is what lets us require a
@@ -40,7 +41,7 @@ class _PromoCandidate:
     first_fix_az_deg: Optional[float] = None
     latest_az_deg: Optional[float] = None
     accumulated_dphi: float = 0.0   # |Δaz| accumulated since fix (not wrapped)
-    last_job_a_epoch: int = -10**9  # sentinel: never
+    last_false_fix_epoch: int = -10**9  # sentinel: never
 
 
 def _az_delta(a: float, b: float) -> float:
@@ -52,11 +53,11 @@ def _az_delta(a: float, b: float) -> float:
 
 
 class ValidationPromoter:
-    """Promotes NL_PROVISIONAL SVs to NL_VALIDATED once geometry has
+    """Promotes NL_SHORT_FIXED SVs to NL_LONG_FIXED once geometry has
     changed enough to trust the integer.
 
     Defaults: Δaz ≥ 15°, clean-window = 180 epochs (≈3 min @ 1 Hz,
-    matches Job A's residual window).  eval_every=10 matches the
+    matches false-fix's residual window).  eval_every=10 matches the
     other monitors.
     """
 
@@ -80,16 +81,16 @@ class ValidationPromoter:
     def ingest_az(self, sv: str, az_deg: Optional[float]) -> None:
         """Record this SV's current azimuth this epoch.
 
-        Only NL_PROVISIONAL SVs are tracked; calls for other states are
+        Only NL_SHORT_FIXED SVs are tracked; calls for other states are
         no-ops (reduces bookkeeping on SVs whose promotion isn't
         relevant, and avoids leaking state across slip → FLOAT → re-fix
         cycles).
         """
         if az_deg is None:
             return
-        if self._tracker.state(sv) is not SvAmbState.NL_PROVISIONAL:
-            # Stop tracking if SV left NL_PROVISIONAL.  Re-entering
-            # NL_PROVISIONAL from a fresh fix starts a new candidate
+        if self._tracker.state(sv) is not SvAmbState.NL_SHORT_FIXED:
+            # Stop tracking if SV left NL_SHORT_FIXED.  Re-entering
+            # NL_SHORT_FIXED from a fresh fix starts a new candidate
             # because the tracker's first_fix_az_deg will have been
             # re-populated on the transition.
             self._cands.pop(sv, None)
@@ -121,8 +122,8 @@ class ValidationPromoter:
             c.accumulated_dphi += _az_delta(az_deg, c.latest_az_deg)
         c.latest_az_deg = float(az_deg)
 
-    def note_job_a_rejection(self, sv: str, epoch: int) -> None:
-        """Called by the Job A apply hook: SV just got demoted back to
+    def note_false_fix_rejection(self, sv: str, epoch: int) -> None:
+        """Called by the false-fix apply hook: SV just got demoted back to
         FLOAT.  We record the epoch so any subsequent re-fix has to
         stay clean for `clean_window_epochs` before being promoted.
 
@@ -141,7 +142,7 @@ class ValidationPromoter:
         'first_fix_az_deg': float, 'latest_az_deg': float}``.
 
         Side effect: tracker transitions each event's SV from
-        NL_PROVISIONAL to NL_VALIDATED.  Caller usually does nothing
+        NL_SHORT_FIXED to NL_LONG_FIXED.  Caller usually does nothing
         else — host RESOLVED logic reads the tracker's count.
         """
         if epoch % self._eval_every != 0:
@@ -149,7 +150,7 @@ class ValidationPromoter:
         events: list[dict] = []
         rej_map = self._last_rejection_epoch_by_sv
         for sv, c in list(self._cands.items()):
-            if self._tracker.state(sv) is not SvAmbState.NL_PROVISIONAL:
+            if self._tracker.state(sv) is not SvAmbState.NL_SHORT_FIXED:
                 self._cands.pop(sv, None)
                 continue
             if c.accumulated_dphi < self._dphi_threshold:
@@ -166,7 +167,7 @@ class ValidationPromoter:
             }
             events.append(event)
             self._tracker.transition(
-                sv, SvAmbState.NL_VALIDATED,
+                sv, SvAmbState.NL_LONG_FIXED,
                 epoch=epoch,
                 reason=(
                     f"promoted after Δaz={c.accumulated_dphi:.1f}°"
@@ -182,4 +183,4 @@ class ValidationPromoter:
         self._cands.pop(sv, None)
 
     def summary(self) -> str:
-        return f"promoter: tracking {len(self._cands)} NL_PROVISIONAL SVs"
+        return f"promoter: tracking {len(self._cands)} NL_SHORT_FIXED SVs"

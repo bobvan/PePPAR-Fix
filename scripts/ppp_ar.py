@@ -154,7 +154,7 @@ class MelbourneWubbenaTracker:
                          sv, s['n_wl'], frac, s['n_epochs'])
                 # Per-SV state: FLOAT → WL_FIXED on MW convergence.  On
                 # re-fix after a slip-induced reset the state is already
-                # FLOAT, so this is the right edge.  BLACKLISTED SVs are
+                # FLOAT, so this is the right edge.  SQUELCHED SVs are
                 # skipped by caller (they shouldn't reach here), but if
                 # they do, the transition is illegal and will raise —
                 # caught loudly in tests, benign in production.
@@ -186,7 +186,7 @@ class MelbourneWubbenaTracker:
 
         The per-SV state-machine transition is NOT driven from here —
         slip-induced transitions come from CycleSlipMonitor so that the
-        slip confidence (HIGH → BLACKLISTED, LOW → FLOAT) reaches the
+        slip confidence (HIGH → SQUELCHED, LOW → FLOAT) reaches the
         tracker correctly.  reset() just drops MW internal state.
         """
         self._state.pop(sv, None)
@@ -295,7 +295,7 @@ class NarrowLaneResolver:
         self._blacklist_epochs = int(blacklist_epochs)
         self._blacklist = {}  # sv -> epoch_until
         self._epoch = 0
-        # Optional tracker.  NL fix → WL_FIXED → NL_PROVISIONAL.
+        # Optional tracker.  NL fix → WL_FIXED → NL_SHORT_FIXED.
         # NL unfix → any NL state → FLOAT.
         self._sv_state = sv_state
         # Optional per-attempt diagnostic.  When present, emits one
@@ -472,7 +472,7 @@ class NarrowLaneResolver:
             if diag is not None:
                 # Corner-margin sum is reported regardless of accept/reject;
                 # useful for spotting marginal fixes that landed just inside
-                # the envelope (common precursor to Job A rejection later).
+                # the envelope (common precursor to false-fix rejection later).
                 corner_sum = (
                     (n1_frac / max(self.frac_threshold, 1e-9))
                     + (sigma_n1 / max(self.sigma_threshold, 1e-9))
@@ -712,19 +712,19 @@ class NarrowLaneResolver:
         """Drive the per-SV tracker on a successful NL fix.
 
         Called by both LAMBDA and rounding fix paths.  Transitions
-        WL_FIXED → NL_PROVISIONAL.  If the SV isn't in WL_FIXED (e.g.
-        we re-fixed an SV that was still in NL_PROVISIONAL because the
+        WL_FIXED → NL_SHORT_FIXED.  If the SV isn't in WL_FIXED (e.g.
+        we re-fixed an SV that was still in NL_SHORT_FIXED because the
         filter constraint drifted and re-converged), the transition
         is a no-op at the tracker (self-edge).
         """
         if self._sv_state is None:
             return
         cur = self._sv_state.state(sv)
-        if cur is SvAmbState.NL_PROVISIONAL or cur is SvAmbState.NL_VALIDATED:
+        if cur is SvAmbState.NL_SHORT_FIXED or cur is SvAmbState.NL_LONG_FIXED:
             return  # already counted; don't re-log per-epoch reconstraints
         if cur is SvAmbState.WL_FIXED:
             self._sv_state.transition(
-                sv, SvAmbState.NL_PROVISIONAL,
+                sv, SvAmbState.NL_SHORT_FIXED,
                 epoch=self._epoch, reason="nl_fix: " + reason,
                 az_deg=az_deg, elev_deg=elev_deg,
             )
@@ -734,20 +734,20 @@ class NarrowLaneResolver:
 
         Drives tracker back to FLOAT when an SV is actively unfixed
         here (e.g. by PFR L1 or a future Job-A caller that wants the
-        NL resolver to forget the integer).  Job A itself transitions
+        NL resolver to forget the integer).  false-fix itself transitions
         the tracker directly, so it should call unfix() after; the
         no-op-on-self-edge rule keeps the log line count correct.
         """
         self._fixed.pop(sv, None)
         if self._sv_state is not None:
             cur = self._sv_state.state(sv)
-            if cur in (SvAmbState.NL_PROVISIONAL, SvAmbState.NL_VALIDATED):
+            if cur in (SvAmbState.NL_SHORT_FIXED, SvAmbState.NL_LONG_FIXED):
                 self._sv_state.transition(
                     sv, SvAmbState.FLOAT,
                     epoch=self._epoch, reason="nl_resolver.unfix",
                 )
-            # If cur is already FLOAT (e.g. Job A got here first), nothing
-            # to do.  If WL_FIXED/RETIRING/BLACKLISTED: also nothing; unfix
+            # If cur is already FLOAT (e.g. false-fix got here first), nothing
+            # to do.  If WL_FIXED/SQUELCHED: also nothing; unfix
             # doesn't imply an MW reset.
 
     def unfix_all(self, filt, inflate_sigma_m=100.0):
@@ -766,7 +766,7 @@ class NarrowLaneResolver:
         if self._sv_state is not None:
             for sv in svs:
                 cur = self._sv_state.state(sv)
-                if cur in (SvAmbState.NL_PROVISIONAL, SvAmbState.NL_VALIDATED):
+                if cur in (SvAmbState.NL_SHORT_FIXED, SvAmbState.NL_LONG_FIXED):
                     self._sv_state.transition(
                         sv, SvAmbState.FLOAT,
                         epoch=self._epoch, reason="nl_resolver.unfix_all",
