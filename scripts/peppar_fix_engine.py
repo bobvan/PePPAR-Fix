@@ -44,7 +44,7 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 
 from solve_pseudorange import C, ecef_to_lla, lla_to_ecef
-from solve_ppp import PPPFilter, FixedPosFilter, ls_init, N_BASE, SIGMA_P_IF
+from solve_ppp import PPPFilter, FixedPosFilter, ls_init, N_BASE, SIGMA_P_IF, IDX_ZTD as PPP_IDX_ZTD
 from peppar_fix.bootstrap_gate import (
     residuals_consistent, nav2_agrees, scrub_for_retry,
 )
@@ -1862,10 +1862,14 @@ class AntPosEstThread(threading.Thread):
                         d = float(np.linalg.norm(pos_ecef - opinion['ecef']))
                         nav2_tag = f" nav2Δ={d:.1f}m"
                 ztd_tag = ""
-                if hasattr(filt, 'IDX_ZTD') and filt.x.shape[0] > filt.IDX_ZTD:
-                    dztd_mm = filt.x[filt.IDX_ZTD] * 1000.0
+                # PPPFilter stores IDX_ZTD as a module-level constant
+                # (not a class attribute), so hasattr on the instance
+                # returns False.  Use the imported constant directly.
+                ztd_idx = getattr(filt, 'IDX_ZTD', PPP_IDX_ZTD)
+                if filt.x.shape[0] > ztd_idx:
+                    dztd_mm = filt.x[ztd_idx] * 1000.0
                     dztd_sigma_mm = math.sqrt(max(0.0,
-                        filt.P[filt.IDX_ZTD, filt.IDX_ZTD])) * 1000.0
+                        filt.P[ztd_idx, ztd_idx])) * 1000.0
                     ztd_tag = f" ZTD={dztd_mm:+.0f}±{dztd_sigma_mm:.0f}mm"
                 log.info(
                     "  [AntPosEst %d] σ=%.3fm pos=(%.6f, %.6f, %.1f) "
