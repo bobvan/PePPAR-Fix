@@ -266,10 +266,10 @@ class NarrowLaneResolver:
                  corner_margin_sum=1.6, blacklist_epochs=60,
                  ar_elev_mask_deg=20.0,
                  lambda_min_p_bootstrap=0.97,
-                 bootstrap_frac_threshold=0.07,
-                 bootstrap_sigma_threshold=0.08,
-                 bootstrap_corner_margin_sum=1.3,
-                 bootstrap_lambda_min_p=0.999,
+                 bootstrap_frac_threshold=0.10,
+                 bootstrap_sigma_threshold=0.12,
+                 bootstrap_corner_margin_sum=1.6,
+                 bootstrap_lambda_min_p=0.97,
                  join_test_enabled=True,
                  join_test_base_m=2.0,
                  position_join_k=3.0,
@@ -339,14 +339,23 @@ class NarrowLaneResolver:
         # resolver behaves as if `reached_resolved=False` always (all
         # runs act as bootstrap), which is the safe default.
         self._ape_state_machine = ape_state_machine
-        # Bootstrap-regime gate overrides.  When reached_resolved is
-        # False, these replace the normal gate parameters — the
-        # filter hasn't earned a defensible position yet and every
-        # NL commit is exploratory, so we apply startup-LAMBDA
-        # skepticism (P_bootstrap → 0.999, tighter rectangle and
-        # corner, narrower σ_N1 cap).  See
-        # `project_to_ptpmon_reached_resolved_reframe_20260421.md`
-        # for the framing Bob and branch-main settled on.
+        # Bootstrap-regime gate overrides.  Defaults now match the
+        # normal-regime values — during bootstrap we no longer apply
+        # extra gate skepticism.  Day0421e showed the tightened
+        # bootstrap gates (P=0.999, frac=0.07, σ=0.08, corner=1.3)
+        # produced ~4× slower TTFF than main with no specific failure
+        # mode they were preventing.  Per Bob's "get to AR lock
+        # sooner; defer robust handling of low-SV conditions", the
+        # bootstrap regime now exists purely as a *structural* phase
+        # (no anchors yet, so the join test bypasses) without any
+        # gate penalty.  The reached_resolved latch, position-
+        # anchored join, and anchor_collapse alarm remain — those
+        # are the defenses that actually fire when a biased-
+        # equilibrium trap would form.  See
+        # `project_to_ptpmon_loosen_bootstrap_gates_20260421.md`.
+        # The kwargs still exist so callers can re-tighten with
+        # empirical justification if a specific failure mode
+        # surfaces later.
         self._bootstrap_frac_threshold = float(bootstrap_frac_threshold)
         self._bootstrap_sigma_threshold = float(bootstrap_sigma_threshold)
         self._bootstrap_corner_margin_sum = float(bootstrap_corner_margin_sum)

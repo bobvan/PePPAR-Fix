@@ -113,9 +113,12 @@ class RegimeSelectionTest(unittest.TestCase):
     def test_bootstrap_when_not_reached_resolved(self):
         self.assertEqual(self.resolver._active_regime(), 'bootstrap')
 
-    def test_bootstrap_gates_are_tighter(self):
-        """Bootstrap regime uses the bootstrap_* params — LAMBDA
-        P threshold should be 0.999, not 0.97."""
+    def test_bootstrap_regime_uses_bootstrap_params(self):
+        """Regime selector plumbs the ``bootstrap_*`` overrides
+        through.  Defaults now match normal mode (no extra gate
+        skepticism during bootstrap), but the mechanism must still
+        work when a caller explicitly tightens — setUp passes
+        ``bootstrap_lambda_min_p=0.999`` so that's what we expect."""
         self.assertEqual(
             self.resolver._active_gates()['lambda_min_p_bootstrap'],
             0.999,
