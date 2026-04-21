@@ -1309,7 +1309,15 @@ class AntPosEstThread(threading.Thread):
             self._nl = (bootstrap_result.nl_resolver
                         or NarrowLaneResolver(
                             ar_elev_mask_deg=ar_elev_mask_deg,
-                            join_test_enabled=join_test_enabled))
+                            join_test_enabled=join_test_enabled,
+                            ape_state_machine=self._ape_sm))
+            # Resolver inherited from bootstrap: patch in the
+            # ape_state_machine reference retroactively so the
+            # thin-anchor / strong-anchor regime selection works
+            # post-bootstrap.  The bootstrap-construction site
+            # doesn't own an AntPosEst machine yet.
+            if getattr(self._nl, '_ape_state_machine', None) is None:
+                self._nl._ape_state_machine = self._ape_sm
             # Inherit diag logger from bootstrap NL; if missing, attach one.
             if getattr(self._nl, "_nl_diag", None) is None:
                 self._nl._nl_diag = NlDiagLogger(enabled=bool(nl_diag_enabled))
@@ -1327,6 +1335,7 @@ class AntPosEstThread(threading.Thread):
                 ar_elev_mask_deg=ar_elev_mask_deg,
                 nl_diag=NlDiagLogger(enabled=bool(nl_diag_enabled)),
                 join_test_enabled=join_test_enabled,
+                ape_state_machine=self._ape_sm,
             )
             log.info("AntPosEstThread: fresh PPPFilter at known position (warm start)")
 
@@ -1354,7 +1363,9 @@ class AntPosEstThread(threading.Thread):
             rec.state = SvAmbState.NL_SHORT_FIXED
         self._false_fix = FalseFixMonitor(self._sv_state)
         self._setting_drop = SettingSvDropMonitor(self._sv_state)
-        self._fix_set_alarm = FixSetIntegrityAlarm(self._sv_state)
+        self._fix_set_alarm = FixSetIntegrityAlarm(
+            self._sv_state, ape_state_machine=self._ape_sm,
+        )
         # Bead 4 — promotes NL_SHORT_FIXED → NL_LONG_FIXED after Δaz ≥ 15°
         # with a clean false-fix window.  Solution-state RESOLVED count (below) reads
         # NL_LONG_FIXED from the tracker instead of raw NL-fix count.

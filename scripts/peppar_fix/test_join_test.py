@@ -32,6 +32,27 @@ from solve_ppp import N_BASE                    # noqa: E402
 from peppar_fix.sv_state import (               # noqa: E402
     SvAmbState, SvStateTracker,
 )
+from peppar_fix.states import AntPosEst, AntPosEstState  # noqa: E402
+
+
+def _ape_sm(reached_resolved: bool = True) -> AntPosEst:
+    """Build an AntPosEst state machine in the requested latch state.
+
+    reached_resolved=True: walk through to RESOLVED and stop there
+    (the state machine latches on first entry).
+    reached_resolved=False: leave the machine in its default
+    UNSURVEYED state.
+
+    Tests that want to exercise post-reached_resolved behavior pass
+    the resulting object as NarrowLaneResolver(ape_state_machine=...).
+    """
+    sm = AntPosEst()
+    if reached_resolved:
+        sm.transition(AntPosEstState.VERIFYING, "test")
+        sm.transition(AntPosEstState.VERIFIED, "test")
+        sm.transition(AntPosEstState.CONVERGING, "test")
+        sm.transition(AntPosEstState.RESOLVED, "test")
+    return sm
 
 
 class _FakeFilter:
@@ -70,9 +91,18 @@ class JoinTestTest(unittest.TestCase):
 
     def setUp(self):
         self.tracker = SvStateTracker()
+        # reached_resolved=True drives the strong-anchor / thin-anchor
+        # regimes.  `strong_anchor_min=1` keeps the SV-anchored path
+        # active for tests that only instantiate 1-2 anchors (the
+        # historical default).  The production value is 3; the
+        # regime-selection test class below exercises both sides of
+        # that boundary directly.
+        self.ape_sm = _ape_sm(reached_resolved=True)
         self.resolver = NarrowLaneResolver(
             sv_state=self.tracker,
+            ape_state_machine=self.ape_sm,
             join_test_base_m=2.0,
+            strong_anchor_min=1,
         )
 
     # ── Fast-path bypasses ───────────────────────────────────────── #
@@ -196,10 +226,14 @@ class JoinTestTest(unittest.TestCase):
         self.assertAlmostEqual(abs_dr, 3.0, places=1)
 
     def test_ignores_short_term_members(self):
-        """Short-term members are *not* anchors — they're what the
-        test is protecting *from*.  A candidate that would disagree
-        with an NL_SHORT_FIXED member's projection must still pass."""
-        # Walk to NL_SHORT_FIXED but not to LONG_FIXED.
+        """Short-term members are *not* anchors in the SV-anchored
+        path — they're what the test is protecting *from*.  A
+        candidate whose P-coupling is only against NL_SHORT_FIXED
+        should pass.  We stay in strong_anchor regime by adding an
+        unrelated long-term member whose H-row decouples entirely
+        from this candidate."""
+        # NL_SHORT_FIXED member with the coupling we'd want the test
+        # to reject (if it were an anchor).
         self.tracker.transition("E05", SvAmbState.FLOAT,
                                 epoch=0, reason="admit")
         self.tracker.transition("E05", SvAmbState.WL_FIXED,
@@ -207,10 +241,17 @@ class JoinTestTest(unittest.TestCase):
         self.tracker.transition("E05", SvAmbState.NL_SHORT_FIXED,
                                 epoch=2, reason="lambda",
                                 az_deg=90.0, elev_deg=60.0)
-        # Huge P coupling that would fail the long-term test.
+        # Long-term member with zero H-coupling to the candidate —
+        # keeps us in strong_anchor regime while providing no basis
+        # for the SV-anchored gate to reject.
+        _put_in_long_term(self.tracker, "E11", elev_deg=60.0)
         h_e05 = [0.0] * N_BASE + [0.0, 0.0]
         h_e05[2] = 1.0
-        filt = _FakeFilter(N_BASE + 2, H_by_sv={"E05": h_e05})
+        h_e11_all_zero = [0.0] * N_BASE + [0.0, 0.0]
+        filt = _FakeFilter(
+            N_BASE + 2,
+            H_by_sv={"E05": h_e05, "E11": h_e11_all_zero},
+        )
         si = N_BASE
         filt.P[2, si] = 10.0
         filt.P[si, 2] = 10.0

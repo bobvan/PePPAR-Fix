@@ -52,7 +52,31 @@ class StateMachine:
 
 
 class AntPosEst(StateMachine):
-    """Antenna Position Estimator state machine."""
+    """Antenna Position Estimator state machine.
+
+    Carries an additional `reached_resolved` latch.  Semantics:
+
+      * False on construction (filter has no earned position yet).
+      * Latches True the first time the machine enters RESOLVED.
+        That transition means ≥ N NL_LONG_FIXED members, each of
+        which survived ≥ 8° of geometry change — a hard-won
+        invariant signalling that the position solution is
+        defensible.
+      * Cleared only by FixSetIntegrityAlarm.record_fire() — the
+        explicit "throw everything out and rebuild from scratch"
+        event.  Ordinary anchor-count decay does NOT clear it;
+        losing the SV anchors means we need a *different* defense
+        (position-anchored join test, anchor-collapse trigger),
+        not a bootstrap restart.
+
+    Why here (not on SvStateTracker): reached_resolved is a host-
+    level property of the position-solution state, not a per-SV
+    fact.  The state machine is already the natural home for
+    position-solution semantics; NarrowLaneResolver and
+    FixSetIntegrityAlarm both receive a reference to this object
+    so they can read the latch for gate selection / anchor-
+    collapse detection.
+    """
 
     def __init__(self):
         super().__init__("AntPosEst", AntPosEstState.UNSURVEYED)
@@ -60,6 +84,25 @@ class AntPosEst(StateMachine):
         self.n_wl_fixed = 0
         self.n_nl_fixed = 0
         self.n_sv_total = 0
+        self.reached_resolved = False
+
+    def transition(self, new_state, reason=""):
+        super().transition(new_state, reason)
+        # Latch on the first entry to RESOLVED.  Base class emits
+        # the [STATE] log line; we don't need to log the latch
+        # separately because every True-transition coincides with
+        # an AntPosEst: ... → resolved line.
+        if self.state is AntPosEstState.RESOLVED:
+            self.reached_resolved = True
+
+    def clear_reached_resolved(self, reason: str = "") -> None:
+        """Called by FixSetIntegrityAlarm after re-init.  Don't call
+        from anywhere else — the latch's whole point is that ordinary
+        state changes don't reset it."""
+        if self.reached_resolved:
+            log.info("[STATE] AntPosEst: reached_resolved cleared (%s)",
+                     reason or "no reason given")
+            self.reached_resolved = False
 
     def update_metrics(self, sigma_m=None, n_wl=None, n_nl=None, n_sv=None):
         if sigma_m is not None:

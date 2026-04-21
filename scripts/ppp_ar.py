@@ -266,8 +266,15 @@ class NarrowLaneResolver:
                  corner_margin_sum=1.6, blacklist_epochs=60,
                  ar_elev_mask_deg=20.0,
                  lambda_min_p_bootstrap=0.97,
+                 bootstrap_frac_threshold=0.07,
+                 bootstrap_sigma_threshold=0.08,
+                 bootstrap_corner_margin_sum=1.3,
+                 bootstrap_lambda_min_p=0.999,
                  join_test_enabled=True,
                  join_test_base_m=2.0,
+                 position_join_k=3.0,
+                 strong_anchor_min=3,
+                 ape_state_machine=None,
                  sv_state: SvStateTracker | None = None,
                  nl_diag: NlDiagLogger | None = None):
         self.frac_threshold = frac_threshold    # |N1_frac| < this to fix
@@ -325,6 +332,36 @@ class NarrowLaneResolver:
         # what "disabled" should mean.
         self._join_test_enabled = bool(join_test_enabled)
         self._join_test_base_m = float(join_test_base_m)
+        # Reference to the AntPosEst state machine — used to read the
+        # `reached_resolved` latch for regime selection.  Optional for
+        # backwards compatibility with callers (tests, legacy bootstrap
+        # paths) that don't own an AntPosEst object; when None, the
+        # resolver behaves as if `reached_resolved=False` always (all
+        # runs act as bootstrap), which is the safe default.
+        self._ape_state_machine = ape_state_machine
+        # Bootstrap-regime gate overrides.  When reached_resolved is
+        # False, these replace the normal gate parameters — the
+        # filter hasn't earned a defensible position yet and every
+        # NL commit is exploratory, so we apply startup-LAMBDA
+        # skepticism (P_bootstrap → 0.999, tighter rectangle and
+        # corner, narrower σ_N1 cap).  See
+        # `project_to_ptpmon_reached_resolved_reframe_20260421.md`
+        # for the framing Bob and branch-main settled on.
+        self._bootstrap_frac_threshold = float(bootstrap_frac_threshold)
+        self._bootstrap_sigma_threshold = float(bootstrap_sigma_threshold)
+        self._bootstrap_corner_margin_sum = float(bootstrap_corner_margin_sum)
+        self._bootstrap_lambda_min_p = float(bootstrap_lambda_min_p)
+        # Anchor-count boundary between SV-anchored and position-
+        # anchored join test (post-reached_resolved).  When
+        # long_term_count < strong_anchor_min, we fall back to the
+        # position-anchored variant — the individual anchor H-rows
+        # are too few to reliably constrain Δx, so we project
+        # against the filter's position block instead.
+        self._strong_anchor_min = int(strong_anchor_min)
+        # Kalman-gain factor for position-anchored join test:
+        # candidate rejected if |Δx[:3]| > k · σ_pos.  3.0 matches
+        # the existing LAMBDA displacement check's 3σ rule.
+        self._position_join_k = float(position_join_k)
         # Anti-lock-in: after PFR (or any external agent) unfixes an SV,
         # skip it from candidates for this many epochs so the next NL
         # attempt doesn't immediately propose the same wrong integer.
@@ -502,6 +539,12 @@ class NarrowLaneResolver:
 
         # Fallback: per-satellite rounding for < 4 or if LAMBDA failed
         self.last_method = "rounding"
+        # Regime-selected gate parameters — bootstrap regime tightens
+        # frac/sigma/corner; normal regimes use the instance defaults.
+        gates = self._active_gates()
+        frac_cap = gates['frac_threshold']
+        sigma_cap = gates['sigma_threshold']
+        corner_cap = gates['corner_margin_sum']
         for c in screened:
             sv, amb_idx, si, f1, f2, n_wl, lambda_wl, lambda_nl, alpha2 = c
             a_if_float = filt.x[si]
@@ -511,8 +554,7 @@ class NarrowLaneResolver:
             sigma_n1 = sigma_a / lambda_nl
 
             # Basic rectangle gate: both metrics must be under their caps.
-            in_rect = (n1_frac < self.frac_threshold
-                       and sigma_n1 < self.sigma_threshold)
+            in_rect = (n1_frac < frac_cap and sigma_n1 < sigma_cap)
             # Corner-margin gate: reject cases that sit near the top-right
             # of the accept rectangle, where BOTH frac and sigma are
             # simultaneously marginal (the classic "barely-everywhere"
@@ -521,17 +563,17 @@ class NarrowLaneResolver:
             # top-right ~20% of the rectangle.  Example: frac=0.10,
             # sigma=0.114 → 1.0 + 0.95 = 1.95 > 1.6 → reject.
             corner_ok = (
-                (n1_frac / max(self.frac_threshold, 1e-9))
-                + (sigma_n1 / max(self.sigma_threshold, 1e-9))
-                < self.corner_margin_sum
+                (n1_frac / max(frac_cap, 1e-9))
+                + (sigma_n1 / max(sigma_cap, 1e-9))
+                < corner_cap
             )
             if diag is not None:
                 # Corner-margin sum is reported regardless of accept/reject;
                 # useful for spotting marginal fixes that landed just inside
                 # the envelope (common precursor to false-fix rejection later).
                 corner_sum = (
-                    (n1_frac / max(self.frac_threshold, 1e-9))
-                    + (sigma_n1 / max(self.sigma_threshold, 1e-9))
+                    (n1_frac / max(frac_cap, 1e-9))
+                    + (sigma_n1 / max(sigma_cap, 1e-9))
                 )
                 diag.update(sv, corner_margin_sum=corner_sum)
             if in_rect and corner_ok:
@@ -643,16 +685,20 @@ class NarrowLaneResolver:
         # dominant at n=4 after the P_bootstrap fix — PAR at min_fixed=4
         # couldn't retry the subset.  FFRT's critical ratio scales with n,
         # so the 0.001 failure target still holds at 3.
+        # Regime-selected P_bootstrap threshold: tighter (0.999) during
+        # bootstrap, loose (0.97) post-reached_resolved.  Matches the
+        # rounding-path regime table.
+        active_lambda_min_p = self._active_gates()['lambda_min_p_bootstrap']
         fixed_vec, n_fixed, ratio, mask = lambda_resolve(
             n1_vec, Qa_nl, ratio_threshold=None, min_fixed=3,
-            min_success_rate=self._lambda_min_p_bootstrap)
+            min_success_rate=active_lambda_min_p)
 
         if fixed_vec is None:
             self.last_ratio = ratio
-            if self.last_success_rate < self._lambda_min_p_bootstrap:
+            if self.last_success_rate < active_lambda_min_p:
                 log.debug("LAMBDA skipped: bootstrap P=%.4f (need %.3f), "
                           "%d candidates", self.last_success_rate,
-                          self._lambda_min_p_bootstrap, n_amb)
+                          active_lambda_min_p, n_amb)
                 if self._nl_diag is not None:
                     self._nl_diag.set_lambda_batch_result(
                         svs, ratio=ratio, p_bootstrap=self.last_success_rate,
@@ -821,6 +867,69 @@ class NarrowLaneResolver:
         filt.P = I_KH @ filt.P @ I_KH.T + K @ R @ K.T
         filt.P = 0.5 * (filt.P + filt.P.T)
 
+    # ── Regime selection (bootstrap vs. thin-anchor vs. strong) ──── #
+
+    def _reached_resolved(self) -> bool:
+        """True iff the AntPosEst state machine has latched reached
+        RESOLVED at least once since the last re-init.  Drives gate
+        selection — see the three-regime table in
+        `project_to_ptpmon_reached_resolved_reframe_20260421.md`.
+        """
+        sm = self._ape_state_machine
+        return bool(sm is not None and getattr(sm, 'reached_resolved', False))
+
+    def _long_term_count(self) -> int:
+        """Number of NL_LONG_FIXED anchors currently held."""
+        if self._sv_state is None:
+            return 0
+        return len(self._sv_state.long_term_members())
+
+    def _active_regime(self) -> str:
+        """One of ``bootstrap``, ``thin_anchor``, ``strong_anchor``.
+
+        Gate selection flows from the combination of reached_resolved
+        (has the filter earned trust?) and the current anchor count
+        (are the SV anchors strong enough to be the thing we defend
+        against?):
+
+          * bootstrap — ``reached_resolved=False``.  Tight gates,
+            join test bypasses.  Every NL commit is exploratory.
+          * thin_anchor — reached_resolved AND long_term < N.
+            Normal gates, position-anchored join test (we have a
+            trusted position but few SV anchors).
+          * strong_anchor — reached_resolved AND long_term ≥ N.
+            Normal gates, SV-anchored join test (standard path).
+
+        The anchor-count boundary is `self._strong_anchor_min`.
+        """
+        if not self._reached_resolved():
+            return 'bootstrap'
+        if self._long_term_count() >= self._strong_anchor_min:
+            return 'strong_anchor'
+        return 'thin_anchor'
+
+    def _active_gates(self) -> dict:
+        """Gate parameters for the current regime.
+
+        Returns keys ``frac_threshold``, ``sigma_threshold``,
+        ``corner_margin_sum``, ``lambda_min_p_bootstrap``.  Non-
+        bootstrap regimes use the instance defaults; bootstrap uses
+        the tighter `_bootstrap_*` overrides.
+        """
+        if self._active_regime() == 'bootstrap':
+            return {
+                'frac_threshold':   self._bootstrap_frac_threshold,
+                'sigma_threshold':  self._bootstrap_sigma_threshold,
+                'corner_margin_sum': self._bootstrap_corner_margin_sum,
+                'lambda_min_p_bootstrap': self._bootstrap_lambda_min_p,
+            }
+        return {
+            'frac_threshold':   self.frac_threshold,
+            'sigma_threshold':  self.sigma_threshold,
+            'corner_margin_sum': self.corner_margin_sum,
+            'lambda_min_p_bootstrap': self._lambda_min_p_bootstrap,
+        }
+
     @classmethod
     def _predict_fix_dx(cls, filt, state_idx, fixed_value):
         """Closed-form prediction of Δx that `_apply_fix` would produce.
@@ -843,33 +952,53 @@ class NarrowLaneResolver:
         return P_col * (z / denom)
 
     def _join_test(self, filt, state_idx, fixed_value):
-        """Would this candidate fix break any NL_LONG_FIXED member?
+        """Would this candidate fix break the current anchor set?
 
-        Predicts the state shift Δx the candidate would cause and
-        projects it through each long-term member's cached PR H-row
-        to estimate the induced |Δresidual|.  If any member's induced
-        residual exceeds the elev-weighted threshold (same shape
-        FalseFixMonitor uses — 2.0 m at zenith, relaxed by 1/sin(elev)
-        below 45°), reject the candidate before it commits.
+        Dispatches on `_active_regime()`:
+          * bootstrap — trivially passes; bootstrap gates provide the
+            defense (no trusted position yet, nothing to anchor to).
+          * strong_anchor — SV-anchored variant: project Δx through
+            each long-term member's cached PR H-row and reject if
+            any anchor's induced |Δresidual| exceeds the elev-
+            weighted FalseFixMonitor threshold.  (Historical default.)
+          * thin_anchor — position-anchored variant: project Δx onto
+            the filter's position state and reject if |Δx[:3]| >
+            k · σ_pos.  Used when reached_resolved is True but the SV
+            anchors are too few (< strong_anchor_min) to constrain
+            Δx reliably on their own.
 
         Returns (ok, worst_sv_or_None, worst_abs_delta, worst_thr).
-        `ok=True` means the candidate is safe to commit.  Callers
-        that don't care about the diagnostic tuple can treat the
-        returned ok bool alone.
+        In the position-anchored path, worst_sv is None (no per-SV
+        attribution) and worst_abs_delta is the |Δ_pos| magnitude in
+        metres.
 
         Cheap fast-paths (always pass):
-          * gate disabled via `join_test_enabled=False` (ok=True)
-          * no SV state tracker (ok=True)
-          * no long-term members yet (bootstrap — ok=True)
-          * filter hasn't run an EKF update yet, so no cached H rows
-            (ok=True — nothing to join against)
+          * gate disabled via `join_test_enabled=False`
+          * no SV state tracker (can't know regime)
+          * bootstrap regime (see above)
+          * no long-term members when we're in strong/thin regimes
+            (shouldn't happen — strong requires ≥ N, thin needs ≥ 1
+            for SV-anchored evidence even if we route to position-
+            anchored for N=0 — see below)
+          * filter hasn't run an EKF update yet (no cached H rows)
         """
         if not self._join_test_enabled:
             return True, None, 0.0, 0.0
         if self._sv_state is None:
             return True, None, 0.0, 0.0
+        regime = self._active_regime()
+        if regime == 'bootstrap':
+            return True, None, 0.0, 0.0
+        if regime == 'thin_anchor':
+            return self._position_anchored_join_test(
+                filt, state_idx, fixed_value,
+            )
+        # regime == 'strong_anchor' — SV-anchored join test below.
         lt_members = self._sv_state.long_term_members()
         if not lt_members:
+            # Defensive — regime said strong but the tracker has no
+            # long-term members; fall back to pass.  Should be a
+            # transient (regime snapshot stale by one epoch at most).
             return True, None, 0.0, 0.0
         h_by_sv = getattr(filt, 'last_H_by_sv', None)
         if not h_by_sv:
@@ -903,6 +1032,36 @@ class NarrowLaneResolver:
             if abs_dr > threshold:
                 return False, sv_lt, abs_dr, threshold
         return True, worst_sv, worst_abs, worst_thr
+
+    def _position_anchored_join_test(self, filt, state_idx, fixed_value):
+        """Reject candidates that would shift position by more than
+        k · σ_pos.  Used in the ``thin_anchor`` regime where SV
+        anchors are too few to reliably drive the SV-anchored variant.
+
+        σ_pos is the 3D position sigma — `sqrt(tr(P[:3, :3]))`, the
+        same quantity `position_sigma_3d` computes in the engine.
+        That matches the existing LAMBDA displacement check's 3σ
+        rule (k=3 by default), making the gate interpretable as
+        "candidate wouldn't move the position further than the 3σ
+        uncertainty the filter claims."
+
+        Returns (ok, None, |Δpos|_m, k·σ_pos_m) — worst_sv is None
+        because the gate isn't attributing rejection to any one SV.
+        """
+        dx = self._predict_fix_dx(filt, state_idx, fixed_value)
+        if len(dx) < 3:
+            # State vector too small to have position — shouldn't
+            # happen with PPPFilter / FixedPosFilter, but bail safely.
+            return True, None, 0.0, 0.0
+        delta_pos = float(np.linalg.norm(dx[:3]))
+        # sqrt of trace of the 3x3 position block of P.
+        var_pos = float(filt.P[0, 0] + filt.P[1, 1] + filt.P[2, 2])
+        if var_pos <= 0.0:
+            return True, None, delta_pos, 0.0
+        sigma_pos = math.sqrt(var_pos)
+        threshold = self._position_join_k * sigma_pos
+        ok = delta_pos <= threshold
+        return ok, None, delta_pos, threshold
 
     def is_fixed(self, sv):
         return sv in self._fixed
