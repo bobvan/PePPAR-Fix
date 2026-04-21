@@ -674,6 +674,16 @@ class NarrowLaneResolver:
 
         newly_fixed = {}
         join_rejected = []  # (sv, worst_sv, Δresid, threshold) for diag
+        # Cumulative-semantics note: _join_test sees the filter state
+        # with earlier batch members already applied.  A candidate
+        # that would pass in isolation can fail after an earlier
+        # commit has shifted state.  This is deliberate — the
+        # physical question we're answering is "given everything
+        # we've already committed in this batch, does adding this
+        # next one break an anchor?"  Decoupling order (evaluating
+        # all members against the pre-batch state up front) would
+        # under-reject when members compound each other's drift.
+        # Iteration order matters and is defined by `svs`.
         for i in range(n_amb):
             if not mask[i]:
                 continue
@@ -767,19 +777,28 @@ class NarrowLaneResolver:
 
         return {sv: info[0] for sv, info in newly_fixed.items()}
 
+    # Measurement variance for the pseudo-observation that pins an
+    # ambiguity state to its fixed integer value.  Both `_apply_fix`
+    # (the real Kalman update) and `_predict_fix_dx` (the closed-form
+    # Δx the join test uses) must read this from the same place,
+    # otherwise the join test's predicted Δresid drifts out of sync
+    # with the actual shift `_apply_fix` produces and the gate lies.
+    _NL_FIX_MEAS_R = 0.001 ** 2  # 1 mm sigma — effectively fixed
+
     def _apply_fix(self, filt, state_idx, fixed_value):
         """Constrain a PPPFilter ambiguity state to a fixed value.
 
         Uses a tight pseudo-measurement update: H = [0...1...0],
-        z = fixed_value, R = (0.001 m)^2.  This pulls the state to
-        the fixed value and collapses its covariance without altering
-        the filter's structure (the state remains, just tightly constrained).
+        z = fixed_value, R = `_NL_FIX_MEAS_R`.  This pulls the state
+        to the fixed value and collapses its covariance without
+        altering the filter's structure (the state remains, just
+        tightly constrained).
         """
         n = len(filt.x)
         H = np.zeros((1, n))
         H[0, state_idx] = 1.0
         z = np.array([fixed_value - filt.x[state_idx]])
-        R = np.array([[0.001**2]])  # 1 mm sigma — effectively fixed
+        R = np.array([[self._NL_FIX_MEAS_R]])
 
         S = H @ filt.P @ H.T + R
         K = filt.P @ H.T / S[0, 0]
@@ -788,8 +807,8 @@ class NarrowLaneResolver:
         filt.P = I_KH @ filt.P @ I_KH.T + K @ R @ K.T
         filt.P = 0.5 * (filt.P + filt.P.T)
 
-    @staticmethod
-    def _predict_fix_dx(filt, state_idx, fixed_value):
+    @classmethod
+    def _predict_fix_dx(cls, filt, state_idx, fixed_value):
         """Closed-form prediction of Δx that `_apply_fix` would produce.
 
         Same math as the Kalman update in `_apply_fix`, but for a
@@ -799,11 +818,11 @@ class NarrowLaneResolver:
 
         No matrices allocated, no side effects — lets the join test
         evaluate a candidate without mutating or copying the full
-        state/cov.
+        state/cov.  R is pulled from the same `_NL_FIX_MEAS_R`
+        constant `_apply_fix` uses, so the two stay in lock-step.
         """
-        R = 0.001 ** 2  # keep in sync with _apply_fix
         P_col = filt.P[:, state_idx]
-        denom = float(filt.P[state_idx, state_idx]) + R
+        denom = float(filt.P[state_idx, state_idx]) + cls._NL_FIX_MEAS_R
         if denom <= 0.0:
             return np.zeros_like(filt.x)
         z = float(fixed_value) - float(filt.x[state_idx])
