@@ -84,6 +84,33 @@ class JoinTestTest(unittest.TestCase):
         ok, *_ = r._join_test(filt, N_BASE, fixed_value=0.0)
         self.assertTrue(ok)
 
+    def test_disabled_flag_short_circuits(self):
+        """`join_test_enabled=False` must bypass the test even when
+        an anchor would otherwise fail.  This is what the A/B arm
+        uses to turn the gate off for a controlled comparison."""
+        _put_in_long_term(self.tracker, "E05", elev_deg=60.0)
+        h_e05 = [0.0] * N_BASE + [0.0, 0.0]
+        h_e05[2] = 1.0
+        filt = _FakeFilter(N_BASE + 2, H_by_sv={"E05": h_e05})
+        si = N_BASE
+        # Same configuration as test_large_delta_rejects — would
+        # reject with the gate enabled.
+        filt.P[2, si] = 10.0
+        filt.P[si, 2] = 10.0
+        filt.P[si, si] = 1.0
+        # Instantiate a resolver with the disable flag.
+        r_off = NarrowLaneResolver(
+            sv_state=self.tracker,
+            join_test_enabled=False,
+        )
+        ok, worst_sv, abs_dr, thr = r_off._join_test(
+            filt, si, fixed_value=1.0,
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(worst_sv)
+        self.assertEqual(abs_dr, 0.0)
+        self.assertEqual(thr, 0.0)
+
     def test_passes_when_no_long_term_members(self):
         """Bootstrap: no anchors yet → join test trivially passes."""
         filt = _FakeFilter(N_BASE + 2)

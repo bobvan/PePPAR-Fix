@@ -962,6 +962,7 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
     nl_diag = NlDiagLogger(enabled=bool(getattr(args, "nl_diag", False)))
     nl_resolver = NarrowLaneResolver(
         ar_elev_mask_deg=args.ar_elev_mask, nl_diag=nl_diag,
+        join_test_enabled=bool(getattr(args, "join_test", True)),
     )
     slip_monitor = CycleSlipMonitor(
         mw_tracker=mw_tracker, csv_writer=_slip_csv_writer())
@@ -1286,7 +1287,8 @@ class AntPosEstThread(threading.Thread):
                  ar_elev_mask_deg=20.0,
                  nav2_store=None, nav2_tension_threshold=5.0,
                  nav2_alarm_count=3, systems=None,
-                 nl_diag_enabled=False):
+                 nl_diag_enabled=False,
+                 join_test_enabled=True):
         super().__init__(daemon=True, name="AntPosEst")
         self.obs_queue = queue.Queue(maxsize=50)
         self._corrections = corrections
@@ -1305,7 +1307,9 @@ class AntPosEstThread(threading.Thread):
             self._filt = bootstrap_result.ppp_filter
             self._mw = bootstrap_result.mw_tracker or MelbourneWubbenaTracker()
             self._nl = (bootstrap_result.nl_resolver
-                        or NarrowLaneResolver(ar_elev_mask_deg=ar_elev_mask_deg))
+                        or NarrowLaneResolver(
+                            ar_elev_mask_deg=ar_elev_mask_deg,
+                            join_test_enabled=join_test_enabled))
             # Inherit diag logger from bootstrap NL; if missing, attach one.
             if getattr(self._nl, "_nl_diag", None) is None:
                 self._nl._nl_diag = NlDiagLogger(enabled=bool(nl_diag_enabled))
@@ -1322,6 +1326,7 @@ class AntPosEstThread(threading.Thread):
             self._nl = NarrowLaneResolver(
                 ar_elev_mask_deg=ar_elev_mask_deg,
                 nl_diag=NlDiagLogger(enabled=bool(nl_diag_enabled)),
+                join_test_enabled=join_test_enabled,
             )
             log.info("AntPosEstThread: fresh PPPFilter at known position (warm start)")
 
@@ -5104,6 +5109,7 @@ def run(args):
             systems=set(args.systems.split(',')) if args.systems else None,
             ar_elev_mask_deg=args.ar_elev_mask,
             nl_diag_enabled=bool(getattr(args, "nl_diag", False)),
+            join_test_enabled=bool(getattr(args, "join_test", True)),
         )
         ape_thread.start()
 
@@ -5314,6 +5320,14 @@ Two-phase operation:
                           "Off by default to keep long runs clean.  Use to "
                           "diagnose NL-doesn't-land situations — see "
                           "scripts/peppar_fix/nl_diag.py for field semantics.")
+    pos.add_argument("--no-join-test", dest="join_test",
+                     action="store_false", default=True,
+                     help="Disable the pre-commit join test that protects "
+                          "NL_LONG_FIXED anchors from biased re-admissions.  "
+                          "On by default.  Used for the same-sky A/B that "
+                          "isolates the join test's effect from other "
+                          "branch-carried changes.  See "
+                          "project_to_main_defensive_mechanisms_20260421.md.")
     pos.add_argument("--timeout", type=int, default=3600,
                      help="Bootstrap timeout in seconds (default: 3600)")
     pos.add_argument("--watchdog-threshold", type=float, default=0.5,

@@ -266,6 +266,7 @@ class NarrowLaneResolver:
                  corner_margin_sum=1.6, blacklist_epochs=60,
                  ar_elev_mask_deg=20.0,
                  lambda_min_p_bootstrap=0.97,
+                 join_test_enabled=True,
                  join_test_base_m=2.0,
                  sv_state: SvStateTracker | None = None,
                  nl_diag: NlDiagLogger | None = None):
@@ -312,6 +313,17 @@ class NarrowLaneResolver:
         # `project_to_main_defensive_mechanisms_20260421.md` for the
         # overnight data (day0420e 01:05-01:55 50-min trap) motivating
         # this gate.
+        #
+        # `join_test_enabled=False` (via engine's --no-join-test flag)
+        # short-circuits the test to always-pass — used for the
+        # same-sky A/B that isolates the gate's effect from other
+        # branch-carried changes (phase-bias gate, ZTD diagnostics,
+        # elev-stratified squelch).  `base_m` is preserved rather
+        # than zeroed so the reverse path ("set base_m=0 to disable")
+        # stays off the table — base_m=0 would reject *every*
+        # candidate (threshold = 0 < any Δresid), the opposite of
+        # what "disabled" should mean.
+        self._join_test_enabled = bool(join_test_enabled)
         self._join_test_base_m = float(join_test_base_m)
         # Anti-lock-in: after PFR (or any external agent) unfixes an SV,
         # skip it from candidates for this many epochs so the next NL
@@ -846,11 +858,14 @@ class NarrowLaneResolver:
         returned ok bool alone.
 
         Cheap fast-paths (always pass):
+          * gate disabled via `join_test_enabled=False` (ok=True)
           * no SV state tracker (ok=True)
           * no long-term members yet (bootstrap — ok=True)
           * filter hasn't run an EKF update yet, so no cached H rows
             (ok=True — nothing to join against)
         """
+        if not self._join_test_enabled:
+            return True, None, 0.0, 0.0
         if self._sv_state is None:
             return True, None, 0.0, 0.0
         lt_members = self._sv_state.long_term_members()
