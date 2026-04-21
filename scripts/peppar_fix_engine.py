@@ -1861,12 +1861,18 @@ class AntPosEstThread(threading.Thread):
                     if opinion is not None:
                         d = float(np.linalg.norm(pos_ecef - opinion['ecef']))
                         nav2_tag = f" nav2Δ={d:.1f}m"
+                ztd_tag = ""
+                if hasattr(filt, 'IDX_ZTD') and filt.x.shape[0] > filt.IDX_ZTD:
+                    dztd_mm = filt.x[filt.IDX_ZTD] * 1000.0
+                    dztd_sigma_mm = math.sqrt(max(0.0,
+                        filt.P[filt.IDX_ZTD, filt.IDX_ZTD])) * 1000.0
+                    ztd_tag = f" ZTD={dztd_mm:+.0f}±{dztd_sigma_mm:.0f}mm"
                 log.info(
                     "  [AntPosEst %d] σ=%.3fm pos=(%.6f, %.6f, %.1f) "
-                    "n=%d amb=%d %s %s%s",
+                    "n=%d amb=%d %s %s%s%s",
                     self._n_epochs, sigma_3d, lat, lon, alt,
                     n_used, len(filt.sv_to_idx),
-                    mw.summary(), nl.summary(), nav2_tag,
+                    mw.summary(), nl.summary(), nav2_tag, ztd_tag,
                 )
 
             # Periodic SV-state summary (replaces the old PFR per-SV
