@@ -308,39 +308,54 @@ class SvObservation:
     half_cyc_ok: bool
 
 
-# Preferred signal codes per system for each profile.  The regression
-# harness picks the pair matching the profile of the receiver it's
-# simulating.  Extend as we add test cases for other receivers.
+# Preferred signal-code pairs per system for each profile.  Each value
+# is a tuple of acceptable (band1+attr, band2+attr) pairs in priority
+# order; the harness picks the first pair whose pseudorange + carrier
+# phase are both present for an SV.  Extend as we add test cases for
+# other receivers / stations with different code-attribute conventions.
 L5_PROFILE = {
-    "GPS": ("1C", "5Q"),    # L1CA + L5Q  (fallback: 5X if 5Q missing)
-    "GAL": ("1C", "5Q"),    # E1C + E5aQ  (fallback: 5X, 7Q for E5b)
-    "BDS": ("2I", "5P"),    # B1I + B2a-P (fallback: 5X, 5D)
+    # F9T-L5 tracks L1CA + L5Q; some stations report combined I+Q (X)
+    # instead of pure Q, so we accept those as fallbacks.
+    "GPS": [("1C", "5Q"), ("1C", "5X"), ("1X", "5X")],
+    # E5aQ preferred; E5aX fallback
+    "GAL": [("1C", "5Q"), ("1C", "5X"), ("1X", "5X")],
+    # B2a-P (D5P) preferred; X (combined) and D (data-only) fallbacks
+    "BDS": [("2I", "5P"), ("2I", "5X"), ("2I", "5D"),
+            ("2X", "5X")],
 }
 L2_PROFILE = {
-    "GPS": ("1C", "2L"),    # L1CA + L2CL
-    "GAL": ("1C", "7Q"),    # E1C + E5bQ
-    "BDS": ("2I", "7I"),    # B1I + B2I (BDS-2 legacy)
+    # F9T-L2 (e.g. ptpmon) tracks L1CA + L2CL; X fallback for stations
+    # that emit combined L2C.
+    "GPS": [("1C", "2L"), ("1C", "2X"), ("1X", "2X")],
+    "GAL": [("1C", "7Q"), ("1C", "7X"), ("1X", "7X")],
+    "BDS": [("2I", "7I"), ("2I", "7X"), ("2X", "7X")],   # BDS-2 legacy
 }
 
 
 def _pick_signal_pair(
     sys_name: str, sv_obs: dict[str, tuple[float, int, int]],
-    profile: dict[str, tuple[str, str]],
+    profile: dict[str, list[tuple[str, str]]],
 ) -> Optional[tuple[str, str]]:
-    """Pick the signal-code pair for this SV.  Returns ('1C', '5Q')
-    etc. — the 2-char RINEX band+attribute codes — if both pseudorange
-    and carrier phase are present for each.  None if missing."""
+    """Pick the first signal-code pair from `profile[sys_name]` whose
+    pseudorange + carrier phase are both present for this SV.
+
+    Returns ('1C', '5Q') — the 2-char RINEX band+attribute codes —
+    or None if no pair matches.  Accepts profile values as either a
+    single pair (back-compat) or a list of pairs in priority order.
+    """
     pref = profile.get(sys_name)
     if pref is None:
         return None
-    b1, b2 = pref
-    pr1_key = f"C{b1}"
-    ph1_key = f"L{b1}"
-    pr2_key = f"C{b2}"
-    ph2_key = f"L{b2}"
-    if (pr1_key in sv_obs and ph1_key in sv_obs
-            and pr2_key in sv_obs and ph2_key in sv_obs):
-        return (b1, b2)
+    # Accept either a list of pairs or a single tuple (back-compat).
+    pairs = pref if isinstance(pref, list) else [pref]
+    for b1, b2 in pairs:
+        pr1_key = f"C{b1}"
+        ph1_key = f"L{b1}"
+        pr2_key = f"C{b2}"
+        ph2_key = f"L{b2}"
+        if (pr1_key in sv_obs and ph1_key in sv_obs
+                and pr2_key in sv_obs and ph2_key in sv_obs):
+            return (b1, b2)
     return None
 
 
