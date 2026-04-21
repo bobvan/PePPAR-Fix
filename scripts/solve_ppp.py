@@ -545,6 +545,16 @@ class PPPFilter:
         # callers can map residuals back to their satellites — used by the
         # post-fix residual monitor to detect wrong integer fixes.
         self.last_residual_labels = labels
+        # Cache the PR H-row per SV.  The join test in NarrowLaneResolver
+        # projects a candidate fix's state-change Δx through each long-term
+        # member's H-row to predict whether the new fix would push any
+        # trusted member's PR residual past the false-fix threshold.  Only
+        # PR rows are cached — phase rows include the SV's own ambiguity
+        # column which is irrelevant for join projection against other SVs.
+        self.last_H_by_sv = {}
+        for (sv_i, kind_i, _elev_i), h_row in zip(labels, H_rows):
+            if kind_i == 'pr':
+                self.last_H_by_sv[sv_i] = h_row
         return n_used, post_resid, dict(sys_counts)
 
 

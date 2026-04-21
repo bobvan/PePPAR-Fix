@@ -31,11 +31,13 @@ from lambda_ar import lambda_resolve, lambda_decorrelate, bootstrap_success_rate
 # / reset.  Tracker is optional (callers can pass None) so tests and
 # legacy code paths keep working without wiring one up.
 from peppar_fix.sv_state import SvAmbState, SvStateTracker
+from peppar_fix.false_fix_monitor import elev_weighted_threshold
 from peppar_fix.nl_diag import (
     NlDiagLogger,
     RESULT_CAND, RESULT_FIXED_LAMBDA, RESULT_FIXED_ROUNDING,
     RESULT_SKIP_ELEV, RESULT_SKIP_BLACKLIST, RESULT_SKIP_NO_WL,
     RESULT_SKIP_NO_FREQS, RESULT_SKIP_NO_PHASE_BIAS, RESULT_SKIP_PRESCREEN,
+    RESULT_REJ_JOIN_TEST,
     RESULT_REJ_LAMBDA_RATIO, RESULT_REJ_LAMBDA_BOOTSTRAP,
     RESULT_REJ_LAMBDA_DISPLACEMENT, RESULT_REJ_CORNER, RESULT_REJ_RECT,
 )
@@ -264,6 +266,7 @@ class NarrowLaneResolver:
                  corner_margin_sum=1.6, blacklist_epochs=60,
                  ar_elev_mask_deg=20.0,
                  lambda_min_p_bootstrap=0.97,
+                 join_test_base_m=2.0,
                  sv_state: SvStateTracker | None = None,
                  nl_diag: NlDiagLogger | None = None):
         self.frac_threshold = frac_threshold    # |N1_frac| < this to fix
@@ -299,6 +302,17 @@ class NarrowLaneResolver:
         # FFRT (active via ratio_threshold=None, P_fail=0.001) still provides
         # the primary reliability guard.
         self._lambda_min_p_bootstrap = float(lambda_min_p_bootstrap)
+        # Join test: before a new candidate integer commits, predict
+        # whether it would push any NL_LONG_FIXED member's PR residual
+        # past this elev-weighted threshold.  Matches FalseFixMonitor's
+        # 2.0 m base; same physics.  The join test is a *pre-commit*
+        # version of what FalseFix catches post-commit — stopping the
+        # biased integer from ever landing instead of detecting it
+        # seconds to minutes after damage has accumulated.  See
+        # `project_to_main_defensive_mechanisms_20260421.md` for the
+        # overnight data (day0420e 01:05-01:55 50-min trap) motivating
+        # this gate.
+        self._join_test_base_m = float(join_test_base_m)
         # Anti-lock-in: after PFR (or any external agent) unfixes an SV,
         # skip it from candidates for this many epochs so the next NL
         # attempt doesn't immediately propose the same wrong integer.
@@ -511,6 +525,22 @@ class NarrowLaneResolver:
             if in_rect and corner_ok:
                 n1_int = round(n1_float)
                 a_if_fixed = lambda_nl * n1_int + alpha2 * lambda_wl * n_wl
+                # Join test: reject the fix if it would push any
+                # NL_LONG_FIXED member's PR residual past threshold.
+                # Pre-empts the FalseFix monitor for this SV and
+                # protects the anchor set from biased re-admits.
+                join_ok, join_sv, join_dr, join_thr = self._join_test(
+                    filt, si, a_if_fixed,
+                )
+                if not join_ok:
+                    if diag is not None:
+                        diag.update(
+                            sv,
+                            result=RESULT_REJ_JOIN_TEST,
+                            reason=(f"{join_sv} Δ={join_dr:.2f}m "
+                                    f"> {join_thr:.2f}m"),
+                        )
+                    continue
                 self._apply_fix(filt, si, a_if_fixed)
                 # Store fix-time NL quality alongside the integer so later
                 # diagnostics can correlate PFR unfix events with how
@@ -643,6 +673,7 @@ class NarrowLaneResolver:
         saved_P = filt.P.copy()
 
         newly_fixed = {}
+        join_rejected = []  # (sv, worst_sv, Δresid, threshold) for diag
         for i in range(n_amb):
             if not mask[i]:
                 continue
@@ -651,8 +682,30 @@ class NarrowLaneResolver:
             lambda_wl, lambda_nl, alpha2, n_wl = params[i]
             a_if_fixed = lambda_nl * n1_int + alpha2 * lambda_wl * n_wl
             si = state_indices[i]
+            # Join test: would this member of the LAMBDA batch push
+            # an existing NL_LONG_FIXED anchor past threshold?  If so,
+            # drop this fix but keep the rest of the batch — LAMBDA's
+            # batch validation already accepted this set as a whole,
+            # but the join test is a per-SV anchor-consistency gate
+            # that's stricter than the batch-level displacement check.
+            join_ok, join_sv, join_dr, join_thr = self._join_test(
+                filt, si, a_if_fixed,
+            )
+            if not join_ok:
+                join_rejected.append((sv, join_sv, join_dr, join_thr))
+                continue
             self._apply_fix(filt, si, a_if_fixed)
             newly_fixed[sv] = (n1_int, a_if_fixed, si)
+
+        # Emit per-SV diag for any LAMBDA candidates the join test
+        # dropped, with the anchor/resid/threshold that triggered it.
+        if join_rejected and self._nl_diag is not None:
+            for sv, anchor_sv, abs_dr, thr in join_rejected:
+                self._nl_diag.update(
+                    sv,
+                    result=RESULT_REJ_JOIN_TEST,
+                    reason=f"{anchor_sv} Δ={abs_dr:.2f}m > {thr:.2f}m",
+                )
 
         # Check position displacement
         fixed_pos = filt.x[:3]
@@ -734,6 +787,86 @@ class NarrowLaneResolver:
         I_KH = np.eye(n) - K @ H
         filt.P = I_KH @ filt.P @ I_KH.T + K @ R @ K.T
         filt.P = 0.5 * (filt.P + filt.P.T)
+
+    @staticmethod
+    def _predict_fix_dx(filt, state_idx, fixed_value):
+        """Closed-form prediction of Δx that `_apply_fix` would produce.
+
+        Same math as the Kalman update in `_apply_fix`, but for a
+        single-column H (identity on state_idx) it reduces to:
+            K = P[:, state_idx] / (P[state_idx, state_idx] + R)
+            Δx = K · (fixed_value − x[state_idx])
+
+        No matrices allocated, no side effects — lets the join test
+        evaluate a candidate without mutating or copying the full
+        state/cov.
+        """
+        R = 0.001 ** 2  # keep in sync with _apply_fix
+        P_col = filt.P[:, state_idx]
+        denom = float(filt.P[state_idx, state_idx]) + R
+        if denom <= 0.0:
+            return np.zeros_like(filt.x)
+        z = float(fixed_value) - float(filt.x[state_idx])
+        return P_col * (z / denom)
+
+    def _join_test(self, filt, state_idx, fixed_value):
+        """Would this candidate fix break any NL_LONG_FIXED member?
+
+        Predicts the state shift Δx the candidate would cause and
+        projects it through each long-term member's cached PR H-row
+        to estimate the induced |Δresidual|.  If any member's induced
+        residual exceeds the elev-weighted threshold (same shape
+        FalseFixMonitor uses — 2.0 m at zenith, relaxed by 1/sin(elev)
+        below 45°), reject the candidate before it commits.
+
+        Returns (ok, worst_sv_or_None, worst_abs_delta, worst_thr).
+        `ok=True` means the candidate is safe to commit.  Callers
+        that don't care about the diagnostic tuple can treat the
+        returned ok bool alone.
+
+        Cheap fast-paths (always pass):
+          * no SV state tracker (ok=True)
+          * no long-term members yet (bootstrap — ok=True)
+          * filter hasn't run an EKF update yet, so no cached H rows
+            (ok=True — nothing to join against)
+        """
+        if self._sv_state is None:
+            return True, None, 0.0, 0.0
+        lt_members = self._sv_state.long_term_members()
+        if not lt_members:
+            return True, None, 0.0, 0.0
+        h_by_sv = getattr(filt, 'last_H_by_sv', None)
+        if not h_by_sv:
+            return True, None, 0.0, 0.0
+
+        dx = self._predict_fix_dx(filt, state_idx, fixed_value)
+
+        worst_sv = None
+        worst_abs = 0.0
+        worst_thr = 0.0
+        for sv_lt in lt_members:
+            h_lt = h_by_sv.get(sv_lt)
+            if h_lt is None:
+                continue  # no PR obs this epoch — can't project
+            # State may have grown (new ambiguity added) since H was
+            # cached.  Project only the columns both vectors share —
+            # the new ambiguity column would be 0 in h_lt anyway
+            # because sv_lt's H doesn't touch sv_new's ambiguity.
+            n = min(len(h_lt), len(dx))
+            delta_resid = float(np.dot(h_lt[:n], dx[:n]))
+            rec = self._sv_state.get(sv_lt)
+            elev = rec.last_elev_deg if rec is not None else None
+            threshold = elev_weighted_threshold(
+                self._join_test_base_m, elev,
+            )
+            abs_dr = abs(delta_resid)
+            if abs_dr > worst_abs:
+                worst_abs = abs_dr
+                worst_sv = sv_lt
+                worst_thr = threshold
+            if abs_dr > threshold:
+                return False, sv_lt, abs_dr, threshold
+        return True, worst_sv, worst_abs, worst_thr
 
     def is_fixed(self, sv):
         return sv in self._fixed
