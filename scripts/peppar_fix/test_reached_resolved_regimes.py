@@ -315,6 +315,71 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
         self.alarm.record_fire(epoch=100)
         self.assertFalse(self.sm.reached_resolved)
 
+    def test_anchor_collapse_event_dict_has_required_fields(self):
+        """The anchor-collapse event dict must carry the fields
+        the engine-side ``_apply_fix_set_alarm`` reads: ``reason``,
+        ``anchor_collapse_epochs``, ``since_epoch``.  This is a
+        regression test for the 2026-04-21 day0421b crash where
+        the engine read ``ev['window_rms_m']`` unconditionally and
+        KeyError'd out of AntPosEstThread on first anchor-collapse
+        fire."""
+        _latch_resolved(self.sm)
+        _long_term(self.tracker, "E05")
+        self.tracker.transition("E05", SvAmbState.FLOAT,
+                                epoch=1, reason="drop")
+        for epoch in range(2, 32):
+            self.alarm.evaluate(epoch)
+        ev = self.alarm.evaluate(32)
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev['reason'], 'anchor_collapse')
+        # Engine-side caller contract: these keys MUST exist.  If
+        # the dict ever loses a field, downstream code that
+        # formats a log line will crash the thread.
+        self.assertIn('anchor_collapse_epochs', ev)
+        self.assertIn('since_epoch', ev)
+
+    def test_window_rms_event_dict_carries_reason(self):
+        """The legacy window-RMS event dict must also carry
+        ``reason='window_rms'`` so the engine-side caller can
+        branch cleanly.  Before b3e9fcb the dict had no reason
+        field — a downstream ``ev.get('reason', 'window_rms')``
+        works either way, but asserting the field is present
+        future-proofs the contract."""
+        # Feed artificial residuals to drive the window RMS above
+        # threshold (default 5.0 m).  Stateful across epochs.
+        # First mark a SV as NL_SHORT_FIXED so ingest accepts
+        # its residuals.
+        self.tracker.transition("E05", SvAmbState.FLOAT,
+                                epoch=0, reason="admit")
+        self.tracker.transition("E05", SvAmbState.WL_FIXED,
+                                epoch=0, reason="mw")
+        self.tracker.transition("E05", SvAmbState.NL_SHORT_FIXED,
+                                epoch=0, reason="lambda",
+                                az_deg=90.0, elev_deg=60.0)
+        # Rebuild the alarm with default rms_threshold (5.0) and
+        # a modest window so the test converges quickly.
+        alarm = FixSetIntegrityAlarm(
+            self.tracker, ape_state_machine=self.sm,
+            eval_every=1, cooldown_epochs=0,
+            min_samples_in_window=5, window_epochs=10,
+            anchor_collapse_epochs=10**6,  # suppress the new path
+            suppress_if_monitors_fired_within=0,
+        )
+        import types
+        # Synthetic ingest: drive the RMS window with high residuals.
+        for epoch in range(1, 20):
+            labels = [("E05", "pr", 60.0)]
+            resid = [10.0]  # 10 m residual — well above 5 m threshold
+            alarm.ingest(epoch, resid, labels)
+            ev = alarm.evaluate(epoch)
+            if ev is not None:
+                break
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev['reason'], 'window_rms')
+        self.assertIn('window_rms_m', ev)
+        self.assertIn('rms_m', ev)
+        self.assertIn('n_samples', ev)
+
     def test_record_fire_resets_collapse_timer(self):
         """After a fire, the timer resets (not stuck at "already
         fired").  Required for a clean re-bootstrap."""

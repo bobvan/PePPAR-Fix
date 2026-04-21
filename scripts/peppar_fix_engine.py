@@ -1575,12 +1575,39 @@ class AntPosEstThread(threading.Thread):
         """Fix-set integrity alarm fired — systemic failure.  Full
         filter re-init at current AR position.  Transitions the position
         solution back to CONVERGING.
+
+        The alarm's ``ev`` dict has two shapes depending on trigger:
+          * ``reason='window_rms'`` — keys ``window_rms_m``, ``rms_m``,
+            ``n_samples``.  Mean PR residual across fix-set members
+            stayed elevated.
+          * ``reason='anchor_collapse'`` — keys
+            ``anchor_collapse_epochs``, ``since_epoch``.  Zero
+            NL_LONG_FIXED anchors for N epochs on a reached_resolved
+            filter.  See
+            ``project_day0421b_anchor_loss_trap_20260421.md``.
+
+        Branch on ``reason`` when building the log line.  Without
+        this branch the anchor-collapse path crashes with a
+        KeyError on the first fire (caught on day0421b, L5 fleet
+        and ptpmon at 15:17 CDT 2026-04-21).
         """
         pos_ecef = filt.x[:3].copy()
+        reason = ev.get('reason', 'window_rms')
+        if reason == 'anchor_collapse':
+            detail = (
+                f"anchor_collapse: 0 NL_LONG_FIXED anchors for "
+                f"{ev['anchor_collapse_epochs']} epochs "
+                f"(since epoch {ev['since_epoch']})"
+            )
+        else:
+            detail = (
+                f"window_rms={ev['window_rms_m']:.2f}m, "
+                f"latest={ev['rms_m']:.2f}m, "
+                f"n={ev['n_samples']}"
+            )
         log.warning(
-            "[FIX_SET_ALARM] re-initialising PPPFilter at %s"
-            " (window RMS=%.2fm, latest=%.2fm, n=%d)",
-            pos_ecef.tolist(), ev['window_rms_m'], ev['rms_m'], ev['n_samples'],
+            "[FIX_SET_ALARM] re-initialising PPPFilter at %s (%s)",
+            pos_ecef.tolist(), detail,
         )
         # Drop all NL fixes (tracker → FLOAT for each via resolver hook),
         # clear MW state entirely (big reset), re-seed filter.
