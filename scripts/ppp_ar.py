@@ -675,14 +675,15 @@ class NarrowLaneResolver:
         newly_fixed = {}
         join_rejected = []  # (sv, worst_sv, Δresid, threshold) for diag
         # Cumulative-semantics note: _join_test sees the filter state
-        # with earlier batch members already applied.  A candidate
-        # that would pass in isolation can fail after an earlier
-        # commit has shifted state.  This is deliberate — the
-        # physical question we're answering is "given everything
-        # we've already committed in this batch, does adding this
-        # next one break an anchor?"  Decoupling order (evaluating
-        # all members against the pre-batch state up front) would
-        # under-reject when members compound each other's drift.
+        # with earlier members of this LAMBDA candidate fix set
+        # already applied.  A candidate that would pass in isolation
+        # can fail after an earlier one has committed and shifted
+        # state.  This is deliberate — the physical question we're
+        # answering is "given the candidates we've already admitted
+        # to the fix set this epoch, does adding the next one break
+        # an anchor?"  Decoupling order (evaluating all candidates
+        # against the pre-admission state up front) would under-
+        # reject when candidates compound each other's drift.
         # Iteration order matters and is defined by `svs`.
         for i in range(n_amb):
             if not mask[i]:
@@ -692,12 +693,13 @@ class NarrowLaneResolver:
             lambda_wl, lambda_nl, alpha2, n_wl = params[i]
             a_if_fixed = lambda_nl * n1_int + alpha2 * lambda_wl * n_wl
             si = state_indices[i]
-            # Join test: would this member of the LAMBDA batch push
-            # an existing NL_LONG_FIXED anchor past threshold?  If so,
-            # drop this fix but keep the rest of the batch — LAMBDA's
-            # batch validation already accepted this set as a whole,
-            # but the join test is a per-SV anchor-consistency gate
-            # that's stricter than the batch-level displacement check.
+            # Join test: would admitting this member of the LAMBDA
+            # candidate fix set push an existing NL_LONG_FIXED anchor
+            # past threshold?  If so, drop this candidate but keep
+            # the rest — LAMBDA has accepted the candidate set as a
+            # whole via its joint ratio + bootstrap gates, but the
+            # join test is a per-SV anchor-consistency gate that's
+            # stricter than the set-level displacement check.
             join_ok, join_sv, join_dr, join_thr = self._join_test(
                 filt, si, a_if_fixed,
             )
