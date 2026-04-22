@@ -62,12 +62,12 @@ def _latch_anchored(sm: AntPosEst) -> None:
 
 def _long_term(tracker: SvStateTracker, sv: str, epoch: int = 0,
                elev: float = 60.0) -> None:
-    """Walk an SV through the legal edges to NL_LONG_FIXED."""
-    tracker.transition(sv, SvAmbState.FLOAT, epoch=epoch, reason="admit")
-    tracker.transition(sv, SvAmbState.WL_FIXED, epoch=epoch, reason="mw")
-    tracker.transition(sv, SvAmbState.NL_SHORT_FIXED, epoch=epoch,
+    """Walk an SV through the legal edges to ANCHORED."""
+    tracker.transition(sv, SvAmbState.FLOATING, epoch=epoch, reason="admit")
+    tracker.transition(sv, SvAmbState.CONVERGING, epoch=epoch, reason="mw")
+    tracker.transition(sv, SvAmbState.ANCHORING, epoch=epoch,
                        reason="lambda", az_deg=90.0, elev_deg=elev)
-    tracker.transition(sv, SvAmbState.NL_LONG_FIXED, epoch=epoch,
+    tracker.transition(sv, SvAmbState.ANCHORED, epoch=epoch,
                        reason="delta_az", elev_deg=elev)
 
 
@@ -90,7 +90,7 @@ class ReachedAnchoringLatchTest(unittest.TestCase):
     def test_latches_indirectly_via_anchored(self):
         """Reaching ANCHORED via any path (including a direct
         jump in a test) must also latch reached_anchoring — the
-        ≥ 4 NL_LONG_FIXED milestone implies ≥ 4 NL fixed."""
+        ≥ 4 ANCHORED milestone implies ≥ 4 NL fixed."""
         sm = AntPosEst()
         _latch_anchored(sm)
         self.assertTrue(sm.reached_anchoring)
@@ -116,7 +116,7 @@ class ReachedAnchoringLatchTest(unittest.TestCase):
 
 class ReachedAnchoredLatchTest(unittest.TestCase):
     """``AntPosEst.reached_anchored``: latches only on first
-    ANCHORED entry (≥ 4 NL_LONG_FIXED validated).  This is the
+    ANCHORED entry (≥ 4 ANCHORED validated).  This is the
     latch that gates the anchor-collapse trigger — firing only on
     filters that genuinely earned the state."""
 
@@ -376,7 +376,7 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
         for epoch in range(1, 11):
             self.assertIsNone(self.alarm.evaluate(epoch))
         for sv in ("E05", "E06", "E07", "E08"):
-            self.tracker.transition(sv, SvAmbState.FLOAT,
+            self.tracker.transition(sv, SvAmbState.FLOATING,
                                     epoch=11, reason="drop")
         # Timer starts at the next evaluate() call where lt_count=0.
         # First such call here is evaluate(12), so fire happens at
@@ -401,24 +401,24 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
             _long_term(self.tracker, sv)
         self.alarm.evaluate(10)
         for sv in ("E05", "E06", "E07", "E08"):
-            self.tracker.transition(sv, SvAmbState.FLOAT,
+            self.tracker.transition(sv, SvAmbState.FLOATING,
                                     epoch=11, reason="drop")
         # 10 epochs without anchor — nowhere near threshold (30).
         for epoch in range(12, 22):
             self.assertIsNone(self.alarm.evaluate(epoch))
         # One anchor returns; walk through the legal edges.
-        self.tracker.transition("E05", SvAmbState.WL_FIXED,
+        self.tracker.transition("E05", SvAmbState.CONVERGING,
                                 epoch=22, reason="mw")
-        self.tracker.transition("E05", SvAmbState.NL_SHORT_FIXED,
+        self.tracker.transition("E05", SvAmbState.ANCHORING,
                                 epoch=22, reason="lambda",
                                 az_deg=90.0, elev_deg=60.0)
-        self.tracker.transition("E05", SvAmbState.NL_LONG_FIXED,
+        self.tracker.transition("E05", SvAmbState.ANCHORED,
                                 epoch=22, reason="delta_az",
                                 elev_deg=60.0)
         # Alarm observes the recovery → timer resets.
         self.assertIsNone(self.alarm.evaluate(22))
         # Anchor drops again.
-        self.tracker.transition("E05", SvAmbState.FLOAT,
+        self.tracker.transition("E05", SvAmbState.FLOATING,
                                 epoch=23, reason="drop again")
         # 20 more epochs of collapse shouldn't fire — timer restarted
         # at 23, need 30 more to reach threshold.
@@ -451,7 +451,7 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
         # is active on subsequent evaluate() calls.
         self.alarm.evaluate(0)
         for sv in ("E05", "E06", "E07", "E08"):
-            self.tracker.transition(sv, SvAmbState.FLOAT,
+            self.tracker.transition(sv, SvAmbState.FLOATING,
                                     epoch=1, reason="drop")
         for epoch in range(2, 32):
             self.alarm.evaluate(epoch)
@@ -470,12 +470,12 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
         branch cleanly."""
         # Feed artificial residuals to drive the window RMS above
         # threshold (default 5.0 m).  First mark a SV as
-        # NL_SHORT_FIXED so ingest accepts its residuals.
-        self.tracker.transition("E05", SvAmbState.FLOAT,
+        # ANCHORING so ingest accepts its residuals.
+        self.tracker.transition("E05", SvAmbState.FLOATING,
                                 epoch=0, reason="admit")
-        self.tracker.transition("E05", SvAmbState.WL_FIXED,
+        self.tracker.transition("E05", SvAmbState.CONVERGING,
                                 epoch=0, reason="mw")
-        self.tracker.transition("E05", SvAmbState.NL_SHORT_FIXED,
+        self.tracker.transition("E05", SvAmbState.ANCHORING,
                                 epoch=0, reason="lambda",
                                 az_deg=90.0, elev_deg=60.0)
         # Rebuild the alarm with default rms_threshold (5.0) and
@@ -508,7 +508,7 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
             _long_term(self.tracker, sv)
         self.alarm.evaluate(0)    # observe the anchored state
         for sv in ("E05", "E06", "E07", "E08"):
-            self.tracker.transition(sv, SvAmbState.FLOAT,
+            self.tracker.transition(sv, SvAmbState.FLOATING,
                                     epoch=1, reason="drop")
         # Timer starts at evaluate(2); fires at epoch 32 (32-2 >= 30).
         for epoch in range(2, 32):

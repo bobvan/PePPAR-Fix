@@ -26,7 +26,7 @@ The alarm is deliberately conservative.  It requires:
     we re-evaluate
   - No false-fix or setting-SV-drop event in the same window
     (tracked via the tracker's `state_entered_epoch` — if many
-    SVs just went to FLOAT, the per-SV monitors are already on it)
+    SVs just went to FLOATING, the per-SV monitors are already on it)
 
 Fire action: full filter re-init at `known_ecef`.  Same as old L3.
 Fix-set-wide; caller clears the NL resolver, MW tracker, and
@@ -54,7 +54,7 @@ class FixSetIntegrityAlarm:
          window.  Catches the gross "many members are lying" case.
       2. **Anchor-collapse** (2026-04-21): on a filter that has
          latched ``reached_anchored=True`` (i.e., has ever
-         entered the ANCHORED state with ≥ 4 NL_LONG_FIXED
+         entered the ANCHORED state with ≥ 4 ANCHORED
          validated members), the long-term anchor count drops to
          zero and stays there for ``anchor_collapse_epochs``.
          Day0421b showed the trap this closes — the filter
@@ -129,13 +129,13 @@ class FixSetIntegrityAlarm:
         """Absorb PR residuals across all NL members for this epoch.
 
         Computes single-epoch RMS across SVs currently in either
-        NL_SHORT_FIXED or NL_LONG_FIXED (the fix set).  SVs outside
+        ANCHORING or ANCHORED (the fix set).  SVs outside
         the fix set are excluded.
         """
         if resid is None:
             return
         vals: list[float] = []
-        nl_states = {SvAmbState.NL_SHORT_FIXED, SvAmbState.NL_LONG_FIXED}
+        nl_states = {SvAmbState.ANCHORING, SvAmbState.ANCHORED}
         for lab, r in zip(labels, resid):
             sv, kind = lab[0], lab[1]
             if kind != 'pr':
@@ -172,7 +172,7 @@ class FixSetIntegrityAlarm:
           - fewer than `min_samples_in_window` RMS samples
           - window mean RMS ≤ threshold
           - within `cooldown_epochs` of last fire
-          - any SV transitioned to FLOAT within
+          - any SV transitioned to FLOATING within
             `suppress_if_monitors_fired_within` epochs (the per-SV
             monitors are already handling it)
         """
@@ -186,7 +186,7 @@ class FixSetIntegrityAlarm:
         # ── Anchor-collapse trigger (checked first: cheaper, can
         # pre-empt the window-RMS path when both would fire).  Only
         # active on filters that have ever reached the ANCHORED
-        # state (≥ 4 NL_LONG_FIXED validated).  During bootstrap,
+        # state (≥ 4 ANCHORED validated).  During bootstrap,
         # CONVERGING, or ANCHORING with zero long-term anchors the
         # filter hasn't earned a position to defend, and triggering
         # here would cycle spuriously (day0421f L5 fleet: 6/8/15
@@ -219,12 +219,12 @@ class FixSetIntegrityAlarm:
             return None
 
         # Suppress if a per-SV monitor fired recently: look for any
-        # SV that transitioned to FLOAT within the suppress window.
-        # (Setting-SV drops and false-fix rejections both land in FLOAT.)
+        # SV that transitioned to FLOATING within the suppress window.
+        # (Setting-SV drops and false-fix rejections both land in FLOATING.)
         # The per-SV state_entered_epoch holds the last entry.
         suppress_cutoff = epoch - self._suppress_window
         for _sv, rec in self._tracker.all_records():
-            if rec.state is SvAmbState.FLOAT:
+            if rec.state is SvAmbState.FLOATING:
                 if rec.state_entered_epoch >= suppress_cutoff:
                     log.info(
                         "[FIX_SET_ALARM] suppressed: %s in %s since epoch %d"

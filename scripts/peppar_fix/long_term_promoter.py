@@ -1,4 +1,4 @@
-"""Bead 4 — NL_SHORT_FIXED → NL_LONG_FIXED promotion.
+"""Bead 4 — ANCHORING → ANCHORED promotion.
 
 Per `docs/sv-lifecycle-and-pfr-split.md`: an NL fix that has survived
 ≥ 8° of satellite-azimuth motion without triggering false-fix
@@ -16,7 +16,7 @@ Shape:
     .note_false_fix_rejection(sv, ep)   called by the false-fix apply hook
     .evaluate(epoch)                at eval_every cadence
         → list of dicts describing promotions, tracker transitions
-          NL_SHORT_FIXED → NL_LONG_FIXED already done.
+          ANCHORING → ANCHORED already done.
 
 The promoter is stateless between evals except for the Job-A-rejection
 memory (per-SV last-rejection epoch), which is what lets us require a
@@ -53,7 +53,7 @@ def _az_delta(a: float, b: float) -> float:
 
 
 class LongTermPromoter:
-    """Promotes NL_SHORT_FIXED SVs to NL_LONG_FIXED once geometry has
+    """Promotes ANCHORING SVs to ANCHORED once geometry has
     changed enough to trust the integer.
 
     Defaults: Δaz ≥ 8°, clean-window = 180 epochs (≈3 min @ 1 Hz,
@@ -81,14 +81,14 @@ class LongTermPromoter:
     def ingest_az(self, sv: str, az_deg: Optional[float]) -> None:
         """Record this SV's current azimuth this epoch.
 
-        Only NL_SHORT_FIXED SVs get their accumulator updated; calls
+        Only ANCHORING SVs get their accumulator updated; calls
         for other states skip the update but preserve the candidate
         state.  Candidates are dropped by:
           - `note_false_fix_rejection` (real integer problem)
           - `forget(sv)` called by the engine when the tracker forgets
             the record (arc boundary)
 
-        Transient state excursions (cycle slip → FLOAT → re-fix) do
+        Transient state excursions (cycle slip → FLOATING → re-fix) do
         NOT drop the candidate.  Day0419i data showed E23 slipping
         every 3-8 min; under the old "drop on state change" behavior
         the accumulator never completed 8° because each slip reset
@@ -97,7 +97,7 @@ class LongTermPromoter:
         """
         if az_deg is None:
             return
-        if self._tracker.state(sv) is not SvAmbState.NL_SHORT_FIXED:
+        if self._tracker.state(sv) is not SvAmbState.ANCHORING:
             # Candidate (if any) stays in _cands for later resumption.
             # The accumulated_dphi is preserved across the gap.
             return
@@ -130,7 +130,7 @@ class LongTermPromoter:
 
     def note_false_fix_rejection(self, sv: str, epoch: int) -> None:
         """Called by the false-fix apply hook: SV just got demoted back to
-        FLOAT.  We record the epoch so any subsequent re-fix has to
+        FLOATING.  We record the epoch so any subsequent re-fix has to
         stay clean for `clean_window_epochs` before being promoted.
 
         Also drops the existing candidate — the SV's NL state changes,
@@ -148,7 +148,7 @@ class LongTermPromoter:
         'first_fix_az_deg': float, 'latest_az_deg': float}``.
 
         Side effect: tracker transitions each event's SV from
-        NL_SHORT_FIXED to NL_LONG_FIXED.  Caller usually does nothing
+        ANCHORING to ANCHORED.  Caller usually does nothing
         else — host RESOLVED logic reads the tracker's count.
         """
         if epoch % self._eval_every != 0:
@@ -156,7 +156,7 @@ class LongTermPromoter:
         events: list[dict] = []
         rej_map = self._last_rejection_epoch_by_sv
         for sv, c in list(self._cands.items()):
-            if self._tracker.state(sv) is not SvAmbState.NL_SHORT_FIXED:
+            if self._tracker.state(sv) is not SvAmbState.ANCHORING:
                 self._cands.pop(sv, None)
                 continue
             if c.accumulated_dphi < self._dphi_threshold:
@@ -173,7 +173,7 @@ class LongTermPromoter:
             }
             events.append(event)
             self._tracker.transition(
-                sv, SvAmbState.NL_LONG_FIXED,
+                sv, SvAmbState.ANCHORED,
                 epoch=epoch,
                 reason=(
                     f"promoted after Δaz={c.accumulated_dphi:.1f}°"
@@ -189,4 +189,4 @@ class LongTermPromoter:
         self._cands.pop(sv, None)
 
     def summary(self) -> str:
-        return f"promoter: tracking {len(self._cands)} NL_SHORT_FIXED SVs"
+        return f"promoter: tracking {len(self._cands)} ANCHORING SVs"

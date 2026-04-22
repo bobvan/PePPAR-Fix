@@ -1357,18 +1357,18 @@ class AntPosEstThread(threading.Thread):
         for sv, st in self._mw._state.items():
             if st.get('fixed'):
                 rec = self._sv_state.get(sv)
-                rec.state = SvAmbState.WL_FIXED
+                rec.state = SvAmbState.CONVERGING
         for sv in self._nl._fixed:
             rec = self._sv_state.get(sv)
-            rec.state = SvAmbState.NL_SHORT_FIXED
+            rec.state = SvAmbState.ANCHORING
         self._false_fix = FalseFixMonitor(self._sv_state)
         self._setting_drop = SettingSvDropMonitor(self._sv_state)
         self._fix_set_alarm = FixSetIntegrityAlarm(
             self._sv_state, ape_state_machine=self._ape_sm,
         )
-        # Bead 4 — promotes NL_SHORT_FIXED → NL_LONG_FIXED after Δaz ≥ 15°
+        # Bead 4 — promotes ANCHORING → ANCHORED after Δaz ≥ 15°
         # with a clean false-fix window.  Solution-state RESOLVED count (below) reads
-        # NL_LONG_FIXED from the tracker instead of raw NL-fix count.
+        # ANCHORED from the tracker instead of raw NL-fix count.
         self._promoter = LongTermPromoter(self._sv_state)
         self._slip_monitor = CycleSlipMonitor(
             mw_tracker=self._mw, csv_writer=_slip_csv_writer())
@@ -1517,7 +1517,7 @@ class AntPosEstThread(threading.Thread):
     def _apply_false_fix(self, filt, mw, nl, ev):
         """False-fix monitor fired on one SV — the short-term integer
         was rejected as wrong.  The tracker already moved the SV to
-        FLOAT; tear down the filter-side state (NL unfix + ambiguity
+        FLOATING; tear down the filter-side state (NL unfix + ambiguity
         inflate + squelch + MW reset) so the AR pipeline re-attempts
         cleanly.
         """
@@ -1547,7 +1547,7 @@ class AntPosEstThread(threading.Thread):
             f"{ev['elev_deg']:.0f}°" if ev['elev_deg'] is not None else "?",
             tag, squelch, prov_str,
         )
-        # Tracker already moved the SV to SQUELCHED with cooldown=squelch.
+        # Tracker already moved the SV to WAITING with cooldown=squelch.
         # NL-side: unfix the integer and blacklist it for the same duration
         # so the resolver's eligibility check stays in sync with the
         # tracker state.
@@ -1561,7 +1561,7 @@ class AntPosEstThread(threading.Thread):
 
     def _apply_setting_sv_drop(self, filt, mw, nl, ev):
         """Setting-SV drop fired — transition the SV out of the fix set
-        gracefully.  Tracker has already moved it back to FLOAT.  Release
+        gracefully.  Tracker has already moved it back to FLOATING.  Release
         the NL integer with gentle covariance growth; keep MW state so
         the SV can be re-acquired if it rises again (a different arc).
         """
@@ -1588,7 +1588,7 @@ class AntPosEstThread(threading.Thread):
             stayed elevated.
           * ``reason='anchor_collapse'`` — keys
             ``anchor_collapse_epochs``, ``since_epoch``.  Zero
-            NL_LONG_FIXED anchors for N epochs on a filter that
+            ANCHORED anchors for N epochs on a filter that
             has ever latched ``reached_anchored`` (post-rename;
             pre-rename this was ``reached_resolved``, which caused
             the day0421f spurious-trip cycle — see
@@ -1605,7 +1605,7 @@ class AntPosEstThread(threading.Thread):
         reason = ev.get('reason', 'window_rms')
         if reason == 'anchor_collapse':
             detail = (
-                f"anchor_collapse: 0 NL_LONG_FIXED anchors for "
+                f"anchor_collapse: 0 ANCHORED anchors for "
                 f"{ev['anchor_collapse_epochs']} epochs "
                 f"(since epoch {ev['since_epoch']})"
             )
@@ -1619,7 +1619,7 @@ class AntPosEstThread(threading.Thread):
             "[FIX_SET_ALARM] re-initialising PPPFilter at %s (%s)",
             pos_ecef.tolist(), detail,
         )
-        # Drop all NL fixes (tracker → FLOAT for each via resolver hook),
+        # Drop all NL fixes (tracker → FLOATING for each via resolver hook),
         # clear MW state entirely (big reset), re-seed filter.
         for sv in list(nl._fixed.keys()):
             nl.unfix(sv)
@@ -1627,16 +1627,16 @@ class AntPosEstThread(threading.Thread):
             mw.reset(sv)
             # MW.reset() intentionally doesn't touch the tracker; after
             # a fix-set-wide re-init every SV's state is meaningless,
-            # so flatten to FLOAT explicitly.
+            # so flatten to FLOATING explicitly.
             cur = self._sv_state.state(sv)
-            if cur is not SvAmbState.FLOAT:
+            if cur is not SvAmbState.FLOATING:
                 try:
                     self._sv_state.transition(
-                        sv, SvAmbState.FLOAT,
+                        sv, SvAmbState.FLOATING,
                         epoch=self._n_epochs, reason="fix_set_alarm:reinit",
                     )
                 except Exception:
-                    # SQUELCHED → FLOAT is legal per the edge set, but
+                    # WAITING → FLOATING is legal per the edge set, but
                     # defensive coding keeps the re-init path robust.
                     pass
         filt.initialize(pos_ecef, 0.0, systems=self._systems)
@@ -1761,7 +1761,7 @@ class AntPosEstThread(threading.Thread):
             self._n_epochs += 1
 
             # MW wide-lane update.  Tell MW the current epoch so its
-            # tracker-driven transitions (FLOAT → WL_FIXED on fix) log
+            # tracker-driven transitions (FLOATING → CONVERGING on fix) log
             # with a meaningful epoch field.
             mw._current_epoch = self._n_epochs
             nl._epoch = self._n_epochs  # resolver also uses _epoch for logs
@@ -1801,12 +1801,12 @@ class AntPosEstThread(threading.Thread):
             self._false_fix.ingest(self._n_epochs, resid, labels)
             self._setting_drop.ingest(self._n_epochs, resid, labels)
             self._fix_set_alarm.ingest(self._n_epochs, resid, labels)
-            # Bead 4: stream azimuths for NL_SHORT_FIXED SVs so the
+            # Bead 4: stream azimuths for ANCHORING SVs so the
             # promoter can accumulate Δaz toward the 15° threshold.  We
             # compute azimuths only when there's at least one SV in
-            # NL_SHORT_FIXED — avoids the per-epoch sat_position call
+            # ANCHORING — avoids the per-epoch sat_position call
             # on hosts that haven't fixed anything yet.
-            prov_count = self._sv_state.count_in(SvAmbState.NL_SHORT_FIXED)
+            prov_count = self._sv_state.count_in(SvAmbState.ANCHORING)
             if prov_count > 0:
                 azimuths = _compute_sv_azimuths(
                     filt, corrections, observations, gps_time)
@@ -1819,8 +1819,8 @@ class AntPosEstThread(threading.Thread):
             host_ev = self._fix_set_alarm.evaluate(self._n_epochs)
             if host_ev is not None:
                 self._apply_fix_set_alarm(filt, mw, nl, host_ev)
-            # Elevation-stratified squelch: sweep SQUELCHED records
-            # whose per-SV cooldown has expired and return them to FLOAT.
+            # Elevation-stratified squelch: sweep WAITING records
+            # whose per-SV cooldown has expired and return them to FLOATING.
             # Also drop records for SVs that haven't been observed in
             # STALE_AFTER_EPOCHS — arc boundary, resets the unexpected-
             # false-fix counter on the next rise.
@@ -1842,7 +1842,7 @@ class AntPosEstThread(threading.Thread):
                     self._setting_drop.forget(sv)
             for ev in self._promoter.evaluate(self._n_epochs):
                 log.info(
-                    "Promoted %s → NL_LONG_FIXED (Δaz=%.1f°, first=%s, now=%.0f°)",
+                    "Promoted %s → ANCHORED (Δaz=%.1f°, first=%s, now=%.0f°)",
                     ev['sv'], ev['accumulated_dphi_deg'],
                     f"{ev['first_fix_az_deg']:.0f}°"
                     if ev['first_fix_az_deg'] is not None else "?",
@@ -1853,13 +1853,13 @@ class AntPosEstThread(threading.Thread):
             sigma_3d = position_sigma_3d(filt.P)
             pos_ecef = filt.x[:3].copy()
             # Two separate counts drive the two thresholds:
-            #   n_nl_fixed   — union of NL_SHORT_FIXED + NL_LONG_FIXED.
+            #   n_nl_fixed   — union of ANCHORING + ANCHORED.
             #                  Drives CONVERGING ↔ ANCHORING (fallback:
             #                  any NL integer committed, validated or not).
-            #   n_anchored   — NL_LONG_FIXED only, survived ≥ 8° Δaz.
+            #   n_anchored   — ANCHORED only, survived ≥ 8° Δaz.
             #                  Drives ANCHORING ↔ ANCHORED (the strict
             #                  "geometry-validated" milestone).
-            n_anchored = self._sv_state.count_in(SvAmbState.NL_LONG_FIXED)
+            n_anchored = self._sv_state.count_in(SvAmbState.ANCHORED)
             n_nl_fixed = sum(1 for sv in filt.sv_to_idx if nl.is_fixed(sv))
 
             # Update state-machine metrics.  n_nl reports the union
@@ -5395,7 +5395,7 @@ Two-phase operation:
     pos.add_argument("--no-join-test", dest="join_test",
                      action="store_false", default=True,
                      help="Disable the pre-commit join test that protects "
-                          "NL_LONG_FIXED anchors from biased re-admissions.  "
+                          "ANCHORED anchors from biased re-admissions.  "
                           "On by default.  Used for the same-sky A/B that "
                           "isolates the join test's effect from other "
                           "branch-carried changes.  See "

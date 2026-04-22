@@ -4,7 +4,7 @@ Per `docs/sv-lifecycle-and-pfr-split.md`: an SV descending through
 the retirement elevation band has multipath-inflated residuals that
 are normal physics, not wrong integers.  The job of this monitor is
 to drop such SVs from the fix set *gracefully* — transition them
-back to FLOAT so the filter stops relying on their integers, without
+back to FLOATING so the filter stops relying on their integers, without
 touching the rest of the AR population.
 
 Called a "setting-SV drop": the intentional removal of an SV from
@@ -22,11 +22,11 @@ Two trigger conditions, either one fires:
    residuals happen to look quiet for a moment.
 
 Like the false-fix monitor, this is stateless between evals.  No
-cooldown, no ladder.  Operates on both short-term (NL_SHORT_FIXED)
-and long-term (NL_LONG_FIXED) members — setting is setting, and
+cooldown, no ladder.  Operates on both short-term (ANCHORING)
+and long-term (ANCHORED) members — setting is setting, and
 both kinds of fix deserve the same graceful drop.
 
-The SV transitions to FLOAT on drop, not to an intermediate
+The SV transitions to FLOATING on drop, not to an intermediate
 "retiring" state.  MW/WL state is preserved by the MW tracker for
 fast re-acquisition if the SV rises again (see slip-retain-freq
 feedback memory).  If the SV has truly set out of tracking, the
@@ -63,14 +63,14 @@ class SettingSvDropMonitor:
         for ev in events:
             # caller unfixes the NL integer in the resolver (gentle
             # covariance growth).  Tracker has already moved the SV
-            # to FLOAT.
+            # to FLOATING.
 
     Stateless per-eval.  Preserves MW/WL history on drop — the SV
     might rise again later in a different arc.
     """
 
     # SVs eligible for a drop: any NL member of the fix set.
-    _ELIGIBLE = frozenset({SvAmbState.NL_SHORT_FIXED, SvAmbState.NL_LONG_FIXED})
+    _ELIGIBLE = frozenset({SvAmbState.ANCHORING, SvAmbState.ANCHORED})
 
     def __init__(
         self,
@@ -122,7 +122,7 @@ class SettingSvDropMonitor:
         'elev_deg': float|None, 'mean_resid_m': float|None,
         'threshold_m': float|None, 'n': int}``.
 
-        Side effect: tracker transitions each firing SV to FLOAT
+        Side effect: tracker transitions each firing SV to FLOATING
         (setting-SV drop).  Caller must release the NL integer in
         the resolver (unfix, gentle covariance growth).
         """
@@ -131,7 +131,7 @@ class SettingSvDropMonitor:
         events: list[dict] = []
         for sv, w in list(self._per_sv.items()):
             if self._tracker.state(sv) not in self._ELIGIBLE:
-                # SV is no longer eligible (fell to FLOAT via false-fix
+                # SV is no longer eligible (fell to FLOATING via false-fix
                 # monitor or cycle slip).  Flush its window.
                 self._per_sv.pop(sv, None)
                 continue
@@ -150,7 +150,7 @@ class SettingSvDropMonitor:
                     'n': len(w.resids),
                 })
                 self._tracker.transition(
-                    sv, SvAmbState.FLOAT,
+                    sv, SvAmbState.FLOATING,
                     epoch=epoch,
                     reason=f"setting_sv_drop:elev={w.last_elev_deg:.0f}° < {self._drop_mask:.0f}°",
                     elev_deg=w.last_elev_deg,
@@ -176,7 +176,7 @@ class SettingSvDropMonitor:
                     'n': n,
                 })
                 self._tracker.transition(
-                    sv, SvAmbState.FLOAT,
+                    sv, SvAmbState.FLOATING,
                     epoch=epoch,
                     reason=(
                         f"setting_sv_drop:|PR|={mean:.2f}m > {thr:.2f}m"

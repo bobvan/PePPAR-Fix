@@ -6,38 +6,48 @@ solution state; answers "does this specific satellite's integer
 ambiguity contribute to the fix set?" rather than "is the antenna
 position trustworthy?".
 
-Six states form this lifecycle:
+Six states form this lifecycle (participle rule: present participle
+names active work, past participle names a terminal milestone):
 
-    TRACKING ──admit──► FLOAT ──MW──► WL_FIXED ──LAMBDA──► NL_SHORT_FIXED ──Δaz≥8°──► NL_LONG_FIXED
-                         ▲              ▲                      │ ▲                          │
-                         │              │                      │ │  false-fix rejection     │
-                         │              │                      │ │  or setting-SV drop      │
-                         │              │                      │ │  or slip (LOW)           │
-                         │              │ slip (LOW)           │ └──────────────────────────┘
-                         │              ◄──────────────────────┤
-                         │                                     ▼
+    TRACKING ──admit──► FLOATING ──MW──► CONVERGING ──LAMBDA──► ANCHORING ──Δaz≥8°──► ANCHORED
+                         ▲                ▲                     │ ▲                        │
+                         │                │                     │ │  false-fix rejection   │
+                         │                │                     │ │  or setting-SV drop    │
+                         │                │                     │ │  or slip (LOW)         │
+                         │                │ slip (LOW)          │ └────────────────────────┘
+                         │                ◄─────────────────────┤
+                         │                                      ▼
                          │               slip (HIGH)   ┌──────────────┐  cooldown expires
-                         └───────────────────◄─────────┤   SQUELCHED  ├────────► FLOAT
+                         └───────────────────◄─────────┤   WAITING    ├────────► FLOATING
                                                        └──────────────┘
 
 Key names:
-  * TRACKING       — receiver sees the SV but no observations have yet
-                     passed the admit gate (elevation + health + constellation).
-  * FLOAT          — admitted; MW tracker accumulating; no integer fix.
-  * WL_FIXED       — integer wide-lane fix landed; NL still float.
-  * NL_SHORT_FIXED — integer NL fix accepted; short-term member of the fix
-                     set; contributes to the position solution but does NOT
-                     count toward the solution's RESOLVED declaration.
-  * NL_LONG_FIXED  — integer NL fix has survived ≥8° of satellite azimuth
-                     motion without a false-fix rejection; long-term member
-                     of the fix set; counts toward RESOLVED.
-  * SQUELCHED      — temporarily excluded from fix attempts after a high-
-                     confidence cycle slip; cooldown-bound, not permanent.
+  * TRACKING   — receiver sees the SV but no observations have yet
+                 passed the admit gate (elevation + health + constellation).
+  * FLOATING   — admitted; MW tracker accumulating; no integer fix.
+  * CONVERGING — integer wide-lane fix landed; narrow-lane still float.
+  * ANCHORING  — integer NL fix accepted; this SV is earning the
+                 ≥ 8° Δaz geometry validation needed to promote it
+                 to an anchor.  Short-term member of the fix set;
+                 contributes to the position solution but its NL
+                 integer isn't geometry-validated yet.
+  * ANCHORED   — integer NL fix has survived ≥ 8° of satellite
+                 azimuth motion without a false-fix rejection.
+                 Long-term (anchored) member of the fix set;
+                 counts toward ANCHORED state at the filter level.
+  * WAITING    — temporarily excluded from fix attempts after a
+                 high-confidence cycle slip; cooldown-bound,
+                 returns to FLOATING on expiry.  Not permanent.
 
-Transitions not in this diagram are illegal and raise `InvalidTransition`.
-The tracker logs every legal transition as one
-`[SV_STATE] <sv>: <from> → <to> (epoch=N, elev=X°, reason=...)` line —
-grep-friendly.
+The SV-level participles mirror the filter-level progression in
+``AntPosEstState`` (SURVEYING → VERIFYING → CONVERGING → ANCHORING
+→ ANCHORED) — one SV is to the filter what one worker is to a
+pipeline.  Both share the same verbs.
+
+Transitions not in this diagram are illegal and raise
+`InvalidTransition`.  The tracker logs every legal transition as
+one `[SV_STATE] <sv>: <from> → <to> (epoch=N, elev=X°, reason=...)`
+line — grep-friendly.
 """
 
 from __future__ import annotations
@@ -53,40 +63,40 @@ log = logging.getLogger(__name__)
 class SvAmbState(Enum):
     """Per-SV integer-fix state — one value per (system, PRN)."""
     TRACKING = "TRACKING"
-    FLOAT = "FLOAT"
-    WL_FIXED = "WL_FIXED"
-    NL_SHORT_FIXED = "NL_SHORT_FIXED"
-    NL_LONG_FIXED = "NL_LONG_FIXED"
-    SQUELCHED = "SQUELCHED"
+    FLOATING = "FLOATING"
+    CONVERGING = "CONVERGING"
+    ANCHORING = "ANCHORING"
+    ANCHORED = "ANCHORED"
+    WAITING = "WAITING"
 
 
 # Legal directed edges.  Built once at import; `transition()` consults it.
 _LEGAL_EDGES: frozenset[tuple[SvAmbState, SvAmbState]] = frozenset({
     # Admit: receiver-tracked SV passes the elevation/health/constellation
     # gate and enters processing.
-    (SvAmbState.TRACKING,        SvAmbState.FLOAT),
+    (SvAmbState.TRACKING,    SvAmbState.FLOATING),
 
     # Normal progression.
-    (SvAmbState.FLOAT,           SvAmbState.WL_FIXED),
-    (SvAmbState.WL_FIXED,        SvAmbState.NL_SHORT_FIXED),
-    (SvAmbState.NL_SHORT_FIXED,  SvAmbState.NL_LONG_FIXED),
+    (SvAmbState.FLOATING,    SvAmbState.CONVERGING),
+    (SvAmbState.CONVERGING,  SvAmbState.ANCHORING),
+    (SvAmbState.ANCHORING,   SvAmbState.ANCHORED),
 
     # False-fix rejection, setting-SV drop, or slip (LOW-confidence)
-    # demotes back toward FLOAT.
-    (SvAmbState.WL_FIXED,        SvAmbState.FLOAT),
-    (SvAmbState.NL_SHORT_FIXED,  SvAmbState.FLOAT),
-    (SvAmbState.NL_LONG_FIXED,   SvAmbState.FLOAT),
+    # demotes back toward FLOATING.
+    (SvAmbState.CONVERGING,  SvAmbState.FLOATING),
+    (SvAmbState.ANCHORING,   SvAmbState.FLOATING),
+    (SvAmbState.ANCHORED,    SvAmbState.FLOATING),
 
-    # Squelch: HIGH-confidence cycle slip from any processing state.
-    # TRACKING is pre-processing, so no squelch there — a slip before
-    # admit is not meaningful (no integer state to protect).
-    (SvAmbState.FLOAT,           SvAmbState.SQUELCHED),
-    (SvAmbState.WL_FIXED,        SvAmbState.SQUELCHED),
-    (SvAmbState.NL_SHORT_FIXED,  SvAmbState.SQUELCHED),
-    (SvAmbState.NL_LONG_FIXED,   SvAmbState.SQUELCHED),
+    # WAITING (high-confidence cycle slip) from any processing state.
+    # TRACKING is pre-processing, so no WAITING edge from there — a
+    # slip before admit is not meaningful (no integer state to protect).
+    (SvAmbState.FLOATING,    SvAmbState.WAITING),
+    (SvAmbState.CONVERGING,  SvAmbState.WAITING),
+    (SvAmbState.ANCHORING,   SvAmbState.WAITING),
+    (SvAmbState.ANCHORED,    SvAmbState.WAITING),
 
-    # Squelch cooldown expires: re-enter at FLOAT (MW must reconverge).
-    (SvAmbState.SQUELCHED,       SvAmbState.FLOAT),
+    # WAITING cooldown expires: re-enter at FLOATING (MW must reconverge).
+    (SvAmbState.WAITING,     SvAmbState.FLOATING),
 })
 
 
@@ -107,9 +117,9 @@ class SvRecord:
     # Epoch at which the current state was entered.  Used by the false-fix
     # monitor to scope "recent fix" residual windows.
     state_entered_epoch: int = 0
-    # Azimuth at first NL fix.  The validation promoter diffs current az
-    # against this to promote NL_SHORT_FIXED → NL_LONG_FIXED.  Populated
-    # when transitioning into NL_SHORT_FIXED; None otherwise.
+    # Azimuth at first NL fix.  The anchoring-SV promoter diffs current
+    # az against this to promote ANCHORING → ANCHORED.  Populated when
+    # transitioning into ANCHORING; None otherwise.
     first_fix_az_deg: Optional[float] = None
     # Most recent observed elevation.  Updated externally (the monitors
     # already have `elevations` per epoch).  Used for log lines and for
@@ -119,9 +129,9 @@ class SvRecord:
     # memory doesn't grow unbounded on long runs.  Useful for offline
     # forensics of cascading transitions.
     history: list[tuple[int, SvAmbState, SvAmbState, str]] = field(default_factory=list)
-    # Epoch at which this SV's current SQUELCHED state expires.  None
-    # when not squelched.  The tracker's check_squelch_cooldowns()
-    # sweeps records and transitions expired ones to FLOAT.
+    # Epoch at which this SV's current WAITING state expires.  None
+    # when not waiting.  The tracker's check_squelch_cooldowns()
+    # sweeps records and transitions expired ones to FLOATING.
     squelch_expires_epoch: Optional[int] = None
     # Count of unexpected false-fix events this arc (events at
     # elev ≥ reliable_elev_deg, defined in the false-fix monitor).
@@ -183,16 +193,19 @@ class SvStateTracker:
     # ── Fix-set membership helpers ───────────────────────────────── #
 
     def short_term_members(self) -> list[str]:
-        """SVs whose integer fix is a short-term member of the fix set."""
-        return self.svs_in(SvAmbState.NL_SHORT_FIXED)
+        """SVs whose integer fix is a short-term (anchoring) member
+        of the fix set — NL fixed, not yet geometry-validated."""
+        return self.svs_in(SvAmbState.ANCHORING)
 
     def long_term_members(self) -> list[str]:
-        """SVs whose integer fix is a long-term member of the fix set."""
-        return self.svs_in(SvAmbState.NL_LONG_FIXED)
+        """SVs whose integer fix is a long-term (anchored) member
+        of the fix set — geometry-validated via ≥ 8° Δaz."""
+        return self.svs_in(SvAmbState.ANCHORED)
 
     def fix_set_members(self) -> list[str]:
-        """All SVs currently contributing an integer fix to the position solution."""
-        return self.svs_in(SvAmbState.NL_SHORT_FIXED, SvAmbState.NL_LONG_FIXED)
+        """All SVs currently contributing an integer fix to the
+        position solution (union of ANCHORING + ANCHORED)."""
+        return self.svs_in(SvAmbState.ANCHORING, SvAmbState.ANCHORED)
 
     # ── State mutations ─────────────────────────────────────────── #
 
@@ -214,10 +227,11 @@ class SvStateTracker:
         raise InvalidTransition — the caller decides whether to catch
         or let it crash tests.
 
-        When `to` is SQUELCHED, `cooldown_epochs` sets the per-SV
+        When `to` is WAITING, `cooldown_epochs` sets the per-SV
         duration until `check_squelch_cooldowns` transitions it back
-        to FLOAT.  Callers that don't pass this value get the legacy
-        60-epoch default.  Logged in the reason frag as `squelch=<N>s`.
+        to FLOATING.  Callers that don't pass this value get the
+        legacy 60-epoch default.  Logged in the reason frag as
+        `squelch=<N>s`.
         """
         rec = self.get(sv)
         if elev_deg is not None:
@@ -233,11 +247,11 @@ class SvStateTracker:
         from_state = rec.state
         rec.state = to
         rec.state_entered_epoch = int(epoch)
-        if to is SvAmbState.NL_SHORT_FIXED and az_deg is not None:
+        if to is SvAmbState.ANCHORING and az_deg is not None:
             rec.first_fix_az_deg = float(az_deg)
-        # Per-SV squelch cooldown: set the expiry epoch on entry to
-        # SQUELCHED; clear it on any other transition.
-        if to is SvAmbState.SQUELCHED:
+        # Per-SV WAITING cooldown: set the expiry epoch on entry to
+        # WAITING; clear it on any other transition.
+        if to is SvAmbState.WAITING:
             dur = int(cooldown_epochs) if cooldown_epochs is not None else 60
             rec.squelch_expires_epoch = int(epoch) + dur
         else:
@@ -249,7 +263,7 @@ class SvStateTracker:
             f"elev={rec.last_elev_deg:.0f}°" if rec.last_elev_deg is not None else "elev=?"
         )
         dur_frag = ""
-        if to is SvAmbState.SQUELCHED and cooldown_epochs is not None:
+        if to is SvAmbState.WAITING and cooldown_epochs is not None:
             dur_frag = f", squelch={int(cooldown_epochs)}s"
         log.info(
             "[SV_STATE] %s: %s → %s (epoch=%d, %s%s, reason=%s)",
@@ -258,22 +272,22 @@ class SvStateTracker:
         )
 
     def check_squelch_cooldowns(self, epoch: int) -> list[str]:
-        """Sweep SQUELCHED records; transition those whose cooldown
-        has expired back to FLOAT.
+        """Sweep WAITING records; transition those whose cooldown
+        has expired back to FLOATING.
 
         Returns the list of SVs that transitioned.  Called each eval
         cycle from the engine main loop.
         """
         recovered: list[str] = []
         for sv, rec in list(self._records.items()):
-            if rec.state is not SvAmbState.SQUELCHED:
+            if rec.state is not SvAmbState.WAITING:
                 continue
             if rec.squelch_expires_epoch is None:
                 continue
             if epoch < rec.squelch_expires_epoch:
                 continue
             try:
-                self.transition(sv, SvAmbState.FLOAT,
+                self.transition(sv, SvAmbState.FLOATING,
                                 epoch=epoch, reason="squelch cooldown expired")
                 recovered.append(sv)
             except InvalidTransition:
@@ -326,9 +340,9 @@ class SvStateTracker:
         Used when the receiver loses tracking for long enough that
         re-initialising state on re-acquisition is cleaner than resuming
         from stale history.  Cycle slips should use
-        `transition(..., to=FLOAT)` (LOW-conf) or
-        `transition(..., to=SQUELCHED)` (HIGH-conf) instead; `forget` is
-        for true disappearance.
+        `transition(..., to=FLOATING)` (LOW-conf) or
+        `transition(..., to=WAITING)` (HIGH-conf) instead; `forget`
+        is for true disappearance.
         """
         self._records.pop(sv, None)
 

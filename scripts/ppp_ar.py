@@ -74,8 +74,8 @@ class MelbourneWubbenaTracker:
         self.fix_threshold = fix_threshold  # |frac| < this to fix
         self.min_epochs = min_epochs    # minimum epochs before fixing
         self._state = {}   # sv -> {mw_avg, n_epochs, n_wl, fixed, f1, f2, ...}
-        # Optional tracker — when supplied, MW fix drives FLOAT → WL_FIXED
-        # and reset drives WL_FIXED → FLOAT.
+        # Optional tracker — when supplied, MW fix drives FLOATING → CONVERGING
+        # and reset drives CONVERGING → FLOATING.
         self._sv_state = sv_state
         # External callers write to this before calling update(); the
         # tracker's transition log line includes the current epoch.  None
@@ -109,13 +109,13 @@ class MelbourneWubbenaTracker:
         # Admit: receiver-tracked SV passing the elev/health/constellation
         # gate enters processing.  MW.update is the first hook that sees
         # a dual-frequency observation that has passed all those gates,
-        # so it's the natural place to transition TRACKING → FLOAT.
-        # Idempotent for SVs already in FLOAT or later states.
+        # so it's the natural place to transition TRACKING → FLOATING.
+        # Idempotent for SVs already in FLOATING or later states.
         if self._sv_state is not None:
             cur = self._sv_state.state(sv)
             if cur is SvAmbState.TRACKING:
                 self._sv_state.transition(
-                    sv, SvAmbState.FLOAT,
+                    sv, SvAmbState.FLOATING,
                     epoch=self._current_epoch, reason="admit",
                 )
 
@@ -167,17 +167,17 @@ class MelbourneWubbenaTracker:
                 s['fix_n_epochs'] = int(s['n_epochs'])
                 log.info("WL fixed: %s N_WL=%d (frac=%.3f, %d epochs)",
                          sv, s['n_wl'], frac, s['n_epochs'])
-                # Per-SV state: FLOAT → WL_FIXED on MW convergence.  On
+                # Per-SV state: FLOATING → CONVERGING on MW convergence.  On
                 # re-fix after a slip-induced reset the state is already
-                # FLOAT, so this is the right edge.  SQUELCHED SVs are
+                # FLOATING, so this is the right edge.  WAITING SVs are
                 # skipped by caller (they shouldn't reach here), but if
                 # they do, the transition is illegal and will raise —
                 # caught loudly in tests, benign in production.
                 if self._sv_state is not None:
                     cur = self._sv_state.state(sv)
-                    if cur is SvAmbState.FLOAT:
+                    if cur is SvAmbState.FLOATING:
                         self._sv_state.transition(
-                            sv, SvAmbState.WL_FIXED,
+                            sv, SvAmbState.CONVERGING,
                             epoch=self._current_epoch,
                             reason=f"MW converged (frac={frac:.3f}, {s['n_epochs']} ep)",
                         )
@@ -201,7 +201,7 @@ class MelbourneWubbenaTracker:
 
         The per-SV state-machine transition is NOT driven from here —
         slip-induced transitions come from CycleSlipMonitor so that the
-        slip confidence (HIGH → SQUELCHED, LOW → FLOAT) reaches the
+        slip confidence (HIGH → WAITING, LOW → FLOATING) reaches the
         tracker correctly.  reset() just drops MW internal state.
         """
         self._state.pop(sv, None)
@@ -311,7 +311,7 @@ class NarrowLaneResolver:
         # the primary reliability guard.
         self._lambda_min_p_bootstrap = float(lambda_min_p_bootstrap)
         # Join test: before a new candidate integer commits, predict
-        # whether it would push any NL_LONG_FIXED member's PR residual
+        # whether it would push any ANCHORED member's PR residual
         # past this elev-weighted threshold.  Matches FalseFixMonitor's
         # 2.0 m base; same physics.  The join test is a *pre-commit*
         # version of what FalseFix catches post-commit — stopping the
@@ -380,8 +380,8 @@ class NarrowLaneResolver:
         self._blacklist_epochs = int(blacklist_epochs)
         self._blacklist = {}  # sv -> epoch_until
         self._epoch = 0
-        # Optional tracker.  NL fix → WL_FIXED → NL_SHORT_FIXED.
-        # NL unfix → any NL state → FLOAT.
+        # Optional tracker.  NL fix → CONVERGING → ANCHORING.
+        # NL unfix → any NL state → FLOATING.
         self._sv_state = sv_state
         # Optional per-attempt diagnostic.  When present, emits one
         # [NL_DIAG] line per SV per attempt + a [NL_DIAG_BATCH] line
@@ -589,7 +589,7 @@ class NarrowLaneResolver:
                 n1_int = round(n1_float)
                 a_if_fixed = lambda_nl * n1_int + alpha2 * lambda_wl * n_wl
                 # Join test: reject the fix if it would push any
-                # NL_LONG_FIXED member's PR residual past threshold.
+                # ANCHORED member's PR residual past threshold.
                 # Pre-empts the FalseFix monitor for this SV and
                 # protects the anchor set from biased re-admits.
                 join_ok, join_sv, join_dr, join_thr = self._join_test(
@@ -762,7 +762,7 @@ class NarrowLaneResolver:
             a_if_fixed = lambda_nl * n1_int + alpha2 * lambda_wl * n_wl
             si = state_indices[i]
             # Join test: would admitting this member of the LAMBDA
-            # candidate fix set push an existing NL_LONG_FIXED anchor
+            # candidate fix set push an existing ANCHORED anchor
             # past threshold?  If so, drop this candidate but keep
             # the rest — LAMBDA has accepted the candidate set as a
             # whole via its joint ratio + bootstrap gates, but the
@@ -886,7 +886,7 @@ class NarrowLaneResolver:
         ``project_to_ptpmon_lifecycle_vocabulary_rename_20260421.md``.
 
         Post-rename semantics: this latches on first entry to
-        ANCHORED (≥ 4 NL_LONG_FIXED validated), not on the
+        ANCHORED (≥ 4 ANCHORED validated), not on the
         fallback ANCHORING entry.  The old ``reached_resolved``
         latch fired on either path and couldn't distinguish — see
         ``project_landed_20260421_anchor_collapse_fix.md``.
@@ -895,7 +895,7 @@ class NarrowLaneResolver:
         return bool(sm is not None and getattr(sm, 'reached_anchored', False))
 
     def _anchored_count(self) -> int:
-        """Number of NL_LONG_FIXED anchors currently held."""
+        """Number of ANCHORED anchors currently held."""
         if self._sv_state is None:
             return 0
         return len(self._sv_state.long_term_members())
@@ -1088,19 +1088,19 @@ class NarrowLaneResolver:
         """Drive the per-SV tracker on a successful NL fix.
 
         Called by both LAMBDA and rounding fix paths.  Transitions
-        WL_FIXED → NL_SHORT_FIXED.  If the SV isn't in WL_FIXED (e.g.
-        we re-fixed an SV that was still in NL_SHORT_FIXED because the
+        CONVERGING → ANCHORING.  If the SV isn't in CONVERGING (e.g.
+        we re-fixed an SV that was still in ANCHORING because the
         filter constraint drifted and re-converged), the transition
         is a no-op at the tracker (self-edge).
         """
         if self._sv_state is None:
             return
         cur = self._sv_state.state(sv)
-        if cur is SvAmbState.NL_SHORT_FIXED or cur is SvAmbState.NL_LONG_FIXED:
+        if cur is SvAmbState.ANCHORING or cur is SvAmbState.ANCHORED:
             return  # already counted; don't re-log per-epoch reconstraints
-        if cur is SvAmbState.WL_FIXED:
+        if cur is SvAmbState.CONVERGING:
             self._sv_state.transition(
-                sv, SvAmbState.NL_SHORT_FIXED,
+                sv, SvAmbState.ANCHORING,
                 epoch=self._epoch, reason="nl_fix: " + reason,
                 az_deg=az_deg, elev_deg=elev_deg,
             )
@@ -1108,7 +1108,7 @@ class NarrowLaneResolver:
     def unfix(self, sv):
         """Remove a fix (e.g. after cycle slip detected).
 
-        Drives tracker back to FLOAT when an SV is actively unfixed
+        Drives tracker back to FLOATING when an SV is actively unfixed
         here (e.g. by PFR L1 or a future Job-A caller that wants the
         NL resolver to forget the integer).  false-fix itself transitions
         the tracker directly, so it should call unfix() after; the
@@ -1117,13 +1117,13 @@ class NarrowLaneResolver:
         self._fixed.pop(sv, None)
         if self._sv_state is not None:
             cur = self._sv_state.state(sv)
-            if cur in (SvAmbState.NL_SHORT_FIXED, SvAmbState.NL_LONG_FIXED):
+            if cur in (SvAmbState.ANCHORING, SvAmbState.ANCHORED):
                 self._sv_state.transition(
-                    sv, SvAmbState.FLOAT,
+                    sv, SvAmbState.FLOATING,
                     epoch=self._epoch, reason="nl_resolver.unfix",
                 )
-            # If cur is already FLOAT (e.g. false-fix got here first), nothing
-            # to do.  If WL_FIXED/SQUELCHED: also nothing; unfix
+            # If cur is already FLOATING (e.g. false-fix got here first), nothing
+            # to do.  If CONVERGING/WAITING: also nothing; unfix
             # doesn't imply an MW reset.
 
     def unfix_all(self, filt, inflate_sigma_m=100.0):
@@ -1142,9 +1142,9 @@ class NarrowLaneResolver:
         if self._sv_state is not None:
             for sv in svs:
                 cur = self._sv_state.state(sv)
-                if cur in (SvAmbState.NL_SHORT_FIXED, SvAmbState.NL_LONG_FIXED):
+                if cur in (SvAmbState.ANCHORING, SvAmbState.ANCHORED):
                     self._sv_state.transition(
-                        sv, SvAmbState.FLOAT,
+                        sv, SvAmbState.FLOATING,
                         epoch=self._epoch, reason="nl_resolver.unfix_all",
                     )
         return svs

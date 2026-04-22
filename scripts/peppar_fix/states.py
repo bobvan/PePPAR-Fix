@@ -16,10 +16,12 @@ class AntPosEstState(enum.Enum):
 
         SURVEYING → VERIFYING → CONVERGING → ANCHORING → ANCHORED
 
-    ``ANCHORING`` entered when ≥ 4 NL-fixed members exist (fallback:
-    short-term OR long-term count).  ``ANCHORED`` entered when ≥ 4
-    NL_LONG_FIXED members have passed the ≥ 8° Δaz geometry
-    validation — the "we've truly earned this position" milestone.
+    ``ANCHORING`` entered when ≥ 4 NL-fixed SVs exist (fallback:
+    any combination of ``SvAmbState.ANCHORING`` and
+    ``SvAmbState.ANCHORED``).  Filter-level ``ANCHORED`` entered
+    when ≥ 4 ``SvAmbState.ANCHORED`` SVs exist concurrently —
+    each having survived the ≥ 8° Δaz geometry validation, the
+    "we've truly earned this position" milestone.
 
     ``MOVED`` is a separate branch used when the position-
     discontinuity detector trips (antenna physically relocated) —
@@ -81,10 +83,11 @@ class AntPosEst(StateMachine):
         fallback-count RESOLVED in pre-rename vocabulary, ≥ 4
         NL-fixed members (short or long) in new vocabulary.
       * ``reached_anchored`` — "Has this filter ever been
-        geometry-validated?"  Latches on first entry to
-        ``ANCHORED`` (≥ 4 NL_LONG_FIXED members concurrently,
-        each having survived ≥ 8° Δaz).  The hard-won milestone
-        that signals the position solution is defensible.
+        geometry-validated?"  Latches on first entry to filter-
+        level ``ANCHORED`` (≥ 4 ``SvAmbState.ANCHORED`` SVs
+        concurrently, each having survived ≥ 8° Δaz).  The
+        hard-won milestone that signals the position solution
+        is defensible.
 
     Both are cleared only by ``clear_latches()`` — called from
     ``FixSetIntegrityAlarm.record_fire()``, the explicit

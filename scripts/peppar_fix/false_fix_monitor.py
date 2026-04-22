@@ -5,7 +5,7 @@ in `project_pfr_event_analysis_20260419.md`: 62% of today's PFR L1
 events are wrong-integer fixes — a recently-NL-fixed high-elev SV
 starts showing 3–4 m PR residuals within minutes of the fix.  LAMBDA
 believed the integer; reality disagrees.  Action: demote the SV back
-to FLOAT so it re-accumulates MW/WL evidence.
+to FLOATING so it re-accumulates MW/WL evidence.
 
 Called a "false fix": an integer fix that was later shown to be wrong.
 
@@ -22,7 +22,7 @@ Threshold is per-SV and elevation-weighted.  At zenith the bar is
 at low elev the bar relaxes by 1/sin(elev) to match physics
 (troposphere and multipath scale that way).
 
-Scope: watches NL_SHORT_FIXED only.  Long-term members (NL_LONG_FIXED)
+Scope: watches ANCHORING only.  Long-term members (ANCHORED)
 have, by definition, already survived geometry-change validation;
 the setting-SV drop monitor is the right gate for them as they
 descend into multipath.
@@ -79,7 +79,7 @@ class FalseFixMonitor:
         for ev in events:
             # caller unfixes the SV in NL resolver, inflates filter
             # ambiguity, squelches, etc.; tracker has already moved
-            # the SV to SQUELCHED with a per-SV cooldown (ev['squelch_epochs']).
+            # the SV to WAITING with a per-SV cooldown (ev['squelch_epochs']).
             ...
 
     Stateless between evals — no ladder, no cooldown that outlives
@@ -89,7 +89,7 @@ class FalseFixMonitor:
 
     ### Elevation-stratified squelch
 
-    The cooldown chosen for the SQUELCHED transition depends on the
+    The cooldown chosen for the WAITING transition depends on the
     elevation at which the false-fix fired:
 
       * **elev < reliable_elev_deg** (default 45°): false-fix is
@@ -145,7 +145,7 @@ class FalseFixMonitor:
             labels: iterable aligned with `resid`; each entry is
                 ``(sv, 'pr'|'phi', elev_deg_or_None)``.
 
-        Only PR residuals for SVs currently in NL_SHORT_FIXED land in
+        Only PR residuals for SVs currently in ANCHORING land in
         the window.  Other entries are ignored — the caller doesn't
         have to pre-filter.
         """
@@ -156,7 +156,7 @@ class FalseFixMonitor:
             elev = lab[2] if len(lab) > 2 else None
             if kind != 'pr':
                 continue
-            if self._tracker.state(sv) is not SvAmbState.NL_SHORT_FIXED:
+            if self._tracker.state(sv) is not SvAmbState.ANCHORING:
                 continue
             w = self._per_sv.get(sv)
             if w is None:
@@ -170,14 +170,14 @@ class FalseFixMonitor:
     # ── Evaluation ──────────────────────────────────────────────── #
 
     def evaluate(self, epoch: int) -> list[dict]:
-        """Check each NL_SHORT_FIXED SV with enough samples.
+        """Check each ANCHORING SV with enough samples.
 
         Returns a list of action dicts, one per SV that failed the
         gate:  ``{'sv': str, 'mean_resid_m': float, 'threshold_m': float,
         'elev_deg': float|None, 'n': int}``.
 
         Side effect: for each firing SV the tracker transitions
-        NL_SHORT_FIXED → FLOAT (false-fix rejection).  The caller is
+        ANCHORING → FLOATING (false-fix rejection).  The caller is
         responsible for the downstream teardown (NL unfix, ambiguity
         inflation, squelch).
 
@@ -187,10 +187,10 @@ class FalseFixMonitor:
             return []
         events: list[dict] = []
         # Iterate over a snapshot — we mutate the tracker (and thus the
-        # "which SVs are NL_SHORT_FIXED" set) as we go.
+        # "which SVs are ANCHORING" set) as we go.
         for sv, w in list(self._per_sv.items()):
-            if self._tracker.state(sv) is not SvAmbState.NL_SHORT_FIXED:
-                # SV left NL_SHORT_FIXED by some other path (cycle slip,
+            if self._tracker.state(sv) is not SvAmbState.ANCHORING:
+                # SV left ANCHORING by some other path (cycle slip,
                 # setting-SV drop, promotion to long-term).  Drop its
                 # window so a future fix starts clean.
                 self._per_sv.pop(sv, None)
@@ -243,7 +243,7 @@ class FalseFixMonitor:
                     f" (base {self._base:.1f}m, n={n})"
                 )
                 self._tracker.transition(
-                    sv, SvAmbState.SQUELCHED,
+                    sv, SvAmbState.WAITING,
                     epoch=epoch, reason="false_fix:" + reason,
                     elev_deg=elev,
                     cooldown_epochs=cooldown,
@@ -261,4 +261,4 @@ class FalseFixMonitor:
         self._per_sv.pop(sv, None)
 
     def summary(self) -> str:
-        return f"false_fix: tracking {len(self._per_sv)} NL_SHORT_FIXED SVs"
+        return f"false_fix: tracking {len(self._per_sv)} ANCHORING SVs"

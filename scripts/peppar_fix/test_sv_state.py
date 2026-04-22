@@ -35,83 +35,83 @@ class LegalTransitionsTest(unittest.TestCase):
 
     def test_happy_path_with_promotion(self):
         self._drive("G01", [
-            SvAmbState.FLOAT,
-            SvAmbState.WL_FIXED,
-            SvAmbState.NL_SHORT_FIXED,
-            SvAmbState.NL_LONG_FIXED,
+            SvAmbState.FLOATING,
+            SvAmbState.CONVERGING,
+            SvAmbState.ANCHORING,
+            SvAmbState.ANCHORED,
         ])
 
     def test_tracking_admit_to_float(self):
-        # Fresh record defaults to TRACKING; admit transitions to FLOAT.
-        self._drive("G02", [SvAmbState.FLOAT])
-        # After admit, state is FLOAT.
-        self.assertIs(self.t.state("G02"), SvAmbState.FLOAT)
+        # Fresh record defaults to TRACKING; admit transitions to FLOATING.
+        self._drive("G02", [SvAmbState.FLOATING])
+        # After admit, state is FLOATING.
+        self.assertIs(self.t.state("G02"), SvAmbState.FLOATING)
 
     def test_false_fix_rejection_short_to_float(self):
         self._drive("G03", [
-            SvAmbState.FLOAT,
-            SvAmbState.WL_FIXED,
-            SvAmbState.NL_SHORT_FIXED,
-            SvAmbState.FLOAT,   # false-fix rejection
+            SvAmbState.FLOATING,
+            SvAmbState.CONVERGING,
+            SvAmbState.ANCHORING,
+            SvAmbState.FLOATING,   # false-fix rejection
         ])
 
     def test_setting_sv_drop_long_to_float(self):
         self._drive("G04", [
-            SvAmbState.FLOAT,
-            SvAmbState.WL_FIXED,
-            SvAmbState.NL_SHORT_FIXED,
-            SvAmbState.NL_LONG_FIXED,
-            SvAmbState.FLOAT,   # setting-SV drop
+            SvAmbState.FLOATING,
+            SvAmbState.CONVERGING,
+            SvAmbState.ANCHORING,
+            SvAmbState.ANCHORED,
+            SvAmbState.FLOATING,   # setting-SV drop
         ])
 
     def test_wl_fixed_back_to_float(self):
         self._drive("G05", [
-            SvAmbState.FLOAT,
-            SvAmbState.WL_FIXED,
-            SvAmbState.FLOAT,   # slip LOW or MW reset
+            SvAmbState.FLOATING,
+            SvAmbState.CONVERGING,
+            SvAmbState.FLOATING,   # slip LOW or MW reset
         ])
 
     def test_nl_states_to_squelched(self):
-        # HIGH-conf slip from either NL state goes to SQUELCHED.
+        # HIGH-conf slip from either NL state goes to WAITING.
         self._drive("G06", [
-            SvAmbState.FLOAT,
-            SvAmbState.WL_FIXED,
-            SvAmbState.NL_SHORT_FIXED,
-            SvAmbState.SQUELCHED,
+            SvAmbState.FLOATING,
+            SvAmbState.CONVERGING,
+            SvAmbState.ANCHORING,
+            SvAmbState.WAITING,
         ])
         self._drive("G07", [
-            SvAmbState.FLOAT,
-            SvAmbState.WL_FIXED,
-            SvAmbState.NL_SHORT_FIXED,
-            SvAmbState.NL_LONG_FIXED,
-            SvAmbState.SQUELCHED,
+            SvAmbState.FLOATING,
+            SvAmbState.CONVERGING,
+            SvAmbState.ANCHORING,
+            SvAmbState.ANCHORED,
+            SvAmbState.WAITING,
         ])
 
     def test_squelched_cooldown_recovery(self):
         self._drive("G08", [
-            SvAmbState.FLOAT,
-            SvAmbState.SQUELCHED,   # slip from FLOAT (MW-only phase)
-            SvAmbState.FLOAT,       # cooldown expired
+            SvAmbState.FLOATING,
+            SvAmbState.WAITING,   # slip from FLOATING (MW-only phase)
+            SvAmbState.FLOATING,       # cooldown expired
         ])
 
     def test_float_to_squelched_direct(self):
-        self._drive("G09", [SvAmbState.FLOAT, SvAmbState.SQUELCHED])
+        self._drive("G09", [SvAmbState.FLOATING, SvAmbState.WAITING])
 
     def test_wl_fixed_to_squelched(self):
         self._drive("G10", [
-            SvAmbState.FLOAT,
-            SvAmbState.WL_FIXED,
-            SvAmbState.SQUELCHED,
+            SvAmbState.FLOATING,
+            SvAmbState.CONVERGING,
+            SvAmbState.WAITING,
         ])
 
     def test_self_transition_is_noop(self):
         """Repeating the current state should not raise or log."""
         sv = "G11"
-        self.t.transition(sv, SvAmbState.FLOAT, epoch=1, reason="first")
-        self.t.transition(sv, SvAmbState.WL_FIXED, epoch=2, reason="wl")
+        self.t.transition(sv, SvAmbState.FLOATING, epoch=1, reason="first")
+        self.t.transition(sv, SvAmbState.CONVERGING, epoch=2, reason="wl")
         # Same state — should be silently accepted.
-        self.t.transition(sv, SvAmbState.WL_FIXED, epoch=3, reason="same")
-        self.assertIs(self.t.state(sv), SvAmbState.WL_FIXED)
+        self.t.transition(sv, SvAmbState.CONVERGING, epoch=3, reason="same")
+        self.assertIs(self.t.state(sv), SvAmbState.CONVERGING)
 
 
 class IllegalTransitionsTest(unittest.TestCase):
@@ -127,39 +127,39 @@ class IllegalTransitionsTest(unittest.TestCase):
     def test_tracking_cannot_skip_to_wl(self):
         self._put("X01", SvAmbState.TRACKING)
         with self.assertRaises(InvalidTransition):
-            self.t.transition("X01", SvAmbState.WL_FIXED, epoch=1)
+            self.t.transition("X01", SvAmbState.CONVERGING, epoch=1)
 
     def test_tracking_cannot_squelch(self):
         # SVs that haven't been admitted can't be squelched — there's
         # no integer state to protect.
         self._put("X02", SvAmbState.TRACKING)
         with self.assertRaises(InvalidTransition):
-            self.t.transition("X02", SvAmbState.SQUELCHED, epoch=1)
+            self.t.transition("X02", SvAmbState.WAITING, epoch=1)
 
     def test_float_cannot_skip_to_nl(self):
-        self._put("X03", SvAmbState.FLOAT)
+        self._put("X03", SvAmbState.FLOATING)
         with self.assertRaises(InvalidTransition):
-            self.t.transition("X03", SvAmbState.NL_SHORT_FIXED, epoch=1)
+            self.t.transition("X03", SvAmbState.ANCHORING, epoch=1)
 
     def test_wl_fixed_cannot_jump_to_long(self):
-        self._put("X04", SvAmbState.WL_FIXED)
+        self._put("X04", SvAmbState.CONVERGING)
         with self.assertRaises(InvalidTransition):
-            self.t.transition("X04", SvAmbState.NL_LONG_FIXED, epoch=1)
+            self.t.transition("X04", SvAmbState.ANCHORED, epoch=1)
 
     def test_short_cannot_rewind_to_wl(self):
-        self._put("X05", SvAmbState.NL_SHORT_FIXED)
+        self._put("X05", SvAmbState.ANCHORING)
         with self.assertRaises(InvalidTransition):
-            self.t.transition("X05", SvAmbState.WL_FIXED, epoch=1)
+            self.t.transition("X05", SvAmbState.CONVERGING, epoch=1)
 
     def test_long_cannot_rewind_to_short(self):
-        self._put("X06", SvAmbState.NL_LONG_FIXED)
+        self._put("X06", SvAmbState.ANCHORED)
         with self.assertRaises(InvalidTransition):
-            self.t.transition("X06", SvAmbState.NL_SHORT_FIXED, epoch=1)
+            self.t.transition("X06", SvAmbState.ANCHORING, epoch=1)
 
     def test_squelched_cannot_skip_to_wl(self):
-        self._put("X07", SvAmbState.SQUELCHED)
+        self._put("X07", SvAmbState.WAITING)
         with self.assertRaises(InvalidTransition):
-            self.t.transition("X07", SvAmbState.WL_FIXED, epoch=1)
+            self.t.transition("X07", SvAmbState.CONVERGING, epoch=1)
 
 
 class FixSetMembershipTest(unittest.TestCase):
@@ -171,10 +171,10 @@ class FixSetMembershipTest(unittest.TestCase):
     def test_short_and_long_term_counts(self):
         # Two in short-term, one in long-term, one unfixed.
         for sv, state in [
-            ("G01", SvAmbState.NL_SHORT_FIXED),
-            ("G02", SvAmbState.NL_SHORT_FIXED),
-            ("G03", SvAmbState.NL_LONG_FIXED),
-            ("G04", SvAmbState.FLOAT),
+            ("G01", SvAmbState.ANCHORING),
+            ("G02", SvAmbState.ANCHORING),
+            ("G03", SvAmbState.ANCHORED),
+            ("G04", SvAmbState.FLOATING),
         ]:
             self.t.get(sv).state = state
         self.assertEqual(len(self.t.short_term_members()), 2)
@@ -200,7 +200,7 @@ class ElevThresholdTest(unittest.TestCase):
 
 
 class FalseFixMonitorTest(unittest.TestCase):
-    """False-fix monitor fires only on NL_SHORT_FIXED SVs, at eval epochs, above threshold."""
+    """False-fix monitor fires only on ANCHORING SVs, at eval epochs, above threshold."""
 
     def setUp(self):
         self.t = SvStateTracker()
@@ -209,13 +209,13 @@ class FalseFixMonitorTest(unittest.TestCase):
         )
 
     def _to_short(self, sv):
-        self.t.transition(sv, SvAmbState.FLOAT, epoch=0)
-        self.t.transition(sv, SvAmbState.WL_FIXED, epoch=1)
-        self.t.transition(sv, SvAmbState.NL_SHORT_FIXED, epoch=2)
+        self.t.transition(sv, SvAmbState.FLOATING, epoch=0)
+        self.t.transition(sv, SvAmbState.CONVERGING, epoch=1)
+        self.t.transition(sv, SvAmbState.ANCHORING, epoch=2)
 
     def test_ignores_svs_not_in_short(self):
-        # SV in FLOAT — should be ignored by the false-fix monitor.
-        self.t.transition("G01", SvAmbState.FLOAT, epoch=0)
+        # SV in FLOATING — should be ignored by the false-fix monitor.
+        self.t.transition("G01", SvAmbState.FLOATING, epoch=0)
         labels = [("G01", 'pr', 45.0)]
         self.m.ingest(10, [5.0], labels)
         events = self.m.evaluate(10)
@@ -230,9 +230,9 @@ class FalseFixMonitorTest(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]['sv'], "G02")
         self.assertAlmostEqual(events[0]['mean_resid_m'], 3.0)
-        # Tracker moved the SV to SQUELCHED (not FLOAT) with a per-SV
+        # Tracker moved the SV to WAITING (not FLOATING) with a per-SV
         # cooldown chosen by elev — high-elev (90°) is unexpected #1.
-        self.assertIs(self.t.state("G02"), SvAmbState.SQUELCHED)
+        self.assertIs(self.t.state("G02"), SvAmbState.WAITING)
         self.assertEqual(events[0]['tag'], "unexpected #1")
         # First unexpected → progression[0] = 120 epochs default.
         self.assertEqual(events[0]['squelch_epochs'], 120)
@@ -277,9 +277,9 @@ class FalseFixStratifiedSquelchTest(unittest.TestCase):
         )
 
     def _to_short(self, sv):
-        self.t.transition(sv, SvAmbState.FLOAT, epoch=0)
-        self.t.transition(sv, SvAmbState.WL_FIXED, epoch=1)
-        self.t.transition(sv, SvAmbState.NL_SHORT_FIXED, epoch=2)
+        self.t.transition(sv, SvAmbState.FLOATING, epoch=0)
+        self.t.transition(sv, SvAmbState.CONVERGING, epoch=1)
+        self.t.transition(sv, SvAmbState.ANCHORING, epoch=2)
 
     def test_low_elev_false_fix_is_expected(self):
         self._to_short("G01")
@@ -301,18 +301,18 @@ class FalseFixStratifiedSquelchTest(unittest.TestCase):
         # SV by manually driving the state machine through each cycle.
         sv = "G02"
         for cycle in range(3):
-            # Put SV into NL_SHORT_FIXED for the next cycle.
+            # Put SV into ANCHORING for the next cycle.
             if cycle == 0:
                 self._to_short(sv)
             else:
-                # After a SQUELCHED → put back through the happy path.
-                # Manually transition back to FLOAT and up to NL_SHORT_FIXED.
-                self.t.transition(sv, SvAmbState.FLOAT,
+                # After a WAITING → put back through the happy path.
+                # Manually transition back to FLOATING and up to ANCHORING.
+                self.t.transition(sv, SvAmbState.FLOATING,
                                   epoch=1000 * cycle,
                                   reason="test:reset for cycle")
-                self.t.transition(sv, SvAmbState.WL_FIXED,
+                self.t.transition(sv, SvAmbState.CONVERGING,
                                   epoch=1000 * cycle + 1)
-                self.t.transition(sv, SvAmbState.NL_SHORT_FIXED,
+                self.t.transition(sv, SvAmbState.ANCHORING,
                                   epoch=1000 * cycle + 2)
                 # Clear false-fix window for the monitor.
                 self.m.forget(sv)
@@ -341,20 +341,20 @@ class SquelchCooldownSweepTest(unittest.TestCase):
         self.t = SvStateTracker()
 
     def test_sweeps_expired(self):
-        self.t.transition("G01", SvAmbState.FLOAT, epoch=0)
-        self.t.transition("G01", SvAmbState.SQUELCHED, epoch=10,
+        self.t.transition("G01", SvAmbState.FLOATING, epoch=0)
+        self.t.transition("G01", SvAmbState.WAITING, epoch=10,
                           cooldown_epochs=50)
         # Not yet expired.
         recovered = self.t.check_squelch_cooldowns(epoch=30)
         self.assertEqual(recovered, [])
-        self.assertIs(self.t.state("G01"), SvAmbState.SQUELCHED)
+        self.assertIs(self.t.state("G01"), SvAmbState.WAITING)
         # Expired.
         recovered = self.t.check_squelch_cooldowns(epoch=61)
         self.assertEqual(recovered, ["G01"])
-        self.assertIs(self.t.state("G01"), SvAmbState.FLOAT)
+        self.assertIs(self.t.state("G01"), SvAmbState.FLOATING)
 
     def test_ignores_non_squelched(self):
-        self.t.transition("G02", SvAmbState.FLOAT, epoch=0)
+        self.t.transition("G02", SvAmbState.FLOATING, epoch=0)
         recovered = self.t.check_squelch_cooldowns(epoch=1000)
         self.assertEqual(recovered, [])
 
@@ -369,7 +369,7 @@ class ForgetStaleTest(unittest.TestCase):
 
     def test_drops_stale(self):
         t = SvStateTracker()
-        t.transition("G01", SvAmbState.FLOAT, epoch=0)
+        t.transition("G01", SvAmbState.FLOATING, epoch=0)
         t.mark_seen("G01", epoch=100)
         # At epoch 1000 with stale_after=600, SV last seen 900 epochs
         # ago → forget.
@@ -381,7 +381,7 @@ class ForgetStaleTest(unittest.TestCase):
 
     def test_keeps_fresh(self):
         t = SvStateTracker()
-        t.transition("G02", SvAmbState.FLOAT, epoch=0)
+        t.transition("G02", SvAmbState.FLOATING, epoch=0)
         t.mark_seen("G02", epoch=900)
         dropped = t.forget_stale(epoch=1000, stale_after_epochs=600)
         self.assertEqual(dropped, [])
@@ -401,9 +401,9 @@ class SettingSvDropMonitorTest(unittest.TestCase):
         )
 
     def _to_short(self, sv):
-        self.t.transition(sv, SvAmbState.FLOAT, epoch=0)
-        self.t.transition(sv, SvAmbState.WL_FIXED, epoch=1)
-        self.t.transition(sv, SvAmbState.NL_SHORT_FIXED, epoch=2)
+        self.t.transition(sv, SvAmbState.FLOATING, epoch=0)
+        self.t.transition(sv, SvAmbState.CONVERGING, epoch=1)
+        self.t.transition(sv, SvAmbState.ANCHORING, epoch=2)
 
     def test_drops_on_elev_below_mask(self):
         self._to_short("G10")
@@ -413,8 +413,8 @@ class SettingSvDropMonitorTest(unittest.TestCase):
         events = self.m.evaluate(10)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]['reason'], 'elev_mask')
-        # Now transitions straight back to FLOAT (no RETIRING in-between).
-        self.assertIs(self.t.state("G10"), SvAmbState.FLOAT)
+        # Now transitions straight back to FLOATING (no RETIRING in-between).
+        self.assertIs(self.t.state("G10"), SvAmbState.FLOATING)
 
     def test_drops_on_elev_weighted_resid(self):
         self._to_short("G11")
@@ -426,11 +426,11 @@ class SettingSvDropMonitorTest(unittest.TestCase):
         events = self.m.evaluate(10)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]['reason'], 'elev_weighted_resid')
-        self.assertIs(self.t.state("G11"), SvAmbState.FLOAT)
+        self.assertIs(self.t.state("G11"), SvAmbState.FLOATING)
 
     def test_ignores_non_nl_svs(self):
-        # SV in FLOAT — not eligible.
-        self.t.transition("G12", SvAmbState.FLOAT, epoch=0)
+        # SV in FLOATING — not eligible.
+        self.t.transition("G12", SvAmbState.FLOATING, epoch=0)
         labels = [("G12", 'pr', 10.0)]
         for e in range(3, 13):
             self.m.ingest(e, [5.0], labels)
@@ -452,9 +452,9 @@ class FixSetIntegrityAlarmTest(unittest.TestCase):
         )
 
     def _to_short(self, sv):
-        self.t.transition(sv, SvAmbState.FLOAT, epoch=0)
-        self.t.transition(sv, SvAmbState.WL_FIXED, epoch=1)
-        self.t.transition(sv, SvAmbState.NL_SHORT_FIXED, epoch=2)
+        self.t.transition(sv, SvAmbState.FLOATING, epoch=0)
+        self.t.transition(sv, SvAmbState.CONVERGING, epoch=1)
+        self.t.transition(sv, SvAmbState.ANCHORING, epoch=2)
 
     def test_fires_when_sustained_rms_exceeds(self):
         self._to_short("G20")
@@ -468,15 +468,15 @@ class FixSetIntegrityAlarmTest(unittest.TestCase):
 
     def test_suppressed_by_recent_per_sv_transition(self):
         self._to_short("G22")
-        # Simulate a false-fix monitor just moved an SV to FLOAT.
-        self.t.transition("G22", SvAmbState.FLOAT, epoch=5,
+        # Simulate a false-fix monitor just moved an SV to FLOATING.
+        self.t.transition("G22", SvAmbState.FLOATING, epoch=5,
                           reason="false_fix:synthetic")
         # Put another SV in short-term so its residuals count.
         self._to_short("G23")
         for e in range(6, 13):
             self.alarm.ingest(e, [6.0], [("G23", 'pr', 45.0)])
         # Epoch 10 is within suppress_if_monitors_fired_within=60 of
-        # G22's FLOAT transition at epoch 5 — alarm stays silent.
+        # G22's FLOATING transition at epoch 5 — alarm stays silent.
         self.assertIsNone(self.alarm.evaluate(10))
 
     def test_respects_cooldown(self):

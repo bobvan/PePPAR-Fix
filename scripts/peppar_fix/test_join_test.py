@@ -1,7 +1,7 @@
 """Unit tests for NarrowLaneResolver._join_test.
 
 The join test is the pre-commit defense against biased integer
-re-admissions that put NL_LONG_FIXED anchors out of residual-
+re-admissions that put ANCHORED anchors out of residual-
 consistency.  See `docs/sv-lifecycle-and-pfr-split.md` and the
 overnight data in `project_to_main_defensive_mechanisms_20260421.md`
 (day0420e 01:05-01:55 50-min trap).
@@ -75,13 +75,13 @@ class _FakeFilter:
 
 def _put_in_long_term(tracker: SvStateTracker, sv: str,
                       elev_deg: float) -> None:
-    """Walk an SV through the legal state chain to NL_LONG_FIXED."""
-    tracker.transition(sv, SvAmbState.FLOAT, epoch=0, reason="admit")
-    tracker.transition(sv, SvAmbState.WL_FIXED, epoch=1, reason="mw")
-    tracker.transition(sv, SvAmbState.NL_SHORT_FIXED,
+    """Walk an SV through the legal state chain to ANCHORED."""
+    tracker.transition(sv, SvAmbState.FLOATING, epoch=0, reason="admit")
+    tracker.transition(sv, SvAmbState.CONVERGING, epoch=1, reason="mw")
+    tracker.transition(sv, SvAmbState.ANCHORING,
                        epoch=2, reason="lambda",
                        az_deg=90.0, elev_deg=elev_deg)
-    tracker.transition(sv, SvAmbState.NL_LONG_FIXED,
+    tracker.transition(sv, SvAmbState.ANCHORED,
                        epoch=3, reason="delta_az >= 8°",
                        elev_deg=elev_deg)
 
@@ -228,17 +228,17 @@ class JoinTestTest(unittest.TestCase):
     def test_ignores_short_term_members(self):
         """Short-term members are *not* anchors in the SV-anchored
         path — they're what the test is protecting *from*.  A
-        candidate whose P-coupling is only against NL_SHORT_FIXED
+        candidate whose P-coupling is only against ANCHORING
         should pass.  We stay in strong_anchor regime by adding an
         unrelated long-term member whose H-row decouples entirely
         from this candidate."""
-        # NL_SHORT_FIXED member with the coupling we'd want the test
+        # ANCHORING member with the coupling we'd want the test
         # to reject (if it were an anchor).
-        self.tracker.transition("E05", SvAmbState.FLOAT,
+        self.tracker.transition("E05", SvAmbState.FLOATING,
                                 epoch=0, reason="admit")
-        self.tracker.transition("E05", SvAmbState.WL_FIXED,
+        self.tracker.transition("E05", SvAmbState.CONVERGING,
                                 epoch=1, reason="mw")
-        self.tracker.transition("E05", SvAmbState.NL_SHORT_FIXED,
+        self.tracker.transition("E05", SvAmbState.ANCHORING,
                                 epoch=2, reason="lambda",
                                 az_deg=90.0, elev_deg=60.0)
         # Long-term member with zero H-coupling to the candidate —
