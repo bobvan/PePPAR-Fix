@@ -259,11 +259,14 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
 
     def test_fires_after_threshold_epochs_of_collapse(self):
         _latch_resolved(self.sm)
-        _long_term(self.tracker, "E05")
+        # Need ≥ 4 anchors to latch _ever_anchored (day0421f fix).
+        for sv in ("E05", "E06", "E07", "E08"):
+            _long_term(self.tracker, sv)
         for epoch in range(1, 11):
             self.assertIsNone(self.alarm.evaluate(epoch))
-        self.tracker.transition("E05", SvAmbState.FLOAT,
-                                epoch=11, reason="drop")
+        for sv in ("E05", "E06", "E07", "E08"):
+            self.tracker.transition(sv, SvAmbState.FLOAT,
+                                    epoch=11, reason="drop")
         # Timer starts at the next evaluate() call where lt_count=0.
         # First such call here is evaluate(12), so fire happens at
         # the first epoch e where (e - 12) >= 30, i.e. epoch 42.
@@ -284,14 +287,20 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
         POV the collapse was continuous.
         """
         _latch_resolved(self.sm)
-        _long_term(self.tracker, "E05")
+        # Need ≥ 4 anchors to latch _ever_anchored (day0421f fix).
+        for sv in ("E05", "E06", "E07", "E08"):
+            _long_term(self.tracker, sv)
         self.alarm.evaluate(10)
-        self.tracker.transition("E05", SvAmbState.FLOAT,
-                                epoch=11, reason="drop")
+        for sv in ("E05", "E06", "E07", "E08"):
+            self.tracker.transition(sv, SvAmbState.FLOAT,
+                                    epoch=11, reason="drop")
         # 10 epochs without anchor — nowhere near threshold (30).
         for epoch in range(12, 22):
             self.assertIsNone(self.alarm.evaluate(epoch))
-        # Anchor returns; walk through the legal edges.
+        # One anchor returns; walk through the legal edges.  Once
+        # `_ever_anchored` has latched, a single returning anchor
+        # is enough to reset the collapse timer (the gate is
+        # `lt_count > 0`, not `lt_count >= 4`).
         self.tracker.transition("E05", SvAmbState.WL_FIXED,
                                 epoch=22, reason="mw")
         self.tracker.transition("E05", SvAmbState.NL_SHORT_FIXED,
@@ -327,9 +336,14 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
         KeyError'd out of AntPosEstThread on first anchor-collapse
         fire."""
         _latch_resolved(self.sm)
-        _long_term(self.tracker, "E05")
-        self.tracker.transition("E05", SvAmbState.FLOAT,
-                                epoch=1, reason="drop")
+        # Need ≥ 4 anchors to latch _ever_anchored (day0421f fix).
+        for sv in ("E05", "E06", "E07", "E08"):
+            _long_term(self.tracker, sv)
+        # Observe the anchored state once so _ever_anchored latches.
+        self.alarm.evaluate(0)
+        for sv in ("E05", "E06", "E07", "E08"):
+            self.tracker.transition(sv, SvAmbState.FLOAT,
+                                    epoch=1, reason="drop")
         for epoch in range(2, 32):
             self.alarm.evaluate(epoch)
         ev = self.alarm.evaluate(32)
@@ -387,18 +401,125 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
         """After a fire, the timer resets (not stuck at "already
         fired").  Required for a clean re-bootstrap."""
         _latch_resolved(self.sm)
-        _long_term(self.tracker, "E05")
-        self.tracker.transition("E05", SvAmbState.FLOAT,
-                                epoch=1, reason="drop")
+        # Need ≥ 4 anchors to latch _ever_anchored (day0421f fix).
+        for sv in ("E05", "E06", "E07", "E08"):
+            _long_term(self.tracker, sv)
+        self.alarm.evaluate(0)     # latch _ever_anchored
+        for sv in ("E05", "E06", "E07", "E08"):
+            self.tracker.transition(sv, SvAmbState.FLOAT,
+                                    epoch=1, reason="drop")
         # Timer starts at evaluate(2); fires at epoch 32 (32-2 >= 30).
         for epoch in range(2, 32):
             self.alarm.evaluate(epoch)
         ev = self.alarm.evaluate(32)
         self.assertIsNotNone(ev)
         self.alarm.record_fire(epoch=32)
-        # Latch was cleared → reached_resolved=False now, so the
+        # Both latches cleared → _ever_anchored=False, so the
         # trigger condition can't be met regardless of anchor count.
         self.assertIsNone(self.alarm.evaluate(33))
+
+
+# ── _ever_anchored latch (day0421f fix) ─────────────────────────── #
+
+class EverAnchoredLatchTest(unittest.TestCase):
+    """The alarm's ``_ever_anchored`` gate on the anchor-collapse
+    trigger.  This prevents the day0421f spurious-trip cycle where
+    the filter fallback-RESOLVEs with zero long-term anchors and
+    the monitor trips 60 epochs later on a state we never actually
+    reached.  Migrates to ``AntPosEst.reached_anchored`` in the
+    lifecycle rename's Commit (a)."""
+
+    def setUp(self):
+        self.tracker = SvStateTracker()
+        self.sm = AntPosEst()
+        self.alarm = FixSetIntegrityAlarm(
+            self.tracker,
+            ape_state_machine=self.sm,
+            anchor_collapse_epochs=30,
+            eval_every=1,
+            cooldown_epochs=0,
+        )
+
+    def test_ever_anchored_stays_false_on_fallback_resolved(self):
+        """State machine bounces CONVERGING → RESOLVED → CONVERGING
+        via the fallback path repeatedly with zero long-term
+        members.  ``_ever_anchored`` must stay False; no trip
+        fires.  This is the day0421f reproduction in unit-test
+        form: L5 fleet had 6-15 trips per host in ~3h because
+        ``reached_resolved`` latched on this exact pattern."""
+        # Walk the latch to RESOLVED (as the engine does on fallback
+        # NL count ≥ 4) without ever promoting any SV to
+        # NL_LONG_FIXED.
+        _latch_resolved(self.sm)
+        self.assertTrue(self.sm.reached_resolved)
+        # 200 epochs of zero-anchor steady state — well past the
+        # 30-epoch trip threshold.  Zero trips must fire.
+        for epoch in range(1, 201):
+            self.assertIsNone(
+                self.alarm.evaluate(epoch),
+                f"spurious anchor_collapse trip at epoch {epoch}",
+            )
+
+    def test_ever_anchored_latches_at_four_long_term(self):
+        """First ``evaluate()`` call after ≥ 4 NL_LONG_FIXED
+        members are present latches ``_ever_anchored = True``.
+        Before that observation, the flag is False; after, it
+        stays True until ``record_fire()``."""
+        # Pre-anchored: flag False.
+        self.alarm.evaluate(0)
+        self.assertFalse(self.alarm._ever_anchored)
+        # Promote 3 anchors — still under threshold.
+        for sv in ("E05", "E06", "E07"):
+            _long_term(self.tracker, sv)
+        self.alarm.evaluate(1)
+        self.assertFalse(
+            self.alarm._ever_anchored,
+            "flag must not latch until the fourth anchor",
+        )
+        # Fourth anchor — flag latches on the next evaluate().
+        _long_term(self.tracker, "E08")
+        self.alarm.evaluate(2)
+        self.assertTrue(self.alarm._ever_anchored)
+        # Dropping below 4 (even to 0) does NOT un-latch the flag.
+        for sv in ("E05", "E06", "E07", "E08"):
+            self.tracker.transition(sv, SvAmbState.FLOAT,
+                                    epoch=3, reason="drop")
+        self.alarm.evaluate(3)
+        self.assertTrue(
+            self.alarm._ever_anchored,
+            "flag is monotonic within a lifetime — only "
+            "record_fire() clears it",
+        )
+
+    def test_record_fire_clears_ever_anchored(self):
+        """After a trip, the filter re-initialises from bootstrap.
+        ``_ever_anchored`` must reset alongside
+        ``reached_resolved`` so the monitor can't trip again
+        until the re-bootstrapped filter has genuinely re-earned
+        the anchored milestone (≥ 4 NL_LONG_FIXED SVs)."""
+        # Latch the flag by observing 4 anchors.
+        _latch_resolved(self.sm)
+        for sv in ("E05", "E06", "E07", "E08"):
+            _long_term(self.tracker, sv)
+        self.alarm.evaluate(0)
+        self.assertTrue(self.alarm._ever_anchored)
+        # Fire resets both latches.
+        self.alarm.record_fire(epoch=100)
+        self.assertFalse(self.alarm._ever_anchored)
+        self.assertFalse(self.sm.reached_resolved)
+        # Even if an old anchor record is still on the tracker (it
+        # wouldn't be in production — the engine clears the fix
+        # set on re-init — but the alarm's defensive posture is
+        # that it re-observes the state itself): with zero long-
+        # term members the flag stays False.
+        for sv in ("E05", "E06", "E07", "E08"):
+            self.tracker.transition(sv, SvAmbState.FLOAT,
+                                    epoch=101, reason="reinit")
+        for epoch in range(102, 200):
+            self.assertIsNone(
+                self.alarm.evaluate(epoch),
+                f"spurious post-fire trip at epoch {epoch}",
+            )
 
 
 # ── Fake filter (shared util) ────────────────────────────────────── #

@@ -114,6 +114,21 @@ class FixSetIntegrityAlarm:
         # a reached_resolved filter.  None whenever anchors are
         # present.  Reset on every fire.
         self._anchor_collapse_since: int | None = None
+        # Internal "has the filter ever held ≥ 4 NL_LONG_FIXED
+        # anchors?" flag.  Gates the anchor-collapse trigger — we
+        # can't meaningfully alarm on anchor *collapse* from a
+        # state we never actually reached.  The AntPosEst
+        # `reached_resolved` latch isn't suitable for this gate
+        # because it fires on the fallback RESOLVED path (≥ 4
+        # short-term NL fixes, pre-promotion) where
+        # long_term_members() is still 0 — which is exactly the
+        # condition we'd be alarming on, producing the spurious
+        # trip cycle seen across the L5 fleet on day0421f (6/8/15
+        # trips per host in ~3 h).  Migrates to
+        # AntPosEst.reached_anchored in commit (a) of the
+        # lifecycle rename (project_to_ptpmon_lifecycle_
+        # vocabulary_rename_20260421.md).
+        self._ever_anchored: bool = False
 
     # ── Data intake ─────────────────────────────────────────────── #
 
@@ -177,12 +192,19 @@ class FixSetIntegrityAlarm:
 
         # ── Anchor-collapse trigger (checked first: cheaper, can
         # pre-empt the window-RMS path when both would fire).  Only
-        # active when the AntPosEst state machine reports
-        # reached_resolved=True — during bootstrap, the filter hasn't
-        # earned a position to defend so zero anchors is expected.
-        ap = self._ape_sm
-        if ap is not None and getattr(ap, 'reached_resolved', False):
-            lt_count = len(self._tracker.long_term_members())
+        # active once the filter has actually reached the anchored
+        # milestone (≥ 4 NL_LONG_FIXED).  During bootstrap or
+        # fallback RESOLVED with zero long-term anchors the filter
+        # hasn't earned a position to defend, and triggering here
+        # would cycle spuriously (day0421f L5 fleet: 6/8/15 trips
+        # per host in ~3h, all spurious).  `_ever_anchored` latches
+        # only on validated anchor count — the AntPosEst
+        # `reached_resolved` latch fires on the fallback path too,
+        # so it can't be used as the gate.
+        lt_count = len(self._tracker.long_term_members())
+        if lt_count >= 4:
+            self._ever_anchored = True
+        if self._ever_anchored:
             if lt_count == 0:
                 if self._anchor_collapse_since is None:
                     self._anchor_collapse_since = epoch
@@ -241,6 +263,10 @@ class FixSetIntegrityAlarm:
         self._last_fire_epoch = int(epoch)
         self._rms_hist.clear()
         self._anchor_collapse_since = None
+        # Clear the internal "ever anchored" flag alongside the
+        # AntPosEst latch — after a re-init the filter has to
+        # re-earn anchored status from scratch.
+        self._ever_anchored = False
         if self._ape_sm is not None:
             self._ape_sm.clear_reached_resolved(reason="fix_set_alarm")
         log.warning("[FIX_SET_ALARM] fired at epoch %d — filter re-init", epoch)
