@@ -1,4 +1,4 @@
-"""Unit tests for the LongTermPromoter (short-term → long-term promotion).
+"""Unit tests for the AnchoringSvPromoter (short-term → long-term promotion).
 
 Covers Δaz accumulation, the 15° threshold, clean-window enforcement
 against prior false-fix rejections, eligibility (ANCHORING only),
@@ -10,7 +10,7 @@ from __future__ import annotations
 import unittest
 
 from peppar_fix.sv_state import SvAmbState, SvStateTracker
-from peppar_fix.long_term_promoter import LongTermPromoter, _az_delta
+from peppar_fix.anchoring_sv_promoter import AnchoringSvPromoter, _az_delta
 
 
 class AzDeltaTest(unittest.TestCase):
@@ -31,7 +31,7 @@ class AzDeltaTest(unittest.TestCase):
 class PromoterEligibilityTest(unittest.TestCase):
     def setUp(self):
         self.t = SvStateTracker()
-        self.p = LongTermPromoter(
+        self.p = AnchoringSvPromoter(
             self.t,
             dphi_threshold_deg=15.0,
             clean_window_epochs=30,
@@ -88,7 +88,7 @@ class PromoterEligibilityTest(unittest.TestCase):
 class PromoterCleanWindowTest(unittest.TestCase):
     def setUp(self):
         self.t = SvStateTracker()
-        self.p = LongTermPromoter(
+        self.p = AnchoringSvPromoter(
             self.t,
             dphi_threshold_deg=15.0,
             clean_window_epochs=30,
@@ -154,7 +154,7 @@ class PromoterInteractionTest(unittest.TestCase):
         transient state excursions (slip → FLOATING → re-fix).
         """
         t = SvStateTracker()
-        p = LongTermPromoter(t, dphi_threshold_deg=8.0,
+        p = AnchoringSvPromoter(t, dphi_threshold_deg=8.0,
                              clean_window_epochs=30, eval_every=10)
         t.transition("E20", SvAmbState.FLOATING, epoch=0)
         t.transition("E20", SvAmbState.CONVERGING, epoch=1)
@@ -188,7 +188,7 @@ class PromoterInteractionTest(unittest.TestCase):
         must drop the candidate so the next arc starts clean.
         """
         t = SvStateTracker()
-        p = LongTermPromoter(t, dphi_threshold_deg=8.0,
+        p = AnchoringSvPromoter(t, dphi_threshold_deg=8.0,
                              clean_window_epochs=30, eval_every=10)
         t.transition("E21", SvAmbState.FLOATING, epoch=0)
         t.transition("E21", SvAmbState.CONVERGING, epoch=1)

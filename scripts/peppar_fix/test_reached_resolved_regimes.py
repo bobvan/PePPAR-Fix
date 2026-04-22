@@ -1,14 +1,14 @@
 """Unit tests for the AntPosEst latch pair, three-regime gate
-selection, and the anchor-collapse FixSetIntegrityAlarm trigger.
+selection, and the anchor-collapse FixSetIntegrityMonitor trigger.
 
 Covers the regime table (post-lifecycle-rename):
 
 | reached_anchored | anchored_count | Gate regime      |
 |---|---|---|
-| False | any | bootstrap       |
-| True  | ≥ N | strong_anchor   |
-| True  | < N | thin_anchor     |
-| True  | = 0 for M epochs | FixSetIntegrityAlarm fires |
+| False | any | unanchored             |
+| True  | ≥ N | anchored_by_svs        |
+| True  | < N | anchored_by_position   |
+| True  | = 0 for M epochs | FixSetIntegrityMonitor fires |
 
 Plus the ``reached_anchoring`` latch which answers the weaker
 question "has the filter ever produced integer fixes?" — set on
@@ -38,7 +38,7 @@ from peppar_fix.sv_state import (               # noqa: E402
     SvAmbState, SvStateTracker,
 )
 from peppar_fix.states import AntPosEst, AntPosEstState  # noqa: E402
-from peppar_fix.fix_set_integrity_alarm import FixSetIntegrityAlarm  # noqa: E402
+from peppar_fix.fix_set_integrity_monitor import FixSetIntegrityMonitor  # noqa: E402
 
 
 # ── Helpers ──────────────────────────────────────────────────────── #
@@ -60,7 +60,7 @@ def _latch_anchored(sm: AntPosEst) -> None:
     sm.transition(AntPosEstState.ANCHORED, "test")
 
 
-def _long_term(tracker: SvStateTracker, sv: str, epoch: int = 0,
+def _anchor(tracker: SvStateTracker, sv: str, epoch: int = 0,
                elev: float = 60.0) -> None:
     """Walk an SV through the legal edges to ANCHORED."""
     tracker.transition(sv, SvAmbState.FLOATING, epoch=epoch, reason="admit")
@@ -76,7 +76,7 @@ def _long_term(tracker: SvStateTracker, sv: str, epoch: int = 0,
 class ReachedAnchoringLatchTest(unittest.TestCase):
     """``AntPosEst.reached_anchoring``: latches on first ANCHORING
     entry.  Cleared only by ``clear_latches()`` (called from
-    ``FixSetIntegrityAlarm.record_fire``)."""
+    ``FixSetIntegrityMonitor.record_trip``)."""
 
     def test_starts_false(self):
         sm = AntPosEst()
@@ -158,7 +158,7 @@ class ReachedAnchoredLatchTest(unittest.TestCase):
         self.assertFalse(sm.reached_anchored)
 
     def test_clear_latches_clears_both(self):
-        """The alarm's record_fire calls clear_latches() once —
+        """The alarm's record_trip calls clear_latches() once —
         both latches must drop together."""
         sm = AntPosEst()
         _latch_anchored(sm)
@@ -195,18 +195,18 @@ class RegimeSelectionTest(unittest.TestCase):
             bootstrap_lambda_min_p=0.999,
         )
 
-    def test_bootstrap_when_not_reached_anchored(self):
-        self.assertEqual(self.resolver._active_regime(), 'bootstrap')
+    def test_unanchored_when_not_reached_anchored(self):
+        self.assertEqual(self.resolver._active_regime(), 'unanchored')
 
-    def test_bootstrap_persists_through_anchoring(self):
+    def test_unanchored_persists_through_anchoring(self):
         """Key guarantee of the rename: while in ANCHORING (not yet
         ANCHORED), the regime stays bootstrap — we haven't earned
         the trust that anchored_by_svs / anchored_by_position
         presume."""
         _latch_anchoring(self.sm)   # latches reached_anchoring only
-        self.assertEqual(self.resolver._active_regime(), 'bootstrap')
+        self.assertEqual(self.resolver._active_regime(), 'unanchored')
 
-    def test_bootstrap_regime_uses_bootstrap_params(self):
+    def test_unanchored_regime_uses_bootstrap_params(self):
         """Regime selector plumbs the ``bootstrap_*`` overrides
         through.  Defaults now match normal mode (no extra gate
         skepticism during bootstrap), but the mechanism must still
@@ -217,43 +217,43 @@ class RegimeSelectionTest(unittest.TestCase):
             0.999,
         )
 
-    def test_thin_anchor_when_anchored_and_few_anchors(self):
+    def test_anchored_by_position_when_few_anchors(self):
         _latch_anchored(self.sm)
-        _long_term(self.tracker, "E05")   # 1 anchor
-        _long_term(self.tracker, "E06")   # 2 anchors
-        # strong_anchor_min=3 → still thin with only 2
-        self.assertEqual(self.resolver._active_regime(), 'thin_anchor')
+        _anchor(self.tracker, "E05")   # 1 anchor
+        _anchor(self.tracker, "E06")   # 2 anchors
+        # strong_anchor_min=3 → still anchored_by_position with only 2 (< 3)
+        self.assertEqual(self.resolver._active_regime(), 'anchored_by_position')
 
-    def test_strong_anchor_when_anchored_and_enough_anchors(self):
+    def test_anchored_by_svs_when_enough_anchors(self):
         _latch_anchored(self.sm)
         for i in range(3):
-            _long_term(self.tracker, f"E0{i+5}")
-        self.assertEqual(self.resolver._active_regime(), 'strong_anchor')
+            _anchor(self.tracker, f"E0{i+5}")
+        self.assertEqual(self.resolver._active_regime(), 'anchored_by_svs')
 
-    def test_strong_and_thin_use_normal_gates(self):
+    def test_all_anchored_regimes_use_normal_gates(self):
         """Post-anchored regimes don't tighten gates — the
         strictness there comes from the join-test variant, not the
         rectangle/corner params."""
         _latch_anchored(self.sm)
-        # thin_anchor (no anchors)
+        # anchored_by_position (no anchors)
         self.assertEqual(
             self.resolver._active_gates()['lambda_min_p_bootstrap'],
             0.97,
         )
         for i in range(3):
-            _long_term(self.tracker, f"E0{i+5}")
-        # strong_anchor
+            _anchor(self.tracker, f"E0{i+5}")
+        # anchored_by_svs
         self.assertEqual(
             self.resolver._active_gates()['lambda_min_p_bootstrap'],
             0.97,
         )
 
-    def test_bootstrap_bypasses_join_test(self):
+    def test_unanchored_bypasses_join_test(self):
         """``_join_test`` in bootstrap regime: always pass, no
         computation.  Even a candidate that would fail the SV-
         anchored test (if one ran) gets admitted."""
         # Set up a long-term anchor but keep reached_anchored False.
-        _long_term(self.tracker, "E05")
+        _anchor(self.tracker, "E05")
         # Shape P so Δx[2] would be huge (reject on SV-anchored).
         import numpy as _np
         filt = _FakeFilter(N_BASE + 2)
@@ -283,7 +283,7 @@ class PositionAnchoredJoinTest(unittest.TestCase):
             strong_anchor_min=3,
             position_join_k=3.0,
         )
-        _latch_anchored(self.sm)   # post-anchored, no anchors ⇒ thin_anchor
+        _latch_anchored(self.sm)   # post-anchored, no anchors ⇒ anchored_by_position
 
     def test_passes_small_position_shift(self):
         """Candidate whose predicted Δ_pos is < k·σ_pos passes."""
@@ -322,16 +322,16 @@ class PositionAnchoredJoinTest(unittest.TestCase):
 # ── Anchor-collapse trigger ──────────────────────────────────────── #
 
 class AnchorCollapseTriggerTest(unittest.TestCase):
-    """FixSetIntegrityAlarm fires on anchor collapse when
-    ``reached_anchored=True`` + long_term=0 for N epochs.  The
-    ``reached_anchored`` gate is the day0421f fix — pre-rename
-    ``reached_resolved`` also fired on fallback ANCHORING without
-    any long-term anchors, producing the spurious trip cycle."""
+    """FixSetIntegrityMonitor trips on anchor collapse when
+    ``reached_anchored=True`` + anchored_count=0 for N epochs.
+    The ``reached_anchored`` gate is the day0421f fix — pre-
+    rename ``reached_resolved`` also fired on fallback ANCHORING
+    without any anchors, producing the spurious trip cycle."""
 
     def setUp(self):
         self.tracker = SvStateTracker()
         self.sm = AntPosEst()
-        self.alarm = FixSetIntegrityAlarm(
+        self.alarm = FixSetIntegrityMonitor(
             self.tracker,
             ape_state_machine=self.sm,
             anchor_collapse_epochs=30,
@@ -364,7 +364,7 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
 
     def test_does_not_fire_with_anchors_present(self):
         _latch_anchored(self.sm)
-        _long_term(self.tracker, "E05")
+        _anchor(self.tracker, "E05")
         for epoch in range(1, 100):
             self.assertIsNone(self.alarm.evaluate(epoch))
 
@@ -372,7 +372,7 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
         _latch_anchored(self.sm)
         # Need ≥ 4 anchors initially to justify the "collapse" framing.
         for sv in ("E05", "E06", "E07", "E08"):
-            _long_term(self.tracker, sv)
+            _anchor(self.tracker, sv)
         for epoch in range(1, 11):
             self.assertIsNone(self.alarm.evaluate(epoch))
         for sv in ("E05", "E06", "E07", "E08"):
@@ -398,7 +398,7 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
         """
         _latch_anchored(self.sm)
         for sv in ("E05", "E06", "E07", "E08"):
-            _long_term(self.tracker, sv)
+            _anchor(self.tracker, sv)
         self.alarm.evaluate(10)
         for sv in ("E05", "E06", "E07", "E08"):
             self.tracker.transition(sv, SvAmbState.FLOATING,
@@ -425,7 +425,7 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
         for epoch in range(24, 44):
             self.assertIsNone(self.alarm.evaluate(epoch))
 
-    def test_record_fire_clears_both_latches(self):
+    def test_record_trip_clears_both_latches(self):
         """Post-fire, both latches must be clear so the resolver
         reverts to bootstrap gates on the re-initialised filter
         and the anchor-collapse trigger can't re-fire until the
@@ -433,20 +433,20 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
         _latch_anchored(self.sm)
         self.assertTrue(self.sm.reached_anchoring)
         self.assertTrue(self.sm.reached_anchored)
-        self.alarm.record_fire(epoch=100)
+        self.alarm.record_trip(epoch=100)
         self.assertFalse(self.sm.reached_anchoring)
         self.assertFalse(self.sm.reached_anchored)
 
     def test_anchor_collapse_event_dict_has_required_fields(self):
         """The anchor-collapse event dict must carry the fields
-        the engine-side ``_apply_fix_set_alarm`` reads: ``reason``,
+        the engine-side ``_apply_integrity_trip`` reads: ``reason``,
         ``anchor_collapse_epochs``, ``since_epoch``.  Regression
         test for the 2026-04-21 day0421b crash where the engine
         read ``ev['window_rms_m']`` unconditionally and KeyError'd
         out of AntPosEstThread on first anchor-collapse fire."""
         _latch_anchored(self.sm)
         for sv in ("E05", "E06", "E07", "E08"):
-            _long_term(self.tracker, sv)
+            _anchor(self.tracker, sv)
         # Observe the anchored state so the anchor-collapse check
         # is active on subsequent evaluate() calls.
         self.alarm.evaluate(0)
@@ -480,7 +480,7 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
                                 az_deg=90.0, elev_deg=60.0)
         # Rebuild the alarm with default rms_threshold (5.0) and
         # a modest window so the test converges quickly.
-        alarm = FixSetIntegrityAlarm(
+        alarm = FixSetIntegrityMonitor(
             self.tracker, ape_state_machine=self.sm,
             eval_every=1, cooldown_epochs=0,
             min_samples_in_window=5, window_epochs=10,
@@ -500,12 +500,12 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
         self.assertIn('rms_m', ev)
         self.assertIn('n_samples', ev)
 
-    def test_record_fire_resets_collapse_timer(self):
+    def test_record_trip_resets_collapse_timer(self):
         """After a fire, the timer resets (not stuck at "already
         fired").  Required for a clean re-bootstrap."""
         _latch_anchored(self.sm)
         for sv in ("E05", "E06", "E07", "E08"):
-            _long_term(self.tracker, sv)
+            _anchor(self.tracker, sv)
         self.alarm.evaluate(0)    # observe the anchored state
         for sv in ("E05", "E06", "E07", "E08"):
             self.tracker.transition(sv, SvAmbState.FLOATING,
@@ -515,7 +515,7 @@ class AnchorCollapseTriggerTest(unittest.TestCase):
             self.alarm.evaluate(epoch)
         ev = self.alarm.evaluate(32)
         self.assertIsNotNone(ev)
-        self.alarm.record_fire(epoch=32)
+        self.alarm.record_trip(epoch=32)
         # Both latches cleared → reached_anchored=False, so the
         # trigger can't be met regardless of anchor count.
         self.assertIsNone(self.alarm.evaluate(33))

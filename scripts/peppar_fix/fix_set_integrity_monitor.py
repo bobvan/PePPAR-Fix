@@ -1,36 +1,38 @@
-"""Fix-set integrity alarm — catches systemic failures the per-SV
+"""Fix-set integrity monitor — catches systemic failures the per-SV
 monitors can't attribute to one satellite.
 
-Per `docs/sv-lifecycle-and-pfr-split.md`: the new design expects
+Per `docs/sv-lifecycle-and-pfr-split.md`: the design expects
 per-SV issues to be handled by the false-fix monitor and the
-setting-SV drop monitor.  This fix-set-wide alarm fires only for
-the residual case where *many* members misbehave at once without
-any single one being the culprit — genuine systemic failure (bad
-SSR correction batch, clock-datum change, reference-frame shift).
-Expected rate: < 1/day.  If it fires more often, something is
-broken at the correction-source level.
+setting-SV drop monitor.  This fix-set-wide monitor trips only
+for the residual case where *many* members misbehave at once
+without any single one being the culprit — genuine systemic
+failure (bad SSR correction batch, clock-datum change, reference-
+frame shift).  Expected trip rate: < 1/day.  If trips happen more
+often, something is broken at the correction-source level.
 
 Old behaviour this replaces: `PostFixResidualMonitor`'s L1→L2→L3
 ladder.  That design had a level-persistence bug — once cascaded
 to L3 it re-fired on every subsequent misfit, losing ~10 min of
 convergence per re-fire (see
 `project_pfr_event_analysis_20260419.md`: 0/16 L3 events had a
-fresh L1 precursor within 10 min).  This alarm is **stateless** —
-each eval looks at the current window and decides independently,
+fresh L1 precursor within 10 min).  This monitor is **stateless**
+— each eval looks at the current window and decides independently,
 no escalation state carried forward.
 
-The alarm is deliberately conservative.  It requires:
+The monitor is deliberately conservative.  Triggering requires:
   - Elevated RMS sustained over a window (not a single spike)
-  - Minimum epoch gap since the last fire (`cooldown_epochs`)
+  - Minimum epoch gap since the last trip (`cooldown_epochs`)
     — so the re-init action has a chance to take effect before
     we re-evaluate
   - No false-fix or setting-SV-drop event in the same window
     (tracked via the tracker's `state_entered_epoch` — if many
-    SVs just went to FLOATING, the per-SV monitors are already on it)
+    SVs just went to FLOATING, the per-SV monitors are already
+    on it)
 
-Fire action: full filter re-init at `known_ecef`.  Same as old L3.
-Fix-set-wide; caller clears the NL resolver, MW tracker, and
-re-seeds PPPFilter.  Expected < 1/day in steady state.
+Trip action: full filter re-init at `known_ecef`.  Same behaviour
+as old L3.  Fix-set-wide; caller clears the NL resolver, MW
+tracker, and re-seeds PPPFilter.  Expected < 1/day in steady
+state.
 """
 
 from __future__ import annotations
@@ -44,48 +46,49 @@ from peppar_fix.sv_state import SvAmbState, SvStateTracker
 log = logging.getLogger(__name__)
 
 
-class FixSetIntegrityAlarm:
-    """Fix-set-wide PR-RMS alarm, stateless per-eval.
+class FixSetIntegrityMonitor:
+    """Fix-set-wide PR-RMS monitor, stateless per-eval.
 
-    Two firing conditions:
+    Two trip conditions:
 
       1. **Window-RMS** (historical): mean PR residual across fix-set
-         members sustained above `rms_threshold_m` for the sampling
+         members sustained above ``rms_threshold_m`` for the sampling
          window.  Catches the gross "many members are lying" case.
       2. **Anchor-collapse** (2026-04-21): on a filter that has
-         latched ``reached_anchored=True`` (i.e., has ever
-         entered the ANCHORED state with ≥ 4 ANCHORED
-         validated members), the long-term anchor count drops to
-         zero and stays there for ``anchor_collapse_epochs``.
-         Day0421b showed the trap this closes — the filter
-         drifts during a hollow-anchor window because the
-         per-candidate join test has nothing to anchor to.  When
-         all anchors are gone on a filter that once had them,
-         don't try to salvage — tear it down and rebuild from
-         bootstrap.  See
+         latched ``reached_anchored=True`` (has ever entered the
+         ANCHORED state with ≥ 4 geometry-validated anchors), the
+         anchor count drops to zero and stays there for
+         ``anchor_collapse_epochs``.  Day0421b showed the trap
+         this closes — the filter drifts during a hollow-anchor
+         window because the per-candidate join test has nothing
+         to anchor to.  When all anchors are gone on a filter
+         that once had them, don't try to salvage — tear it down
+         and rebuild from bootstrap.  See
          ``project_day0421b_anchor_loss_trap_20260421.md`` and
          ``project_landed_20260421_anchor_collapse_fix.md``
-         (858f7da, which originally used a local `_ever_anchored`
-         flag migrated into this latch in Commit (a) of the
-         lifecycle rename).
+         (858f7da, which originally used a local ``_ever_anchored``
+         flag migrated into the ``reached_anchored`` latch in
+         Commit (a) of the lifecycle rename).
 
-    The alarm's event dict carries a `reason` key so callers can
-    log the trigger type.
+    The event dict returned by ``evaluate()`` carries a ``reason``
+    key so callers can log the trigger type.  Edge-triggered: the
+    monitor produces one event at the moment the threshold is
+    crossed, then stays silent until ``record_trip`` is called.
 
     Usage:
 
-        alarm = FixSetIntegrityAlarm(tracker, ape_sm, ...)
-        alarm.ingest(epoch, resid, labels)
-        ev = alarm.evaluate(epoch)
+        monitor = FixSetIntegrityMonitor(tracker, ape_sm, ...)
+        monitor.ingest(epoch, resid, labels)
+        ev = monitor.evaluate(epoch)
         if ev is not None:
             # caller executes the re-init: unfix all NL, reset MW,
-            # reseed filter.  alarm.record_fire clears the
-            # reached_anchoring + reached_anchored latches on the
-            # AntPosEst state machine.
-            alarm.record_fire(epoch)
+            # reseed filter, emit the [FIX_SET_INTEGRITY] TRIPPED
+            # log line, then tell the monitor it has tripped so
+            # both latches clear and the cooldown starts.
+            monitor.record_trip(epoch)
 
-    `record_fire` is the only state the alarm carries forward — it's
-    just the cooldown timestamp plus the latch clear.  No level
+    ``record_trip`` is the only state the monitor carries forward
+    — just the cooldown timestamp plus the latch clear.  No level
     ladder, no "next step" memory.
     """
 
@@ -105,7 +108,7 @@ class FixSetIntegrityAlarm:
         self._tracker = tracker
         # Reference to AntPosEst state machine — used to read the
         # reached_anchored latch for the anchor-collapse trigger
-        # and to clear both latches in record_fire.  None disables
+        # and to clear both latches in record_trip.  None disables
         # the anchor-collapse trigger entirely — the window-RMS
         # path still works (legacy callers are unaffected).
         self._ape_sm = ape_state_machine
@@ -116,11 +119,11 @@ class FixSetIntegrityAlarm:
         self._suppress_window = int(suppress_if_monitors_fired_within)
         self._anchor_collapse_epochs = int(anchor_collapse_epochs)
         self._rms_hist: deque = deque(maxlen=int(window_epochs))
-        self._last_fire_epoch: int = -10**9
+        self._last_trip_epoch: int = -10**9
         # First epoch at which we observed zero long-term anchors on
         # a filter that has ever been ANCHORED.  None whenever
         # anchors are present or the filter has never been
-        # anchored.  Reset on every fire.
+        # anchored.  Reset on every trip.
         self._anchor_collapse_since: int | None = None
 
     # ── Data intake ─────────────────────────────────────────────── #
@@ -150,7 +153,7 @@ class FixSetIntegrityAlarm:
     # ── Evaluation ──────────────────────────────────────────────── #
 
     def evaluate(self, epoch: int) -> dict | None:
-        """Return an alarm event dict, or None if no fire.
+        """Return a trip event dict, or None if no trip.
 
         Event dict carries a ``reason`` key so callers can branch on
         trigger type:
@@ -162,7 +165,7 @@ class FixSetIntegrityAlarm:
             ``anchor_collapse_epochs`` (field
             ``anchor_collapse_epochs``, ``since_epoch``).
 
-        Caller executes re-init and calls `record_fire(epoch)`
+        Caller executes re-init and calls `record_trip(epoch)`
         exactly once per event.
 
         Suppression rules (applied only to the window-RMS path —
@@ -171,7 +174,7 @@ class FixSetIntegrityAlarm:
         filter, per-SV monitors aren't going to fix it):
           - fewer than `min_samples_in_window` RMS samples
           - window mean RMS ≤ threshold
-          - within `cooldown_epochs` of last fire
+          - within `cooldown_epochs` of last trip
           - any SV transitioned to FLOATING within
             `suppress_if_monitors_fired_within` epochs (the per-SV
             monitors are already handling it)
@@ -180,11 +183,11 @@ class FixSetIntegrityAlarm:
             return None
         # Cooldown applies to both triggers — the filter just got
         # re-initialized and needs time to settle before re-evaluating.
-        if epoch < self._last_fire_epoch + self._cooldown:
+        if epoch < self._last_trip_epoch + self._cooldown:
             return None
 
         # ── Anchor-collapse trigger (checked first: cheaper, can
-        # pre-empt the window-RMS path when both would fire).  Only
+        # pre-empt the window-RMS path when both would trip).  Only
         # active on filters that have ever reached the ANCHORED
         # state (≥ 4 ANCHORED validated).  During bootstrap,
         # CONVERGING, or ANCHORING with zero long-term anchors the
@@ -196,7 +199,7 @@ class FixSetIntegrityAlarm:
         # fallback path too and couldn't be used as the gate.
         ap = self._ape_sm
         if ap is not None and getattr(ap, 'reached_anchored', False):
-            lt_count = len(self._tracker.long_term_members())
+            lt_count = len(self._tracker.anchored_svs())
             if lt_count == 0:
                 if self._anchor_collapse_since is None:
                     self._anchor_collapse_since = epoch
@@ -227,7 +230,7 @@ class FixSetIntegrityAlarm:
             if rec.state is SvAmbState.FLOATING:
                 if rec.state_entered_epoch >= suppress_cutoff:
                     log.info(
-                        "[FIX_SET_ALARM] suppressed: %s in %s since epoch %d"
+                        "[FIX_SET_INTEGRITY] suppressed: %s in %s since epoch %d"
                         " (per-SV monitor handling; window RMS=%.2fm)",
                         rec.sv, rec.state.value, rec.state_entered_epoch,
                         window_mean,
@@ -242,7 +245,7 @@ class FixSetIntegrityAlarm:
             'n_samples': len(self._rms_hist),
         }
 
-    def record_fire(self, epoch: int) -> None:
+    def record_trip(self, epoch: int) -> None:
         """Caller calls this after executing the re-init.
 
         Clears the window-RMS history (so the next eval starts
@@ -252,20 +255,23 @@ class FixSetIntegrityAlarm:
         bootstrap mode and must re-earn both milestones through
         promotion, not through mere stabilization.
         """
-        self._last_fire_epoch = int(epoch)
+        self._last_trip_epoch = int(epoch)
         self._rms_hist.clear()
         self._anchor_collapse_since = None
         if self._ape_sm is not None:
-            self._ape_sm.clear_latches(reason="fix_set_alarm")
-        log.warning("[FIX_SET_ALARM] fired at epoch %d — filter re-init", epoch)
+            self._ape_sm.clear_latches(reason="fix_set_integrity_trip")
+        # The trip itself is announced by the caller as a single
+        # [FIX_SET_INTEGRITY] TRIPPED line with reason + params.  We
+        # don't re-announce here — keeps "monitor only speaks on
+        # trip, once" as the interface contract.
 
     # ── Diagnostics ─────────────────────────────────────────────── #
 
     def summary(self) -> str:
         if not self._rms_hist:
-            return "fix_set_alarm: no samples"
+            return "fix_set_integrity: no samples"
         window_mean = sum(self._rms_hist) / len(self._rms_hist)
         return (
-            f"fix_set_alarm: window_rms={window_mean:.2f}m"
+            f"fix_set_integrity: window_rms={window_mean:.2f}m"
             f" (last={self._rms_hist[-1]:.2f}m, n={len(self._rms_hist)})"
         )

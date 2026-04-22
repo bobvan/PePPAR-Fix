@@ -18,7 +18,7 @@ from peppar_fix.false_fix_monitor import (
     FalseFixMonitor, elev_weighted_threshold,
 )
 from peppar_fix.setting_sv_drop_monitor import SettingSvDropMonitor
-from peppar_fix.fix_set_integrity_alarm import FixSetIntegrityAlarm
+from peppar_fix.fix_set_integrity_monitor import FixSetIntegrityMonitor
 
 
 class LegalTransitionsTest(unittest.TestCase):
@@ -168,7 +168,7 @@ class FixSetMembershipTest(unittest.TestCase):
     def setUp(self):
         self.t = SvStateTracker()
 
-    def test_short_and_long_term_counts(self):
+    def test_anchoring_and_anchored_counts(self):
         # Two in short-term, one in long-term, one unfixed.
         for sv, state in [
             ("G01", SvAmbState.ANCHORING),
@@ -177,8 +177,8 @@ class FixSetMembershipTest(unittest.TestCase):
             ("G04", SvAmbState.FLOATING),
         ]:
             self.t.get(sv).state = state
-        self.assertEqual(len(self.t.short_term_members()), 2)
-        self.assertEqual(len(self.t.long_term_members()), 1)
+        self.assertEqual(len(self.t.anchoring_svs()), 2)
+        self.assertEqual(len(self.t.anchored_svs()), 1)
         self.assertEqual(len(self.t.fix_set_members()), 3)
 
 
@@ -437,12 +437,12 @@ class SettingSvDropMonitorTest(unittest.TestCase):
         self.assertEqual(self.m.evaluate(10), [])
 
 
-class FixSetIntegrityAlarmTest(unittest.TestCase):
+class FixSetIntegrityMonitorTest(unittest.TestCase):
     """Alarm requires RMS threshold sustained, no recent per-SV monitor, no cooldown."""
 
     def setUp(self):
         self.t = SvStateTracker()
-        self.alarm = FixSetIntegrityAlarm(
+        self.alarm = FixSetIntegrityMonitor(
             self.t,
             rms_threshold_m=5.0,
             min_samples_in_window=3,
@@ -486,7 +486,7 @@ class FixSetIntegrityAlarmTest(unittest.TestCase):
             self.alarm.ingest(e, [6.0], labels)
         ev1 = self.alarm.evaluate(10)
         self.assertIsNotNone(ev1)
-        self.alarm.record_fire(10)
+        self.alarm.record_trip(10)
         # Immediate re-check must be suppressed by cooldown.
         for e in range(11, 21):
             self.alarm.ingest(e, [6.0], labels)

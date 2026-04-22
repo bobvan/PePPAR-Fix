@@ -73,7 +73,7 @@ class _FakeFilter:
                                  for sv, h in H_by_sv.items()}
 
 
-def _put_in_long_term(tracker: SvStateTracker, sv: str,
+def _put_in_anchored(tracker: SvStateTracker, sv: str,
                       elev_deg: float) -> None:
     """Walk an SV through the legal state chain to ANCHORED."""
     tracker.transition(sv, SvAmbState.FLOATING, epoch=0, reason="admit")
@@ -118,7 +118,7 @@ class JoinTestTest(unittest.TestCase):
         """`join_test_enabled=False` must bypass the test even when
         an anchor would otherwise fail.  This is what the A/B arm
         uses to turn the gate off for a controlled comparison."""
-        _put_in_long_term(self.tracker, "E05", elev_deg=60.0)
+        _put_in_anchored(self.tracker, "E05", elev_deg=60.0)
         h_e05 = [0.0] * N_BASE + [0.0, 0.0]
         h_e05[2] = 1.0
         filt = _FakeFilter(N_BASE + 2, H_by_sv={"E05": h_e05})
@@ -141,7 +141,7 @@ class JoinTestTest(unittest.TestCase):
         self.assertEqual(abs_dr, 0.0)
         self.assertEqual(thr, 0.0)
 
-    def test_passes_when_no_long_term_members(self):
+    def test_passes_when_no_anchored_svs(self):
         """Bootstrap: no anchors yet → join test trivially passes."""
         filt = _FakeFilter(N_BASE + 2)
         ok, *_ = self.resolver._join_test(filt, N_BASE, fixed_value=0.0)
@@ -150,7 +150,7 @@ class JoinTestTest(unittest.TestCase):
     def test_passes_when_filter_has_no_cached_H(self):
         """Before the first EKF update → no H to project against →
         pass through (nothing to test)."""
-        _put_in_long_term(self.tracker, "E05", elev_deg=60.0)
+        _put_in_anchored(self.tracker, "E05", elev_deg=60.0)
         filt = _FakeFilter(N_BASE + 2)  # no H_by_sv
         # Make the candidate's ambiguity column non-zero so Δx would
         # actually be non-zero if H existed.
@@ -163,7 +163,7 @@ class JoinTestTest(unittest.TestCase):
     def test_small_delta_passes(self):
         """A candidate that shifts state by sub-threshold amounts
         should pass (Δresidual on all anchors < 2.0 m)."""
-        _put_in_long_term(self.tracker, "E05", elev_deg=60.0)
+        _put_in_anchored(self.tracker, "E05", elev_deg=60.0)
         # H row for E05: pure position-z sensitivity.  Δresid =
         # h · dx.  With this H = [0,0,1,0,...,0] (row), Δresid =
         # Δx[2].  Δx comes from the Kalman closed-form:
@@ -186,7 +186,7 @@ class JoinTestTest(unittest.TestCase):
     def test_large_delta_rejects(self):
         """A candidate that would push an anchor's PR residual past
         the elev-weighted threshold must be rejected."""
-        _put_in_long_term(self.tracker, "E05", elev_deg=60.0)
+        _put_in_anchored(self.tracker, "E05", elev_deg=60.0)
         # Same H as above but we'll crank P[2, si] so Δx[2] is huge.
         h_e05 = [0.0] * N_BASE + [0.0, 0.0]
         h_e05[2] = 1.0
@@ -208,7 +208,7 @@ class JoinTestTest(unittest.TestCase):
         """Threshold scales up by 1/sin(elev) below 45°, matching
         FalseFixMonitor.  An anchor at 15° tolerates a larger
         Δresidual than one at 60° for the same base=2.0 m."""
-        _put_in_long_term(self.tracker, "E05", elev_deg=15.0)
+        _put_in_anchored(self.tracker, "E05", elev_deg=15.0)
         h_e05 = [0.0] * N_BASE + [0.0, 0.0]
         h_e05[2] = 1.0
         filt = _FakeFilter(N_BASE + 2, H_by_sv={"E05": h_e05})
@@ -225,11 +225,11 @@ class JoinTestTest(unittest.TestCase):
         self.assertGreater(thr, 2.0)  # threshold was relaxed
         self.assertAlmostEqual(abs_dr, 3.0, places=1)
 
-    def test_ignores_short_term_members(self):
+    def test_ignores_anchoring_svs(self):
         """Short-term members are *not* anchors in the SV-anchored
         path — they're what the test is protecting *from*.  A
         candidate whose P-coupling is only against ANCHORING
-        should pass.  We stay in strong_anchor regime by adding an
+        should pass.  We stay in anchored_by_svs regime by adding an
         unrelated long-term member whose H-row decouples entirely
         from this candidate."""
         # ANCHORING member with the coupling we'd want the test
@@ -242,9 +242,9 @@ class JoinTestTest(unittest.TestCase):
                                 epoch=2, reason="lambda",
                                 az_deg=90.0, elev_deg=60.0)
         # Long-term member with zero H-coupling to the candidate —
-        # keeps us in strong_anchor regime while providing no basis
+        # keeps us in anchored_by_svs regime while providing no basis
         # for the SV-anchored gate to reject.
-        _put_in_long_term(self.tracker, "E11", elev_deg=60.0)
+        _put_in_anchored(self.tracker, "E11", elev_deg=60.0)
         h_e05 = [0.0] * N_BASE + [0.0, 0.0]
         h_e05[2] = 1.0
         h_e11_all_zero = [0.0] * N_BASE + [0.0, 0.0]
@@ -262,8 +262,8 @@ class JoinTestTest(unittest.TestCase):
     def test_multiple_anchors_uses_worst(self):
         """With two long-term members, the reject is triggered by
         the one whose Δresid exceeds threshold, not by any that pass."""
-        _put_in_long_term(self.tracker, "E05", elev_deg=60.0)
-        _put_in_long_term(self.tracker, "E10", elev_deg=60.0)
+        _put_in_anchored(self.tracker, "E05", elev_deg=60.0)
+        _put_in_anchored(self.tracker, "E10", elev_deg=60.0)
         # E05 has near-zero sensitivity; E10 has huge sensitivity.
         h_e05 = [0.0] * N_BASE + [0.0, 0.0]
         h_e05[2] = 1.0

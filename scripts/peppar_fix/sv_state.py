@@ -192,14 +192,15 @@ class SvStateTracker:
 
     # ── Fix-set membership helpers ───────────────────────────────── #
 
-    def short_term_members(self) -> list[str]:
-        """SVs whose integer fix is a short-term (anchoring) member
-        of the fix set — NL fixed, not yet geometry-validated."""
+    def anchoring_svs(self) -> list[str]:
+        """SVs with an integer fix that haven't yet been geometry-
+        validated — short-term (anchoring) members of the fix
+        set.  SvAmbState.ANCHORING."""
         return self.svs_in(SvAmbState.ANCHORING)
 
-    def long_term_members(self) -> list[str]:
-        """SVs whose integer fix is a long-term (anchored) member
-        of the fix set — geometry-validated via ≥ 8° Δaz."""
+    def anchored_svs(self) -> list[str]:
+        """SVs whose integer fix has survived ≥ 8° Δaz — long-term
+        (anchored) members of the fix set.  SvAmbState.ANCHORED."""
         return self.svs_in(SvAmbState.ANCHORED)
 
     def fix_set_members(self) -> list[str]:

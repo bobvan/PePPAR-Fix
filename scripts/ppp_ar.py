@@ -898,43 +898,53 @@ class NarrowLaneResolver:
         """Number of ANCHORED anchors currently held."""
         if self._sv_state is None:
             return 0
-        return len(self._sv_state.long_term_members())
+        return len(self._sv_state.anchored_svs())
 
     def _active_regime(self) -> str:
-        """One of ``bootstrap``, ``thin_anchor``, ``strong_anchor``.
+        """One of ``unanchored``, ``anchored_by_position``,
+        ``anchored_by_svs``.
 
         Gate selection flows from the combination of
         ``reached_anchored`` (has the filter earned trust?) and
         the current anchor count (are the SV anchors strong
         enough to be the thing we defend against?):
 
-          * bootstrap — ``reached_anchored=False``.  Normal gates
+          * unanchored — ``reached_anchored=False``.  Normal gates
             post-372ef3b; join test bypasses.  Every NL commit is
             exploratory — we haven't yet validated an integer
             fix against geometry.
-          * thin_anchor — reached_anchored AND anchored_count < N.
-            Normal gates, position-anchored join test (we have a
-            trusted position but few SV anchors).
-          * strong_anchor — reached_anchored AND anchored_count ≥ N.
-            Normal gates, SV-anchored join test (standard path).
+          * anchored_by_position — reached_anchored AND
+            anchored_count < N.  Normal gates, position-anchored
+            join test (we have a trusted position but few SV
+            anchors to project through).
+          * anchored_by_svs — reached_anchored AND
+            anchored_count ≥ N.  Normal gates, SV-anchored join
+            test: project Δx through each anchored SV's cached
+            PR H-row (standard path).
 
         The anchor-count boundary is ``self._strong_anchor_min``.
         """
         if not self._reached_anchored():
-            return 'bootstrap'
+            return 'unanchored'
         if self._anchored_count() >= self._strong_anchor_min:
-            return 'strong_anchor'
-        return 'thin_anchor'
+            return 'anchored_by_svs'
+        return 'anchored_by_position'
 
     def _active_gates(self) -> dict:
         """Gate parameters for the current regime.
 
         Returns keys ``frac_threshold``, ``sigma_threshold``,
-        ``corner_margin_sum``, ``lambda_min_p_bootstrap``.  Non-
-        bootstrap regimes use the instance defaults; bootstrap uses
-        the tighter `_bootstrap_*` overrides.
+        ``corner_margin_sum``, ``lambda_min_p_bootstrap``.  Post-
+        372ef3b all regimes return the same values (normal gates).
+        The ``unanchored`` regime reads from ``_bootstrap_*``
+        overrides for plumbing purposes — callers can re-tighten
+        those kwargs for a specific failure mode without touching
+        the ``anchored_by_*`` paths.  The kwarg name
+        ``lambda_min_p_bootstrap`` refers to LAMBDA's integer-
+        least-squares bootstrap success probability (PPP-AR math
+        literature term), not the regime name.
         """
-        if self._active_regime() == 'bootstrap':
+        if self._active_regime() == 'unanchored':
             return {
                 'frac_threshold':   self._bootstrap_frac_threshold,
                 'sigma_threshold':  self._bootstrap_sigma_threshold,
@@ -972,32 +982,32 @@ class NarrowLaneResolver:
     def _join_test(self, filt, state_idx, fixed_value):
         """Would this candidate fix break the current anchor set?
 
-        Dispatches on `_active_regime()`:
-          * bootstrap — trivially passes; bootstrap gates provide the
-            defense (no trusted position yet, nothing to anchor to).
-          * strong_anchor — SV-anchored variant: project Δx through
-            each long-term member's cached PR H-row and reject if
-            any anchor's induced |Δresidual| exceeds the elev-
-            weighted FalseFixMonitor threshold.  (Historical default.)
-          * thin_anchor — position-anchored variant: project Δx onto
-            the filter's position state and reject if |Δx[:3]| >
-            k · σ_pos.  Used when reached_anchored is True but the
-            SV anchors are too few (< strong_anchor_min) to
+        Dispatches on ``_active_regime()``:
+          * unanchored — trivially passes; no trusted position
+            yet, nothing to anchor to.
+          * anchored_by_svs — project Δx through each anchored
+            SV's cached PR H-row and reject if any anchor's
+            induced |Δresidual| exceeds the elev-weighted
+            FalseFixMonitor threshold.  Standard path once the
+            filter has accumulated enough anchors.
+          * anchored_by_position — project Δx onto the filter's
+            position state and reject if |Δx[:3]| > k · σ_pos.
+            Used when reached_anchored is True but the SV
+            anchors are too few (< ``_strong_anchor_min``) to
             constrain Δx reliably on their own.
 
-        Returns (ok, worst_sv_or_None, worst_abs_delta, worst_thr).
+        Returns ``(ok, worst_sv_or_None, worst_abs_delta, worst_thr)``.
         In the position-anchored path, worst_sv is None (no per-SV
         attribution) and worst_abs_delta is the |Δ_pos| magnitude in
         metres.
 
         Cheap fast-paths (always pass):
-          * gate disabled via `join_test_enabled=False`
+          * gate disabled via ``join_test_enabled=False``
           * no SV state tracker (can't know regime)
-          * bootstrap regime (see above)
-          * no long-term members when we're in strong/thin regimes
-            (shouldn't happen — strong requires ≥ N, thin needs ≥ 1
-            for SV-anchored evidence even if we route to position-
-            anchored for N=0 — see below)
+          * unanchored regime (see above)
+          * no anchored SVs when we're in anchored_by_svs regime
+            (defensive — a transient one-epoch gap between the
+            regime check and the anchor list read)
           * filter hasn't run an EKF update yet (no cached H rows)
         """
         if not self._join_test_enabled:
@@ -1005,18 +1015,19 @@ class NarrowLaneResolver:
         if self._sv_state is None:
             return True, None, 0.0, 0.0
         regime = self._active_regime()
-        if regime == 'bootstrap':
+        if regime == 'unanchored':
             return True, None, 0.0, 0.0
-        if regime == 'thin_anchor':
+        if regime == 'anchored_by_position':
             return self._position_anchored_join_test(
                 filt, state_idx, fixed_value,
             )
-        # regime == 'strong_anchor' — SV-anchored join test below.
-        lt_members = self._sv_state.long_term_members()
-        if not lt_members:
-            # Defensive — regime said strong but the tracker has no
-            # long-term members; fall back to pass.  Should be a
-            # transient (regime snapshot stale by one epoch at most).
+        # regime == 'anchored_by_svs' — SV-anchored join test below.
+        anchors = self._sv_state.anchored_svs()
+        if not anchors:
+            # Defensive — regime said anchored_by_svs but the
+            # tracker has no anchors; fall back to pass.  Should
+            # be a transient (regime snapshot stale by one epoch
+            # at most).
             return True, None, 0.0, 0.0
         h_by_sv = getattr(filt, 'last_H_by_sv', None)
         if not h_by_sv:
@@ -1027,17 +1038,17 @@ class NarrowLaneResolver:
         worst_sv = None
         worst_abs = 0.0
         worst_thr = 0.0
-        for sv_lt in lt_members:
-            h_lt = h_by_sv.get(sv_lt)
-            if h_lt is None:
+        for anchor_sv in anchors:
+            h_anchor = h_by_sv.get(anchor_sv)
+            if h_anchor is None:
                 continue  # no PR obs this epoch — can't project
             # State may have grown (new ambiguity added) since H was
             # cached.  Project only the columns both vectors share —
-            # the new ambiguity column would be 0 in h_lt anyway
-            # because sv_lt's H doesn't touch sv_new's ambiguity.
-            n = min(len(h_lt), len(dx))
-            delta_resid = float(np.dot(h_lt[:n], dx[:n]))
-            rec = self._sv_state.get(sv_lt)
+            # the new ambiguity column would be 0 in h_anchor anyway
+            # because anchor_sv's H doesn't touch sv_new's ambiguity.
+            n = min(len(h_anchor), len(dx))
+            delta_resid = float(np.dot(h_anchor[:n], dx[:n]))
+            rec = self._sv_state.get(anchor_sv)
             elev = rec.last_elev_deg if rec is not None else None
             threshold = elev_weighted_threshold(
                 self._join_test_base_m, elev,
@@ -1045,15 +1056,15 @@ class NarrowLaneResolver:
             abs_dr = abs(delta_resid)
             if abs_dr > worst_abs:
                 worst_abs = abs_dr
-                worst_sv = sv_lt
+                worst_sv = anchor_sv
                 worst_thr = threshold
             if abs_dr > threshold:
-                return False, sv_lt, abs_dr, threshold
+                return False, anchor_sv, abs_dr, threshold
         return True, worst_sv, worst_abs, worst_thr
 
     def _position_anchored_join_test(self, filt, state_idx, fixed_value):
         """Reject candidates that would shift position by more than
-        k · σ_pos.  Used in the ``thin_anchor`` regime where SV
+        k · σ_pos.  Used in the ``anchored_by_position`` regime where SV
         anchors are too few to reliably drive the SV-anchored variant.
 
         σ_pos is the 3D position sigma — `sqrt(tr(P[:3, :3]))`, the

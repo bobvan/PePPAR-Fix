@@ -90,7 +90,7 @@ class AntPosEst(StateMachine):
         is defensible.
 
     Both are cleared only by ``clear_latches()`` — called from
-    ``FixSetIntegrityAlarm.record_fire()``, the explicit
+    ``FixSetIntegrityMonitor.record_trip()``, the explicit
     "throw everything out and rebuild from scratch" event.
     Ordinary state regressions (ANCHORED → ANCHORING → CONVERGING
     on slip storm) do NOT clear them; losing anchors means we
@@ -136,7 +136,7 @@ class AntPosEst(StateMachine):
             self.reached_anchored = True
 
     def clear_latches(self, reason: str = "") -> None:
-        """Called by FixSetIntegrityAlarm after re-init.  Don't
+        """Called by FixSetIntegrityMonitor after re-init.  Don't
         call from anywhere else — the latches' whole point is
         that ordinary state regressions don't reset them.
 

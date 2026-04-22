@@ -55,8 +55,8 @@ from peppar_fix.cycle_slip import CycleSlipMonitor, SlipEvent, flush_sv_phase
 from peppar_fix.sv_state import SvAmbState, SvStateTracker
 from peppar_fix.false_fix_monitor import FalseFixMonitor
 from peppar_fix.setting_sv_drop_monitor import SettingSvDropMonitor
-from peppar_fix.fix_set_integrity_alarm import FixSetIntegrityAlarm
-from peppar_fix.long_term_promoter import LongTermPromoter
+from peppar_fix.fix_set_integrity_monitor import FixSetIntegrityMonitor
+from peppar_fix.anchoring_sv_promoter import AnchoringSvPromoter
 from peppar_fix.nl_diag import NlDiagLogger
 
 
@@ -115,7 +115,7 @@ def _compute_sv_azimuths(filt, corrections, observations, gps_time):
 
     Same return-contract as _compute_sv_elevations: empty dict if
     filter has no position or corrections can't provide satellite
-    positions.  Used by the Bead 4 LongTermPromoter to measure
+    positions.  Used by the Bead 4 AnchoringSvPromoter to measure
     accumulated sky motion since NL fix.
     """
     if filt is None or not hasattr(filt, 'x') or len(filt.x) < 3:
@@ -1363,13 +1363,13 @@ class AntPosEstThread(threading.Thread):
             rec.state = SvAmbState.ANCHORING
         self._false_fix = FalseFixMonitor(self._sv_state)
         self._setting_drop = SettingSvDropMonitor(self._sv_state)
-        self._fix_set_alarm = FixSetIntegrityAlarm(
+        self._fix_set_integrity = FixSetIntegrityMonitor(
             self._sv_state, ape_state_machine=self._ape_sm,
         )
         # Bead 4 — promotes ANCHORING → ANCHORED after Δaz ≥ 15°
         # with a clean false-fix window.  Solution-state RESOLVED count (below) reads
         # ANCHORED from the tracker instead of raw NL-fix count.
-        self._promoter = LongTermPromoter(self._sv_state)
+        self._promoter = AnchoringSvPromoter(self._sv_state)
         self._slip_monitor = CycleSlipMonitor(
             mw_tracker=self._mw, csv_writer=_slip_csv_writer())
 
@@ -1577,47 +1577,46 @@ class AntPosEstThread(threading.Thread):
         # Preserve MW state — a drop is "this integer is done," not
         # "this SV is bad."  Next arc or re-acquisition re-uses it.
 
-    def _apply_fix_set_alarm(self, filt, mw, nl, ev):
-        """Fix-set integrity alarm fired — systemic failure.  Full
-        filter re-init at current AR position.  Transitions the position
-        solution back to CONVERGING.
+    def _apply_integrity_trip(self, filt, mw, nl, ev):
+        """Fix-set integrity monitor tripped — systemic failure.
+        Full filter re-init at current AR position.  Transitions
+        the filter state back to CONVERGING.
 
-        The alarm's ``ev`` dict has two shapes depending on trigger:
-          * ``reason='window_rms'`` — keys ``window_rms_m``, ``rms_m``,
-            ``n_samples``.  Mean PR residual across fix-set members
-            stayed elevated.
+        The monitor's ``ev`` dict has two shapes depending on trigger:
+          * ``reason='window_rms'`` — keys ``window_rms_m``,
+            ``rms_m``, ``n_samples``.  Mean PR residual across
+            fix-set members stayed elevated.
           * ``reason='anchor_collapse'`` — keys
             ``anchor_collapse_epochs``, ``since_epoch``.  Zero
-            ANCHORED anchors for N epochs on a filter that
-            has ever latched ``reached_anchored`` (post-rename;
-            pre-rename this was ``reached_resolved``, which caused
-            the day0421f spurious-trip cycle — see
-            ``project_landed_20260421_anchor_collapse_fix.md``).
-            See ``project_day0421b_anchor_loss_trap_20260421.md``
-            for the originating motivation.
+            anchored SVs for N epochs on a filter that has ever
+            latched ``reached_anchored``.  See
+            ``project_landed_20260421_anchor_collapse_fix.md`` and
+            ``project_day0421b_anchor_loss_trap_20260421.md``.
 
-        Branch on ``reason`` when building the log line.  Without
-        this branch the anchor-collapse path crashes with a
-        KeyError on the first fire (caught on day0421b, L5 fleet
-        and ptpmon at 15:17 CDT 2026-04-21).
+        Emits the single [FIX_SET_INTEGRITY] TRIPPED log line
+        (monitor itself stays silent per the "monitor only speaks
+        on trip, once" interface contract).  Branch on ``reason``
+        to format the params key-value frag — without this branch
+        the anchor-collapse path would KeyError on missing
+        ``window_rms_m`` (regression fix landed on day0421b
+        15:17 CDT).
         """
         pos_ecef = filt.x[:3].copy()
         reason = ev.get('reason', 'window_rms')
         if reason == 'anchor_collapse':
-            detail = (
-                f"anchor_collapse: 0 ANCHORED anchors for "
-                f"{ev['anchor_collapse_epochs']} epochs "
-                f"(since epoch {ev['since_epoch']})"
+            params = (
+                f"anchor_collapse_epochs={ev['anchor_collapse_epochs']} "
+                f"since_epoch={ev['since_epoch']}"
             )
         else:
-            detail = (
-                f"window_rms={ev['window_rms_m']:.2f}m, "
-                f"latest={ev['rms_m']:.2f}m, "
-                f"n={ev['n_samples']}"
+            params = (
+                f"window_rms_m={ev['window_rms_m']:.2f} "
+                f"rms_m={ev['rms_m']:.2f} "
+                f"n_samples={ev['n_samples']}"
             )
         log.warning(
-            "[FIX_SET_ALARM] re-initialising PPPFilter at %s (%s)",
-            pos_ecef.tolist(), detail,
+            "[FIX_SET_INTEGRITY] TRIPPED reason=%s %s at pos=%s",
+            reason, params, pos_ecef.tolist(),
         )
         # Drop all NL fixes (tracker → FLOATING for each via resolver hook),
         # clear MW state entirely (big reset), re-seed filter.
@@ -1633,7 +1632,8 @@ class AntPosEstThread(threading.Thread):
                 try:
                     self._sv_state.transition(
                         sv, SvAmbState.FLOATING,
-                        epoch=self._n_epochs, reason="fix_set_alarm:reinit",
+                        epoch=self._n_epochs,
+                        reason="fix_set_integrity_trip:reinit",
                     )
                 except Exception:
                     # WAITING → FLOATING is legal per the edge set, but
@@ -1646,9 +1646,9 @@ class AntPosEstThread(threading.Thread):
                                   AntPosEstState.ANCHORED):
             self._ape_sm.transition(
                 AntPosEstState.CONVERGING,
-                "fix-set integrity alarm — re-bootstrap",
+                "fix-set integrity trip — re-bootstrap",
             )
-        self._fix_set_alarm.record_fire(self._n_epochs)
+        self._fix_set_integrity.record_trip(self._n_epochs)
 
     def run(self):
         log.info("AntPosEstThread started (resolved_decimation=%d, resolve_threshold=%d)",
@@ -1800,7 +1800,7 @@ class AntPosEstThread(threading.Thread):
             labels = getattr(filt, 'last_residual_labels', [])
             self._false_fix.ingest(self._n_epochs, resid, labels)
             self._setting_drop.ingest(self._n_epochs, resid, labels)
-            self._fix_set_alarm.ingest(self._n_epochs, resid, labels)
+            self._fix_set_integrity.ingest(self._n_epochs, resid, labels)
             # Bead 4: stream azimuths for ANCHORING SVs so the
             # promoter can accumulate Δaz toward the 15° threshold.  We
             # compute azimuths only when there's at least one SV in
@@ -1816,9 +1816,9 @@ class AntPosEstThread(threading.Thread):
                 self._apply_false_fix(filt, mw, nl, ev)
             for ev in self._setting_drop.evaluate(self._n_epochs):
                 self._apply_setting_sv_drop(filt, mw, nl, ev)
-            host_ev = self._fix_set_alarm.evaluate(self._n_epochs)
+            host_ev = self._fix_set_integrity.evaluate(self._n_epochs)
             if host_ev is not None:
-                self._apply_fix_set_alarm(filt, mw, nl, host_ev)
+                self._apply_integrity_trip(filt, mw, nl, host_ev)
             # Elevation-stratified squelch: sweep WAITING records
             # whose per-SV cooldown has expired and return them to FLOATING.
             # Also drop records for SVs that haven't been observed in
@@ -1878,7 +1878,7 @@ class AntPosEstThread(threading.Thread):
             tag = (f"{n_anchored} anchored ({n_nl_fixed} fixed)"
                    if n_anchored > 0 else f"{n_nl_fixed} NL fixed")
             # Hysteresis: enter ANCHORED at ≥ 4 anchored, exit at < 3
-            # (4↑/3↓).  Matches the strong_anchor / thin_anchor regime
+            # (4↑/3↓).  Matches the anchored_by_svs / anchored_by_position regime
             # boundary in ppp_ar.NarrowLaneResolver (strong_anchor_min=3).
             # Enter ANCHORING at ≥ 4 NL fixed (any kind), exit at < 4.
             state = self._ape_sm.state
