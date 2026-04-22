@@ -52,16 +52,22 @@ class FixSetIntegrityAlarm:
       1. **Window-RMS** (historical): mean PR residual across fix-set
          members sustained above `rms_threshold_m` for the sampling
          window.  Catches the gross "many members are lying" case.
-      2. **Anchor-collapse** (new, 2026-04-21): on a filter that has
-         latched `reached_resolved=True`, the long-term anchor count
-         drops to zero and stays there for
-         `anchor_collapse_epochs`.  Day0421b showed the trap this
-         closes — the filter drifts during a hollow-anchor window
-         because the per-candidate join test has nothing to anchor
-         to.  When both anchors are gone on a trusted-position
-         filter, don't try to salvage — tear it down and rebuild
-         from bootstrap.  See
-         `project_day0421b_anchor_loss_trap_20260421.md`.
+      2. **Anchor-collapse** (2026-04-21): on a filter that has
+         latched ``reached_anchored=True`` (i.e., has ever
+         entered the ANCHORED state with ≥ 4 NL_LONG_FIXED
+         validated members), the long-term anchor count drops to
+         zero and stays there for ``anchor_collapse_epochs``.
+         Day0421b showed the trap this closes — the filter
+         drifts during a hollow-anchor window because the
+         per-candidate join test has nothing to anchor to.  When
+         all anchors are gone on a filter that once had them,
+         don't try to salvage — tear it down and rebuild from
+         bootstrap.  See
+         ``project_day0421b_anchor_loss_trap_20260421.md`` and
+         ``project_landed_20260421_anchor_collapse_fix.md``
+         (858f7da, which originally used a local `_ever_anchored`
+         flag migrated into this latch in Commit (a) of the
+         lifecycle rename).
 
     The alarm's event dict carries a `reason` key so callers can
     log the trigger type.
@@ -74,7 +80,8 @@ class FixSetIntegrityAlarm:
         if ev is not None:
             # caller executes the re-init: unfix all NL, reset MW,
             # reseed filter.  alarm.record_fire clears the
-            # reached_resolved latch on the AntPosEst state machine.
+            # reached_anchoring + reached_anchored latches on the
+            # AntPosEst state machine.
             alarm.record_fire(epoch)
 
     `record_fire` is the only state the alarm carries forward — it's
@@ -97,10 +104,10 @@ class FixSetIntegrityAlarm:
     ) -> None:
         self._tracker = tracker
         # Reference to AntPosEst state machine — used to read the
-        # reached_resolved latch for the anchor-collapse trigger
-        # and to clear it in record_fire.  None disables the
-        # anchor-collapse trigger entirely — the window-RMS path
-        # still works (legacy callers are unaffected).
+        # reached_anchored latch for the anchor-collapse trigger
+        # and to clear both latches in record_fire.  None disables
+        # the anchor-collapse trigger entirely — the window-RMS
+        # path still works (legacy callers are unaffected).
         self._ape_sm = ape_state_machine
         self._threshold = float(rms_threshold_m)
         self._min_samples = int(min_samples_in_window)
@@ -111,24 +118,10 @@ class FixSetIntegrityAlarm:
         self._rms_hist: deque = deque(maxlen=int(window_epochs))
         self._last_fire_epoch: int = -10**9
         # First epoch at which we observed zero long-term anchors on
-        # a reached_resolved filter.  None whenever anchors are
-        # present.  Reset on every fire.
+        # a filter that has ever been ANCHORED.  None whenever
+        # anchors are present or the filter has never been
+        # anchored.  Reset on every fire.
         self._anchor_collapse_since: int | None = None
-        # Internal "has the filter ever held ≥ 4 NL_LONG_FIXED
-        # anchors?" flag.  Gates the anchor-collapse trigger — we
-        # can't meaningfully alarm on anchor *collapse* from a
-        # state we never actually reached.  The AntPosEst
-        # `reached_resolved` latch isn't suitable for this gate
-        # because it fires on the fallback RESOLVED path (≥ 4
-        # short-term NL fixes, pre-promotion) where
-        # long_term_members() is still 0 — which is exactly the
-        # condition we'd be alarming on, producing the spurious
-        # trip cycle seen across the L5 fleet on day0421f (6/8/15
-        # trips per host in ~3 h).  Migrates to
-        # AntPosEst.reached_anchored in commit (a) of the
-        # lifecycle rename (project_to_ptpmon_lifecycle_
-        # vocabulary_rename_20260421.md).
-        self._ever_anchored: bool = False
 
     # ── Data intake ─────────────────────────────────────────────── #
 
@@ -164,10 +157,10 @@ class FixSetIntegrityAlarm:
           - ``reason='window_rms'`` — traditional PR-residual
             blow-up path (field ``window_rms_m``, ``rms_m``,
             ``n_samples``).
-          - ``reason='anchor_collapse'`` — reached_resolved filter
-            sat with zero long-term anchors for
-            ``anchor_collapse_epochs`` (field ``anchor_collapse_epochs``,
-            ``since_epoch``).
+          - ``reason='anchor_collapse'`` — filter that has ever
+            reached ANCHORED sat with zero long-term anchors for
+            ``anchor_collapse_epochs`` (field
+            ``anchor_collapse_epochs``, ``since_epoch``).
 
         Caller executes re-init and calls `record_fire(epoch)`
         exactly once per event.
@@ -192,19 +185,18 @@ class FixSetIntegrityAlarm:
 
         # ── Anchor-collapse trigger (checked first: cheaper, can
         # pre-empt the window-RMS path when both would fire).  Only
-        # active once the filter has actually reached the anchored
-        # milestone (≥ 4 NL_LONG_FIXED).  During bootstrap or
-        # fallback RESOLVED with zero long-term anchors the filter
-        # hasn't earned a position to defend, and triggering here
-        # would cycle spuriously (day0421f L5 fleet: 6/8/15 trips
-        # per host in ~3h, all spurious).  `_ever_anchored` latches
-        # only on validated anchor count — the AntPosEst
-        # `reached_resolved` latch fires on the fallback path too,
-        # so it can't be used as the gate.
-        lt_count = len(self._tracker.long_term_members())
-        if lt_count >= 4:
-            self._ever_anchored = True
-        if self._ever_anchored:
+        # active on filters that have ever reached the ANCHORED
+        # state (≥ 4 NL_LONG_FIXED validated).  During bootstrap,
+        # CONVERGING, or ANCHORING with zero long-term anchors the
+        # filter hasn't earned a position to defend, and triggering
+        # here would cycle spuriously (day0421f L5 fleet: 6/8/15
+        # trips per host in ~3h, all spurious, pre-rename).
+        # ``reached_anchored`` latches only on actual ANCHORED
+        # entry — the old ``reached_resolved`` latch fired on the
+        # fallback path too and couldn't be used as the gate.
+        ap = self._ape_sm
+        if ap is not None and getattr(ap, 'reached_anchored', False):
+            lt_count = len(self._tracker.long_term_members())
             if lt_count == 0:
                 if self._anchor_collapse_since is None:
                     self._anchor_collapse_since = epoch
@@ -255,20 +247,16 @@ class FixSetIntegrityAlarm:
 
         Clears the window-RMS history (so the next eval starts
         fresh) and the anchor-collapse timer (re-initialisation
-        invalidates both observations).  Clears
-        `reached_resolved` on the AntPosEst state machine — the
-        filter is back to bootstrap mode and must re-earn that
-        latch through promotion, not through mere stabilization.
+        invalidates both observations).  Clears both latches on
+        the AntPosEst state machine — the filter is back to
+        bootstrap mode and must re-earn both milestones through
+        promotion, not through mere stabilization.
         """
         self._last_fire_epoch = int(epoch)
         self._rms_hist.clear()
         self._anchor_collapse_since = None
-        # Clear the internal "ever anchored" flag alongside the
-        # AntPosEst latch — after a re-init the filter has to
-        # re-earn anchored status from scratch.
-        self._ever_anchored = False
         if self._ape_sm is not None:
-            self._ape_sm.clear_reached_resolved(reason="fix_set_alarm")
+            self._ape_sm.clear_latches(reason="fix_set_alarm")
         log.warning("[FIX_SET_ALARM] fired at epoch %d — filter re-init", epoch)
 
     # ── Diagnostics ─────────────────────────────────────────────── #

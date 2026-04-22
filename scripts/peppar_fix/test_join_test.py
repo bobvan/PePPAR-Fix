@@ -35,23 +35,23 @@ from peppar_fix.sv_state import (               # noqa: E402
 from peppar_fix.states import AntPosEst, AntPosEstState  # noqa: E402
 
 
-def _ape_sm(reached_resolved: bool = True) -> AntPosEst:
+def _ape_sm(reached_anchored: bool = True) -> AntPosEst:
     """Build an AntPosEst state machine in the requested latch state.
 
-    reached_resolved=True: walk through to RESOLVED and stop there
-    (the state machine latches on first entry).
-    reached_resolved=False: leave the machine in its default
-    UNSURVEYED state.
+    reached_anchored=True: walk through ANCHORED (both latches set
+    — the state machine latches on first entry to each milestone).
+    reached_anchored=False: leave the machine in its default
+    SURVEYING state.
 
-    Tests that want to exercise post-reached_resolved behavior pass
-    the resulting object as NarrowLaneResolver(ape_state_machine=...).
+    Tests that want to exercise post-anchored behavior pass the
+    resulting object as NarrowLaneResolver(ape_state_machine=...).
     """
     sm = AntPosEst()
-    if reached_resolved:
+    if reached_anchored:
         sm.transition(AntPosEstState.VERIFYING, "test")
-        sm.transition(AntPosEstState.VERIFIED, "test")
         sm.transition(AntPosEstState.CONVERGING, "test")
-        sm.transition(AntPosEstState.RESOLVED, "test")
+        sm.transition(AntPosEstState.ANCHORING, "test")
+        sm.transition(AntPosEstState.ANCHORED, "test")
     return sm
 
 
@@ -91,13 +91,13 @@ class JoinTestTest(unittest.TestCase):
 
     def setUp(self):
         self.tracker = SvStateTracker()
-        # reached_resolved=True drives the strong-anchor / thin-anchor
+        # reached_anchored=True drives the strong-anchor / thin-anchor
         # regimes.  `strong_anchor_min=1` keeps the SV-anchored path
         # active for tests that only instantiate 1-2 anchors (the
         # historical default).  The production value is 3; the
         # regime-selection test class below exercises both sides of
         # that boundary directly.
-        self.ape_sm = _ape_sm(reached_resolved=True)
+        self.ape_sm = _ape_sm(reached_anchored=True)
         self.resolver = NarrowLaneResolver(
             sv_state=self.tracker,
             ape_state_machine=self.ape_sm,

@@ -8,11 +8,30 @@ log = logging.getLogger("peppar_fix.states")
 
 
 class AntPosEstState(enum.Enum):
-    UNSURVEYED = "unsurveyed"
+    """Filter-level lifecycle.  Participle rule: present participle
+    (``-ING``) names active work, past participle (``-ED``) names a
+    milestone reached.
+
+    Forward progression:
+
+        SURVEYING → VERIFYING → CONVERGING → ANCHORING → ANCHORED
+
+    ``ANCHORING`` entered when ≥ 4 NL-fixed members exist (fallback:
+    short-term OR long-term count).  ``ANCHORED`` entered when ≥ 4
+    NL_LONG_FIXED members have passed the ≥ 8° Δaz geometry
+    validation — the "we've truly earned this position" milestone.
+
+    ``MOVED`` is a separate branch used when the position-
+    discontinuity detector trips (antenna physically relocated) —
+    position state is discarded and ``SURVEYING`` restarts the
+    cycle.  Integrity-monitor trips do NOT go to ``MOVED``; they
+    fall back to ``CONVERGING`` with position retained.
+    """
+    SURVEYING = "surveying"
     VERIFYING = "verifying"
-    VERIFIED = "verified"
     CONVERGING = "converging"
-    RESOLVED = "resolved"
+    ANCHORING = "anchoring"
+    ANCHORED = "anchored"
     MOVED = "moved"
 
 
@@ -54,55 +73,84 @@ class StateMachine:
 class AntPosEst(StateMachine):
     """Antenna Position Estimator state machine.
 
-    Carries an additional `reached_resolved` latch.  Semantics:
+    Carries two monotonic latches, separately answering:
 
-      * False on construction (filter has no earned position yet).
-      * Latches True the first time the machine enters RESOLVED.
-        That transition means ≥ N NL_LONG_FIXED members, each of
-        which survived ≥ 8° of geometry change — a hard-won
-        invariant signalling that the position solution is
-        defensible.
-      * Cleared only by FixSetIntegrityAlarm.record_fire() — the
-        explicit "throw everything out and rebuild from scratch"
-        event.  Ordinary anchor-count decay does NOT clear it;
-        losing the SV anchors means we need a *different* defense
-        (position-anchored join test, anchor-collapse trigger),
-        not a bootstrap restart.
+      * ``reached_anchoring`` — "Has this filter ever produced
+        integer fixes?"  Latches on first entry to ``ANCHORING``.
+        Equivalent to the old ``reached_resolved`` field —
+        fallback-count RESOLVED in pre-rename vocabulary, ≥ 4
+        NL-fixed members (short or long) in new vocabulary.
+      * ``reached_anchored`` — "Has this filter ever been
+        geometry-validated?"  Latches on first entry to
+        ``ANCHORED`` (≥ 4 NL_LONG_FIXED members concurrently,
+        each having survived ≥ 8° Δaz).  The hard-won milestone
+        that signals the position solution is defensible.
 
-    Why here (not on SvStateTracker): reached_resolved is a host-
-    level property of the position-solution state, not a per-SV
-    fact.  The state machine is already the natural home for
-    position-solution semantics; NarrowLaneResolver and
-    FixSetIntegrityAlarm both receive a reference to this object
-    so they can read the latch for gate selection / anchor-
-    collapse detection.
+    Both are cleared only by ``clear_latches()`` — called from
+    ``FixSetIntegrityAlarm.record_fire()``, the explicit
+    "throw everything out and rebuild from scratch" event.
+    Ordinary state regressions (ANCHORED → ANCHORING → CONVERGING
+    on slip storm) do NOT clear them; losing anchors means we
+    need a different defense (position-anchored join test,
+    anchor-collapse trigger), not a bootstrap restart.
+
+    The ``reached_anchored`` latch in particular gates the
+    anchor-collapse trigger — firing the monitor only on filters
+    that have genuinely earned the anchored state.  Gating on
+    ``reached_anchoring`` instead would spuriously trip whenever
+    the fallback count dropped to zero, which is the day0421f
+    pattern that ``858f7da`` corrected.
+
+    Why here (not on SvStateTracker): both latches are host-level
+    properties of the position-solution state, not per-SV facts.
+    The state machine is the natural home.
     """
 
     def __init__(self):
-        super().__init__("AntPosEst", AntPosEstState.UNSURVEYED)
+        super().__init__("AntPosEst", AntPosEstState.SURVEYING)
         self.sigma_m = None
         self.n_wl_fixed = 0
         self.n_nl_fixed = 0
         self.n_sv_total = 0
-        self.reached_resolved = False
+        self.reached_anchoring = False
+        self.reached_anchored = False
 
     def transition(self, new_state, reason=""):
         super().transition(new_state, reason)
-        # Latch on the first entry to RESOLVED.  Base class emits
-        # the [STATE] log line; we don't need to log the latch
-        # separately because every True-transition coincides with
-        # an AntPosEst: ... → resolved line.
-        if self.state is AntPosEstState.RESOLVED:
-            self.reached_resolved = True
+        # Latch on first entry to each milestone state.  Base-class
+        # ``transition`` emits the ``[STATE]`` log line; we don't
+        # log the latch separately because each True-transition
+        # coincides with an AntPosEst: ... → anchoring / anchored
+        # line.
+        if self.state is AntPosEstState.ANCHORING:
+            self.reached_anchoring = True
+        elif self.state is AntPosEstState.ANCHORED:
+            # Entering ANCHORED implies we must have passed
+            # through ANCHORING, so belt-and-suspenders: latch
+            # reached_anchoring too in case a code path ever
+            # skips ANCHORING directly.
+            self.reached_anchoring = True
+            self.reached_anchored = True
 
-    def clear_reached_resolved(self, reason: str = "") -> None:
-        """Called by FixSetIntegrityAlarm after re-init.  Don't call
-        from anywhere else — the latch's whole point is that ordinary
-        state changes don't reset it."""
-        if self.reached_resolved:
-            log.info("[STATE] AntPosEst: reached_resolved cleared (%s)",
+    def clear_latches(self, reason: str = "") -> None:
+        """Called by FixSetIntegrityAlarm after re-init.  Don't
+        call from anywhere else — the latches' whole point is
+        that ordinary state regressions don't reset them.
+
+        Logs a single line covering whichever latches were set,
+        for operator visibility when tracing a re-init.
+        """
+        cleared = []
+        if self.reached_anchored:
+            cleared.append("reached_anchored")
+            self.reached_anchored = False
+        if self.reached_anchoring:
+            cleared.append("reached_anchoring")
+            self.reached_anchoring = False
+        if cleared:
+            log.info("[STATE] AntPosEst: %s cleared (%s)",
+                     " + ".join(cleared),
                      reason or "no reason given")
-            self.reached_resolved = False
 
     def update_metrics(self, sigma_m=None, n_wl=None, n_nl=None, n_sv=None):
         if sigma_m is not None:

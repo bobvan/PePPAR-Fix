@@ -1375,13 +1375,18 @@ class AntPosEstThread(threading.Thread):
 
     @property
     def decimation(self):
-        """Effective decimation rate: 1 until RESOLVED, then resolved_decimation.
+        """Effective decimation rate: 1 until integer fixes are
+        landing, then resolved_decimation.
 
         Until AR fixes are established, every observation accelerates
-        convergence and WL/NL accumulation.  Once RESOLVED, we can
-        afford to decimate — the position is stable and AR is locked.
+        convergence and WL/NL accumulation.  Once in ANCHORING or
+        ANCHORED, we can afford to decimate — the position is stable
+        and AR is locked.  ANCHORING (any NL fix) is enough; waiting
+        for ANCHORED (geometry-validated) would waste CPU during the
+        ~minutes between first fix and first Δaz promotion.
         """
-        if self._ape_sm.state == AntPosEstState.RESOLVED:
+        if self._ape_sm.state in (AntPosEstState.ANCHORING,
+                                  AntPosEstState.ANCHORED):
             return self._resolved_decimation
         return 1
 
@@ -1502,7 +1507,8 @@ class AntPosEstThread(threading.Thread):
         self._nav2_cooldown_until = self._n_epochs + 120
         log.info("NAV2 check cooldown until epoch %d",
                  self._nav2_cooldown_until)
-        if self._ape_sm.state == AntPosEstState.RESOLVED:
+        if self._ape_sm.state in (AntPosEstState.ANCHORING,
+                                  AntPosEstState.ANCHORED):
             self._ape_sm.transition(
                 AntPosEstState.CONVERGING,
                 f"antenna moved (horiz={disp_h:.0f}m)",
@@ -1582,9 +1588,13 @@ class AntPosEstThread(threading.Thread):
             stayed elevated.
           * ``reason='anchor_collapse'`` — keys
             ``anchor_collapse_epochs``, ``since_epoch``.  Zero
-            NL_LONG_FIXED anchors for N epochs on a reached_resolved
-            filter.  See
-            ``project_day0421b_anchor_loss_trap_20260421.md``.
+            NL_LONG_FIXED anchors for N epochs on a filter that
+            has ever latched ``reached_anchored`` (post-rename;
+            pre-rename this was ``reached_resolved``, which caused
+            the day0421f spurious-trip cycle — see
+            ``project_landed_20260421_anchor_collapse_fix.md``).
+            See ``project_day0421b_anchor_loss_trap_20260421.md``
+            for the originating motivation.
 
         Branch on ``reason`` when building the log line.  Without
         this branch the anchor-collapse path crashes with a
@@ -1632,7 +1642,8 @@ class AntPosEstThread(threading.Thread):
         filt.initialize(pos_ecef, 0.0, systems=self._systems)
         self._prev_t = None
         self._best_sigma = 999.0
-        if self._ape_sm.state == AntPosEstState.RESOLVED:
+        if self._ape_sm.state in (AntPosEstState.ANCHORING,
+                                  AntPosEstState.ANCHORED):
             self._ape_sm.transition(
                 AntPosEstState.CONVERGING,
                 "fix-set integrity alarm — re-bootstrap",
@@ -1841,45 +1852,61 @@ class AntPosEstThread(threading.Thread):
             # Position quality
             sigma_3d = position_sigma_3d(filt.P)
             pos_ecef = filt.x[:3].copy()
-            # Host RESOLVED keys off NL_LONG_FIXED count (Bead 4): a fresh
-            # NL_SHORT_FIXED fix doesn't count toward RESOLVED until
-            # geometry has shifted enough to validate it.  Falls back to
-            # the old raw NL-fix count when the tracker has no validated
-            # SVs yet — preserves old behavior during the ramp-up before
-            # any promotion lands.
-            n_nl_validated = self._sv_state.count_in(SvAmbState.NL_LONG_FIXED)
+            # Two separate counts drive the two thresholds:
+            #   n_nl_fixed   — union of NL_SHORT_FIXED + NL_LONG_FIXED.
+            #                  Drives CONVERGING ↔ ANCHORING (fallback:
+            #                  any NL integer committed, validated or not).
+            #   n_anchored   — NL_LONG_FIXED only, survived ≥ 8° Δaz.
+            #                  Drives ANCHORING ↔ ANCHORED (the strict
+            #                  "geometry-validated" milestone).
+            n_anchored = self._sv_state.count_in(SvAmbState.NL_LONG_FIXED)
             n_nl_fixed = sum(1 for sv in filt.sv_to_idx if nl.is_fixed(sv))
-            n_resolved_count = (
-                n_nl_validated if n_nl_validated > 0 else n_nl_fixed
-            )
 
-            # Update state machine metrics — n_nl reports the count
-            # actually driving RESOLVED, which may be NL_LONG_FIXED or
-            # the raw fall-back.
+            # Update state-machine metrics.  n_nl reports the union
+            # count — operators want the "NL fixes currently held"
+            # number, not just the subset that's geometry-validated.
             self._ape_sm.update_metrics(
                 sigma_m=sigma_3d,
                 n_wl=mw.n_fixed,
-                n_nl=n_resolved_count,
+                n_nl=n_nl_fixed,
                 n_sv=len(filt.sv_to_idx),
             )
 
-            # State transitions — uses Bead 4 validated count when
-            # available.  Message includes both numbers so operators
-            # can see the ramp-up: "5 validated (8 fixed)" vs "8 fixed".
-            tag = (f"{n_nl_validated} validated ({n_nl_fixed} fixed)"
-                   if n_nl_validated > 0 else f"{n_nl_fixed} NL fixed")
-            if (self._ape_sm.state == AntPosEstState.CONVERGING
-                    and n_resolved_count >= self._resolve_threshold):
-                self._ape_sm.transition(
-                    AntPosEstState.RESOLVED,
-                    f"{tag}, σ={sigma_3d:.3f}m",
-                )
-            elif (self._ape_sm.state == AntPosEstState.RESOLVED
-                    and n_resolved_count < self._resolve_threshold):
-                self._ape_sm.transition(
-                    AntPosEstState.CONVERGING,
-                    f"resolved count dropped to {n_resolved_count} ({tag})",
-                )
+            # State transitions.  Message includes both counts so
+            # operators can see the ramp: "5 anchored (8 fixed)" vs
+            # "8 NL fixed" (pre-promotion).
+            tag = (f"{n_anchored} anchored ({n_nl_fixed} fixed)"
+                   if n_anchored > 0 else f"{n_nl_fixed} NL fixed")
+            # Hysteresis: enter ANCHORED at ≥ 4 anchored, exit at < 3
+            # (4↑/3↓).  Matches the strong_anchor / thin_anchor regime
+            # boundary in ppp_ar.NarrowLaneResolver (strong_anchor_min=3).
+            # Enter ANCHORING at ≥ 4 NL fixed (any kind), exit at < 4.
+            state = self._ape_sm.state
+            if state == AntPosEstState.CONVERGING:
+                if n_nl_fixed >= self._resolve_threshold:
+                    self._ape_sm.transition(
+                        AntPosEstState.ANCHORING,
+                        f"{tag}, σ={sigma_3d:.3f}m",
+                    )
+            elif state == AntPosEstState.ANCHORING:
+                if n_anchored >= self._resolve_threshold:
+                    self._ape_sm.transition(
+                        AntPosEstState.ANCHORED,
+                        f"{tag}, σ={sigma_3d:.3f}m",
+                    )
+                elif n_nl_fixed < self._resolve_threshold:
+                    self._ape_sm.transition(
+                        AntPosEstState.CONVERGING,
+                        f"NL fix count dropped to {n_nl_fixed} ({tag})",
+                    )
+            elif state == AntPosEstState.ANCHORED:
+                if n_anchored < self._resolve_threshold - 1:
+                    # Hysteresis exit at < 3 (threshold - 1); falls
+                    # back to ANCHORING, not all the way to CONVERGING.
+                    self._ape_sm.transition(
+                        AntPosEstState.ANCHORING,
+                        f"anchored count dropped to {n_anchored} ({tag})",
+                    )
 
             # NAV2 position sanity check (every 10 epochs ≈ 10s)
             if (self._nav2_store is not None
@@ -5036,7 +5063,8 @@ def run(args):
             bootstrap_result = result
             known_ecef = bootstrap_result.ecef
             sigma_m = bootstrap_result.sigma_m
-            ape_sm.transition(AntPosEstState.VERIFIED, f"bootstrap converged (σ={sigma_m:.1f}m)")
+            ape_sm.transition(AntPosEstState.CONVERGING,
+                              f"bootstrap converged (σ={sigma_m:.1f}m), entering steady state")
 
             # Save position
             uid = getattr(args, 'receiver_unique_id', None)
@@ -5059,7 +5087,8 @@ def run(args):
         if skip_validation:
             log.info('Position from trusted source (σ=%.1fm) — skipping LS validation',
                      pos_sigma_m)
-            ape_sm.transition(AntPosEstState.VERIFIED, "trusted source, LS validation skipped")
+            ape_sm.transition(AntPosEstState.CONVERGING,
+                              "trusted source, LS validation skipped, entering steady state")
         elif uid is not None or args.known_pos:
             log.info('Validating loaded position against live LS fix...')
             for _attempt in range(30):
@@ -5110,7 +5139,8 @@ def run(args):
                         log.info("Position saved to receiver state (re-bootstrapped)")
                 else:
                     log.info(f'  Position validated (within {separation_m:.0f}m of LS fix)')
-                    ape_sm.transition(AntPosEstState.VERIFIED, f"LS validation passed ({separation_m:.0f}m)")
+                    ape_sm.transition(AntPosEstState.CONVERGING,
+                                      f"LS validation passed ({separation_m:.0f}m), entering steady state")
                 break
 
         if stop_event.is_set():
@@ -5151,8 +5181,12 @@ def run(args):
         )
         ape_thread.start()
 
-        # Phase 2: Steady state (with internal re-bootstrap on PHC divergence)
-        ape_sm.transition(AntPosEstState.CONVERGING, "entering steady state")
+        # Phase 2: Steady state (with internal re-bootstrap on PHC divergence).
+        # The transition into CONVERGING happened at the Phase-1 terminator
+        # above (collapsed from the old VERIFYING → VERIFIED → CONVERGING
+        # three-edge chain into a single VERIFYING → CONVERGING edge with
+        # Phase-1 info pinned in the reason string).  We're already in
+        # CONVERGING by the time we start the steady-state loop.
         max_rebootstrap = 3
         for _attempt in range(1, max_rebootstrap + 1):
             steady_result = run_steady_state(

@@ -333,11 +333,11 @@ class NarrowLaneResolver:
         self._join_test_enabled = bool(join_test_enabled)
         self._join_test_base_m = float(join_test_base_m)
         # Reference to the AntPosEst state machine — used to read the
-        # `reached_resolved` latch for regime selection.  Optional for
-        # backwards compatibility with callers (tests, legacy bootstrap
-        # paths) that don't own an AntPosEst object; when None, the
-        # resolver behaves as if `reached_resolved=False` always (all
-        # runs act as bootstrap), which is the safe default.
+        # ``reached_anchored`` latch for regime selection.  Optional
+        # for callers (tests, legacy bootstrap paths) that don't own
+        # an AntPosEst object; when None, the resolver behaves as
+        # if ``reached_anchored=False`` always (all runs act as
+        # bootstrap), which is the safe default.
         self._ape_state_machine = ape_state_machine
         # Bootstrap-regime gate overrides.  Defaults now match the
         # normal-regime values — during bootstrap we no longer apply
@@ -348,11 +348,11 @@ class NarrowLaneResolver:
         # sooner; defer robust handling of low-SV conditions", the
         # bootstrap regime now exists purely as a *structural* phase
         # (no anchors yet, so the join test bypasses) without any
-        # gate penalty.  The reached_resolved latch, position-
-        # anchored join, and anchor_collapse alarm remain — those
-        # are the defenses that actually fire when a biased-
-        # equilibrium trap would form.  See
-        # `project_to_ptpmon_loosen_bootstrap_gates_20260421.md`.
+        # gate penalty.  The reached_anchoring / reached_anchored
+        # latches, position-anchored join, and anchor_collapse
+        # trigger remain — those are the defenses that actually
+        # fire when a biased-equilibrium trap would form.  See
+        # ``project_to_ptpmon_loosen_bootstrap_gates_20260421.md``.
         # The kwargs still exist so callers can re-tighten with
         # empirical justification if a specific failure mode
         # surfaces later.
@@ -361,8 +361,8 @@ class NarrowLaneResolver:
         self._bootstrap_corner_margin_sum = float(bootstrap_corner_margin_sum)
         self._bootstrap_lambda_min_p = float(bootstrap_lambda_min_p)
         # Anchor-count boundary between SV-anchored and position-
-        # anchored join test (post-reached_resolved).  When
-        # long_term_count < strong_anchor_min, we fall back to the
+        # anchored join test (post-reached_anchored).  When
+        # anchored_count < strong_anchor_min, we fall back to the
         # position-anchored variant — the individual anchor H-rows
         # are too few to reliably constrain Δx, so we project
         # against the filter's position block instead.
@@ -694,9 +694,10 @@ class NarrowLaneResolver:
         # dominant at n=4 after the P_bootstrap fix — PAR at min_fixed=4
         # couldn't retry the subset.  FFRT's critical ratio scales with n,
         # so the 0.001 failure target still holds at 3.
-        # Regime-selected P_bootstrap threshold: tighter (0.999) during
-        # bootstrap, loose (0.97) post-reached_resolved.  Matches the
-        # rounding-path regime table.
+        # Regime-selected P_bootstrap threshold.  Post-372ef3b all
+        # regimes share the normal 0.97 gate; kwargs remain for
+        # selective re-tightening if a specific failure mode
+        # surfaces later.  Matches the rounding-path regime table.
         active_lambda_min_p = self._active_gates()['lambda_min_p_bootstrap']
         fixed_vec, n_fixed, ratio, mask = lambda_resolve(
             n1_vec, Qa_nl, ratio_threshold=None, min_fixed=3,
@@ -878,16 +879,22 @@ class NarrowLaneResolver:
 
     # ── Regime selection (bootstrap vs. thin-anchor vs. strong) ──── #
 
-    def _reached_resolved(self) -> bool:
-        """True iff the AntPosEst state machine has latched reached
-        RESOLVED at least once since the last re-init.  Drives gate
-        selection — see the three-regime table in
-        `project_to_ptpmon_reached_resolved_reframe_20260421.md`.
+    def _reached_anchored(self) -> bool:
+        """True iff the AntPosEst state machine has latched
+        ``reached_anchored`` at least once since the last re-init.
+        Drives gate selection — see the three-regime table in
+        ``project_to_ptpmon_lifecycle_vocabulary_rename_20260421.md``.
+
+        Post-rename semantics: this latches on first entry to
+        ANCHORED (≥ 4 NL_LONG_FIXED validated), not on the
+        fallback ANCHORING entry.  The old ``reached_resolved``
+        latch fired on either path and couldn't distinguish — see
+        ``project_landed_20260421_anchor_collapse_fix.md``.
         """
         sm = self._ape_state_machine
-        return bool(sm is not None and getattr(sm, 'reached_resolved', False))
+        return bool(sm is not None and getattr(sm, 'reached_anchored', False))
 
-    def _long_term_count(self) -> int:
+    def _anchored_count(self) -> int:
         """Number of NL_LONG_FIXED anchors currently held."""
         if self._sv_state is None:
             return 0
@@ -896,24 +903,26 @@ class NarrowLaneResolver:
     def _active_regime(self) -> str:
         """One of ``bootstrap``, ``thin_anchor``, ``strong_anchor``.
 
-        Gate selection flows from the combination of reached_resolved
-        (has the filter earned trust?) and the current anchor count
-        (are the SV anchors strong enough to be the thing we defend
-        against?):
+        Gate selection flows from the combination of
+        ``reached_anchored`` (has the filter earned trust?) and
+        the current anchor count (are the SV anchors strong
+        enough to be the thing we defend against?):
 
-          * bootstrap — ``reached_resolved=False``.  Tight gates,
-            join test bypasses.  Every NL commit is exploratory.
-          * thin_anchor — reached_resolved AND long_term < N.
+          * bootstrap — ``reached_anchored=False``.  Normal gates
+            post-372ef3b; join test bypasses.  Every NL commit is
+            exploratory — we haven't yet validated an integer
+            fix against geometry.
+          * thin_anchor — reached_anchored AND anchored_count < N.
             Normal gates, position-anchored join test (we have a
             trusted position but few SV anchors).
-          * strong_anchor — reached_resolved AND long_term ≥ N.
+          * strong_anchor — reached_anchored AND anchored_count ≥ N.
             Normal gates, SV-anchored join test (standard path).
 
-        The anchor-count boundary is `self._strong_anchor_min`.
+        The anchor-count boundary is ``self._strong_anchor_min``.
         """
-        if not self._reached_resolved():
+        if not self._reached_anchored():
             return 'bootstrap'
-        if self._long_term_count() >= self._strong_anchor_min:
+        if self._anchored_count() >= self._strong_anchor_min:
             return 'strong_anchor'
         return 'thin_anchor'
 
@@ -972,9 +981,9 @@ class NarrowLaneResolver:
             weighted FalseFixMonitor threshold.  (Historical default.)
           * thin_anchor — position-anchored variant: project Δx onto
             the filter's position state and reject if |Δx[:3]| >
-            k · σ_pos.  Used when reached_resolved is True but the SV
-            anchors are too few (< strong_anchor_min) to constrain
-            Δx reliably on their own.
+            k · σ_pos.  Used when reached_anchored is True but the
+            SV anchors are too few (< strong_anchor_min) to
+            constrain Δx reliably on their own.
 
         Returns (ok, worst_sv_or_None, worst_abs_delta, worst_thr).
         In the position-anchored path, worst_sv is None (no per-SV
