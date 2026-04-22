@@ -1894,7 +1894,12 @@ class AntPosEstThread(threading.Thread):
                         AntPosEstState.ANCHORED,
                         f"{tag}, σ={sigma_3d:.3f}m",
                     )
-                elif n_nl_fixed < self._resolve_threshold:
+                elif n_nl_fixed < self._resolve_threshold - 1:
+                    # Hysteresis exit at < 3 (threshold - 1),
+                    # matching the ANCHORED → ANCHORING boundary.
+                    # Both reverse transitions use the same 4↑/3↓
+                    # pattern so a single dropped fix doesn't
+                    # chatter the state back across the threshold.
                     self._ape_sm.transition(
                         AntPosEstState.CONVERGING,
                         f"NL fix count dropped to {n_nl_fixed} ({tag})",
