@@ -314,6 +314,24 @@ def run(args) -> int:
     except ValueError as e:
         log.error("%s", e)
         return 2
+    # Filter-tuning overrides: apply before any PPPFilter is built so the
+    # class attribute is live when .predict() / .update() look it up.
+    q_pos_override = getattr(args, "q_pos_converged", None)
+    if q_pos_override is not None:
+        from solve_ppp import PPPFilter
+        PPPFilter.Q_POS_CONVERGED = q_pos_override
+        log.info("PPPFilter.Q_POS_CONVERGED overridden: %.3e (default 1e-4)",
+                 q_pos_override)
+    sig_pr_override = getattr(args, "sigma_pr", None)
+    if sig_pr_override is not None:
+        import solve_ppp as _sp
+        _sp._SIGMA_P_IF_OVERRIDE = sig_pr_override
+        log.info("SIGMA_P_IF overridden: %.3f m (default 3.0)", sig_pr_override)
+    sig_phi_override = getattr(args, "sigma_phi", None)
+    if sig_phi_override is not None:
+        import solve_ppp as _sp
+        _sp._SIGMA_PHI_IF_OVERRIDE = sig_phi_override
+        log.info("SIGMA_PHI_IF overridden: %.4f m (default 0.03)", sig_phi_override)
     wl_only = bool(getattr(args, "wl_only", False))
     position_csv_path = getattr(args, "position_csv", None)
     position_csv_writer = None
@@ -942,6 +960,25 @@ def main():
                          "first; only enable this if --ztd-tie "
                          "doesn't reach the convergence target.  "
                          "Recommended SIGMA: 0.10 m if enabled.")
+    ap.add_argument("--q-pos-converged", type=float, default=None,
+                    metavar="VAR",
+                    help="Override the converged-regime position "
+                         "process-noise variance (m² per epoch) in "
+                         "PPPFilter.predict.  Default in production "
+                         "filter is 1e-4 (σ_step ≈ 55 mm per 30 s "
+                         "→ unbounded position random walk over 24 h).  "
+                         "For static receivers, tighter values (1e-8 "
+                         "to 1e-10) are more defensible and test "
+                         "whether the Q2 overconfidence is driven by "
+                         "position-state wander vs other mechanisms.")
+    ap.add_argument("--sigma-pr", type=float, default=None, metavar="SIGMA_M",
+                    help="Override SIGMA_P_IF (IF pseudorange measurement "
+                         "noise, default 3.0 m).  Used to test whether "
+                         "R-inflation honestly reports σ when obs-model "
+                         "gaps produce non-measurement-noise residuals.")
+    ap.add_argument("--sigma-phi", type=float, default=None, metavar="SIGMA_M",
+                    help="Override SIGMA_PHI_IF (IF carrier-phase "
+                         "measurement noise, default 0.03 m).")
     ap.add_argument("--solid-tide", action="store_true",
                     help="Apply IERS 2010 Step-1 solid Earth tide "
                          "displacement to the station position when "

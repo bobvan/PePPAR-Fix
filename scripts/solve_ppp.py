@@ -61,6 +61,13 @@ IF_WL = {
 SIGMA_P_IF = 3.0
 SIGMA_PHI_IF = 0.03
 
+# Module-level overrides for filter-tuning experiments.  When non-None
+# the update() path uses these instead of the SIGMA_P_IF /
+# SIGMA_PHI_IF constants above.  Allows R-inflation sweeps without
+# shipping a permanent change to the constants themselves.
+_SIGMA_P_IF_OVERRIDE = None
+_SIGMA_PHI_IF_OVERRIDE = None
+
 ELEV_MASK = 10.0  # degrees.  Tried 15° on 2026-04-17: with GAL-only the SV count dropped to 6/epoch (from ~8–10 at 10°) and LAMBDA couldn't fix NL at all — all three hosts went into persistent NAV2-reset cycling.  Low-elevation SVs do cause wrong-integer poisoning, but the remedy can't be a harder hard cut on SV-limited runs.  Next try: elevation-dependent measurement weighting (already partially present via `cno_factor * elev_factor` in SIGMA_P_IF weighting) or per-SV exclusion in the NL resolver rather than the observation stream.
 BDS_MIN_PRN = 19  # Exclude BDS-2 GEO/IGSO
 
@@ -290,7 +297,13 @@ class PPPFilter:
         elif pos_sigma > 1.0:
             q_pos = 0.01         # Converging: moderate
         else:
-            q_pos = 1e-4         # Converged: static with breathing room
+            # Converged: static station with breathing room.  Overridable
+            # via class attribute for filter-tuning experiments — the
+            # Q2 investigation on pride-harness-ar found 1e-4 allowed
+            # meter-scale state wander over 24 h, contributing to the
+            # 6× overconfidence floor.  See
+            # `project_to_main_filter_tuning_result_20260423`.
+            q_pos = getattr(self, "Q_POS_CONVERGED", 1e-4)
         for i in range(3):
             Q[i, i] = q_pos * dt
         Q[IDX_CLK, IDX_CLK] = 1e6 * dt
@@ -507,7 +520,8 @@ class PPPFilter:
             h_pr[IDX_ZTD] = m_wet
             H_rows.append(h_pr)
             z_rows.append(dz_pr)
-            R_diag.append((SIGMA_P_IF / w) ** 2)
+            _sp = _SIGMA_P_IF_OVERRIDE if _SIGMA_P_IF_OVERRIDE is not None else SIGMA_P_IF
+            R_diag.append((_sp / w) ** 2)
             labels.append((sv, 'pr', elev))
 
             # --- IF Carrier phase ---
@@ -525,7 +539,8 @@ class PPPFilter:
                 h_phi[amb_idx] = 1.0
                 H_rows.append(h_phi)
                 z_rows.append(dz_phi)
-                R_diag.append((SIGMA_PHI_IF / w) ** 2)
+                _spi = _SIGMA_PHI_IF_OVERRIDE if _SIGMA_PHI_IF_OVERRIDE is not None else SIGMA_PHI_IF
+                R_diag.append((_spi / w) ** 2)
                 labels.append((sv, 'phi', elev))
 
             n_used += 1
