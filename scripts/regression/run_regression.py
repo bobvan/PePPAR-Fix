@@ -332,6 +332,17 @@ def run(args) -> int:
         import solve_ppp as _sp
         _sp._SIGMA_PHI_IF_OVERRIDE = sig_phi_override
         log.info("SIGMA_PHI_IF overridden: %.4f m (default 0.03)", sig_phi_override)
+    ou_tau = getattr(args, "ztd_ou_tau", None)
+    ou_sig = getattr(args, "ztd_ou_sigma", None)
+    if (ou_tau is not None) ^ (ou_sig is not None):
+        log.error("--ztd-ou-tau and --ztd-ou-sigma must both be set or both omitted")
+        return 2
+    if ou_tau is not None and ou_sig is not None:
+        from solve_ppp import PPPFilter
+        PPPFilter.ZTD_OU_TAU_S = ou_tau
+        PPPFilter.ZTD_OU_SIGMA_STEADY_M = ou_sig
+        log.info("ZTD OU process: τ=%.0f s (%.2f h), σ_steady=%.3f m",
+                 ou_tau, ou_tau / 3600.0, ou_sig)
     wl_only = bool(getattr(args, "wl_only", False))
     position_csv_path = getattr(args, "position_csv", None)
     position_csv_writer = None
@@ -971,6 +982,23 @@ def main():
                          "to 1e-10) are more defensible and test "
                          "whether the Q2 overconfidence is driven by "
                          "position-state wander vs other mechanisms.")
+    ap.add_argument("--ztd-ou-tau", type=float, default=None, metavar="SECONDS",
+                    help="Mean-reversion time constant τ (seconds) for "
+                         "the ZTD Ornstein-Uhlenbeck process model.  "
+                         "Both --ztd-ou-tau and --ztd-ou-sigma must be "
+                         "set to enable OU; otherwise the filter uses "
+                         "the default random-walk ZTD model.  τ should "
+                         "be hours-scale (3600–43200) to match real "
+                         "tropospheric coherence time.  Smaller τ "
+                         "fights real weather; larger τ degenerates "
+                         "toward random walk.")
+    ap.add_argument("--ztd-ou-sigma", type=float, default=None, metavar="SIGMA_M",
+                    help="Steady-state standard deviation of the ZTD "
+                         "OU process (metres).  Sets the amplitude of "
+                         "allowed ZTD variation around the Saastamoinen "
+                         "a priori.  ABMF's measured 24 h variation is "
+                         "~18 cm so σ_steady=0.05–0.10 m is a starting "
+                         "range.")
     ap.add_argument("--sigma-pr", type=float, default=None, metavar="SIGMA_M",
                     help="Override SIGMA_P_IF (IF pseudorange measurement "
                          "noise, default 3.0 m).  Used to test whether "

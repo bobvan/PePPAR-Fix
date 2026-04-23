@@ -314,8 +314,40 @@ class PPPFilter:
             Q[IDX_ISB_GAL, IDX_ISB_GAL] = 1.0 * dt
         if IDX_ISB_BDS not in pinned:
             Q[IDX_ISB_BDS, IDX_ISB_BDS] = 1.0 * dt
-        Q[IDX_ZTD, IDX_ZTD] = (5e-5)**2 * dt  # ~5 cm/hour RMS (IGS standard)
-        self.P = self.P + Q
+        # ZTD process model: random walk by default (IGS standard at
+        # ~5 cm/hour RMS), or Ornstein-Uhlenbeck mean-reverting when
+        # class attributes ZTD_OU_TAU_S and ZTD_OU_SIGMA_STEADY_M are
+        # both set.  OU is mechanistically correct for wet-tropo
+        # (bounded state with mean reversion); random walk allows
+        # unbounded drift, which on a 24 h static run with
+        # rank-deficient GPS+GAL geometry accumulates up to ±2 m of
+        # ZTD wander and excites the null-mode coupling.  See
+        # `project_to_main_filter_tuning_result_20260423`.
+        tau = getattr(self, "ZTD_OU_TAU_S", None)
+        sig_ss = getattr(self, "ZTD_OU_SIGMA_STEADY_M", None)
+        if tau is not None and sig_ss is not None and tau > 0 and sig_ss > 0:
+            # Discrete OU step: x_{k+1} = α * x_k (mean μ = 0),
+            # with process noise σ²_step = σ_steady² * (1 - α²).
+            # Apply to IDX_ZTD row/col of self.P and self.x so the
+            # state AND its covariance mix correctly with every other
+            # state that touches IDX_ZTD through cross-correlations.
+            alpha = math.exp(-dt / tau)
+            var_step = sig_ss * sig_ss * (1.0 - alpha * alpha)
+            # State: decay toward 0 (μ = 0 for the residual-ZTD state).
+            self.x[IDX_ZTD] *= alpha
+            # Covariance: α² scaling on the ZTD diagonal and α on the
+            # off-diagonal cross-correlations (x_new = α·x means
+            # cov(x_new, y) = α·cov(x, y)).
+            self.P[IDX_ZTD, :] *= alpha
+            self.P[:, IDX_ZTD] *= alpha
+            # Then add process-noise variance to the diagonal; add all
+            # other Q terms for the non-ZTD states via the regular path.
+            self.P = self.P + Q
+            self.P[IDX_ZTD, IDX_ZTD] += var_step
+        else:
+            # Default: random walk with IGS-standard process noise.
+            Q[IDX_ZTD, IDX_ZTD] = (5e-5)**2 * dt
+            self.P = self.P + Q
 
     def add_ambiguity(self, sv, N_init_m):
         idx = len(self.x) - N_BASE
