@@ -355,6 +355,14 @@ def run(args) -> int:
             "clk_m", "isb_gal_m", "isb_bds_m", "ztd_m",
             "n_amb", "amb_mean_m", "amb_std_m",
             "err_3d_m",
+            # Reported uncertainty (Q2 σ-trust analysis): filter's
+            # diagonal P entries expressed as σ.  Compare to
+            # err_3d_m to test whether reported σ envelopes the
+            # empirical error vs truth.  sigma_3d is the 3D
+            # position sigma sqrt(trace(P_pos)) — a filter that's
+            # "strong and wrong" reports tiny sigma_3d while
+            # err_3d_m stays large.
+            "sigma_3d_m", "sigma_clk_m", "sigma_ztd_m",
         ])
 
     residuals_csv_path = getattr(args, "residuals_csv", None)
@@ -690,6 +698,14 @@ def run(args) -> int:
 
         if state_csv_writer is not None:
             amb_slice = filt.x[N_BASE:] if len(filt.x) > N_BASE else np.array([])
+            # Diagonal σ extraction: sqrt of variance on each scalar
+            # state; for the 3D position we use sqrt of the trace of
+            # the position block (sum of per-axis variances).
+            sigma_3d = float(np.sqrt(
+                filt.P[0, 0] + filt.P[1, 1] + filt.P[2, 2]
+            ))
+            sigma_clk = float(np.sqrt(filt.P[IDX_CLK, IDX_CLK]))
+            sigma_ztd = float(np.sqrt(filt.P[IDX_ZTD, IDX_ZTD]))
             state_csv_writer.writerow([
                 ep_idx, t.strftime("%Y-%m-%dT%H:%M:%S"),
                 f"{filt.x[0]:.4f}", f"{filt.x[1]:.4f}", f"{filt.x[2]:.4f}",
@@ -701,6 +717,7 @@ def run(args) -> int:
                 f"{amb_slice.mean():.4f}" if len(amb_slice) else "0",
                 f"{amb_slice.std():.4f}" if len(amb_slice) else "0",
                 f"{float(np.linalg.norm(err_ecef)):.4f}",
+                f"{sigma_3d:.4f}", f"{sigma_clk:.4f}", f"{sigma_ztd:.4f}",
             ])
 
         if position_csv_writer is not None:
