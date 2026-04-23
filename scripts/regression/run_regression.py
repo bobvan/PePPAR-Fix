@@ -189,9 +189,11 @@ def run(args) -> int:
     # Late imports so the module is importable without engine deps
     from broadcast_eph import BroadcastEphemeris
     from solve_ppp import PPPFilter, ls_init
+    from ppp_ar import MelbourneWubbenaTracker
 
     truth_ecef = _parse_truth(args.truth)
     profile = L5_PROFILE if args.profile == "l5" else L2_PROFILE
+    wl_only = bool(getattr(args, "wl_only", False))
 
     # Header — gives us the receiver's APPROX POSITION as seed if no
     # explicit seed; gives us the observation interval too.
@@ -250,6 +252,25 @@ def run(args) -> int:
     systems_lower = {_SYS_TO_LOWER.get(s, s.lower()) for s in profile.keys()}
     seed_offset: Optional[float] = None
 
+    # Melbourne-Wubbena wide-lane tracker.  Per-SV WL integer fixing
+    # plus jump (cycle-slip) detection.  In WL-only / float mode we
+    # don't apply any pseudo-measurement to the float IF state from
+    # MW — the win is purely from cycle-slip detection: when MW
+    # detects a jump on an SV, we drop and re-add that SV's
+    # ambiguity in the float filter so the slip doesn't poison the
+    # float estimate for the rest of the run.
+    #
+    # Engine reference: `peppar_fix_engine.py:1911-1928` for the
+    # MW.update call, `:1929-1980` for slip handling on already-
+    # WL-fixed SVs (post-fix drift monitor).  We adapt the same
+    # pattern but skip the drift monitor — for the harness the
+    # simpler `MelbourneWubbenaTracker.detect_jump` is enough.
+    mw = MelbourneWubbenaTracker()
+    n_wl_fixed_max = 0       # high-water mark of concurrent WL fixes
+    n_slip_resets = 0        # SV ambiguity resets due to MW jump
+    if wl_only:
+        log.info("WL-only mode: MW slip detection on, no NL constraint")
+
     # Iterate epochs
     prev_t = None
     n_processed = 0
@@ -257,6 +278,13 @@ def run(args) -> int:
     n_skipped_too_few = 0
     last_pos = truth_ecef
     lock_accum: dict = {}
+    # Convergence-checkpoint reporting: drop a one-line per-epoch
+    # summary at each of these processed-epoch counts so the gate
+    # ladder is self-documenting.  FINAL is reported at end.  The
+    # epochs are spaced log-style — early epochs converge fast,
+    # later epochs reveal long-tail biases.
+    checkpoint_epochs = sorted({100, 500, 1000, 2000, 4000, 8000, 16000})
+    checkpoint_results: list[tuple[int, float, float, float]] = []
 
     for ep_idx, ep in enumerate(iter_epochs(obs_path)):
         if args.max_epochs and ep_idx >= args.max_epochs:
@@ -307,6 +335,54 @@ def run(args) -> int:
                 filt.predict(dt)
         prev_t = t
 
+        # MW wide-lane update (per SV).  The pre-update step here
+        # mirrors the engine's order: MW first so the slip detector
+        # sees current observations against the pre-update average,
+        # then filter update absorbs the (possibly slip-flushed)
+        # observations.  Slip detection on an SV that's already in
+        # the float filter triggers a remove + re-add: dropping the
+        # ambiguity flushes its float estimate so the post-slip
+        # observations don't anchor against a now-wrong integer.
+        # Filter re-adds the SV's ambiguity on the next observation
+        # at line 502-503 of solve_ppp.py.
+        mw._current_epoch = ep_idx
+        slip_resets_this_ep = 0
+        for o in observations:
+            sv = o['sv']
+            phi1 = o.get('phi1_cyc')
+            phi2 = o.get('phi2_cyc')
+            pr1 = o.get('pr1_m')
+            pr2 = o.get('pr2_m')
+            wl1 = o.get('wl_f1')
+            wl2 = o.get('wl_f2')
+            if not all(v is not None for v in (phi1, phi2, pr1, pr2, wl1, wl2)):
+                continue
+            f1_hz = C_LIGHT / wl1
+            f2_hz = C_LIGHT / wl2
+            # Slip detection BEFORE update: detect_jump compares the
+            # incoming MW sample against the existing tracker state;
+            # a real cycle slip lands many σ outside the rolling
+            # residual window.
+            try:
+                jump = mw.detect_jump(o)
+            except Exception:
+                jump = None
+            jumped = bool(jump and jump.get('is_slip'))
+            if jumped and sv in filt.sv_to_idx:
+                # Reset MW state and remove the ambiguity from the
+                # filter.  Filter re-adds with a fresh float estimate
+                # on the next phase observation for this SV.
+                mw.reset(sv)
+                filt.remove_ambiguity(sv)
+                slip_resets_this_ep += 1
+                n_slip_resets += 1
+            mw.update(sv, phi1, phi2, pr1, pr2, f1_hz, f2_hz)
+
+        # Track WL-fix high-water mark for diagnostics.
+        n_wl_now = mw.n_fixed
+        if n_wl_now > n_wl_fixed_max:
+            n_wl_fixed_max = n_wl_now
+
         # Filter update — eph_source supplies sat_position which returns
         # (pos, clk).  clk_file overrides the clock when given (high-rate
         # CLK product); otherwise the filter uses the clock value from
@@ -327,12 +403,29 @@ def run(args) -> int:
         n_processed += 1
         last_pos = filt.x[:3].copy()
 
+        # Convergence-checkpoint capture: snapshot the position error
+        # at each milestone so the gate ladder reports show how the
+        # error decays over time.
+        while checkpoint_epochs and n_processed == checkpoint_epochs[0]:
+            err = last_pos - truth_ecef
+            checkpoint_results.append((
+                n_processed,
+                float(np.linalg.norm(err)),
+                float(np.linalg.norm(err[:2])),
+                float(abs(err[2])),
+            ))
+            checkpoint_epochs.pop(0)
+
         if n_processed == 1 or n_processed % 20 == 0:
             err = last_pos - truth_ecef
             err_h = float(np.linalg.norm(err[:2]))
             err_v = float(abs(err[2]))
-            log.info("epoch %4d  t=%s  n_used=%2d  err_h=%6.2fm err_v=%6.2fm",
-                     ep_idx, t.strftime("%H:%M:%S"), n_used, err_h, err_v)
+            slip_frag = (f" slips={slip_resets_this_ep}"
+                         if slip_resets_this_ep else "")
+            log.info("epoch %4d  t=%s  n_used=%2d  err_h=%6.2fm "
+                     "err_v=%6.2fm  wl_fixed=%d/%d%s",
+                     ep_idx, t.strftime("%H:%M:%S"), n_used, err_h, err_v,
+                     n_wl_now, len(filt.sv_to_idx), slip_frag)
 
     # Final assessment
     err = last_pos - truth_ecef
@@ -344,12 +437,19 @@ def run(args) -> int:
     print(f"Regression result")
     print(f"{'=' * 60}")
     print(f"Profile:           {args.profile}")
+    print(f"AR mode:           {'wl-only' if wl_only else 'float'}")
     print(f"Epochs processed:  {n_processed}")
     print(f"Epochs skipped:    {n_skipped_empty} (empty), "
           f"{n_skipped_too_few} (too-few-SVs)")
     print(f"Initial seed err:  "
           f"{seed_offset:.3f} m" if seed_offset is not None else "n/a")
-    print(f"Final position:    {last_pos.tolist()}")
+    print(f"Max concurrent WL: {n_wl_fixed_max}")
+    print(f"MW slip resets:    {n_slip_resets}")
+    if checkpoint_results:
+        print(f"\nConvergence ladder (3D / H / V error in m):")
+        for n_ep, e3, eh, ev in checkpoint_results:
+            print(f"  @ {n_ep:>5d} ep:  {e3:7.3f}  /  {eh:7.3f}  /  {ev:7.3f}")
+    print(f"\nFinal position:    {last_pos.tolist()}")
     print(f"Truth position:    {truth_ecef.tolist()}")
     print(f"Final error 3D:    {err_3d:.3f} m")
     print(f"Final error H:     {err_h:.3f} m")
@@ -394,6 +494,23 @@ def main():
                     help="Receiver profile: l5 (F9T-L5) or l2 (F9T-L2)")
     ap.add_argument("--max-epochs", type=int, default=None,
                     help="Limit epoch count for quick runs (default: full file)")
+    ap.add_argument("--wl-only", action="store_true",
+                    help="WL-only AR mode: enable Melbourne-Wubbena slip "
+                         "detection (resets ambiguity in the float filter "
+                         "on a detected jump) but apply no NL fixing.  "
+                         "Mirrors the engine's --wl-only contract: MW "
+                         "tracks per-SV WL fix status for diagnostic "
+                         "reporting (high-water mark + slip count) but "
+                         "the float IF filter receives no pseudo-"
+                         "measurement on its ambiguity state.  The win "
+                         "vs pure float-PPP is purely from cycle-slip "
+                         "detection preventing slips from poisoning the "
+                         "float ambiguity for the rest of the run.  "
+                         "Without this, undetected slips on a 24h run "
+                         "leave the float ambiguity stuck at a wrong "
+                         "value, biasing position by 10 cm-1 m for "
+                         "the affected SV.  Target: ABMF 2020 DOY 001 "
+                         "≤ 20 cm 3D vs ITRF14.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
