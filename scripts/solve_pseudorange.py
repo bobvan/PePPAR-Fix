@@ -76,7 +76,23 @@ class SP3:
 
     def sat_position(self, sv, t):
         """Interpolate satellite position at time t (datetime).
-        Returns (x, y, z) in ECEF meters, or None if sv not in file.
+        Returns (x, y, z) in ECEF meters, or (None, None) if sv
+        not in file or ``t`` falls outside the safe interpolation
+        window of the SP3 coverage.
+
+        Bounds check: 8-point Lagrange polynomial extrapolation
+        outside its fit window diverges rapidly (non-physical
+        orbit positions, followed by garbage residuals in the
+        filter).  PRIDE-PPPAR's convention is to pull adjacent-
+        day SP3 (days ±1) to buffer the interpolation window; when
+        only a single day is available, the safe window is
+        [epochs[half_win] .. epochs[-half_win]] — roughly the
+        middle (n - 8) epochs.  Queries outside that window
+        return (None, None) so the filter can skip the SV cleanly
+        instead of processing non-physical orbits.  See
+        ``project_to_main_pride_sp3_clk_bia_diagnostics_20260423``
+        for the day0423 regression harness blow-up (1231 m final
+        error on ABMF 2020/001) that motivated this.
         """
         if sv not in self.positions:
             return None, None
@@ -85,12 +101,20 @@ class SP3:
         clk = self.clocks[sv]
         n = len(self.epochs)
 
+        # Safe-window bounds check.  Mirrors the half-window used
+        # below; out-of-window queries refuse rather than
+        # extrapolate.
+        half_win = 4
+        safe_lo = self._epoch_seconds[half_win]
+        safe_hi = self._epoch_seconds[n - half_win - 1]
+        if t_sec < safe_lo or t_sec > safe_hi:
+            return None, None
+
         # Find bracketing interval
         idx = np.searchsorted(self._epoch_seconds, t_sec) - 1
         idx = max(0, min(idx, n - 2))
 
         # 9-point Lagrange interpolation (or fewer near edges)
-        half_win = 4
         i0 = max(0, idx - half_win + 1)
         i1 = min(n, i0 + 2 * half_win)
         i0 = max(0, i1 - 2 * half_win)
