@@ -86,6 +86,61 @@ _SYS_TO_LOWER = {'GPS': 'gps', 'GAL': 'gal', 'BDS': 'bds',
                  'GLO': 'glo', 'QZS': 'qzs'}
 
 
+_UNIFORM_PROFILES = {'l5': L5_PROFILE, 'l2': L2_PROFILE}
+
+
+def _parse_profile(spec: str) -> dict[str, list[tuple[str, str]]]:
+    """Parse the --profile spec into a per-constellation profile dict.
+
+    Two formats supported:
+
+    - **Uniform**: ``l5`` or ``l2`` — apply one profile to every
+      constellation in the profile dict (legacy behaviour, equivalent
+      to the original ``args.profile`` semantics).
+    - **Per-constellation**: ``gps:l2,gal:l5,bds:l5`` — assign each
+      listed constellation a specific profile.  Omitted constellations
+      are absent from the returned dict (observations from them are
+      dropped at `extract_dual_freq` time, same path as `--systems`).
+
+    The per-constellation form is the fix for ABMF 2020/001's
+    5.7 m GPS+GAL L5 residual: CODE's GPS precise clocks are
+    referenced to IF(L1, L2W), so GPS observations must use the
+    L2 profile even when GAL is using L5.  See
+    `project_to_main_pride_gps_filter_degeneracy_20260423` and
+    `project_to_main_part_a_result_20260423`.
+    """
+    spec = (spec or "").strip().lower()
+    if spec in _UNIFORM_PROFILES:
+        return _UNIFORM_PROFILES[spec]
+    out: dict[str, list[tuple[str, str]]] = {}
+    for pair in spec.split(','):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ':' not in pair:
+            raise ValueError(
+                f"bad --profile entry {pair!r}: expected 'l5', 'l2', "
+                f"or 'sys:profile' (e.g. 'gps:l2,gal:l5')"
+            )
+        sys_spec, prof_spec = pair.split(':', 1)
+        sys_upper = sys_spec.strip().upper()
+        prof_lower = prof_spec.strip().lower()
+        if sys_upper not in ('GPS', 'GAL', 'BDS'):
+            raise ValueError(
+                f"unknown system in --profile: {sys_spec!r} "
+                f"(expected one of gps, gal, bds)"
+            )
+        if prof_lower not in _UNIFORM_PROFILES:
+            raise ValueError(
+                f"unknown profile in --profile: {prof_spec!r} "
+                f"(expected one of {sorted(_UNIFORM_PROFILES)})"
+            )
+        out[sys_upper] = _UNIFORM_PROFILES[prof_lower][sys_upper]
+    if not out:
+        raise ValueError(f"empty --profile spec: {spec!r}")
+    return out
+
+
 # L2C-family tracking modes (L, S, X) and L5 I-or-combined (Q, X) all
 # target the same physical signal, and analysis centers typically
 # publish one bias value that covers all tracking variants.  CODE's
@@ -195,7 +250,11 @@ def run(args) -> int:
     from ppp_ar import MelbourneWubbenaTracker
 
     truth_ecef = _parse_truth(args.truth)
-    profile = L5_PROFILE if args.profile == "l5" else L2_PROFILE
+    try:
+        profile = _parse_profile(args.profile)
+    except ValueError as e:
+        log.error("%s", e)
+        return 2
     wl_only = bool(getattr(args, "wl_only", False))
     position_csv_path = getattr(args, "position_csv", None)
     position_csv_writer = None
@@ -686,8 +745,19 @@ def main():
                     help="Truth ECEF position 'X,Y,Z' in meters")
     ap.add_argument("--tolerance-m", type=float, default=5.0,
                     help="3D position-error tolerance in meters (default 5)")
-    ap.add_argument("--profile", choices=["l5", "l2"], default="l5",
-                    help="Receiver profile: l5 (F9T-L5) or l2 (F9T-L2)")
+    ap.add_argument("--profile", default="l5",
+                    help="Receiver profile selection.  Two forms: "
+                         "(1) uniform — 'l5' (F9T-L5: L1CA+L5Q per-"
+                         "system) or 'l2' (F9T-L2: L1CA+L2CL per-"
+                         "system) applies one profile to every "
+                         "constellation; (2) per-constellation — "
+                         "e.g. 'gps:l2,gal:l5,bds:l5' assigns a "
+                         "different profile to each listed "
+                         "constellation.  Per-constellation is the "
+                         "fix for GPS-on-L5-profile vs CODE's "
+                         "IF(L1,L2) GPS clocks — GPS must use L2 "
+                         "even when GAL/BDS use L5.  Omitted "
+                         "constellations drop their observations.")
     ap.add_argument("--max-epochs", type=int, default=None,
                     help="Limit epoch count for quick runs (default: full file)")
     ap.add_argument("--systems", default=None,

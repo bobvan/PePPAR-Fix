@@ -76,6 +76,60 @@ class EndToEndIntegrationTest(unittest.TestCase):
         self.assertIn("Final error 3D:", result.stdout)
 
 
+class ProfileParserTest(unittest.TestCase):
+    """_parse_profile handles uniform and per-constellation forms."""
+
+    def setUp(self):
+        # Import lazily so the subprocess tests above don't suffer an
+        # import cost when only they run.
+        sys.path.insert(0, "scripts")
+        from regression.run_regression import _parse_profile
+        from regression.rinex_reader import L5_PROFILE, L2_PROFILE
+        self._parse = _parse_profile
+        self._L5 = L5_PROFILE
+        self._L2 = L2_PROFILE
+
+    def test_uniform_l5(self):
+        p = self._parse("l5")
+        self.assertEqual(p, self._L5)
+
+    def test_uniform_l2(self):
+        p = self._parse("l2")
+        self.assertEqual(p, self._L2)
+
+    def test_uniform_whitespace_and_case(self):
+        p = self._parse("  L5  ")
+        self.assertEqual(p, self._L5)
+
+    def test_per_constellation_gps_l2_gal_l5(self):
+        p = self._parse("gps:l2,gal:l5")
+        self.assertEqual(p["GPS"], self._L2["GPS"])
+        self.assertEqual(p["GAL"], self._L5["GAL"])
+        self.assertNotIn("BDS", p)
+
+    def test_per_constellation_three_systems(self):
+        p = self._parse("gps:l2,gal:l5,bds:l5")
+        self.assertEqual(p["GPS"], self._L2["GPS"])
+        self.assertEqual(p["GAL"], self._L5["GAL"])
+        self.assertEqual(p["BDS"], self._L5["BDS"])
+
+    def test_unknown_system_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown system"):
+            self._parse("xyz:l5")
+
+    def test_unknown_profile_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown profile"):
+            self._parse("gps:l9")
+
+    def test_missing_colon_rejected(self):
+        with self.assertRaisesRegex(ValueError, "expected 'l5', 'l2'"):
+            self._parse("gpsl2")
+
+    def test_empty_rejected(self):
+        with self.assertRaisesRegex(ValueError, "empty --profile"):
+            self._parse("")
+
+
 class RankDeficiencyGateTest(unittest.TestCase):
     """Verify the single-constellation-with-SP3 gate refuses to run.
 
