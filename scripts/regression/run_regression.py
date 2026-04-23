@@ -239,6 +239,65 @@ def _build_obs_for_filter(rx_obs, gps_time, osb=None):
     return out
 
 
+def _apply_tie_updates(filt, ztd_tie_sigma: Optional[float],
+                       mean_amb_tie_sigma: Optional[float]) -> None:
+    """Apply optional ZTD and mean-ambiguity pseudo-measurements as
+    rank-1 EKF updates on the filter state after the regular
+    observation update.
+
+    Motivation: the (rx_clock, ZTD·m_wet, mean-ambiguity) triple
+    forms a near-null vector at some receiver geometries (GPS+GAL
+    at ABMF 2020/001 is the documented case).  Observations alone
+    can't constrain the null direction, so the filter oscillates in
+    that subspace and position error grows.  These pseudo-
+    measurements constrain two of the three null-vector components
+    directly.
+
+    Both args default to None (tie disabled).  σ units are metres.
+    Recommended values from the harness prototype (ABMF 2020/001):
+
+    - ztd_tie_sigma=0.05 (5 cm): bounds the null-mode ZTD wander
+      while accommodating the empirically observed real atmospheric
+      ZTD variation of 18 cm / 24 h at ABMF (σ ~6 cm).
+    - mean_amb_tie_sigma=0.10 (10 cm): only enable if ztd_tie alone
+      isn't enough — weaker physical justification (mean N legitimately
+      drifts with visible-SV set as satellites rise and set).
+
+    See `project_to_main_pride_gps_filter_degeneracy_20260423` and
+    `project_to_main_ztd_pseudomeasurement_proposal_20260423`.
+    """
+    # Late imports keep the helper testable without engine deps.
+    from solve_ppp import N_BASE, IDX_ZTD
+
+    if ztd_tie_sigma is not None and ztd_tie_sigma > 0:
+        # H = unit row at IDX_ZTD; z = 0; R = sigma^2
+        # y = 0 - x[IDX_ZTD]
+        # S = P[IDX_ZTD, IDX_ZTD] + R
+        # K = P[:, IDX_ZTD] / S
+        # x += K * y
+        # P -= outer(K, P[IDX_ZTD, :])
+        y = -float(filt.x[IDX_ZTD])
+        S = float(filt.P[IDX_ZTD, IDX_ZTD]) + ztd_tie_sigma ** 2
+        K = filt.P[:, IDX_ZTD] / S
+        filt.x = filt.x + K * y
+        filt.P = filt.P - np.outer(K, filt.P[IDX_ZTD, :])
+
+    if mean_amb_tie_sigma is not None and mean_amb_tie_sigma > 0:
+        n = len(filt.x)
+        n_amb = n - N_BASE
+        if n_amb == 0:
+            return
+        # H = (1/n_amb) at each ambiguity index, 0 elsewhere
+        H = np.zeros(n)
+        H[N_BASE:] = 1.0 / n_amb
+        HP = H @ filt.P                       # 1 x n
+        y = -float(np.mean(filt.x[N_BASE:]))  # 0 - mean(amb)
+        S = float(HP @ H) + mean_amb_tie_sigma ** 2
+        K = (filt.P @ H) / S                  # n
+        filt.x = filt.x + K * y
+        filt.P = filt.P - np.outer(K, HP)
+
+
 def run(args) -> int:
     """Run one regression scenario.  Returns process exit code."""
     # Late imports so the module is importable without engine deps
@@ -596,6 +655,15 @@ def run(args) -> int:
             n_skipped_too_few += 1
             continue
 
+        # Optional pseudo-measurement ties.  Applied after the regular
+        # observation update so they act as a prior constraint on the
+        # post-observation state rather than competing with it in a
+        # joint update.  Both default-off; see `_apply_tie_updates`.
+        ztd_tie = getattr(args, "ztd_tie", None)
+        mean_amb_tie = getattr(args, "mean_amb_tie", None)
+        if ztd_tie or mean_amb_tie:
+            _apply_tie_updates(filt, ztd_tie, mean_amb_tie)
+
         n_processed += 1
         last_pos = filt.x[:3].copy()
 
@@ -820,6 +888,31 @@ def main():
                          "value, biasing position by 10 cm-1 m for "
                          "the affected SV.  Target: ABMF 2020 DOY 001 "
                          "≤ 20 cm 3D vs ITRF14.")
+    ap.add_argument("--ztd-tie", type=float, default=None, metavar="SIGMA",
+                    help="If set, apply a per-epoch ZTD pseudo-"
+                         "measurement (z=0 against the filter's "
+                         "residual-ZTD state) with standard deviation "
+                         "SIGMA metres.  Bounds the rank-deficient "
+                         "(rx_clock, ZTD·m_wet, mean-ambiguity) null "
+                         "mode that causes GPS+GAL SP3 runs at ABMF "
+                         "to oscillate.  Empirically safe value for "
+                         "tropical stations: 0.05 m (5 cm).  Larger "
+                         "(0.10 m) is more conservative for "
+                         "mid-latitude stations where real ZTD can "
+                         "swing 30-50 cm during frontal passages.")
+    ap.add_argument("--mean-amb-tie", type=float, default=None,
+                    metavar="SIGMA",
+                    help="If set, apply a per-epoch mean-ambiguity "
+                         "pseudo-measurement (z=0 against Σ N_i / "
+                         "n_SVs) with standard deviation SIGMA.  "
+                         "Constrains the common-mode ambiguity drift "
+                         "component of the null mode.  Physical "
+                         "justification is weaker than --ztd-tie "
+                         "(real mean N drifts with SV rise/set), so "
+                         "prefer validating with --ztd-tie alone "
+                         "first; only enable this if --ztd-tie "
+                         "doesn't reach the convergence target.  "
+                         "Recommended SIGMA: 0.10 m if enabled.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
