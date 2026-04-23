@@ -28,6 +28,7 @@ listed first.
 | **RTCM** | Radio Technical Commission for Maritime Services.  The binary message format for GNSS corrections (1019, 1045, 1060, 1265, etc.). |
 | **ISB** | Inter-System Bias.  The constant time offset between two GNSS constellations (e.g., GPS-Galileo). |
 | **ephemeris** | Satellite orbit and clock parameters.  "Broadcast" = from the satellite signal.  "Precise" = from SSR corrections. |
+| **SP3** | Standard Product 3.  NGS text format for precise satellite orbits (positions and optionally clocks) on a fixed grid (5 or 15 minutes typical), interpolated at query time with Lagrange polynomials over an 8- or 9-point window.  Published daily by IGS analysis centers (CODE, GFZ, WHU, CNES, etc.) with sub-cm orbit accuracy and sub-ns clock accuracy.  The clock resolution in SP3 is 1 fs but sampling at 5 min limits effective precision; higher-rate CLK files (30 s or 5 s RINEX CLK) are paired with SP3 when sub-dm PPP is the goal.  Used by the regression harness (`scripts/regression/run_regression.py`) as the "post-processed truth" reference against which we compare broadcast-NAV and SSR solutions.  See `scripts/solve_pseudorange.py:SP3` for our parser/interpolator. |
 | **carrier phase** | The phase of the GNSS L-band carrier signal.  Sub-centimeter precision but ambiguous by an unknown integer number of wavelengths. |
 | **integer ambiguity** | The unknown whole-cycle count in a carrier-phase measurement.  Resolving it ("fixing") eliminates a major noise source. |
 | **phase bias** | Per-satellite, per-signal correction that makes integer ambiguity resolution possible.  Only available from single analysis center SSR streams (CAS, CNES, WHU). |
@@ -43,6 +44,7 @@ listed first.
 | **IF** | Ionosphere-free combination.  A linear combination of L1 and L5 that cancels first-order ionospheric delay.  Used for the PPP position filter's carrier-phase observable (pr_if, phi_if_m).  Its ambiguity is not integer — PPP-AR decomposes IF into WL+NL to get integers. |
 | **CNES** | Centre National d'Etudes Spatiales (French space agency).  Provides single-AC SSR corrections on `products.igs-ip.net` mount `SSRA00CNE0`.  CNES phase biases match F9T Galileo signals (L1C, L5Q, L7Q) — the only confirmed source for PPP-AR. |
 | **CAS** | Chinese Academy of Sciences.  SSR provider on `SSRA00BKG0`.  Phase biases use I-component (data) codes that don't match F9T's Q-component (pilot) observations.  Cannot be used for PPP-AR. |
+| **ABMF** | IGS MGEX reference station at Aéroport du Raizet, Les Abymes, Guadeloupe (~16°N, −61°W).  Multi-GNSS (GPS + Galileo + BeiDou + GLONASS) Septentrio tracking, used as the primary external regression target for `scripts/regression/run_regression.py` because the PRIDE-PPPAR repo bundles a 24 h 30 s RINEX OBS file for 2020/001 alongside a truth ECEF (`2919785.79086, −5383744.95943, 1774604.85992`, ITRF14 2020-01-01).  Used to answer "does our PPP pipeline converge close to a published coordinate on a third-party dataset?".  Paired in the harness with `com20863.eph` (SP3), `com20863.clk` (CLK), and `com20863.bia` (Bias-SINEX OSB) from CODE's 2020/001 MGEX products. |
 
 ## PPS and timing
 

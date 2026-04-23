@@ -332,6 +332,29 @@ def run(args) -> int:
                  sorted(systems_filter),
                  sorted({_SYS_TO_LOWER.get(s, s.lower())
                          for s in profile.keys()}))
+
+    # Rank-deficiency gate: single-constellation + smooth precise
+    # clocks (SP3/CLK) reliably falls into a near-singular drift mode
+    # on static receivers.  The (rx_clock, ZTD·m_wet, mean-ambiguity)
+    # triple forms a near-null vector that smooth SP3 clocks cannot
+    # break; NAV's 2-hour polynomial discontinuities inject the rank
+    # information that breaks it.  Observed at ABMF 2020/001: GPS-only
+    # SP3+CLK drifts 15+ m over 50 min while GAL-only is identical and
+    # GPS+GAL is <50 cm.  See
+    # `project_to_main_pride_gps_filter_degeneracy_20260423`.
+    if args.sp3 and len(systems_lower) < 2:
+        log.error(
+            "Single-constellation %s with --sp3 falls into a "
+            "rank-deficient drift mode (15+ m over 50 min).  Use "
+            "--systems with ≥ 2 constellations when --sp3 is "
+            "active, or switch to --nav for single-constellation "
+            "runs (NAV page-boundary discontinuities break the "
+            "null mode).  See "
+            "project_to_main_pride_gps_filter_degeneracy_20260423.",
+            sorted(systems_lower),
+        )
+        return 2
+
     seed_offset: Optional[float] = None
 
     # Melbourne-Wubbena wide-lane tracker.  Per-SV WL integer fixing
@@ -675,7 +698,12 @@ def main():
                          "filter.  Default: all constellations "
                          "in the active --profile.  Used to "
                          "isolate per-constellation systematic "
-                         "bias signatures.")
+                         "bias signatures.  With --sp3, the runner "
+                         "refuses single-constellation filters "
+                         "because (rx_clock, ZTD, mean-ambiguity) "
+                         "form a near-null mode under smooth "
+                         "precise clocks.  Use --nav for single-"
+                         "constellation diagnostics.")
     ap.add_argument("--state-csv", default=None,
                     help="If set, write one row per processed "
                          "epoch with the full filter state "
