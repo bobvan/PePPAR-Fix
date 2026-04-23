@@ -239,6 +239,130 @@ def _build_obs_for_filter(rx_obs, gps_time, osb=None):
     return out
 
 
+# Profile → IGS ANTEX frequency-id pairs per system.  Keyed by the
+# RINEX band/attribute chars we use in extract_dual_freq's profile
+# dicts (see rinex_reader.L2_PROFILE / L5_PROFILE).
+_PROFILE_FREQ_IDS = {
+    ('G', '1C'): 'G01', ('G', '1W'): 'G01', ('G', '1X'): 'G01',
+    ('G', '2L'): 'G02', ('G', '2W'): 'G02', ('G', '2X'): 'G02',
+    ('G', '5Q'): 'G05', ('G', '5X'): 'G05',
+    ('E', '1C'): 'E01', ('E', '1X'): 'E01',
+    ('E', '5Q'): 'E05', ('E', '5X'): 'E05',
+    ('E', '7Q'): 'E07', ('E', '7X'): 'E07',
+    ('C', '2I'): 'C02', ('C', '2X'): 'C02',
+    ('C', '7I'): 'C07', ('C', '5P'): 'C05', ('C', '5D'): 'C05',
+    ('C', '5X'): 'C05', ('C', '7X'): 'C07',
+}
+
+
+def _compute_pcv_correction(o, sat_pos_ecef, receiver_ecef, antex, ant_type,
+                            epoch_t):
+    """Compute the IF-combined PCV+PCO range correction for one
+    observation dict.
+
+    Returns (Δrange_m, ok) — add Δrange to both pr_if and phi_if_m
+    (same signal path, same phase-center geometry) to correct the
+    observation from ARP-to-ARP range to MPC-to-MPC range.  ok is
+    False when any antenna pattern lookup missed (either freq not in
+    ANTEX or receiver antenna type not found) — caller should skip
+    applying in that case.
+    """
+    from regression.antex import ecef_to_enu_matrix, nadir_angle_deg
+    import math
+
+    sv = o['sv']
+    sys_char = sv[0]
+
+    # Map RINEX (band, attr) → ANTEX freq_id for each of f1, f2.  The
+    # band/attr comes from o['f1_sig_name'] / o['f2_sig_name'] which
+    # are internal names like 'GPS-L1CA'.  Parse the attr from the
+    # existing RINEX info stored in wl_f1 / wl_f2 isn't direct, so
+    # look it up from the profile map we threaded through.
+    # Alternative: use the sig_name suffix.
+    f1_name = o.get('f1_sig_name', '')
+    f2_name = o.get('f2_sig_name', '')
+
+    # Map internal signal names to ANTEX freq IDs.
+    SIG_TO_ANTEX = {
+        'GPS-L1CA': 'G01', 'GPS-L1W': 'G01', 'GPS-L1X': 'G01',
+        'GPS-L2CL': 'G02', 'GPS-L2W': 'G02', 'GPS-L2X': 'G02',
+        'GPS-L5Q': 'G05', 'GPS-L5X': 'G05',
+        'GAL-E1C': 'E01', 'GAL-E1X': 'E01',
+        'GAL-E5aQ': 'E05', 'GAL-E5aX': 'E05',
+        'GAL-E5bQ': 'E07', 'GAL-E5bX': 'E07',
+        'BDS-B1I': 'C02', 'BDS-B1X': 'C02',
+        'BDS-B2I': 'C07', 'BDS-B2aP': 'C05', 'BDS-B2aD': 'C05',
+        'BDS-B2aX': 'C05',
+    }
+    fid1 = SIG_TO_ANTEX.get(f1_name)
+    fid2 = SIG_TO_ANTEX.get(f2_name)
+    if fid1 is None or fid2 is None:
+        return 0.0, False
+
+    # Geometry at receiver: LOS from receiver up to satellite
+    dx = sat_pos_ecef - receiver_ecef
+    rho = float(np.linalg.norm(dx))
+    if rho < 1.0:
+        return 0.0, False
+    los_rcv_to_sat = dx / rho
+    R_enu = ecef_to_enu_matrix(receiver_ecef)
+    los_enu = R_enu @ los_rcv_to_sat
+    elev_rad = math.asin(max(-1.0, min(1.0, los_enu[2])))
+    elev_deg = math.degrees(elev_rad)
+    zen_deg = 90.0 - elev_deg
+    az_deg = math.degrees(math.atan2(los_enu[0], los_enu[1])) % 360.0
+
+    # Satellite-side nadir angle
+    nadir_deg = nadir_angle_deg(sat_pos_ecef, receiver_ecef)
+
+    # Per-freq contributions.  Satellite-side: simplified nominal-yaw
+    # (project PCO_U along nadir axis; ignore body N/E because true
+    # yaw angle needs an attitude model we don't carry).  Receiver-
+    # side: full 3-component PCO_enu projection onto los_enu, plus
+    # PCV(zen, az).
+    corrs = []
+    for fid in (fid1, fid2):
+        sat_pat = antex.get_sat_pattern_fallback(sv, fid, epoch_t)
+        rcv_pat = antex.get_recv_pattern(ant_type, fid)  # already has fallback
+        if sat_pat is None or rcv_pat is None:
+            return 0.0, False
+        # Range correction to ADD to observed phase/pseudorange so it
+        # represents ARP-to-ARP geometry (matching what the filter's
+        # rho_pred computes).  Sign: if MPC is closer to the other end
+        # than ARP is, the observed range is SHORTER than ARP-to-ARP,
+        # so we need to ADD the offset to get ARP range.
+        # Satellite: PCO in body frame has +U pointing at Earth = toward
+        #   receiver.  Projection along nadir = -PCO_U * (-cos(nadir))
+        #   → +PCO_U * cos(nadir) brings obs to ARP range.
+        sat_pco_u = sat_pat.pco_m[2]
+        sat_term = sat_pco_u * math.cos(math.radians(nadir_deg)) \
+                   + sat_pat.pcv(nadir_deg)
+        # Receiver: PCO in ENU, LOS_rcv_to_sat in ENU.  Projection
+        #   dot(PCO_enu, LOS_enu) is how much MPC is offset along LOS.
+        #   Add to obs to get ARP range.
+        rcv_pco_enu = rcv_pat.pco_m  # (N, E, U)
+        # ANTEX line 1 is North, East, Up.  Our ecef_to_enu returns
+        # rows [E, N, U] so los_enu = [E, N, U].  Align accordingly:
+        rcv_dot = (rcv_pco_enu[0] * los_enu[1]   # N_pco × N_los
+                   + rcv_pco_enu[1] * los_enu[0]   # E_pco × E_los
+                   + rcv_pco_enu[2] * los_enu[2])  # U_pco × U_los
+        rcv_term = rcv_dot + rcv_pat.pcv(zen_deg, az_deg)
+        corrs.append(sat_term + rcv_term)
+
+    # IF combine using the coefficients from the obs (wavelengths
+    # already stored).  α₁ = f1² / (f1² − f2²), α₂ = −f2² / (f1² − f2²).
+    f1_hz = C_LIGHT / o.get('wl_f1', 1.0)
+    f2_hz = C_LIGHT / o.get('wl_f2', 1.0)
+    denom = f1_hz * f1_hz - f2_hz * f2_hz
+    if abs(denom) < 1.0:
+        return 0.0, False
+    a1 = f1_hz * f1_hz / denom
+    a2 = -f2_hz * f2_hz / denom
+    # pr/phi_if = a1*f1 + a2*f2 so correction combines same way
+    corr_if = a1 * corrs[0] + a2 * corrs[1]
+    return corr_if, True
+
+
 def _apply_tie_updates(filt, ztd_tie_sigma: Optional[float],
                        mean_amb_tie_sigma: Optional[float]) -> None:
     """Apply optional ZTD and mean-ambiguity pseudo-measurements as
@@ -461,6 +585,32 @@ def run(args) -> int:
         log.info("Loaded OSB: %d (PRN, signal) bias entries across %d SVs",
                  len(osb.biases), len(osb.prns()))
 
+    # Optional ANTEX PCV/PCO correction file.  When --antex is set, the
+    # harness applies satellite + receiver phase-center corrections at
+    # observation ingest.  The receiver antenna type is read from the
+    # RINEX OBS file's ANT # / TYPE record.
+    antex = None
+    recv_ant_type = None
+    if getattr(args, "antex", None):
+        from regression.antex import ANTEXParser
+        antex = ANTEXParser(args.antex)
+        log.info("Loaded ANTEX: %d sat keys, %d rcv keys",
+                 len(antex.sat_patterns), len(antex.recv_patterns))
+        # Read receiver antenna type from RINEX OBS header
+        with open(args.obs, encoding='latin-1') as _f:
+            for _line in _f:
+                if _line[60:80].rstrip() == 'ANT # / TYPE':
+                    recv_ant_type = _line[20:40].rstrip()
+                    break
+                if 'END OF HEADER' in _line:
+                    break
+        if recv_ant_type:
+            log.info("Receiver antenna type: %r", recv_ant_type)
+        else:
+            log.warning("Could not read ANT # / TYPE from %s; PCV disabled",
+                        args.obs)
+            antex = None
+
     # Filter is initialised lazily on the first usable epoch — we use
     # ls_init() to seed both position AND receiver clock from that
     # epoch's pseudoranges.  Seeding clock=0 (the previous behavior)
@@ -679,6 +829,31 @@ def run(args) -> int:
         # (pos, clk).  clk_file overrides the clock when given (high-rate
         # CLK product); otherwise the filter uses the clock value from
         # sat_position.
+        # PCV/PCO correction: adjust phi_if and pr_if for each SV before
+        # the filter sees them.  Skip silently per-SV on ANTEX lookup
+        # miss (e.g. BDS SVs when ANTEX lacks entries).
+        if antex is not None and recv_ant_type is not None:
+            from datetime import timedelta as _td
+            from solve_pseudorange import C as _C_PR
+            n_pcv_applied = 0
+            rcv_pos_now = filt.x[:3] if filt is not None else truth_ecef
+            for o in observations:
+                tau_approx = o['pr_if'] / _C_PR if 'pr_if' in o else 0.075
+                t_tx = t - _td(seconds=tau_approx)
+                sat_pos, _ = eph_source.sat_position(o['sv'], t_tx)
+                if sat_pos is None:
+                    continue
+                delta, ok = _compute_pcv_correction(
+                    o, sat_pos, rcv_pos_now, antex, recv_ant_type, t
+                )
+                if ok:
+                    o['pr_if'] += delta
+                    if o.get('phi_if_m') is not None:
+                        o['phi_if_m'] += delta
+                    n_pcv_applied += 1
+            if ep_idx == 0 or (ep_idx % 500 == 0 and n_pcv_applied > 0):
+                log.debug("PCV applied to %d SVs at epoch %d", n_pcv_applied, ep_idx)
+
         # Solid Earth tide: when --solid-tide is enabled, the filter
         # estimates the ITRF position but observations see an
         # instantaneous position displaced by up to ~150 mm vertical.
@@ -1007,6 +1182,15 @@ def main():
     ap.add_argument("--sigma-phi", type=float, default=None, metavar="SIGMA_M",
                     help="Override SIGMA_PHI_IF (IF carrier-phase "
                          "measurement noise, default 0.03 m).")
+    ap.add_argument("--antex", default=None, metavar="PATH",
+                    help="Optional IGS ANTEX 1.4 file (e.g. IGS14.atx) "
+                         "for satellite + receiver phase-center "
+                         "corrections.  When set, applies PCV/PCO "
+                         "correction to pr_if and phi_if at ingest.  "
+                         "Receiver antenna type is read from the RINEX "
+                         "OBS header's ANT # / TYPE record.  Expected "
+                         "improvement per PRIDE ablation: ~10-25 mm on "
+                         "clean geometries.")
     ap.add_argument("--solid-tide", action="store_true",
                     help="Apply IERS 2010 Step-1 solid Earth tide "
                          "displacement to the station position when "
