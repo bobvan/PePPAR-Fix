@@ -214,6 +214,26 @@ def run(args) -> int:
             "n_used", "n_filter_svs", "n_wl_fixed",
         ])
 
+    residuals_csv_path = getattr(args, "residuals_csv", None)
+    residuals_csv_writer = None
+    residuals_csv_fh = None
+    if residuals_csv_path:
+        import csv
+        residuals_csv_fh = open(residuals_csv_path, "w", newline="")
+        residuals_csv_writer = csv.writer(residuals_csv_fh)
+        # Per-measurement row at every processed epoch.  Each
+        # filt.update() call yields one row per PR measurement
+        # and one per phase measurement per SV used.  Aligned
+        # with `filt.last_residual_labels` (sv, kind, elev) so we
+        # can do per-SV + per-signal analysis post-run:
+        # clusters of same-signed residuals → common-mode
+        # (reference frame / clock); per-SV scatter → per-SV
+        # bias table (DCB / TGD / ISC).
+        residuals_csv_writer.writerow([
+            "ep_idx", "utc", "sv", "sys", "kind", "elev_deg",
+            "post_resid_m",
+        ])
+
     # Header — gives us the receiver's APPROX POSITION as seed if no
     # explicit seed; gives us the observation interval too.
     obs_path = Path(args.obs)
@@ -378,6 +398,32 @@ def run(args) -> int:
                 filt.predict(dt)
         prev_t = t
 
+        # Ambiguity management.  Must happen BEFORE filt.update
+        # so phase observations contribute (the update loop
+        # gates `if sv in self.sv_to_idx` for phase).  Mirrors
+        # what `solve_ppp.__main__`'s steady-state loop does at
+        # lines 1172-1178; the existing harness lacked this so
+        # it was silently running PR-only PPP.
+        current_svs = {o['sv'] for o in observations}
+        tracked = set(filt.sv_to_idx.keys())
+        # SVs that vanished this epoch — drop their ambiguity
+        # state so stale float values don't linger as SV rises
+        # again (cycle slip + arc gap semantics are handled via
+        # MW's detect_jump + explicit remove above).
+        for sv in tracked - current_svs:
+            filt.remove_ambiguity(sv)
+        # New SVs this epoch — seed the ambiguity from the first
+        # phase observation.  N_init = phi_if - pr_if is the
+        # standard cold-start for a float IF ambiguity
+        # (meters), leverages the PR estimate of range so the
+        # initial phase ambiguity is close to truth.
+        for o in observations:
+            if (o['sv'] not in filt.sv_to_idx
+                    and o.get('phi_if_m') is not None):
+                filt.add_ambiguity(
+                    o['sv'], o['phi_if_m'] - o['pr_if'],
+                )
+
         # MW wide-lane update (per SV).  The pre-update step here
         # mirrors the engine's order: MW first so the slip detector
         # sees current observations against the pre-update average,
@@ -446,6 +492,20 @@ def run(args) -> int:
         n_processed += 1
         last_pos = filt.x[:3].copy()
 
+        # Per-SV residual dump.  Runs after filt.update so the
+        # residuals are post-fit.  Labels are (sv, kind, elev)
+        # and align with the `resid` vector returned above.
+        # Matching labels against resid is O(n_used); n_used is
+        # typically ~10-25, so per-epoch overhead is negligible.
+        if residuals_csv_writer is not None:
+            labels_out = getattr(filt, "last_residual_labels", [])
+            for (sv, kind, elev), r in zip(labels_out, resid):
+                residuals_csv_writer.writerow([
+                    ep_idx, t.strftime("%Y-%m-%dT%H:%M:%S"),
+                    sv, sv[0], kind, f"{elev:.1f}",
+                    f"{float(r):.4f}",
+                ])
+
         # Per-epoch error tracking.  ENU decomposition anchored at
         # the truth point (not the filter estimate) so the ENU
         # values are the true east / north / up components of our
@@ -491,6 +551,10 @@ def run(args) -> int:
     if position_csv_fh is not None:
         position_csv_fh.close()
         log.info("Wrote per-epoch position errors to %s", position_csv_path)
+
+    if residuals_csv_fh is not None:
+        residuals_csv_fh.close()
+        log.info("Wrote per-SV residuals to %s", residuals_csv_path)
 
     # Final assessment
     err = last_pos - truth_ecef
@@ -568,6 +632,15 @@ def main():
                          "in the active --profile.  Used to "
                          "isolate per-constellation systematic "
                          "bias signatures.")
+    ap.add_argument("--residuals-csv", default=None,
+                    help="If set, write one row per per-SV-per-"
+                         "epoch post-fit residual to this CSV.  "
+                         "Columns: ep_idx, utc, sv, sys, kind "
+                         "(pr/phi), elev_deg, post_resid_m.  "
+                         "Use to diff per-SV signatures between "
+                         "constellations and pin down systematic "
+                         "biases (common-mode = reference-frame "
+                         "issue; per-SV scatter = DCB/TGD/ISC).")
     ap.add_argument("--position-csv", default=None,
                     help="If set, write one row per processed "
                          "epoch to this CSV file.  Columns: "
