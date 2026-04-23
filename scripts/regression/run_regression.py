@@ -188,12 +188,31 @@ def run(args) -> int:
     """Run one regression scenario.  Returns process exit code."""
     # Late imports so the module is importable without engine deps
     from broadcast_eph import BroadcastEphemeris
-    from solve_ppp import PPPFilter, ls_init
+    from solve_ppp import PPPFilter, ls_init, ecef_to_enu
     from ppp_ar import MelbourneWubbenaTracker
 
     truth_ecef = _parse_truth(args.truth)
     profile = L5_PROFILE if args.profile == "l5" else L2_PROFILE
     wl_only = bool(getattr(args, "wl_only", False))
+    position_csv_path = getattr(args, "position_csv", None)
+    position_csv_writer = None
+    position_csv_fh = None
+    if position_csv_path:
+        import csv
+        position_csv_fh = open(position_csv_path, "w", newline="")
+        position_csv_writer = csv.writer(position_csv_fh)
+        # Headers: epoch index, UTC timestamp, per-axis ECEF
+        # error (m), per-axis ENU error (m), 3D / H / V norms,
+        # SV counts so we can correlate residual shape with
+        # geometry.  This is the direct per-epoch bias trace
+        # for the Q1 systematic-bias question.
+        position_csv_writer.writerow([
+            "ep_idx", "utc",
+            "err_ecef_x", "err_ecef_y", "err_ecef_z",
+            "err_e", "err_n", "err_u",
+            "err_3d", "err_h", "err_v",
+            "n_used", "n_filter_svs", "n_wl_fixed",
+        ])
 
     # Header — gives us the receiver's APPROX POSITION as seed if no
     # explicit seed; gives us the observation interval too.
@@ -250,6 +269,24 @@ def run(args) -> int:
     # before its EKF can converge.
     filt: Optional[PPPFilter] = None
     systems_lower = {_SYS_TO_LOWER.get(s, s.lower()) for s in profile.keys()}
+    # Optional per-constellation gate — lets us isolate which
+    # constellation drives any systematic bias.  --systems gps,gal
+    # keeps only GPS and Galileo observations; SVs from other
+    # constellations are dropped at _build_obs_for_filter time.
+    # Name convention matches the engine's --systems flag.
+    systems_filter: Optional[set[str]] = None
+    if getattr(args, "systems", None):
+        systems_filter = {
+            _SYS_TO_LOWER.get(s.strip().upper(), s.strip().lower())
+            for s in args.systems.split(",")
+        }
+        # Also narrow the filter-init set so the filter doesn't
+        # allocate ISB states for systems we're skipping.
+        systems_lower = systems_lower & systems_filter
+        log.info("Systems filter: %s (profile had %s)",
+                 sorted(systems_filter),
+                 sorted({_SYS_TO_LOWER.get(s, s.lower())
+                         for s in profile.keys()}))
     seed_offset: Optional[float] = None
 
     # Melbourne-Wubbena wide-lane tracker.  Per-SV WL integer fixing
@@ -300,6 +337,12 @@ def run(args) -> int:
             continue
 
         observations = _build_obs_for_filter(sv_obs_list, t, osb=osb)
+        if systems_filter is not None:
+            observations = [o for o in observations
+                            if o['sys'] in systems_filter]
+            if not observations:
+                n_skipped_empty += 1
+                continue
 
         # First-usable-epoch bootstrap via ls_init: solves for
         # position + receiver-clock offset from the IF pseudoranges
@@ -403,29 +446,51 @@ def run(args) -> int:
         n_processed += 1
         last_pos = filt.x[:3].copy()
 
+        # Per-epoch error tracking.  ENU decomposition anchored at
+        # the truth point (not the filter estimate) so the ENU
+        # values are the true east / north / up components of our
+        # bias, not of our uncertainty ellipse.
+        err_ecef = last_pos - truth_ecef
+        err_enu = ecef_to_enu(err_ecef, truth_ecef)
+
+        if position_csv_writer is not None:
+            position_csv_writer.writerow([
+                ep_idx, t.strftime("%Y-%m-%dT%H:%M:%S"),
+                f"{err_ecef[0]:.4f}", f"{err_ecef[1]:.4f}",
+                f"{err_ecef[2]:.4f}",
+                f"{err_enu[0]:.4f}", f"{err_enu[1]:.4f}",
+                f"{err_enu[2]:.4f}",
+                f"{float(np.linalg.norm(err_ecef)):.4f}",
+                f"{float(np.linalg.norm(err_ecef[:2])):.4f}",
+                f"{float(abs(err_ecef[2])):.4f}",
+                n_used, len(filt.sv_to_idx), n_wl_now,
+            ])
+
         # Convergence-checkpoint capture: snapshot the position error
         # at each milestone so the gate ladder reports show how the
         # error decays over time.
         while checkpoint_epochs and n_processed == checkpoint_epochs[0]:
-            err = last_pos - truth_ecef
             checkpoint_results.append((
                 n_processed,
-                float(np.linalg.norm(err)),
-                float(np.linalg.norm(err[:2])),
-                float(abs(err[2])),
+                float(np.linalg.norm(err_ecef)),
+                float(np.linalg.norm(err_ecef[:2])),
+                float(abs(err_ecef[2])),
             ))
             checkpoint_epochs.pop(0)
 
         if n_processed == 1 or n_processed % 20 == 0:
-            err = last_pos - truth_ecef
-            err_h = float(np.linalg.norm(err[:2]))
-            err_v = float(abs(err[2]))
+            err_h = float(np.linalg.norm(err_ecef[:2]))
+            err_v = float(abs(err_ecef[2]))
             slip_frag = (f" slips={slip_resets_this_ep}"
                          if slip_resets_this_ep else "")
             log.info("epoch %4d  t=%s  n_used=%2d  err_h=%6.2fm "
                      "err_v=%6.2fm  wl_fixed=%d/%d%s",
                      ep_idx, t.strftime("%H:%M:%S"), n_used, err_h, err_v,
                      n_wl_now, len(filt.sv_to_idx), slip_frag)
+
+    if position_csv_fh is not None:
+        position_csv_fh.close()
+        log.info("Wrote per-epoch position errors to %s", position_csv_path)
 
     # Final assessment
     err = last_pos - truth_ecef
@@ -494,6 +559,28 @@ def main():
                     help="Receiver profile: l5 (F9T-L5) or l2 (F9T-L2)")
     ap.add_argument("--max-epochs", type=int, default=None,
                     help="Limit epoch count for quick runs (default: full file)")
+    ap.add_argument("--systems", default=None,
+                    help="Comma-separated constellation filter "
+                         "(e.g. 'gps', 'gal', 'gps,gal').  "
+                         "Drops observations from constellations "
+                         "not in the list before they reach the "
+                         "filter.  Default: all constellations "
+                         "in the active --profile.  Used to "
+                         "isolate per-constellation systematic "
+                         "bias signatures.")
+    ap.add_argument("--position-csv", default=None,
+                    help="If set, write one row per processed "
+                         "epoch to this CSV file.  Columns: "
+                         "ep_idx, utc, ECEF error (x, y, z), ENU "
+                         "error (e, n, u), 3D / H / V norms, SV "
+                         "counts.  ENU is anchored at the truth "
+                         "point — the values are the systematic "
+                         "bias, east / north / up, of our "
+                         "solution vs ITRF14 at every epoch.  "
+                         "Intended for post-run bias-signature "
+                         "analysis: trend, periodicity, per-axis "
+                         "breakdown.  Not enabled by default; the "
+                         "CSV is ~30 KB per 1000 epochs.")
     ap.add_argument("--wl-only", action="store_true",
                     help="WL-only AR mode: enable Melbourne-Wubbena slip "
                          "detection (resets ambiguity in the float filter "
