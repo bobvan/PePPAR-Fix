@@ -650,9 +650,21 @@ def run(args) -> int:
         # (pos, clk).  clk_file overrides the clock when given (high-rate
         # CLK product); otherwise the filter uses the clock value from
         # sat_position.
+        # Solid Earth tide: when --solid-tide is enabled, the filter
+        # estimates the ITRF position but observations see an
+        # instantaneous position displaced by up to ~150 mm vertical.
+        # Compute the displacement at this epoch against the current
+        # filter position (accuracy of that position is irrelevant to
+        # sub-µm precision of the SET formula).
+        set_offset = None
+        if getattr(args, "solid_tide", False):
+            from regression.solid_tide import solid_tide_displacement
+            set_offset = solid_tide_displacement(t, filt.x[:3])
+
         try:
             n_used, resid, sys_counts = filt.update(
                 observations, eph_source, t, clk_file=clk_file,
+                receiver_offset_ecef=set_offset,
             )
         except Exception as e:
             log.error("filt.update failed at epoch %d (%s): %s",
@@ -930,6 +942,15 @@ def main():
                          "first; only enable this if --ztd-tie "
                          "doesn't reach the convergence target.  "
                          "Recommended SIGMA: 0.10 m if enabled.")
+    ap.add_argument("--solid-tide", action="store_true",
+                    help="Apply IERS 2010 Step-1 solid Earth tide "
+                         "displacement to the station position when "
+                         "computing geometric range.  ~42 mm single-"
+                         "largest missing-model correction per PRIDE "
+                         "ablation; see "
+                         "project_to_main_pride_ablation_20260423.  "
+                         "Harness-side only; engine impact requires "
+                         "porting the solid_tide module there too.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 

@@ -411,14 +411,26 @@ class PPPFilter:
         if sys_name == 'bds': return IDX_ISB_BDS
         return None
 
-    def update(self, observations, sp3, t, clk_file=None):
+    def update(self, observations, sp3, t, clk_file=None,
+               receiver_offset_ecef=None):
+        """Kalman update step for one epoch.
+
+        receiver_offset_ecef: optional np.array(3,) offset ADDED to the
+            filter's state position when computing the geometric range.
+            Use for observation-model displacements like solid Earth
+            tide.  Does NOT modify the filter state; the filter still
+            estimates the ITRF position.  Default None = no offset.
+        """
         H_rows = []
         z_rows = []
         R_diag = []
         labels = []  # (sv, 'pr'|'phi', elev_deg) aligned with rows — elev for PFR diagnostics
         n_used = 0
         sys_counts = defaultdict(int)
-        receiver_pos = self.x[:3]
+        if receiver_offset_ecef is not None:
+            receiver_pos = self.x[:3] + np.asarray(receiver_offset_ecef)
+        else:
+            receiver_pos = self.x[:3]
 
         for obs in observations:
             sv = obs['sv']
