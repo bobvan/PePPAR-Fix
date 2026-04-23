@@ -188,7 +188,10 @@ def run(args) -> int:
     """Run one regression scenario.  Returns process exit code."""
     # Late imports so the module is importable without engine deps
     from broadcast_eph import BroadcastEphemeris
-    from solve_ppp import PPPFilter, ls_init, ecef_to_enu
+    from solve_ppp import (
+        PPPFilter, ls_init, ecef_to_enu,
+        N_BASE, IDX_CLK, IDX_ISB_GAL, IDX_ISB_BDS, IDX_ZTD,
+    )
     from ppp_ar import MelbourneWubbenaTracker
 
     truth_ecef = _parse_truth(args.truth)
@@ -212,6 +215,28 @@ def run(args) -> int:
             "err_e", "err_n", "err_u",
             "err_3d", "err_h", "err_v",
             "n_used", "n_filter_svs", "n_wl_fixed",
+        ])
+
+    state_csv_path = getattr(args, "state_csv", None)
+    state_csv_writer = None
+    state_csv_fh = None
+    if state_csv_path:
+        import csv
+        state_csv_fh = open(state_csv_path, "w", newline="")
+        state_csv_writer = csv.writer(state_csv_fh)
+        # Full filter state snapshot per epoch.  Used to diff
+        # the NAV-path vs SP3-path filter trajectories on
+        # identical observations — the divergence point tells
+        # us which state component carries the GPS-SP3 bug.
+        # pos_x/y/z are filter state (not error vs truth).
+        # amb_* columns summarize the ambiguity block so we
+        # can watch for wild drift there too.
+        state_csv_writer.writerow([
+            "ep_idx", "utc",
+            "pos_x", "pos_y", "pos_z",
+            "clk_m", "isb_gal_m", "isb_bds_m", "ztd_m",
+            "n_amb", "amb_mean_m", "amb_std_m",
+            "err_3d_m",
         ])
 
     residuals_csv_path = getattr(args, "residuals_csv", None)
@@ -513,6 +538,21 @@ def run(args) -> int:
         err_ecef = last_pos - truth_ecef
         err_enu = ecef_to_enu(err_ecef, truth_ecef)
 
+        if state_csv_writer is not None:
+            amb_slice = filt.x[N_BASE:] if len(filt.x) > N_BASE else np.array([])
+            state_csv_writer.writerow([
+                ep_idx, t.strftime("%Y-%m-%dT%H:%M:%S"),
+                f"{filt.x[0]:.4f}", f"{filt.x[1]:.4f}", f"{filt.x[2]:.4f}",
+                f"{filt.x[IDX_CLK]:.4f}",
+                f"{filt.x[IDX_ISB_GAL]:.4f}",
+                f"{filt.x[IDX_ISB_BDS]:.4f}",
+                f"{filt.x[IDX_ZTD]:.4f}",
+                len(amb_slice),
+                f"{amb_slice.mean():.4f}" if len(amb_slice) else "0",
+                f"{amb_slice.std():.4f}" if len(amb_slice) else "0",
+                f"{float(np.linalg.norm(err_ecef)):.4f}",
+            ])
+
         if position_csv_writer is not None:
             position_csv_writer.writerow([
                 ep_idx, t.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -555,6 +595,10 @@ def run(args) -> int:
     if residuals_csv_fh is not None:
         residuals_csv_fh.close()
         log.info("Wrote per-SV residuals to %s", residuals_csv_path)
+
+    if state_csv_fh is not None:
+        state_csv_fh.close()
+        log.info("Wrote per-epoch filter state to %s", state_csv_path)
 
     # Final assessment
     err = last_pos - truth_ecef
@@ -632,6 +676,13 @@ def main():
                          "in the active --profile.  Used to "
                          "isolate per-constellation systematic "
                          "bias signatures.")
+    ap.add_argument("--state-csv", default=None,
+                    help="If set, write one row per processed "
+                         "epoch with the full filter state "
+                         "(position, clock, ISBs, ZTD, ambiguity "
+                         "summary, 3D error vs truth).  Used to "
+                         "diff NAV vs SP3 filter trajectories to "
+                         "isolate where they diverge.")
     ap.add_argument("--residuals-csv", default=None,
                     help="If set, write one row per per-SV-per-"
                          "epoch post-fit residual to this CSV.  "
