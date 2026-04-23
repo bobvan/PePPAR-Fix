@@ -344,6 +344,42 @@ def ecef_to_enu_matrix(station_ecef: np.ndarray) -> np.ndarray:
     return np.vstack([east, north, up])
 
 
+def sat_body_frame(sat_pos_ecef: np.ndarray,
+                   sun_pos_ecef: np.ndarray) -> tuple[np.ndarray,
+                                                      np.ndarray,
+                                                      np.ndarray]:
+    """Nominal yaw-steering satellite body frame (IGS convention).
+
+    Returns the three orthonormal ECEF unit vectors (e_x, e_y, e_z)
+    of the satellite body frame:
+
+    - e_z: nadir direction (toward Earth center) = -sat_pos_hat
+    - e_y: solar panel rotation axis (perpendicular to Sun-Earth-
+      satellite plane) = normalize(e_z × e_sun)
+    - e_x: completes a right-handed frame = e_y × e_z
+
+    The ANTEX "NORTH" column corresponds to the body-X component,
+    "EAST" to body-Y, "UP" to body-Z (IGS convention, per Montenbruck
+    et al. 2015 and the IGS14 reprocessing campaign).
+
+    This is the NOMINAL attitude.  During eclipse / near orbit-noon
+    or orbit-midnight for satellites with small β angles, the
+    actual attitude deviates from nominal by up to the yaw rate's
+    saturation time — typically < 30 minutes per orbit.  PRIDE uses
+    per-epoch attitude from the WUM ATT.OBX file to capture this;
+    we approximate with nominal throughout, which is adequate at
+    the cm scale of PCV effects for most epochs.
+    """
+    r_sat = float(np.linalg.norm(sat_pos_ecef))
+    e_z = -sat_pos_ecef / r_sat
+    e_sun = sun_pos_ecef - sat_pos_ecef
+    e_sun = e_sun / float(np.linalg.norm(e_sun))
+    cross = np.cross(e_z, e_sun)
+    e_y = cross / float(np.linalg.norm(cross))
+    e_x = np.cross(e_y, e_z)
+    return e_x, e_y, e_z
+
+
 def nadir_angle_deg(sat_pos_ecef: np.ndarray,
                     receiver_pos_ecef: np.ndarray) -> float:
     """Compute the nadir angle at the satellite for its LOS to the

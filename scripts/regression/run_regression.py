@@ -256,7 +256,7 @@ _PROFILE_FREQ_IDS = {
 
 
 def _compute_pcv_correction(o, sat_pos_ecef, receiver_ecef, antex, ant_type,
-                            epoch_t):
+                            epoch_t, sun_pos_ecef=None):
     """Compute the IF-combined PCV+PCO range correction for one
     observation dict.
 
@@ -267,7 +267,7 @@ def _compute_pcv_correction(o, sat_pos_ecef, receiver_ecef, antex, ant_type,
     ANTEX or receiver antenna type not found) — caller should skip
     applying in that case.
     """
-    from regression.antex import ecef_to_enu_matrix, nadir_angle_deg
+    from regression.antex import ecef_to_enu_matrix, nadir_angle_deg, sat_body_frame
     import math
 
     sv = o['sv']
@@ -315,6 +315,21 @@ def _compute_pcv_correction(o, sat_pos_ecef, receiver_ecef, antex, ant_type,
     # Satellite-side nadir angle
     nadir_deg = nadir_angle_deg(sat_pos_ecef, receiver_ecef)
 
+    # Satellite body-frame unit vectors (nominal yaw-steering) for
+    # projecting body-XYZ PCO components onto the LOS.  Caller should
+    # pass sun_pos_ecef once per epoch; skip the full-3-axis projection
+    # if absent (falls back to U-only).
+    e_x = e_y = e_z = None
+    los_sat_to_rcv_body = None
+    if sun_pos_ecef is not None:
+        e_x, e_y, e_z = sat_body_frame(sat_pos_ecef, sun_pos_ecef)
+        los_sat_to_rcv_ecef = (receiver_ecef - sat_pos_ecef) / rho
+        los_sat_to_rcv_body = np.array([
+            float(np.dot(los_sat_to_rcv_ecef, e_x)),
+            float(np.dot(los_sat_to_rcv_ecef, e_y)),
+            float(np.dot(los_sat_to_rcv_ecef, e_z)),
+        ])
+
     # Per-freq contributions.  Satellite-side: simplified nominal-yaw
     # (project PCO_U along nadir axis; ignore body N/E because true
     # yaw angle needs an attitude model we don't carry).  Receiver-
@@ -331,12 +346,17 @@ def _compute_pcv_correction(o, sat_pos_ecef, receiver_ecef, antex, ant_type,
         # rho_pred computes).  Sign: if MPC is closer to the other end
         # than ARP is, the observed range is SHORTER than ARP-to-ARP,
         # so we need to ADD the offset to get ARP range.
-        # Satellite: PCO in body frame has +U pointing at Earth = toward
-        #   receiver.  Projection along nadir = -PCO_U * (-cos(nadir))
-        #   → +PCO_U * cos(nadir) brings obs to ARP range.
-        sat_pco_u = sat_pat.pco_m[2]
-        sat_term = sat_pco_u * math.cos(math.radians(nadir_deg)) \
-                   + sat_pat.pcv(nadir_deg)
+        # Satellite side: project PCO_body onto LOS_sat_to_rcv_body.
+        #   ANTEX "NORTH" = body-X, "EAST" = body-Y, "UP" = body-Z.
+        #   If sun direction isn't available (no ephemeris), fall back
+        #   to U-only projection via cos(nadir); this approximates the
+        #   dominant term (body-Z is typically 1-2 m vs dm N/E).
+        sat_pco = sat_pat.pco_m  # [X_body, Y_body, Z_body] in meters
+        if los_sat_to_rcv_body is not None:
+            sat_pco_proj = float(np.dot(sat_pco, los_sat_to_rcv_body))
+        else:
+            sat_pco_proj = sat_pco[2] * math.cos(math.radians(nadir_deg))
+        sat_term = sat_pco_proj + sat_pat.pcv(nadir_deg)
         # Receiver: PCO in ENU, LOS_rcv_to_sat in ENU.  Projection
         #   dot(PCO_enu, LOS_enu) is how much MPC is offset along LOS.
         #   Add to obs to get ARP range.
@@ -835,6 +855,15 @@ def run(args) -> int:
         if antex is not None and recv_ant_type is not None:
             from datetime import timedelta as _td
             from solve_pseudorange import C as _C_PR
+            # Per-epoch Sun position (ECEF) for nominal-yaw body frame.
+            # Reused across all SVs at this epoch.
+            from regression.solid_tide import (_jd_from_datetime,
+                                                _gmst_rad,
+                                                _sun_pos_eci,
+                                                _eci_to_ecef)
+            _jd = _jd_from_datetime(t)
+            _gmst = _gmst_rad(_jd)
+            _sun_ecef = _eci_to_ecef(_sun_pos_eci(_jd), _gmst)
             n_pcv_applied = 0
             rcv_pos_now = filt.x[:3] if filt is not None else truth_ecef
             for o in observations:
@@ -844,7 +873,8 @@ def run(args) -> int:
                 if sat_pos is None:
                     continue
                 delta, ok = _compute_pcv_correction(
-                    o, sat_pos, rcv_pos_now, antex, recv_ant_type, t
+                    o, sat_pos, rcv_pos_now, antex, recv_ant_type, t,
+                    sun_pos_ecef=_sun_ecef,
                 )
                 if ok:
                     o['pr_if'] += delta
