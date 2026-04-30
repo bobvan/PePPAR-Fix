@@ -1,8 +1,11 @@
-# ZED-F9T Firmware Capability Matrix
+# u-blox ZED-F9 Firmware Capability Matrix
 
-Experimentally determined 2026-04-14 via factory reset + individual
-CFG-VALSET probing on lab receivers sharing a common antenna/splitter,
-plus follow-up probing on ptpmon 2026-04-18.
+Experimentally determined via CFG-VALSET probing on lab receivers
+sharing a common antenna/splitter:
+  - F9T variants: 2026-04-14 (factory reset on F9T-TOP, running
+    state on F9T-BOT), follow-up on ptpmon 2026-04-18.
+  - F9P variants: 2026-04-30 (per-key probe via /tmp/f9p_probe.py
+    on clkPoC3, F9P-1 idle after the rawx-log overnight).
 
 ## Test receivers
 
@@ -11,35 +14,40 @@ plus follow-up probing on ptpmon 2026-04-18.
 | F9T-TOP | ZED-F9T | TIM 2.20 | 29.20 | 136395244089 | TimeHat | 1 |
 | F9T-BOT | ZED-F9T-20B | TIM 2.25 | 29.25 | 262843023907 | MadHat | 1 |
 | F9T-PTP | ZED-F9T | TIM 2.20 | 29.20 | 675836739647 | ptpmon | **0** |
+| F9P-1 | ZED-F9P (HPG 1.51) | EXT CORE 1.00 | 27.50 | 904584649306 | clkPoC3 | (n/a) |
+| F9P-2 | ZED-F9P (HPG 1.51) | EXT CORE 1.00 | 27.50 | 914202187869 | clkPoC3 | (n/a) |
 
 `vpManager_07` is bit 7 of the virtual-pin manager bitmap returned by
-UBX-MON-HW3.  On the tested receivers it correlates perfectly with
-the presence of the 1176.45 MHz (L5/E5a/B2a) RF front-end — units
-with =0 NAK every signal in that band.  The firmware/module strings
-give no such hint: ptpmon and TimeHat report identical
-`MOD=ZED-F9T`, `FWVER=TIM 2.20`, `PROTVER=29.20`, and
-`ROM BASE 0x118B2060`.
+UBX-MON-HW3.  On the tested F9T receivers it correlates perfectly
+with the presence of the 1176.45 MHz (L5/E5a/B2a) RF front-end —
+F9T units with vpManager_07=0 NAK every signal in that band.  The
+firmware/module strings give no such hint: ptpmon and TimeHat
+report identical `MOD=ZED-F9T`, `FWVER=TIM 2.20`, `PROTVER=29.20`,
+and `ROM BASE 0x118B2060`.  F9P is a different module family
+(HPG firmware, not TIM); the vpManager probe wasn't run on F9P
+because the L5-band signal probe directly NAKed every 1176.45 MHz
+key — the hardware front-end isn't there.
 
 ## Signal capability matrix
 
-Tested by sending CFG-VALSET (RAM layer) for each key individually
-after a CFG-CFG factory reset (F9T-TOP) or from running state
-(F9T-BOT). ACK = accepted, NAK = rejected by firmware.
+Tested by sending CFG-VALSET (RAM layer) for each key individually.
+ACK = accepted, NAK = rejected by firmware.
 
-| Capability | CFG key | ZED-F9T (2.20, L5-hw) | ZED-F9T (2.20, L2-only hw) | ZED-F9T-20B (2.25) |
-|---|---|---|---|---|
-| GPS L1 C/A | CFG_SIGNAL_GPS_L1CA_ENA | ACK | ACK | ACK |
-| GPS L2C | CFG_SIGNAL_GPS_L2C_ENA | **ACK** | **ACK** | **NAK** |
-| GPS L5 | CFG_SIGNAL_GPS_L5_ENA | **ACK** | **NAK** | ACK |
-| GPS L5 health override | 0x10320001 | **ACK** | **ACK** | ACK |
-| GAL E1 | CFG_SIGNAL_GAL_E1_ENA | ACK | ACK | ACK |
-| GAL E5a | CFG_SIGNAL_GAL_E5A_ENA | ACK | **NAK** | ACK |
-| GAL E5b | CFG_SIGNAL_GAL_E5B_ENA | **NAK** | **ACK** | **NAK** |
-| GLONASS | CFG_SIGNAL_GLO_ENA | **NAK** | **NAK** | **NAK** |
-| NavIC | CFG_SIGNAL_NAVIC_ENA | **NAK** | (not tested) | **ACK** |
-| BeiDou B1 | CFG_SIGNAL_BDS_B1_ENA | ACK | ACK | ACK |
-| BeiDou B2 (B2I) | CFG_SIGNAL_BDS_B2_ENA | (not tested) | **ACK** | (not tested) |
-| BeiDou B2a | CFG_SIGNAL_BDS_B2A_ENA | (not tested) | **NAK** | (not tested) |
+| Capability | CFG key | ZED-F9T (2.20, L5-hw) | ZED-F9T (2.20, L2-only hw) | ZED-F9T-20B (2.25) | ZED-F9P-15 (HPG 1.51) |
+|---|---|---|---|---|---|
+| GPS L1 C/A | CFG_SIGNAL_GPS_L1CA_ENA | ACK | ACK | ACK | ACK |
+| GPS L2C | CFG_SIGNAL_GPS_L2C_ENA | **ACK** | **ACK** | **NAK** | **ACK** |
+| GPS L5 | CFG_SIGNAL_GPS_L5_ENA | **ACK** | **NAK** | ACK | **NAK** |
+| GPS L5 health override | 0x10320001 | **ACK** | **ACK** | ACK | (not tested) |
+| GAL E1 | CFG_SIGNAL_GAL_E1_ENA | ACK | ACK | ACK | ACK |
+| GAL E5a | CFG_SIGNAL_GAL_E5A_ENA | ACK | **NAK** | ACK | **NAK** |
+| GAL E5b | CFG_SIGNAL_GAL_E5B_ENA | **NAK** | **ACK** | **NAK** | **ACK** |
+| GLONASS L1 | CFG_SIGNAL_GLO_L1_ENA | **NAK** | **NAK** | **NAK** | **ACK** |
+| GLONASS L2 | CFG_SIGNAL_GLO_L2_ENA | **NAK** | **NAK** | **NAK** | **ACK** |
+| NavIC | CFG_SIGNAL_NAVIC_ENA | **NAK** | (not tested) | **ACK** | (not tested) |
+| BeiDou B1 | CFG_SIGNAL_BDS_B1_ENA | ACK | ACK | ACK | ACK |
+| BeiDou B2 (B2I) | CFG_SIGNAL_BDS_B2_ENA | (not tested) | **ACK** | (not tested) | **ACK** |
+| BeiDou B2a | CFG_SIGNAL_BDS_B2A_ENA | (not tested) | **NAK** | (not tested) | **NAK** |
 
 ## Key findings
 
@@ -120,12 +128,50 @@ CNES SSRA00CNE0 publishes both L5Q (E5a) and L7Q (E5b) phase biases,
 so GAL dual-band AR works on either hardware variant with the existing
 SSR pipeline.
 
+### ZED-F9P-15 (HPG 1.51) is L1+L2 only — no L5/E5a/B2a-I path
+
+The lab's two F9Ps (clkPoC3, post-DO-decommission slot) NAK every
+1176.45 MHz signal: GPS L5, GAL E5a, BDS B2a-I.  The F9P-15 module's
+RF front-end is L1+L2 band only.  Confirmed 2026-04-30 with
+`/tmp/f9p_probe.py` against F9P-1.
+
+The F9P signal set looks like the L2-only F9T variant, with one
+addition: **GLONASS dual-band**.  GPS L1+L2C, GAL E1+E5b, BDS
+B1I+B2I, GLO L1+L2.
+
+There is a newer F9P-04 module that adds L5/E5a/B2a tracking
+(announced post-2023) but our F9P-15 hardware predates it.
+Configuration tweaks cannot make our F9P-15 produce L5-band
+observations — the front-end isn't there.
+
+**Practical implication for PPP-AR:** WUM rapid products
+(used by PRIDE-PPPAR) provide observable-specific phase biases
+keyed to L5/E5a/B2a-I codes, not E5b or B2I.  PRIDE on F9P-15
+data therefore drops every GAL and BDS observation as
+unmatched-OSB and falls back to GPS-only PPP-AR (~15 GPS NL
+fixes, 0 GAL, 0 BDS) — the residual systematic biases land in
+the GPS float ambiguities and position lands ~1.7 m off the
+F9P-RTK ground truth, not the cm-level we'd see on F9T-20B.
+
+This makes the **ZED-F9T-20B (2.25) better suited to PPP-AR
+with WUM products than the ZED-F9P-15**, despite the F9P being
+a more expensive RTK-marketed receiver.  The F9P advantage is
+elsewhere: it does GLONASS, supports built-in RTK rover/base
+modes, and runs a different firmware family (HPG vs TIM) with
+millimetre-scale RTK accuracy when paired with a base station
+that emits matching legacy RTCM 3 codes.  For PPP-AR third-leg
+ARP work the L5-band-tracking F9T-20B is the right tool.
+
 ### Default config after factory reset
 
 After CFG-CFG factory reset, both L2C_ENA and L5_ENA are **OFF** (0).
 The receiver boots to L1-only mode. `ensure_receiver_ready()` detects
 single-frequency and applies the L5 signal plan, which is why all
 receivers end up on L5 regardless of hardware variant.
+
+The F9P factory default ships with **L2C, E5b, B2I, and both GLONASS
+bands enabled**, matching its L1+L2 hardware.  No reconfiguration
+needed for normal RTK use.
 
 ### L5 SV count is identical across firmware versions
 
@@ -136,17 +182,18 @@ dropout difference between firmware versions.
 
 ## Summary: what each variant can actually do
 
-| Feature | ZED-F9T 2.20 (L5-hw) | ZED-F9T 2.20 (L2-only hw) | ZED-F9T-20B (2.25) |
-|---|---|---|---|
-| L1 + L2C | Yes | Yes | **No** |
-| L1 + L5 | **Yes** | **No** | Yes |
-| L5 health override CFG key | Yes | Yes (but no effect) | Yes |
-| GLONASS | No | No | No |
-| NavIC | No | (untested) | **Yes** |
-| GAL E5a | Yes | **No** | Yes |
-| GAL E5b | **No** | **Yes** | No |
-| BDS B2I | (untested) | Yes | (untested) |
-| BDS B2a | (untested, expect Yes) | **No** | (untested) |
+| Feature | ZED-F9T 2.20 (L5-hw) | ZED-F9T 2.20 (L2-only hw) | ZED-F9T-20B (2.25) | ZED-F9P-15 (HPG 1.51) |
+|---|---|---|---|---|
+| L1 + L2C | Yes | Yes | **No** | Yes |
+| L1 + L5 | **Yes** | **No** | Yes | **No** |
+| L5 health override CFG key | Yes | Yes (but no effect) | Yes | (n/a) |
+| GLONASS L1 + L2 | No | No | No | **Yes** |
+| NavIC | No | (untested) | **Yes** | (untested) |
+| GAL E5a | Yes | **No** | Yes | **No** |
+| GAL E5b | **No** | **Yes** | No | **Yes** |
+| BDS B2I | (untested) | Yes | (untested) | Yes |
+| BDS B2a | (untested, expect Yes) | **No** | (untested) | **No** |
+| Match for WUM PPP-AR phase biases | **Yes** (L5/E5a/B2a-I) | No | **Yes** (L5/E5a/B2a-I) | No |
 
 The L5-hardware ZED-F9T (TIM 2.20) is the most capable: can run
 either L2 or L5, GAL dual-band via E5a.  The classic L2-only
