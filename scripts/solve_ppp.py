@@ -494,6 +494,85 @@ class PPPFilter:
         self.x = self.x + K * y
         self.P = self.P - np.outer(K, self.P[IDX_ZTD, :])
 
+    def apply_nav2_anchor(self, nav2_ecef, h_acc_m, v_acc_m=None):
+        """Soft-anchor the position state to NAV2's reported ECEF.
+
+        Per-epoch position pseudo-measurement that bounds the
+        steady-state walk-back failure mode: between SO_POS resets,
+        systematic SSR phase-bias residuals can pull the EKF toward
+        an internally-consistent wrong basin (typical signature: 5-7 m
+        position offset + ZTD residual carrying the bias).  Applying
+        NAV2's own SPP fix as a 3D pseudo-measurement at every epoch
+        creates a continuous position constraint with weight ~hAcc/
+        vAcc, equivalent to Charlie's Phase-1 NAV2 seed prior taken
+        from one-shot to continuous.
+
+        Caller responsibility: gate freshness (NAV2 opinion < 10 s)
+        and quality (NAV2 hAcc below some threshold like 3 m).  This
+        function trusts its inputs and applies the update unconditionally.
+
+        NAV2 reports horizontal and vertical accuracy separately;
+        these define a diagonal R in the local ENU frame which is
+        rotated into ECEF before the EKF update.  If v_acc_m is None
+        or non-positive, defaults to 2 × h_acc_m per typical SPP
+        vDOP/hDOP ratio.
+
+        Per Bob's directive 2026-04-30 + dayplan I-200128-main +
+        docs/filter-stiffness-redesign.md "Validation plan" sections.
+        """
+        if h_acc_m is None or h_acc_m <= 0:
+            return
+        if v_acc_m is None or v_acc_m <= 0:
+            v_acc_m = 2.0 * h_acc_m
+
+        pos = self.x[:3]
+        if np.linalg.norm(pos) < 1e3:
+            # Filter not initialized at a meaningful position; skip.
+            return
+
+        # Diagonal R in the local ENU frame: hAcc² on E and N axes,
+        # vAcc² on U.  NAV2 hAcc is the 1-σ horizontal radius; split
+        # equally over E and N which is the SPP convention.
+        R_enu = np.diag([h_acc_m ** 2, h_acc_m ** 2, v_acc_m ** 2])
+
+        # ENU → ECEF rotation at the filter's current position.  Lat/
+        # lon from spherical approximation is sufficient for the
+        # rotation matrix (sub-mm error vs full geodetic conversion
+        # at lab latitudes).
+        lat = math.atan2(
+            float(pos[2]),
+            math.sqrt(float(pos[0]) ** 2 + float(pos[1]) ** 2))
+        lon = math.atan2(float(pos[1]), float(pos[0]))
+        sl, cl = math.sin(lat), math.cos(lat)
+        so, co = math.sin(lon), math.cos(lon)
+        # Columns are E, N, U unit vectors in ECEF (local-frame basis).
+        R_enu_to_ecef = np.array([
+            [-so, -sl * co, cl * co],
+            [co,  -sl * so, cl * so],
+            [0.0,       cl,      sl],
+        ])
+        R_ecef = R_enu_to_ecef @ R_enu @ R_enu_to_ecef.T
+
+        # Standard EKF update on the 3-state position sub-vector.
+        # H = [I_3 | 0_(N-3)] selects position columns, so HPH' is
+        # P[:3, :3] and the cross-covariances are P[:, :3].
+        z = np.asarray(nav2_ecef, dtype=float)
+        y = z - pos                                    # 3-vector innovation
+        HPHt = self.P[:3, :3]                          # 3x3
+        S = HPHt + R_ecef                              # 3x3
+        try:
+            S_inv = np.linalg.inv(S)
+        except np.linalg.LinAlgError:
+            # Singular S — extremely tight R combined with degenerate
+            # P shouldn't happen in practice; bail out rather than
+            # corrupt the filter.
+            return
+        K = self.P[:, :3] @ S_inv                      # N x 3
+        self.x = self.x + K @ y                        # N
+        self.P = self.P - K @ S @ K.T                  # N x N
+        # Symmetrize to guard against accumulated numerical asymmetry.
+        self.P = 0.5 * (self.P + self.P.T)
+
     def add_ambiguity(self, sv, N_init_m):
         idx = len(self.x) - N_BASE
         self.sv_to_idx[sv] = idx

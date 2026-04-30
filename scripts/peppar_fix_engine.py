@@ -1640,7 +1640,9 @@ class AntPosEstThread(threading.Thread):
                  gmf_enabled=False,
                  slip_rate_limit_s=0.0,
                  ztd_tie_sigma=None,
-                 pos_sigma_m=10.0):
+                 pos_sigma_m=10.0,
+                 nav2_anchor_enabled=True,
+                 nav2_anchor_max_hacc_m=3.0):
         super().__init__(daemon=True, name="AntPosEst")
         # Phase 3 wind-up (Wu 1993): per-SV cumulative wind-up tracker
         # + carrier-phase correction applied before filter.update().
@@ -1693,6 +1695,14 @@ class AntPosEstThread(threading.Thread):
         self._nav2_store = nav2_store
         self._nav2_tension_threshold = nav2_tension_threshold
         self._nav2_alarm_count = nav2_alarm_count  # consecutive checks before reset
+        # NAV2 continuous soft-anchor: per-epoch position pseudo-
+        # measurement that bounds the steady-state walk-back failure
+        # mode (filter drifts toward an internally-consistent wrong
+        # basin between SO_POS trips).  Per Bob's directive 2026-04-30
+        # + I-200128-main + docs/filter-stiffness-redesign.md.  Gated
+        # by NAV2 freshness (<10s) and quality (hAcc < threshold).
+        self._nav2_anchor_enabled = bool(nav2_anchor_enabled)
+        self._nav2_anchor_max_hacc_m = float(nav2_anchor_max_hacc_m)
         self._systems = systems  # {'gps','gal','bds'} subset — for ISB pinning
 
         # Initialize from bootstrap result or create fresh filter
@@ -2617,6 +2627,29 @@ class AntPosEstThread(threading.Thread):
             # m-scale.  No-op when self._ztd_tie_sigma is None or <= 0.
             if getattr(self, "_ztd_tie_sigma", None):
                 filt.apply_ztd_tie(self._ztd_tie_sigma)
+
+            # NAV2 continuous soft-anchor (post-update 3D EKF pseudo-
+            # measurement).  Bounds the steady-state walk-back failure
+            # mode: between SO_POS trips, systematic SSR-PB-gap
+            # residuals can pull the filter toward a wrong basin
+            # (typical signature: 5-7 m position offset, ZTD residual
+            # carrying meters of bias).  Per Bob's directive 2026-04-30
+            # + I-200128-main.  Gated by NAV2 freshness + quality.
+            if (self._nav2_anchor_enabled
+                    and self._nav2_store is not None):
+                _nav2_op = self._nav2_store.get_opinion(max_age_s=10.0)
+                if (_nav2_op is not None
+                        and _nav2_op.get('fix_type') == 3
+                        and _nav2_op.get('h_acc_m') is not None
+                        and _nav2_op['h_acc_m']
+                        < self._nav2_anchor_max_hacc_m):
+                    filt.apply_nav2_anchor(
+                        np.asarray(_nav2_op['ecef'], dtype=float),
+                        float(_nav2_op['h_acc_m']),
+                        (float(_nav2_op['v_acc_m'])
+                         if _nav2_op.get('v_acc_m') is not None
+                         else None),
+                    )
 
             self._n_epochs += 1
 
@@ -6950,6 +6983,10 @@ def run(args):
                 getattr(args, "slip_rate_limit_s", 0.0)),
             ztd_tie_sigma=getattr(args, "ztd_tie_sigma", None),
             pos_sigma_m=ape_pos_sigma_m,
+            nav2_anchor_enabled=bool(
+                getattr(args, "nav2_soft_anchor", True)),
+            nav2_anchor_max_hacc_m=float(
+                getattr(args, "nav2_anchor_max_hacc_m", 3.0)),
         )
         ape_thread.start()
 
@@ -7176,6 +7213,23 @@ Two-phase operation:
                           "take 30-60 s.  Set to 0 to disable the wait "
                           "and use LS-init immediately when NAV2 isn't "
                           "ready on the first epoch.")
+    pos.add_argument("--no-nav2-soft-anchor",
+                     dest="nav2_soft_anchor",
+                     action="store_false", default=True,
+                     help="Disable the per-epoch NAV2 soft-anchor in "
+                          "AntPosEst.  By default the engine applies a "
+                          "3D position pseudo-measurement at every "
+                          "epoch with R = diag(hAcc², hAcc², vAcc²) "
+                          "rotated to ECEF, bounding the steady-state "
+                          "walk-back failure mode (filter drifts toward "
+                          "an internally-consistent wrong basin between "
+                          "SO_POS trips).  Disable for diagnostic A/B "
+                          "or when NAV2 is known to be biased (rare).")
+    pos.add_argument("--nav2-anchor-max-hacc-m", type=float, default=3.0,
+                     help="Skip the NAV2 soft-anchor when NAV2's reported "
+                          "hAcc exceeds this threshold (NAV2 too noisy to "
+                          "trust as a continuous position witness).  "
+                          "Default 3 m matches Bravo's SO_POS hAcc gate.")
     pos.add_argument("--bootstrap-rms-k", type=float, default=2.0,
                      help="Phase-1 convergence requires PR-residual RMS < "
                           "k × SIGMA_P_IF.  Catches locally-consistent but "
