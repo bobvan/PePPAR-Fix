@@ -1667,22 +1667,6 @@ class AntPosEstThread(threading.Thread):
                 self._nl._nl_diag.enabled = True
             log.info("AntPosEstThread: continuing from bootstrap PPPFilter "
                      "(amb=%d, %s)", len(self._filt.sv_to_idx), self._mw.summary())
-            # Diagnostic: dump inherited state to bisect Phase-1→AntPosEst
-            # handoff failures (cold_boot_smoke 2026-04-30).
-            try:
-                _x = self._filt.x
-                _P = self._filt.P
-                from solve_ppp import IDX_ZTD as _IDX_ZTD, IDX_CLK as _IDX_CLK
-                log.info(
-                    "[ANTPOS_INHERIT] x_pos=(%.3f,%.3f,%.3f) "
-                    "x_clk=%.3e x_ztd=%.3e σ_pos=(%.2f,%.2f,%.2f) σ_ztd=%.3f",
-                    _x[0], _x[1], _x[2], _x[_IDX_CLK], _x[_IDX_ZTD],
-                    math.sqrt(max(0.0, _P[0, 0])),
-                    math.sqrt(max(0.0, _P[1, 1])),
-                    math.sqrt(max(0.0, _P[2, 2])),
-                    math.sqrt(max(0.0, _P[_IDX_ZTD, _IDX_ZTD])))
-            except Exception as _e:
-                log.warning("[ANTPOS_INHERIT] dump failed: %s", _e)
         else:
             ppp_kwargs = {}
             if clock_model and clock_model != "random_walk":
@@ -2378,20 +2362,6 @@ class AntPosEstThread(threading.Thread):
                 continue
 
             # EKF predict
-            _first_epoch_diag = (self._prev_t is None and self._n_epochs == 0)
-            if _first_epoch_diag:
-                # Diagnostic: state right before first observation
-                # processing.  Catches Phase-1→AntPosEst handoff
-                # corruption (cold_boot_smoke 2026-04-30).
-                try:
-                    from solve_ppp import IDX_ZTD as _IDX_ZTD
-                    log.info(
-                        "[ANTPOS_FIRST_EPOCH_PRE] x_pos=(%.3f,%.3f,%.3f) "
-                        "x_ztd=%.3e n_obs=%d gps_time=%s",
-                        filt.x[0], filt.x[1], filt.x[2],
-                        filt.x[_IDX_ZTD], len(observations), gps_time)
-                except Exception as _e:
-                    log.warning("[ANTPOS_FIRST_EPOCH_PRE] dump failed: %s", _e)
             if self._prev_t is not None:
                 dt = (gps_time - self._prev_t).total_seconds()
                 if dt <= 0 or dt > 120:
