@@ -1023,6 +1023,64 @@ def wait_for_ephemeris(beph, stop_event, systems=None, timeout_s=120):
     return True
 
 
+def wait_for_nav2_seed(nav2_store, stop_event, timeout_s=60.0,
+                       hacc_max_m=5.0, max_age_s=5.0):
+    """Wait for NAV2 to produce a usable position fix for filter seeding.
+
+    NAV2 (the F9T's secondary nav engine) computes a fresh position
+    every epoch independent of our PPP filter.  At cold start it
+    typically reaches fixType=3 within 30-60 s on clean sky.  This
+    helper polls Nav2PositionStore until the opinion meets the
+    quality bar (fixType=3, hAcc < hacc_max_m, age < max_age_s) or
+    the timeout expires.
+
+    Returns:
+        (ecef_ndarray, h_acc_m, num_sv) on success
+        None on timeout or if the store isn't available
+
+    Used by the engine's main loop in lieu of run_bootstrap when a
+    live receiver with NAV2 is present (the typical lab case).
+    Per I-024532-charlie #3: collapse the Phase 1/Phase 2 dichotomy
+    by using NAV2 as the seed and skipping the LS-init bootstrap +
+    CONVERGED ceremony.
+    """
+    if nav2_store is None:
+        return None
+    log.info("Waiting for NAV2 seed (fixType=3, hAcc<%.0fm) up to %.0fs...",
+             hacc_max_m, timeout_s)
+    deadline = time.time() + timeout_s
+    last_log = 0.0
+    while time.time() < deadline:
+        if stop_event.is_set():
+            return None
+        opinion = nav2_store.get_opinion(max_age_s=max_age_s)
+        if opinion is not None:
+            ftype = opinion.get('fix_type')
+            hacc = opinion.get('h_acc_m')
+            if ftype == 3 and hacc is not None and hacc < hacc_max_m:
+                ecef = np.asarray(opinion['ecef'], dtype=float)
+                num_sv = opinion.get('num_sv', 0)
+                log.info("NAV2 seed acquired: fixType=3 hAcc=%.2fm "
+                         "nSV=%d after %.1fs",
+                         hacc, num_sv, time.time() - (deadline - timeout_s))
+                return ecef, float(hacc), int(num_sv)
+        if time.time() - last_log >= 10.0:
+            if opinion is None:
+                log.info("  NAV2 not yet emitting NAV2-PVT...")
+            else:
+                log.info("  NAV2 fix=%s hAcc=%s — not yet at seed quality",
+                         opinion.get('fix_type'),
+                         f"{opinion.get('h_acc_m'):.2f}m"
+                         if opinion.get('h_acc_m') is not None else "?")
+            last_log = time.time()
+        time.sleep(1.0)
+    log.warning("NAV2 seed timed out after %.0fs — falling back to LS-init "
+                "bootstrap.  This is the regression-harness path; live "
+                "receivers should produce a NAV2 fix within ~30-60s.",
+                timeout_s)
+    return None
+
+
 def _build_ppp_filter(args):
     """PPPFilter factory honouring --clock-model + --rx-tcxo-adev-1s.
 
@@ -1544,7 +1602,8 @@ class AntPosEstThread(threading.Thread):
                  phase_windup_enabled=False,
                  gmf_enabled=False,
                  slip_rate_limit_s=0.0,
-                 ztd_tie_sigma=None):
+                 ztd_tie_sigma=None,
+                 pos_sigma_m=10.0):
         super().__init__(daemon=True, name="AntPosEst")
         # Phase 3 wind-up (Wu 1993): per-SV cumulative wind-up tracker
         # + carrier-phase correction applied before filter.update().
@@ -1643,7 +1702,8 @@ class AntPosEstThread(threading.Thread):
                 self._filt.clock_model,
                 "" if self._filt.clock_model == "random_walk"
                 else f" rx_tcxo_adev_1s={self._filt.rx_tcxo_adev_1s:g}")
-            self._filt.initialize(known_ecef, 0.0, systems=self._systems)
+            self._filt.initialize(known_ecef, 0.0, systems=self._systems,
+                                  pos_sigma_m=pos_sigma_m)
             self._mw = MelbourneWubbenaTracker()
             self._nl = NarrowLaneResolver(
                 ar_elev_mask_deg=ar_elev_mask_deg,
@@ -6576,32 +6636,65 @@ def run(args):
             'n_ambiguities',
         ])
 
-    # Determine starting phase
+    # Determine starting position.
+    #
+    # Per I-024532-charlie #3 (Phase 1 / Phase 2 collapse): position
+    # is seeded from NAV2 by default — the F9T's secondary nav engine
+    # is independent of our PPP filter and gives a hAcc ~1 m fix on
+    # clean sky within 30-60 s.  No bootstrap CONVERGED ceremony.
+    #
+    # Priority order:
+    #   1. --known-pos config — operator override (sigma_m=0, treated
+    #      as anchor-quality).
+    #   2. NAV2 seed — fixType=3 + hAcc < 5 m (typical lab path).
+    #   3. LS-init bootstrap — fallback for the regression harness
+    #      and any cold-start where NAV2 isn't available within 60s.
+    #
+    # Receiver state file (state/receivers/<uid>.json) is no longer
+    # read for position — it's identity-only now (TCXO calibration,
+    # qErr characterization, slot mapping).  The position field, if
+    # present from older runs, is logged for diagnostic comparison
+    # only and is NOT used to seed the filter.  Per Q3 of the
+    # I-133648-main consensus call.
     known_ecef = None
-
-    # Position loading priority:
-    #   1. Receiver state (per-receiver, persisted across runs)
-    #   2. known_pos from config (operator-provided, first-run fallback)
-    #   3. Legacy position file (migration only)
-    #   4. Phase 1 bootstrap (no position at all)
     pos_source = None
     pos_sigma_m = None
     uid = getattr(args, 'receiver_unique_id', None)
+
+    # Diagnostic: log what's in the state file (if anything) for
+    # comparison to whatever seed we end up using.
     if uid is not None:
         from peppar_fix.receiver_state import load_position_detail_from_receiver
-        known_ecef, pos_sigma_m, pos_source = load_position_detail_from_receiver(uid)
-        if known_ecef is not None:
-            pos_source = f"receiver state ({pos_source}, σ={pos_sigma_m}m)"
-            ape_sm.transition(AntPosEstState.VERIFYING, "loaded from receiver state")
-    if known_ecef is None and args.known_pos:
+        _state_ecef, _state_sigma, _state_src = (
+            load_position_detail_from_receiver(uid))
+        if _state_ecef is not None:
+            log.info("Receiver state file has position (%s, σ=%sm) — "
+                     "informational only, no longer used for seeding",
+                     _state_src, _state_sigma)
+
+    # 1. --known-pos operator override.
+    if args.known_pos:
         lat, lon, alt = [float(v) for v in args.known_pos.split(',')]
         known_ecef = lla_to_ecef(lat, lon, alt)
         pos_source = "known_pos (config)"
         ape_sm.transition(AntPosEstState.VERIFYING, "known_pos from config")
         pos_sigma_m = 0.0
-        # Persist to receiver state so future runs use it directly
+        # Persist to receiver state so the file's last-known position
+        # stays current as a diagnostic record (not for seeding).
         if uid is not None:
             save_position_to_receiver(uid, known_ecef, 0.0, "known_pos")
+
+    # 2. NAV2 seed — the typical lab path.
+    if known_ecef is None and nav2_store is not None:
+        seed = wait_for_nav2_seed(nav2_store, stop_event,
+                                  timeout_s=60.0, hacc_max_m=5.0)
+        if seed is not None:
+            nav2_ecef, nav2_h_acc, nav2_n_sv = seed
+            known_ecef = nav2_ecef
+            pos_sigma_m = nav2_h_acc
+            pos_source = f"NAV2 (hAcc={nav2_h_acc:.2f}m, nSV={nav2_n_sv})"
+            ape_sm.transition(AntPosEstState.VERIFYING,
+                              f"NAV2 seed @ hAcc={nav2_h_acc:.2f}m")
     if known_ecef is not None:
         # --seed-pos-offset: apply (E,N,U) displacement in meters to
         # whatever known_ecef was loaded.  Used for seed-error
@@ -6678,20 +6771,31 @@ def run(args):
         # A tampered or stale position file would send the FixedPosFilter
         # into 100+ km residuals without any warning.
         #
-        # Skip validation for trusted positions: receiver state with
-        # sigma < _TRUSTED_POSITION_SIGMA_M (Phase-2 steady-state save
-        # at σ<0.1 m, or known_pos at σ=0).  Phase-1 bootstrap saves
-        # are deliberately stored above this threshold (see
-        # _PHASE1_BOOTSTRAP_SAVE_FLOOR_M) so they fall through to the
-        # live-LS-fix validation step below.
-        skip_validation = (pos_sigma_m is not None
-                           and pos_sigma_m < _TRUSTED_POSITION_SIGMA_M)
+        # Skip validation for trusted positions:
+        #   - --known-pos (sigma_m=0, operator override).
+        #   - NAV2 seed — already validated by virtue of being a live
+        #     fix from the receiver's secondary nav engine.  The
+        #     hAcc<5m gate at seed acquisition (wait_for_nav2_seed)
+        #     IS the LS validation, just done by the receiver's own
+        #     SPP solver instead of ours.  Per I-024532-charlie #3.
+        #
+        # Receiver-state position-read is no longer a seeding path
+        # (file is identity-only now), so the historical
+        # _TRUSTED_POSITION_SIGMA_M trust-skip is mostly vestigial —
+        # it only triggers when --known-pos is used (sigma=0 < threshold).
+        seeded_from_nav2 = (pos_source is not None
+                            and pos_source.startswith("NAV2"))
+        skip_validation = (
+            seeded_from_nav2
+            or (pos_sigma_m is not None
+                and pos_sigma_m < _TRUSTED_POSITION_SIGMA_M))
         uid = getattr(args, 'receiver_unique_id', None)
         if skip_validation:
-            log.info('Position from trusted source (σ=%.1fm) — skipping LS validation',
-                     pos_sigma_m)
+            why = ("NAV2 seed (live-fix-validated)" if seeded_from_nav2
+                   else f"trusted source (σ={pos_sigma_m:.1f}m)")
+            log.info("Position from %s — skipping LS validation", why)
             ape_sm.transition(AntPosEstState.CONVERGING,
-                              "trusted source, LS validation skipped, entering steady state")
+                              f"{why}, entering steady state")
         elif uid is not None or args.known_pos:
             log.info('Validating loaded position against live LS fix...')
             for _attempt in range(30):
@@ -6776,6 +6880,14 @@ def run(args):
                 _ar_position['ecef'] = np.array(ecef, dtype=float)
                 _ar_position['sigma'] = sigma_m
 
+        # AntPosEstThread fresh-PPPFilter init (warm-start path) gets
+        # the seed σ from whichever source supplied known_ecef.  When
+        # bootstrap_result is supplied (legacy LS-init bootstrap path),
+        # the thread inherits that filter's already-tightened P and
+        # the pos_sigma_m argument is unused.  Per I-024532-charlie #3.
+        ape_pos_sigma_m = (pos_sigma_m
+                           if pos_sigma_m is not None and pos_sigma_m > 0
+                           else 10.0)
         ape_thread = AntPosEstThread(
             known_ecef=known_ecef,
             corrections=corrections,
@@ -6800,6 +6912,7 @@ def run(args):
             slip_rate_limit_s=float(
                 getattr(args, "slip_rate_limit_s", 0.0)),
             ztd_tie_sigma=getattr(args, "ztd_tie_sigma", None),
+            pos_sigma_m=ape_pos_sigma_m,
         )
         ape_thread.start()
 
