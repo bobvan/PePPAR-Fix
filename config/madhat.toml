@@ -14,7 +14,15 @@ ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
 # CNES SSR for PPP-AR (credentials in ntrip-cnes.conf)
 ssr_ntrip_conf = "ntrip-cnes.conf"
-systems = "gps,gal,bds"
+# 2026-05-01 morning: BDS-off A/B test (I-133619-main P1).  CNES has
+# no SSR phase-bias coverage for BDS B2a-I; tracking it on TIM 2.25
+# leaves the cross-SV mean of the missing-PB error to land in
+# position (now blocked by NAV2 anchor) or ZTD (now the trip source,
+# 4.76 trips/hr overnight).  TimeHat (TIM 2.20, no native B2a-I)
+# stays on gps,gal,bds as the control — it was at 2.82 trips/hr.
+# If MadHat's rate drops toward TimeHat's, BDS-as-cause confirmed
+# and afternoon plan is WHU OSBC00WHU1 mount swap (P2).
+systems = "gps,gal"
 
 # TICC #2: chA = PEROUT (i226 PPS OUT), chB = GNSS PPS.
 ticc_port = "/dev/ticc2"
