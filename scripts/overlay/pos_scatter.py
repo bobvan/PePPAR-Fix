@@ -11,13 +11,15 @@ reference; doesn't require an external ARP).  Color encodes elapsed
 time since the first epoch (perceptually-uniform colormap).  Alpha is
 fixed transparency so dense regions show through.
 
-Default axis limits are tuned for decimeter-scale detail (±50 cm
-horizontal, ±100 cm vertical); cold-start / re-init points outside
-those bounds are clipped from the view but stay in the data.
+Default axis limits are auto-fit so 90% of points are visible per
+axis (10% clip per axis ⇒ ~81-90% inside each box depending on how
+correlated the deviations are).  --cover overrides the fraction;
+explicit --xlim / --ylim / --zlim override individual axes.
 
 Usage:
-    pos_scatter.py <engine.log> [-o out.png] [--xlim 0.5] [--ylim 0.5] \\
-                                [--zlim 1.0] [--alpha 0.3]
+    pos_scatter.py <engine.log> [-o out.png]            # auto-zoom 90%
+    pos_scatter.py <engine.log> --cover 0.95            # tighter — 5% clip
+    pos_scatter.py <engine.log> --xlim 0.05 --ylim 0.05 # decimeter zoom override
 
 Engine log shape parsed:
     [AntPosEst N] positionσ=X.XXXm pos=(LAT, LON, ALT) ...
@@ -87,12 +89,15 @@ def main() -> int:
     ap.add_argument("log", help="engine log file with [AntPosEst N] lines")
     ap.add_argument("-o", "--output", default=None,
                     help="output image (default: <log_basename>.scatter.png)")
-    ap.add_argument("--xlim", type=float, default=0.5,
-                    help="E/W half-range in meters (default: 0.5)")
-    ap.add_argument("--ylim", type=float, default=0.5,
-                    help="N/S half-range in meters (default: 0.5)")
-    ap.add_argument("--zlim", type=float, default=1.0,
-                    help="U/D half-range in meters (default: 1.0)")
+    ap.add_argument("--cover", type=float, default=0.9,
+                    help="fraction of points to keep visible per axis when "
+                         "axis bounds are auto (default: 0.9 = 10%% clip per axis)")
+    ap.add_argument("--xlim", type=float, default=None,
+                    help="explicit E/W half-range in meters (default: auto)")
+    ap.add_argument("--ylim", type=float, default=None,
+                    help="explicit N/S half-range in meters (default: auto)")
+    ap.add_argument("--zlim", type=float, default=None,
+                    help="explicit U/D half-range in meters (default: auto)")
     ap.add_argument("--alpha", type=float, default=0.3,
                     help="point transparency (default: 0.3)")
     ap.add_argument("--cmap", default="viridis",
@@ -107,6 +112,20 @@ def main() -> int:
     elapsed_s = ts - ts[0]
     elapsed_h = elapsed_s / 3600.0
     n_total = len(ts)
+
+    # Auto-fit axis bounds so --cover fraction of points fit per axis.
+    # Per-axis percentile of |deviation| is the smallest symmetric
+    # bound that keeps that fraction of points visible on that axis;
+    # combined per-box coverage is typically 81-90% depending on how
+    # correlated the deviations are.
+    auto_pct = max(0.0, min(100.0, 100.0 * args.cover))
+    if args.xlim is None:
+        args.xlim = float(np.percentile(np.abs(e_m), auto_pct)) or 0.01
+    if args.ylim is None:
+        args.ylim = float(np.percentile(np.abs(n_m), auto_pct)) or 0.01
+    if args.zlim is None:
+        args.zlim = float(np.percentile(np.abs(u_m), auto_pct)) or 0.01
+
     n_clipped_h = int(np.sum((np.abs(e_m) > args.xlim) | (np.abs(n_m) > args.ylim)))
     n_clipped_v = int(np.sum((np.abs(e_m) > args.xlim) | (np.abs(u_m) > args.zlim)))
 
@@ -151,8 +170,10 @@ def main() -> int:
     out = args.output or str(Path(args.log).with_suffix('.scatter.png'))
     fig.savefig(out, dpi=120, bbox_inches='tight')
     print(f"Wrote {out}")
-    print(f"  Horizontal: {n_clipped_h}/{n_total} clipped at ±{args.xlim}m E/W × ±{args.ylim}m N/S")
-    print(f"  Vertical:   {n_clipped_v}/{n_total} clipped at ±{args.xlim}m E/W × ±{args.zlim}m U/D")
+    print(f"  Horizontal: {n_clipped_h}/{n_total} ({100.0*n_clipped_h/n_total:.1f}%) "
+          f"clipped at ±{args.xlim:.3f}m E/W × ±{args.ylim:.3f}m N/S")
+    print(f"  Vertical:   {n_clipped_v}/{n_total} ({100.0*n_clipped_v/n_total:.1f}%) "
+          f"clipped at ±{args.xlim:.3f}m E/W × ±{args.zlim:.3f}m U/D")
     return 0
 
 
