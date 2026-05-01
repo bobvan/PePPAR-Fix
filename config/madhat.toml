@@ -12,17 +12,21 @@ ptp_profile = "i226"
 ptp_dev = "/dev/ptp_i226"
 ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
-# CNES SSR for PPP-AR (credentials in ntrip-cnes.conf)
+# Dual-mount SSR (I-133619-main P2, 2026-05-01 afternoon):
+#   orbit/clock + GAL phase biases + GPS L2W code biases:  CNES SSRA00CNE0
+#   per-(SV,signal) phase biases incl. BDS B2a-I + GPS L5Q: WHU OSBC00WHU1
+# Both mounts on products.igs-ip.net (same caster, same login —
+# ntrip-cnes.conf credentials cover both).
+# Restores BDS B2a-I + GPS L5Q phase-bias coverage that CNES alone
+# leaves as gaps; this morning's BDS-off A/B confirmed the gap as
+# the dominant ZTD-bias source (MadHat ZTD went from -1500mm
+# stuck-bias overnight to +242mm sane).  WHU mount expected to keep
+# ZTD healthy AND restore the dropped SVs for full geometry.
+# See docs/ssr-mount-survey.md and commit 7ae1392.
 ssr_ntrip_conf = "ntrip-cnes.conf"
-# 2026-05-01 morning: BDS-off A/B test (I-133619-main P1).  CNES has
-# no SSR phase-bias coverage for BDS B2a-I; tracking it on TIM 2.25
-# leaves the cross-SV mean of the missing-PB error to land in
-# position (now blocked by NAV2 anchor) or ZTD (now the trip source,
-# 4.76 trips/hr overnight).  TimeHat (TIM 2.20, no native B2a-I)
-# stays on gps,gal,bds as the control — it was at 2.82 trips/hr.
-# If MadHat's rate drops toward TimeHat's, BDS-as-cause confirmed
-# and afternoon plan is WHU OSBC00WHU1 mount swap (P2).
-systems = "gps,gal"
+ssr_bias_mount = "OSBC00WHU1"
+ssr_bias_ntrip_conf = "ntrip-cnes.conf"
+systems = "gps,gal,bds"
 
 # TICC #2: chA = PEROUT (i226 PPS OUT), chB = GNSS PPS.
 ticc_port = "/dev/ticc2"
