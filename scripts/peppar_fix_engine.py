@@ -2123,27 +2123,29 @@ class AntPosEstThread(threading.Thread):
             reset MW entirely, transition all SVs to FLOATING,
             re-initialize PPPFilter.  Assumes systemic failure that
             the per-SV monitors can't fix.
-          * ``reason='ztd_impossible'`` — **NL-only revert.** Drop
-            NL fixes and reset the ZTD state, but **keep MW / WL
-            fixes, keep position state, keep clock/ISB state**.
-            Rationale: wrong NL integers are the likely driver
-            of ZTD corruption; reverting to WL-only stops their
-            accumulation without discarding fast-to-acquire state.
-            ANCHORED / ANCHORING SVs transition to FLOATING (no
-            legal ANCHORING→CONVERGING edge); MW state kept so the
-            SVs can rapidly return to CONVERGING on next observation.
-          * ``reason='ztd_cycling'`` — **full WL flush, keep
-            position.**  ZTD trip has fired repeatedly without the
-            filter escaping its biased-equilibrium basin — most
-            likely a wrong WL integer somewhere in the fix set is
-            trapping every NL search in the wrong integer
-            subspace (NL is bounded by WL: a wrong N_WL excludes
-            the correct NL integer from LAMBDA's search).  Reset
-            the MW tracker for every SV to force WL re-acquisition
-            through the full pipeline, in addition to everything
-            the ztd_impossible path does.  Position / clock / ISB
-            preserved — the diagnosis is bad ambiguities, not
-            bad position.
+          * ``reason='ztd_impossible'`` / ``'ztd_cycling'`` —
+            **surgical ZTD-only reset (I-133619-main P3).**  Reset
+            ``x[IDX_ZTD]`` to 0 and ``P[IDX_ZTD,IDX_ZTD]`` to
+            ``filt._ztd_sigma_m ** 2``; keep position / clock / ISB /
+            NL fixes / MW state / SV states untouched.
+
+            Why: 2026-04-30 overnight evidence (37+62+82 trips across
+            the lab fleet) showed ``|Δalt|`` at recovery = 0.05-0.06 m
+            and ``Δhoriz`` = 0.02 m on every ZTD-class trip — i.e.
+            the position/ambiguity scaffold was correct at trip time;
+            only ZTD was off (the cross-SV mean of the missing
+            SSR-PB-coverage error has no other state to land in
+            once NAV2 anchor pins position).  The legacy NL-only-
+            revert was throwing away genuinely-good NL fixes and
+            ANCHORED state on every trip, costing the trust scaffold
+            ~7 minutes of accumulation each time.  The legacy
+            ztd_cycling WL flush was based on a "wrong WL integer
+            traps NL search" hypothesis that the SSR-PB-gap analysis
+            invalidates: WL integers are correct; ZTD just keeps
+            re-absorbing the bias mean.  Surgical reset stops the
+            collateral damage; the trip detector still fires (so
+            the SSR-PB-gap signal stays measurable in the log) but
+            the recovery is essentially free for the trust scaffold.
 
         Emits the single [FIX_SET_INTEGRITY] TRIPPED log line
         (monitor itself stays silent per the "monitor only speaks
@@ -2208,58 +2210,41 @@ class AntPosEstThread(threading.Thread):
         except Exception:
             log.exception("pre-revert state snapshot failed (non-fatal)")
 
-        if reason == 'ztd_cycling':
-            # Full WL flush — wipe MW tracker for every SV and
-            # every NL fix.  Position / clock / ISB kept (the
-            # basin trap is in the ambiguities, not the position).
-            # After this, every SV is back at FLOATING and must
-            # re-converge WL through MW before any NL attempt.
-            nl_revert = len(nl._fixed)
-            for sv in list(nl._fixed.keys()):
-                nl.unfix(sv)
-            mw_reset = 0
-            for sv in list(mw._state.keys()):
-                mw.reset(sv)
-                mw_reset += 1
-                cur = self._sv_state.state(sv)
-                if cur is not SvAmbState.FLOATING:
-                    try:
-                        self._sv_state.transition(
-                            sv, SvAmbState.FLOATING,
-                            epoch=self._n_epochs,
-                            reason="ztd_cycling:wl_flush",
-                        )
-                    except Exception:
-                        pass
+        if reason in ('ztd_impossible', 'ztd_cycling'):
+            # Surgical ZTD-only reset (I-133619-main P3).  Per
+            # 2026-04-30 overnight evidence: ZTD-class trips
+            # recover with |Δalt|=0.05m and Δhoriz=0.02m, meaning
+            # the position/ambiguity scaffold is correct at trip
+            # time and only ZTD needs the reset.  Surgical reset
+            # preserves the trust scaffold (NL fixes, ANCHORED
+            # state, MW tracker).  Trip detector still fires so
+            # the SSR-PB-gap signal stays measurable, but the
+            # recovery is free for the trust scaffold.
             ztd_idx = getattr(filt, 'IDX_ZTD', PPP_IDX_ZTD)
+            ztd_sigma_m = float(getattr(filt, '_ztd_sigma_m', 0.2))
             if filt.x.shape[0] > ztd_idx:
                 filt.x[ztd_idx] = 0.0
-                filt.P[ztd_idx, ztd_idx] = 0.5 ** 2
+                filt.P[ztd_idx, ztd_idx] = ztd_sigma_m ** 2
             log.info(
-                "ZTD cycling escalation: flushed MW for %d SVs, "
-                "reverted %d NL fixes, reset ZTD state "
-                "(recent ZTD trips=%d); position/clock preserved",
-                mw_reset, nl_revert, ev.get('recent_trip_count', -1),
+                "ZTD trip recovery (surgical, P3): reset "
+                "x[IDX_ZTD]=0 and σ_ZTD=%.3fm; "
+                "kept %d NL fix(es), MW state, SV states, "
+                "position, clock, ISB intact "
+                "(recent ZTD trips=%d)",
+                ztd_sigma_m, len(nl._fixed),
+                ev.get('recent_trip_count', -1),
             )
-            if self._ape_sm.state in (AntPosEstState.ANCHORING,
-                                      AntPosEstState.ANCHORED):
-                self._ape_sm.transition(
-                    AntPosEstState.CONVERGING,
-                    "ztd-cycling escalation — full WL flush",
-                )
             self._fix_set_integrity.record_trip(self._n_epochs)
             return
 
-        if reason in ('ztd_impossible', 'ztd_consensus'):
-            # NL-only revert — keep WL, keep position, reset ZTD.
-            # Consensus path fires earlier (tens of mm vs. hundreds)
-            # but same remediation: wrong NL integers are the likely
-            # corruption driver, so reverting to WL only stops
-            # accumulation without discarding fast-to-acquire state.
-            # ANCHORED and ANCHORING SVs revert to FLOATING (the
-            # state-machine's only legal exit from the NL-fixed
-            # states); MW state is preserved so the SVs will
-            # rapidly re-enter CONVERGING on their next observation.
+        if reason == 'ztd_consensus':
+            # Peer-cohort agreement that ZTD is wrong.  This is a
+            # stronger external signal than ztd_impossible's local
+            # threshold breach; the cohort sees the same drift, so
+            # something beyond local SSR-PB-gap may be at play.
+            # Keep the legacy NL-revert + ZTD-reset behavior here
+            # until we have evidence that surgical-only is enough
+            # for cohort-confirmed cases.
             revert_count = 0
             for sv in list(nl._fixed.keys()):
                 nl.unfix(sv)
@@ -2270,32 +2255,26 @@ class AntPosEstThread(threading.Thread):
                         self._sv_state.transition(
                             sv, SvAmbState.FLOATING,
                             epoch=self._n_epochs,
-                            reason="ztd_impossible:revert_to_wl",
+                            reason="ztd_consensus:revert_to_wl",
                         )
                     except Exception:
                         pass
-            # Reset the ZTD residual state to 0 with inflated
-            # covariance — the filter re-estimates ZTD from scratch
-            # alongside any new NL fixes.  Other state untouched.
-            # (IDX_ZTD is a module-level constant, not an instance
-            # attribute; getattr falls through to the imported one.)
             ztd_idx = getattr(filt, 'IDX_ZTD', PPP_IDX_ZTD)
+            ztd_sigma_m = float(getattr(filt, '_ztd_sigma_m', 0.2))
             if filt.x.shape[0] > ztd_idx:
                 filt.x[ztd_idx] = 0.0
-                # Initial PPPFilter sigma on ZTD residual is 0.5 m
-                # (see PPPFilter.initialize); matching here keeps
-                # the EKF's re-estimation well-posed.
-                filt.P[ztd_idx, ztd_idx] = 0.5 ** 2
+                filt.P[ztd_idx, ztd_idx] = ztd_sigma_m ** 2
             log.info(
-                "ZTD trip recovery: reverted %d NL fixes, reset ZTD"
-                " state, preserved MW/position/clock",
-                revert_count,
+                "ZTD consensus recovery: reverted %d NL fixes, "
+                "reset ZTD state (σ=%.3fm), preserved "
+                "MW/position/clock",
+                revert_count, ztd_sigma_m,
             )
             if self._ape_sm.state in (AntPosEstState.ANCHORING,
                                       AntPosEstState.ANCHORED):
                 self._ape_sm.transition(
                     AntPosEstState.CONVERGING,
-                    "ztd-impossible trip — NL revert, WL preserved",
+                    "ztd-consensus trip — NL revert, WL preserved",
                 )
             self._fix_set_integrity.record_trip(self._n_epochs)
             return
