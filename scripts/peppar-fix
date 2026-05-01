@@ -49,6 +49,7 @@ if [[ ! -f "$DO_CHAR_FILE" ]]; then
     # Resolve host config to check for PTP_DEV and KNOWN_POS
     _hc_eval=""
     _hc_explicit=""
+    _hc_flag=""
     for arg in "$@"; do
         if [[ "$_hc_flag" == "1" ]]; then
             _hc_explicit="$arg"
