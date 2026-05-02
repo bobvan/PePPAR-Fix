@@ -35,7 +35,7 @@ ssr_ntrip_conf = "ntrip-cnes.conf"
 # the diagnostic backbone for the bisect in P3+P4 of I-122350-main.
 ssr_bias_mount      = "OSBC00WHU1"
 ssr_bias_ntrip_conf = "ntrip-cnes.conf"
-systems = "gps,gal,bds"
+systems = "gps,gal"
 phase_step_bias_ns = 2283.0
 
 # TICC #1: chA = PEROUT (i226 PPS OUT), chB = GNSS PPS.
