@@ -1345,12 +1345,18 @@ def ntrip_reader(stream, beph, ssr, stop_event, label="NTRIP",
 
             # Route to appropriate handler.  In bias_only mode, reject
             # everything except the bias message subset — the primary
-            # mount owns orbit/clock/ephemeris.
+            # mount owns orbit/clock/ephemeris.  AND filter the
+            # secondary-mount bias writes to gap-fill signals only:
+            # cross-AC datum mixing on shared (SV, signal) breaks AR
+            # because LAMBDA expects integer ambiguities in a single
+            # datum but the persistent AC datum offset is non-integer.
+            # See docs/ac-datum-mixing.md and ssr_corrections.GAP_FILL_SIGNALS.
             if bias_only:
                 if identity in BIAS_MSG_TYPES:
-                    result = ssr.update_from_rtcm(msg_view, src_mount=label)
+                    result = ssr.update_from_rtcm(
+                        msg_view, src_mount=label, gap_fill_only=True)
                     if n_total <= 5:
-                        log.info(f"[{label}] bias routed: "
+                        log.info(f"[{label}] bias routed (gap-fill only): "
                                  f"{identity} → {result}")
                 else:
                     n_skipped_non_phase_bias += 1
