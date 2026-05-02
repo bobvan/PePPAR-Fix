@@ -45,8 +45,8 @@ ssr_ntrip_conf = "ntrip-cnes.conf"
 # 2026-05-02 ~10:09 CDT, snapshot at TimeHat:~/peppar-fix/data/
 # day0502-baseline-reference/).  bias_diff overlay (commit 2603d71)
 # consumes the new src= field for the twin-WHU diff.
-#ssr_bias_mount      = "OSBC00WHU1"
-#ssr_bias_ntrip_conf = "ntrip-cnes.conf"
+ssr_bias_mount      = "OSBC00WHU1"
+ssr_bias_ntrip_conf = "ntrip-cnes.conf"
 systems = "gps,gal,bds"
 
 # TICC #2: chA = PEROUT (i226 PPS OUT), chB = GNSS PPS.
