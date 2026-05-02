@@ -1359,7 +1359,16 @@ def ntrip_reader(stream, beph, ssr, stop_event, label="NTRIP",
                 if prn and beph.n_satellites % 10 == 0:
                     log.debug(f"[{label}] {beph.summary()}")
             elif identity in SSR_MSG_TYPES or identity.startswith('4076_'):
-                result = ssr.update_from_rtcm(msg_view)
+                # I-122350-main P1 follow-up: pass label as src_mount on
+                # the primary-mount path too.  Without this, every bias
+                # delivered by the primary mount tags src=? in
+                # [CB_APPLIED] / [PB_APPLIED] (only the bias_only
+                # secondary-mount path was plumbing src_mount, which
+                # makes the dual-mount diagnostic asymmetric — CNES
+                # biases unlabelled, WHU biases labelled).  Also
+                # confirmed against TimeHat day0502-cnes-baseline log
+                # (184/184 entries with src=?).
+                result = ssr.update_from_rtcm(msg_view, src_mount=label)
                 if n_total <= 5:
                     log.info(f"[{label}] SSR routed: {identity} → {result}")
 
