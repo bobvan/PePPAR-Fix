@@ -177,9 +177,16 @@ coverage frontier**, not a config switch.
   - **Does not enable mid-arc AC switches.**  Switching between
     AC sources for the same (SV, signal) ambiguity invalidates
     the float ambiguity (datum just changed; the existing
-    estimate is in the old datum).  Treated as a cycle slip.  We
-    don't switch in normal operation; this is documented for
-    correctness.
+    estimate is in the old datum).  We don't switch in normal
+    operation, so the gap-fill code does not have a slip-trigger
+    code path for this case.  If a switch were to happen anyway
+    (e.g., we add a feature that does mid-arc fallover later,
+    or the secondary AC briefly publishes a primary-covered
+    signal in violation of our coverage assumption), the
+    downstream cycle-slip detectors (GF, MW) would catch the
+    persistent bias jump as a phase-residual outlier and trigger
+    the normal slip-handling path that way.  Defense in depth,
+    not by design.
 
 ## Verifying via bias_diff overlay
 
