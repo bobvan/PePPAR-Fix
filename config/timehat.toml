@@ -33,8 +33,8 @@ ssr_ntrip_conf = "ntrip-cnes.conf"
 # 60/hr.  Re-enable here only after Main's P1 per-SV per-signal bias
 # logging (commit 87e5da3 onwards) is in place — bias-value logs are
 # the diagnostic backbone for the bisect in P3+P4 of I-122350-main.
-#ssr_bias_mount      = "OSBC00WHU1"
-#ssr_bias_ntrip_conf = "ntrip-cnes.conf"
+ssr_bias_mount      = "OSBC00WHU1"
+ssr_bias_ntrip_conf = "ntrip-cnes.conf"
 systems = "gps,gal,bds"
 phase_step_bias_ns = 2283.0
 
