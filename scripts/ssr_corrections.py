@@ -239,6 +239,49 @@ class ClockCorrection:
         self.correlation_confidence = correlation_confidence
 
 
+# Gap-fill allow-list for the dual-mount SSR design (I-122350-main P3
+# fix, 2026-05-02).  Per docs/ac-datum-mixing.md: phase biases from
+# different ACs are calibrations in different datums, not noise around
+# a common truth.  Mixing CNES-bias and WHU-bias for the same
+# (SV, signal) breaks AR because LAMBDA expects integer ambiguities in
+# a single datum; the persistent ~0.1-1.5 m datum offset between ACs
+# becomes a non-integer residual the search can't recover from.
+#
+# To make the dual-mount config sound: the secondary mount writes to
+# the bias cache only for signals on this allow-list.  The primary
+# mount's writes are unrestricted.  The cache becomes single-source-
+# per-(SV, signal) by construction; last-write-wins becomes a no-op
+# for shared signals because the key collisions don't happen.
+#
+# Entries: (system_prefix, rinex_signal_code) where the rinex code is
+# either C-prefix (code observable) or L-prefix (phase observable).
+# Both the code and phase variants of a gap signal must be enumerated
+# because _code_bias and _phase_bias are stored separately.
+#
+# This list is the **AC coverage frontier**, not a config switch.
+# When the primary AC (CNES SSRA00CNE0 in our setup) adds coverage
+# for a signal, the corresponding tuples are removed.  When the
+# secondary AC (WHU OSBC00WHU1) drops coverage, also removed.
+GAP_FILL_SIGNALS = frozenset({
+    # GPS L5 — CNES SSRA00CNE0 omits L5 phase bias (per
+    # docs/l5i-l5q-phase-bias-empirical.md and the L5I/L5Q gap).
+    # WHU OSBC00WHU1 publishes L5Q + L5X.
+    ('G', 'C5Q'), ('G', 'L5Q'),
+    ('G', 'C5X'), ('G', 'L5X'),
+    # BDS B2a-I — CNES covers B1I + B3I; WHU adds C5X / C5P
+    # (the BDS-3 modernized B2a signal at 1176.45 MHz).
+    ('C', 'C5X'), ('C', 'L5X'),
+    ('C', 'C5P'), ('C', 'L5P'),
+    # GLONASS — CNES does not publish GLO biases at all (FDMA
+    # signal handling differs from CDMA constellations); WHU
+    # provides C1C/C1P (G1) and C2C/C2P (G2).
+    ('R', 'C1C'), ('R', 'L1C'),
+    ('R', 'C1P'), ('R', 'L1P'),
+    ('R', 'C2C'), ('R', 'L2C'),
+    ('R', 'C2P'), ('R', 'L2P'),
+})
+
+
 class BiasCorrection:
     """SSR code or phase bias for one satellite, one signal.
 
@@ -302,7 +345,7 @@ class SSRState:
     def n_clock(self):
         return len(self._clock)
 
-    def update_from_rtcm(self, msg, src_mount=None):
+    def update_from_rtcm(self, msg, src_mount=None, gap_fill_only=False):
         """Ingest a decoded SSR RTCM message.
 
         Handles both IGS SSR (4076_*) and standard RTCM SSR (1057-1068, 1240-1263).
@@ -313,6 +356,15 @@ class SSRState:
         message — propagated to ``BiasCorrection.src_mount`` for
         bias-application logging.  When two mounts emit a bias for the
         same (sv, signal), last-write-wins records the winner.
+
+        ``gap_fill_only`` (optional, default False): when True, code
+        bias and phase bias writes are restricted to the
+        ``GAP_FILL_SIGNALS`` allow-list — signals the primary AC
+        leaves blank.  Set this for secondary-mount streams in
+        dual-mount configurations to prevent cross-AC datum mixing
+        on shared signals.  Orbit, clock, and combined messages are
+        passed through unchanged (gap-fill is a bias-only concept).
+        See ``GAP_FILL_SIGNALS`` and ``docs/ac-datum-mixing.md``.
         """
         identity = str(getattr(msg, 'identity', ''))
 
@@ -362,12 +414,14 @@ class SSRState:
         elif subtype == 'code_bias':
             self._parse_code_bias(msg, sys_prefix, n_sats,
                                   rx_mono, queue_remains, correlation_confidence,
-                                  src_mount=src_mount)
+                                  src_mount=src_mount,
+                                  gap_fill_only=gap_fill_only)
             self._last_bias_update_mono = rx_mono
         elif subtype == 'phase_bias':
             self._parse_phase_bias(msg, sys_prefix, n_sats,
                                    rx_mono, queue_remains, correlation_confidence,
-                                   src_mount=src_mount)
+                                   src_mount=src_mount,
+                                   gap_fill_only=gap_fill_only)
             self._last_bias_update_mono = rx_mono
 
         self._last_update_mono = rx_mono
@@ -539,12 +593,17 @@ class SSRState:
 
     def _parse_code_bias(self, msg, sys_prefix, n_sats,
                          rx_mono=None, queue_remains=None, correlation_confidence=None,
-                         src_mount=None):
+                         src_mount=None, gap_fill_only=False):
         """Extract per-satellite code bias corrections.
 
         Standard RTCM SSR code bias fields (pyrtcm):
           DF379 = num biases, DF380 = signal ID, DF383 = bias (m)
         IGS SSR fields: IDF023/024/025
+
+        ``gap_fill_only``: see ``update_from_rtcm`` docstring.  When
+        True, only writes for ``(sys_prefix, rinex_code)`` pairs in
+        ``GAP_FILL_SIGNALS`` are stored; others are dropped at intake
+        and tallied in ``_dropped_gap_only``.
         """
         identity = str(getattr(msg, 'identity', ''))
         # Pick the signal-code map based on message source.  IGS SSR 4076
@@ -570,6 +629,7 @@ class SSRState:
             rtcm_style = True
 
         _dropped_no_map = 0
+        _dropped_gap_only = 0
         _stored = 0
         _sats_seen = 0
         for i in range(1, n_sats + 1):
@@ -602,6 +662,14 @@ class SSRState:
                     rinex_code = 'C' + mapped[1:]
                 else:
                     rinex_code = mapped
+                # Gap-fill secondary-mount filter (I-122350-main P3 fix):
+                # when gap_fill_only is set, only signals on the
+                # GAP_FILL_SIGNALS allow-list are stored.  Per
+                # docs/ac-datum-mixing.md.
+                if (gap_fill_only
+                        and (sys_prefix, rinex_code) not in GAP_FILL_SIGNALS):
+                    _dropped_gap_only += 1
+                    continue
                 _stored += 1
                 self._code_bias[prn][rinex_code] = BiasCorrection(
                     signal_code=rinex_code, bias_m=float(bias_m), is_phase=False,
@@ -621,14 +689,14 @@ class SSRState:
         lk = (identity, sys_prefix)
         if lk not in self._cb_parse_logged:
             log.info("code_bias parse: id=%s sys=%s n_sats=%d sats_seen=%d "
-                     "stored=%d dropped_no_map=%d",
+                     "stored=%d dropped_no_map=%d dropped_gap_only=%d",
                      identity, sys_prefix, n_sats, _sats_seen,
-                     _stored, _dropped_no_map)
+                     _stored, _dropped_no_map, _dropped_gap_only)
             self._cb_parse_logged.add(lk)
 
     def _parse_phase_bias(self, msg, sys_prefix, n_sats,
                           rx_mono=None, queue_remains=None, correlation_confidence=None,
-                          src_mount=None):
+                          src_mount=None, gap_fill_only=False):
         """Extract per-satellite phase bias corrections.
 
         pyrtcm (as of 1.1.12) does not decode RTCM 1265-1270 phase bias
@@ -637,6 +705,10 @@ class SSRState:
 
         IGS SSR (4076 subtypes) may be decoded by pyrtcm, so we still try
         the attribute-based path first.
+
+        ``gap_fill_only``: see ``update_from_rtcm`` docstring.  When
+        True, only writes for ``(sys_prefix, rinex_code)`` pairs in
+        ``GAP_FILL_SIGNALS`` are stored.
         """
         # Check if pyrtcm actually decoded satellite data
         has_decoded = n_sats > 0 and self._get_sat_id(msg, 1) is not None
@@ -648,7 +720,8 @@ class SSRState:
                     payload, sys_prefix,
                     rx_mono=rx_mono, queue_remains=queue_remains,
                     correlation_confidence=correlation_confidence,
-                    src_mount=src_mount)
+                    src_mount=src_mount,
+                    gap_fill_only=gap_fill_only)
             return
 
         # pyrtcm-decoded path (IGS SSR 4076 subtypes)
@@ -680,12 +753,13 @@ class SSRState:
                     disc=getattr(msg, f'IDF031_{i:02d}_{j:02d}', 0),
                     rx_mono=rx_mono, queue_remains=queue_remains,
                     correlation_confidence=correlation_confidence,
-                    src_mount=src_mount)
+                    src_mount=src_mount,
+                    gap_fill_only=gap_fill_only)
 
     def _parse_phase_bias_binary(self, payload, sys_prefix,
                                  rx_mono=None, queue_remains=None,
                                  correlation_confidence=None,
-                                 src_mount=None):
+                                 src_mount=None, gap_fill_only=False):
         """Decode RTCM 1265-1270 phase bias from raw payload bytes.
 
         Both RTCM SSR and some casters that wrap IGS-SSR-style content in
@@ -776,7 +850,8 @@ class SSRState:
                     int_ind=int_ind, wl_ind=wl_ind, disc=disc,
                     rx_mono=rx_mono, queue_remains=queue_remains,
                     correlation_confidence=correlation_confidence,
-                    src_mount=src_mount)
+                    src_mount=src_mount,
+                    gap_fill_only=gap_fill_only)
 
         if n_stored > 0:
             if not hasattr(self, '_pb_binary_logged'):
@@ -792,8 +867,14 @@ class SSRState:
                           signal_map, int_ind=0, wl_ind=0, disc=0,
                           rx_mono=None, queue_remains=None,
                           correlation_confidence=None,
-                          src_mount=None):
-        """Store one phase bias correction.  Returns 1 if stored, 0 if skipped."""
+                          src_mount=None, gap_fill_only=False):
+        """Store one phase bias correction.  Returns 1 if stored, 0 if skipped.
+
+        ``gap_fill_only``: when True, the (sys_prefix, rinex_code)
+        pair must be in ``GAP_FILL_SIGNALS`` or the write is dropped
+        (returns 0).  See ``update_from_rtcm`` and
+        ``docs/ac-datum-mixing.md``.
+        """
         rinex_code = signal_map.get((sys_prefix, sig_id_int))
         if rinex_code is None:
             if not hasattr(self, '_pb_unmapped_logged'):
@@ -804,6 +885,12 @@ class SSRState:
                             "(bias=%.4f m) — add to signal map",
                             sys_prefix, sig_id_int, bias_m)
                 self._pb_unmapped_logged.add(key)
+            return 0
+        if (gap_fill_only
+                and (sys_prefix, rinex_code) not in GAP_FILL_SIGNALS):
+            # Secondary-mount writes are restricted to GAP_FILL_SIGNALS
+            # to prevent cross-AC datum mixing on shared signals.  Per
+            # I-122350-main P3 fix and docs/ac-datum-mixing.md.
             return 0
         if not hasattr(self, '_pb_codes_logged'):
             self._pb_codes_logged = set()

@@ -171,6 +171,119 @@ scope:
 `project_wl_drift_vs_bnc_finding_20260428` for the full
 investigation chain.
 
+## Pattern — 2026-05-02
+
+### Residual-domain mismatch — recurring shape
+
+**The pattern**: a class/monitor whose name or stated job lives in
+the integer-fix domain (NL, WL, ambiguity, fix-set, anchor,
+setting-SV) but whose trigger reads PR (code) residuals while
+ignoring IF (carrier-phase) residuals.
+
+PR multipath inflates code residuals at low elevation while the
+carrier-phase integer is unaffected.  When the trigger reads PR
+only, every multipath spike gets misread as an integer-fix problem
+and produces wasted filter actions (eviction, re-init, demotion).
+
+**How to find more by inspection** — three conditions, mechanical:
+
+1. Class/file name contains a token from the integer-fix
+   vocabulary: `fix`, `ambiguity`, `integer`, `wl`, `nl`, `ar`,
+   `anchor`, `lifecycle`, `sv_state`, `evict`, `drop`,
+   `setting_sv`, `false_fix`, `integrity`.
+2. `ingest()` or trigger reads PR residuals or filters out non-PR
+   (`kind == 'pr'` / `kind != 'pr'` / iterates only `pr_resid`).
+3. Docstring does **not** explicitly justify excluding carrier-phase
+   residuals.
+
+The clean exemplar that passes (1) and (2) but fails as a
+candidate is `bootstrap_gate.py:79` — its docstring says *"Phi
+residuals not checked — they pick up carrier-phase ambiguity bias
+rather than measurement noise during cold-start float phase."*
+That's the model: when PR-only is correct, the docstring tells
+the inspector why.
+
+When (3) fails — silent docstring or one that describes what the
+code does without saying why IF is left out — you almost certainly
+have a misnomer-and-bug.
+
+### `SettingSvDropMonitor` Condition 2 — Misleading
+
+**Where**: `scripts/peppar_fix/setting_sv_drop_monitor.py:124,191-235`
+(class `SettingSvDropMonitor`, method `evaluate`).
+**Claim**: Drops SVs that have become unreliable as they descend
+through the setting band.  "Setting-SV drop: the intentional
+removal of an SV from the fix set as it descends into
+multipath-prone elevations."  Name and docstring frame this as an
+integer-fix-domain action.
+**Actual**: Trigger fires on elev-weighted **PR** mean only.  When
+PR multipath inflates the code residual but the carrier-phase
+integer remains correct (IF residual sub-cm), the SV is still
+demoted ANCHORING → FLOATING.  The next epoch the same n_nl is
+re-admitted because nothing was wrong.
+**Why it matters**: 100% of same-second wasted evictions on
+day0501 overnight (TimeHat 11/11, MadHat 10/10) trace to this
+trigger.  Each wasted eviction costs trust-scaffold tier (mostly
+PROVISIONAL preserved, some drop to NEW).  Across both hosts:
+24/32 wasted evicts.
+**Proposed**: Gate Condition 2 on IF residual breach in addition
+to PR breach.  ~30 LOC change; see `I-161514-main`.
+**Notes**: Condition 1 (absolute elev_mask) is geometric and
+correct — leave alone.
+
+### `FixSetIntegrityMonitor.window_rms` trip — Dangerous
+
+**Where**: `scripts/peppar_fix/fix_set_integrity_monitor.py:195`
+(method `ingest`, trip path `window_rms` in `evaluate`).
+**Claim**: "Computes single-epoch RMS across SVs currently in
+either ANCHORING or ANCHORED (the fix set)."  Fix-set is
+integer-fix-domain language.  When the RMS exceeds threshold for a
+sustained window, the most severe action in the system fires:
+`[FIX_SET_INTEGRITY] TRIPPED reason=window_rms` → full filter
+re-init.
+**Actual**: RMS is computed over PR residuals only.  A multipath
+storm on the fix set's PR residuals trips it identically whether
+or not the integers are pathological.
+**Why it matters**: 12 window_rms trips on TimeHat day0501.  Of
+those, **8 (67%) are confirmed PR-multipath false positives** —
+PR-RMS over the 30-epoch lookback was 5-12 m while IF-RMS was
+4-80 mm (sub-cm to low-cm, integers clean).  3 (25%) were
+justified (IF-RMS 122-226 mm, real integer pathology).  1 (8%)
+ambiguous (no NL samples in window — re-init recovery edge case).
+Each false positive is a full filter re-init (loses NL anchors,
+restarts trust scaffold) — the most expensive recovery action in
+the system.  Verification at `/tmp/evict-waste/window_rms_attribution.py`.
+**Proposed**: Gate the trip on PR-RMS breach AND IF-RMS breach.
+The other trip reasons (`ztd_impossible`, `ztd_cycling`,
+`anchor_collapse`) read filter state, not residuals — leave alone.
+~40 LOC; see `I-162353-main`.
+
+### `FalseFixMonitor` — Dangerous (already self-flagged)
+
+**Where**: `scripts/peppar_fix/false_fix_monitor.py:166`
+(method `ingest`).
+**Claim**: "False fix" — the name implies detection of wrong NL
+integer fixes.
+**Actual**: Trigger reads PR residuals only.  Cannot reliably
+distinguish wrong-integer fixes from PR multipath.  The codebase
+already knows this — every `[FALSE_FIX]` log line carries the
+literal qualifier `[observe-only — IF step is canonical demoter]`.
+The monitor is neutralized but still emits.
+**Why it matters**: 1675 `[FALSE_FIX]` log entries on TimeHat
+day0501 vs zero real evictions.  That's the steady-state cost of
+the wrong-domain trigger — log noise, no signal.
+**Proposed**: Two paths, pick one.  (a) Gate trigger on IF
+residual; promote from observe-only to canonical demoter.
+(b) Demote to a diagnostic log at lower verbosity, keep IF_STEP as
+the canonical demoter and rename the class `PrResidualOutlier`
+which is what it actually computes.
+**Notes**: Path (b) is cheaper but admits the misnomer rather
+than fixing it.  Path (a) puts a second carrier-domain demoter
+in the system alongside IF_STEP — could be redundant or could be
+useful belt-and-suspenders.  Defer until after the
+`SettingSvDropMonitor` and `FixSetIntegrityMonitor.window_rms`
+fixes ship and we measure the residual log noise.
+
 ## Code-quality issues found alongside (not misnomers)
 
 ### `gmf._coeff_sum` — dead code
