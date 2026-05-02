@@ -244,10 +244,15 @@ re-init.
 **Actual**: RMS is computed over PR residuals only.  A multipath
 storm on the fix set's PR residuals trips it identically whether
 or not the integers are pathological.
-**Why it matters**: 11 window_rms trips on TimeHat day0501, 6 on
-MadHat.  At least some are likely PR-multipath false positives by
-the same mechanism as `SettingSvDropMonitor`.  Each false trip is
-a full filter re-init (loses NL anchors, restarts trust scaffold).
+**Why it matters**: 12 window_rms trips on TimeHat day0501.  Of
+those, **8 (67%) are confirmed PR-multipath false positives** —
+PR-RMS over the 30-epoch lookback was 5-12 m while IF-RMS was
+4-80 mm (sub-cm to low-cm, integers clean).  3 (25%) were
+justified (IF-RMS 122-226 mm, real integer pathology).  1 (8%)
+ambiguous (no NL samples in window — re-init recovery edge case).
+Each false positive is a full filter re-init (loses NL anchors,
+restarts trust scaffold) — the most expensive recovery action in
+the system.  Verification at `/tmp/evict-waste/window_rms_attribution.py`.
 **Proposed**: Gate the trip on PR-RMS breach AND IF-RMS breach.
 The other trip reasons (`ztd_impossible`, `ztd_cycling`,
 `anchor_collapse`) read filter state, not residuals — leave alone.
