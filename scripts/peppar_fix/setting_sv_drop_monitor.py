@@ -13,14 +13,24 @@ the fix set as it descends into multipath-prone elevations.
 Two trigger conditions, either one fires:
 
 1. **Elev-weighted PR residual exceeds threshold in the setting
-   band.**  Base 3.0 m at `elev_clamp_deg` (45° zenith cap); scaled
-   up by 1/sin(elev) below the clamp.  Only fires when elev is in
-   the setting band — between `drop_mask_deg` (default 18°) and
-   `residual_ceiling_deg` (default 30°).  Above the ceiling an SV
-   is not physically setting — residual issues at high elev are
-   FalseFixMonitor's domain (tighter 2.0 m threshold, designed for
-   wrong integers) or filter-health issues handled by the integrity
-   monitor / join test.
+   band, AND IF residual also breaches.**  Base 3.0 m PR threshold
+   at `elev_clamp_deg` (45° zenith cap); scaled up by 1/sin(elev)
+   below the clamp.  Only fires when elev is in the setting band —
+   between `drop_mask_deg` (default 18°) and `residual_ceiling_deg`
+   (default 30°).  Above the ceiling an SV is not physically setting
+   — residual issues at high elev are FalseFixMonitor's domain
+   (tighter 2.0 m threshold, designed for wrong integers) or
+   filter-health issues handled by the integrity monitor / join test.
+
+   The IF gate (I-161514, 2026-05-02): require window-mean phi
+   residual > `if_threshold_m` (default 0.05 m) in addition to the
+   PR breach.  PR multipath at low elevation inflates the code
+   residual without affecting the carrier-phase integer; the IF
+   residual stays sub-cm even at 25-29° elev when the integer is
+   correct.  Without this gate, day0501 overnight saw 100% of
+   same-second wasted evictions (24/24 across TimeHat + MadHat) —
+   evict + re-admit at the same integer 1 second later.  See
+   docs/misnomers.md "Residual-domain mismatch" pattern.
 2. **Elev below absolute drop mask.**  Independent of residual
    quality: below `drop_mask_deg` (default 18°) we drop regardless.
    Keeps stale low-elev integers from polluting the filter when
@@ -64,6 +74,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class _SvResidWindow:
     resids: deque = field(default_factory=lambda: deque(maxlen=30))
+    if_resids: deque = field(default_factory=lambda: deque(maxlen=30))
     last_elev_deg: Optional[float] = None
 
 
@@ -98,6 +109,7 @@ class SettingSvDropMonitor:
         window_epochs: int = 30,
         min_samples: int = 10,
         eval_every: int = 10,
+        if_threshold_m: float = 0.05,
     ) -> None:
         self._tracker = tracker
         self._base = float(base_threshold_m)
@@ -107,6 +119,14 @@ class SettingSvDropMonitor:
         self._window = int(window_epochs)
         self._min_samples = int(min_samples)
         self._eval_every = int(eval_every)
+        # IF-residual gate (I-161514, 2026-05-02): Condition 2 (elev-
+        # weighted PR breach) requires the IF (carrier-phase) residual
+        # to also breach this threshold.  Empirically false-positive
+        # PR-multipath storms have IF residuals at sub-cm; legitimate
+        # wrong-integer pathology has IF > 100mm.  50mm is the
+        # conservative inner edge of that boundary.  See
+        # docs/misnomers.md "Residual-domain mismatch" pattern.
+        self._if_threshold = float(if_threshold_m)
         self._per_sv: dict[str, _SvResidWindow] = {}
         # Per-SV drop count across this session.  An SV only sets
         # once; a second drop is diagnostic for multipath or filter
@@ -121,18 +141,28 @@ class SettingSvDropMonitor:
         for lab, r in zip(labels, resid):
             sv, kind = lab[0], lab[1]
             elev = lab[2] if len(lab) > 2 else None
-            if kind != 'pr':
+            # Accept both PR (code) and phi (carrier-phase) residuals.
+            # PR drives Condition 2's elev-weighted threshold; phi
+            # provides the IF-residual gate that suppresses
+            # PR-multipath false positives.
+            if kind not in ('pr', 'phi'):
                 continue
             if self._tracker.state(sv) not in self._ELIGIBLE:
                 continue
             w = self._per_sv.get(sv)
             if w is None:
-                w = _SvResidWindow(resids=deque(maxlen=self._window))
+                w = _SvResidWindow(
+                    resids=deque(maxlen=self._window),
+                    if_resids=deque(maxlen=self._window),
+                )
                 self._per_sv[sv] = w
-            w.resids.append(abs(float(r)))
-            if elev is not None:
-                w.last_elev_deg = float(elev)
-                self._tracker.update_elev(sv, elev)
+            if kind == 'pr':
+                w.resids.append(abs(float(r)))
+                if elev is not None:
+                    w.last_elev_deg = float(elev)
+                    self._tracker.update_elev(sv, elev)
+            else:  # 'phi'
+                w.if_resids.append(abs(float(r)))
 
     # ── Evaluation ──────────────────────────────────────────────── #
 
@@ -201,6 +231,31 @@ class SettingSvDropMonitor:
                 self._base, w.last_elev_deg, clamp_deg=self._elev_clamp,
             )
             if mean > thr:
+                # IF-residual gate (I-161514, 2026-05-02): suppress
+                # PR-multipath false positives.  When the carrier-phase
+                # integer is correct the IF residual stays sub-cm even
+                # at low elevation; only a wrong integer breaches IF.
+                # Require the IF window mean to exceed if_threshold
+                # before evicting.  Need at least min_samples IF
+                # samples too — if no IF samples are available (rare,
+                # most likely an early-arc state), fall through to
+                # the legacy PR-only behaviour (don't suppress what we
+                # can't classify).
+                n_if = len(w.if_resids)
+                if n_if >= self._min_samples:
+                    if_mean = sum(w.if_resids) / n_if
+                    if if_mean <= self._if_threshold:
+                        # PR breached but IF clean → integer is correct,
+                        # PR is multipath.  Don't evict.
+                        log.debug(
+                            "[SETTING_SV_DROP_SUPPRESSED] %s elev=%s° "
+                            "|PR|=%.2fm > %.2fm but |IF|=%.3fm ≤ %.3fm "
+                            "(integer clean; PR multipath only)",
+                            sv,
+                            f"{w.last_elev_deg:.0f}" if w.last_elev_deg is not None else "?",
+                            mean, thr, if_mean, self._if_threshold,
+                        )
+                        continue
                 n_prior = self._drop_count.get(sv, 0) + 1
                 self._drop_count[sv] = n_prior
                 if n_prior > 1:
