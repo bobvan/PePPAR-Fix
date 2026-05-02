@@ -173,6 +173,43 @@ The F9P factory default ships with **L2C, E5b, B2I, and both GLONASS
 bands enabled**, matching its L1+L2 hardware.  No reconfiguration
 needed for normal RTK use.
 
+### Engine `--systems` is software-side only — it does NOT reconfigure the receiver
+
+A subtle but load-bearing fact, confirmed by code-path audit
+2026-05-02:
+
+  - The engine's ``--systems gps,gal[,bds]`` argument filters
+    observations in two places: ``serial_reader`` drops obs from
+    non-listed systems before they enter the obs queue, and
+    ``PPPFilter.initialize(systems=)`` uses the set for ISB
+    pinning of single-constellation runs.
+  - It is **NOT** consumed by ``configure_signals()`` in
+    ``peppar_fix/receiver.py``.  ``configure_signals`` writes a
+    static ``signal_config`` dict per driver
+    (``F9T_L5_SIGNAL_CONFIG`` etc.) which always has
+    ``CFG_SIGNAL_BDS_ENA = 1`` (and analogous keys for other
+    constellations) regardless of what ``--systems`` says.
+  - Net: with ``--systems gps,gal``, the receiver still tracks
+    BDS at the RF level; the engine just drops the resulting
+    observations.
+
+Implications:
+
+  - **Channel-saturation hypotheses based on `--systems` are
+    invalid.**  Switching the engine config does not change
+    receiver tracking demand.  ZED-F9T and ZED-F9P each have
+    184 acquisition+tracking channels; full multi-constellation
+    L5-band tracking (GPS L1+L5 + GAL E1+E5a + BDS B1+B2a-I,
+    plus GLO if hardware allows) is well under that ceiling.
+  - To truly disable a constellation at the receiver, send
+    ``CFG_SIGNAL_<sys>_ENA = 0`` via ``CFG-VALSET`` directly.
+    No engine code path does this today.
+  - For diagnostic A/B between "BDS receiving + engine using"
+    vs "BDS receiving but engine ignoring" vs "BDS not received
+    at all," the third case requires manual receiver
+    reconfiguration outside the engine's normal ``--systems``
+    flag.  The first two are accessible via ``--systems``.
+
 ### L5 SV count is identical across firmware versions
 
 With L5 enabled and health override applied, all three lab receivers
