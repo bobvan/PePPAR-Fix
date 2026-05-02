@@ -15,6 +15,26 @@ eph_mount = "BCEP00BKG0"
 # CNES SSR for PPP-AR: GAL fully matched (L1C/L5Q), GPS works via
 # L5I/L5Q shared carrier.  Credentials in ntrip-cnes.conf (not in repo).
 ssr_ntrip_conf = "ntrip-cnes.conf"
+# Dual-mount WHU phase-bias capability — disabled by default (I-122350
+# P2, 2026-05-02).  Uncomment the two ssr_bias_* lines below to bring
+# in WHU OSBC00WHU1 alongside CNES SSRA00CNE0.  Both mounts live on
+# products.igs-ip.net under the same login, so ntrip-cnes.conf covers
+# both.
+#
+# Asymmetric-hardware role: TimeHat (TIM 2.20, no L5/B2a-I) only
+# tracks signals that CNES already covers.  Enabling WHU here
+# exercises the dual-mount merge path on shared-only signals — any
+# regression isolates a merge bug rather than a gap-signal bug (the
+# MadHat (TIM 2.25) leg covers gap signals).  See I-122350-main
+# 'useful asymmetry' framing + I-003751-main stepwise plan.
+#
+# Yesterday's MadHat WHU run (commit e4627d7, reverted in ef49574)
+# regressed: ZTD walked to -7m, WL fixing collapsed (2/31), trip rate
+# 60/hr.  Re-enable here only after Main's P1 per-SV per-signal bias
+# logging (commit 87e5da3 onwards) is in place — bias-value logs are
+# the diagnostic backbone for the bisect in P3+P4 of I-122350-main.
+#ssr_bias_mount      = "OSBC00WHU1"
+#ssr_bias_ntrip_conf = "ntrip-cnes.conf"
 systems = "gps,gal,bds"
 phase_step_bias_ns = 2283.0
 
