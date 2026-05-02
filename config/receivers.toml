@@ -22,9 +22,7 @@ note = "OCXO, 4x25G, SyncE, DPLL (ZL30795), onboard ZED-F9T. PHC and DPLL are in
 [ptp.i226]
 device = "/dev/ptp0"
 pps_pin = 1                   # SDP1 = PPS IN from F9T (EXTTS / chB)
-pps_out_pin = 0               # SDP0 = PHC PPS OUT (PEROUT / chA)
 extts_channel = 0
-program_pin = true            # auto-program both pins at startup
 timescale = "tai"
 measurement_rate_ms = 1000    # 1 Hz — USB serial has ample bandwidth
 sfrbx_rate = 1                # every epoch — serial bandwidth is free
