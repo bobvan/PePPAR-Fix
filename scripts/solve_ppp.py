@@ -495,17 +495,24 @@ class PPPFilter:
         self.P = self.P - np.outer(K, self.P[IDX_ZTD, :])
 
     def apply_nav2_anchor(self, nav2_ecef, h_acc_m, v_acc_m=None):
-        """Soft-anchor the position state to NAV2's reported ECEF.
+        """Apply NAV2's SPP fix as a per-epoch 3D position measurement
+        update on the EKF.
 
-        Per-epoch position pseudo-measurement that bounds the
-        steady-state walk-back failure mode: between SO_POS resets,
-        systematic SSR phase-bias residuals can pull the EKF toward
-        an internally-consistent wrong basin (typical signature: 5-7 m
-        position offset + ZTD residual carrying the bias).  Applying
-        NAV2's own SPP fix as a 3D pseudo-measurement at every epoch
-        creates a continuous position constraint with weight ~hAcc/
-        vAcc, equivalent to Charlie's Phase-1 NAV2 seed prior taken
-        from one-shot to continuous.
+        ⚠ Misnomer note (I-051234, 2026-05-02): the method name says
+        "anchor" but the math is a standard variance-weighted Kalman
+        measurement update with R = diag(hAcc², hAcc², vAcc²).  When
+        the filter's position covariance P is much smaller than R
+        (typical post-convergence: P ≈ (cm)² vs R ≈ (m)²), the Kalman
+        gain K ≈ P/(P+R) → 0 and this update contributes essentially
+        nothing per epoch — it does NOT pull the filter toward NAV2
+        truth.  A static offset between the filter's basin and NAV2's
+        SPP fix is invisible to this update once P has tightened.
+
+        For a true truth-pull anchor (constant fractional pull
+        independent of P), see I-051234 sub-change B (separate
+        method, deferred).  This one is correctly described as a
+        "covariance update" or "variance-weighted measurement update";
+        the legacy method name is kept for compatibility.
 
         Caller responsibility: gate freshness (NAV2 opinion < 10 s)
         and quality (NAV2 hAcc below some threshold like 3 m).  This

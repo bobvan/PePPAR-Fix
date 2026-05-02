@@ -1695,12 +1695,21 @@ class AntPosEstThread(threading.Thread):
         self._nav2_store = nav2_store
         self._nav2_tension_threshold = nav2_tension_threshold
         self._nav2_alarm_count = nav2_alarm_count  # consecutive checks before reset
-        # NAV2 continuous soft-anchor: per-epoch position pseudo-
-        # measurement that bounds the steady-state walk-back failure
-        # mode (filter drifts toward an internally-consistent wrong
-        # basin between SO_POS trips).  Per Bob's directive 2026-04-30
-        # + I-200128-main + docs/filter-stiffness-redesign.md.  Gated
-        # by NAV2 freshness (<10s) and quality (hAcc < threshold).
+        # NAV2 continuous covariance update: per-epoch variance-
+        # weighted Kalman measurement update on the position state,
+        # using NAV2's SPP fix and reported hAcc/vAcc as R.  Per Bob's
+        # directive 2026-04-30 + I-200128-main + docs/filter-stiffness-
+        # redesign.md.  Gated by NAV2 freshness (<10s) and quality
+        # (hAcc < threshold).
+        #
+        # MISNOMER WARNING (I-051234, 2026-05-02): variable names below
+        # say "anchor" but the math is variance-weighted update, not
+        # truth-pull.  When filter P shrinks to (cm)² and NAV2 R ≈
+        # (m)², Kalman gain → 0 and the update contributes ~nothing
+        # per epoch.  A static offset between the filter's basin and
+        # NAV2's SPP fix is invisible.  A separate true truth-pull
+        # anchor (constant fractional pull, σ-blind) is on backlog as
+        # I-051234 sub-B.
         self._nav2_anchor_enabled = bool(nav2_anchor_enabled)
         self._nav2_anchor_max_hacc_m = float(nav2_anchor_max_hacc_m)
         self._systems = systems  # {'gps','gal','bds'} subset — for ISB pinning
@@ -2607,13 +2616,13 @@ class AntPosEstThread(threading.Thread):
             if getattr(self, "_ztd_tie_sigma", None):
                 filt.apply_ztd_tie(self._ztd_tie_sigma)
 
-            # NAV2 continuous soft-anchor (post-update 3D EKF pseudo-
-            # measurement).  Bounds the steady-state walk-back failure
-            # mode: between SO_POS trips, systematic SSR-PB-gap
-            # residuals can pull the filter toward a wrong basin
-            # (typical signature: 5-7 m position offset, ZTD residual
-            # carrying meters of bias).  Per Bob's directive 2026-04-30
-            # + I-200128-main.  Gated by NAV2 freshness + quality.
+            # NAV2 continuous covariance update (post-update 3D EKF
+            # variance-weighted measurement).  Per Bob's directive
+            # 2026-04-30 + I-200128-main.  Gated by NAV2 freshness +
+            # quality.  See solve_ppp.PPPFilter.apply_nav2_anchor for
+            # the misnomer note: this is variance-weighted Kalman, not
+            # a truth-pull anchor.  Static offset between filter and
+            # NAV2 is invisible once filter P has tightened.
             if (self._nav2_anchor_enabled
                     and self._nav2_store is not None):
                 _nav2_op = self._nav2_store.get_opinion(max_age_s=10.0)
@@ -7195,19 +7204,21 @@ Two-phase operation:
     pos.add_argument("--no-nav2-soft-anchor",
                      dest="nav2_soft_anchor",
                      action="store_false", default=True,
-                     help="Disable the per-epoch NAV2 soft-anchor in "
-                          "AntPosEst.  By default the engine applies a "
-                          "3D position pseudo-measurement at every "
-                          "epoch with R = diag(hAcc², hAcc², vAcc²) "
-                          "rotated to ECEF, bounding the steady-state "
-                          "walk-back failure mode (filter drifts toward "
-                          "an internally-consistent wrong basin between "
-                          "SO_POS trips).  Disable for diagnostic A/B "
-                          "or when NAV2 is known to be biased (rare).")
+                     help="Disable the per-epoch NAV2 covariance update "
+                          "in AntPosEst.  By default the engine applies "
+                          "a 3D variance-weighted Kalman measurement "
+                          "update at every epoch with R = diag(hAcc², "
+                          "hAcc², vAcc²) rotated to ECEF.  NOTE: despite "
+                          "the legacy 'soft-anchor' flag name, this is "
+                          "variance-weighted update math, not truth-pull "
+                          "(static offsets persist once filter P "
+                          "tightens — see I-051234).  Disable for "
+                          "diagnostic A/B or when NAV2 is known to be "
+                          "biased (rare).")
     pos.add_argument("--nav2-anchor-max-hacc-m", type=float, default=3.0,
-                     help="Skip the NAV2 soft-anchor when NAV2's reported "
-                          "hAcc exceeds this threshold (NAV2 too noisy to "
-                          "trust as a continuous position witness).  "
+                     help="Skip the NAV2 covariance update when NAV2's "
+                          "reported hAcc exceeds this threshold (NAV2 too "
+                          "noisy to trust as a continuous position witness).  "
                           "Default 3 m matches Bravo's SO_POS hAcc gate.")
     pos.add_argument("--bootstrap-rms-k", type=float, default=2.0,
                      help="Phase-1 convergence requires PR-residual RMS < "

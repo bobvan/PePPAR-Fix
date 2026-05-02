@@ -105,11 +105,19 @@ class ZtdProcessNoiseTest(unittest.TestCase):
 
 
 class Nav2AnchorTest(unittest.TestCase):
-    """PPPFilter.apply_nav2_anchor — continuous NAV2 soft-anchor.
+    """PPPFilter.apply_nav2_anchor — per-epoch NAV2 covariance update.
 
-    Validates the per-epoch position pseudo-measurement that bounds
-    the steady-state walk-back failure mode.  See
+    Validates the variance-weighted Kalman measurement update that
+    consumes NAV2's SPP fix as a 3D position observation.  See
     docs/filter-stiffness-redesign.md and dayplan I-200128-main.
+
+    Misnomer note (I-051234, 2026-05-02): despite the legacy method
+    name 'anchor', the math is a standard EKF update — not a
+    truth-pull anchor.  Once filter P shrinks below NAV2's R, the
+    Kalman gain → 0 and this update contributes ~nothing per epoch.
+    A static offset between filter basin and NAV2 SPP fix is
+    invisible.  See apply_nav2_anchor docstring + I-051234 sub-B
+    for the planned true truth-pull anchor (separate method).
     """
 
     # UFO1-class ECEF (lab roof, 41.84°N).  Magnitudes are realistic
