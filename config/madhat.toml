@@ -12,21 +12,19 @@ ptp_profile = "i226"
 ptp_dev = "/dev/ptp_i226"
 ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
-# Dual-mount SSR (I-133619-main P2, 2026-05-01 afternoon):
-#   orbit/clock + GAL phase biases + GPS L2W code biases:  CNES SSRA00CNE0
-#   per-(SV,signal) phase biases incl. BDS B2a-I + GPS L5Q: WHU OSBC00WHU1
-# Both mounts on products.igs-ip.net (same caster, same login —
-# ntrip-cnes.conf credentials cover both).
-# Restores BDS B2a-I + GPS L5Q phase-bias coverage that CNES alone
-# leaves as gaps; this morning's BDS-off A/B confirmed the gap as
-# the dominant ZTD-bias source (MadHat ZTD went from -1500mm
-# stuck-bias overnight to +242mm sane).  WHU mount expected to keep
-# ZTD healthy AND restore the dropped SVs for full geometry.
-# See docs/ssr-mount-survey.md and commit 7ae1392.
+# 2026-05-01 evening: revert to morning's known-good config
+# (BDS-off, CNES-only) per I-003751-main.  WHU dual-mount tried
+# this afternoon (commit 1124a0f) regressed badly — ZTD walked
+# to -7m, WL fixing collapsed (2/31 fixed), trip rate 60/hr.
+# Bias-routing across CNES + WHU mounts has interplay we have to
+# bring up stepwise per the new backlog item.  Tomorrow midday
+# when PiFace rejoins UFO1, MadHat + PiFace become an F9T-20B
+# twin pair (same hardware, same antenna) — the optimal test
+# bed for the WHU bringup work.
+#
+# Until then: known-good single-mount CNES.
 ssr_ntrip_conf = "ntrip-cnes.conf"
-ssr_bias_mount = "OSBC00WHU1"
-ssr_bias_ntrip_conf = "ntrip-cnes.conf"
-systems = "gps,gal,bds"
+systems = "gps,gal"
 
 # TICC #2: chA = PEROUT (i226 PPS OUT), chB = GNSS PPS.
 ticc_port = "/dev/ticc2"
