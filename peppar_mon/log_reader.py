@@ -895,9 +895,14 @@ _PHASE_BIAS_LOOKUP_RE = re.compile(
 # Engine source: scripts/realtime_ppp.py per-epoch phase-bias log
 # (search the file for "[PB_APPLIED]").
 _PB_APPLIED_RE = re.compile(
+    # Tolerates optional ``src=<mount>`` after each ``val=...m`` —
+    # added 2026-05-02 (P1 of I-122350) for cross-mount bias
+    # source attribution.  Captured if present.
     r"\[PB_APPLIED\]\s+(?P<sv>[A-Z]\d{2,3})\s+"
-    r"f1=\S+→\S+\s+val=(?P<f1_val>MISS|[-+]?[\d.]+)m\s+"
+    r"f1=\S+→\S+\s+val=(?P<f1_val>MISS|[-+]?[\d.]+)m"
+    r"(?:\s+src=(?P<f1_src>\S+))?\s+"
     r"f2=\S+→\S+\s+val=(?P<f2_val>MISS|[-+]?[\d.]+)m"
+    r"(?:\s+src=(?P<f2_src>\S+))?"
 )
 
 # Matches ``[AntPosEst 4200] positionσ=0.023m pos=(LAT, LON, ALT) ...``.

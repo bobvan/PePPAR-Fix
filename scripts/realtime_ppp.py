@@ -849,26 +849,46 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                         # drift.
                         if not hasattr(ssr, '_cb_lookup_logged'):
                             ssr._cb_lookup_logged = {}
+                        if not hasattr(ssr, '_cb_lookup_heartbeat'):
+                            ssr._cb_lookup_heartbeat = {}
                         # Key by (sv, f1_sig, f2_sig); value snapshot
-                        # includes cb VALUES (rounded to mm) so we re-emit
-                        # whenever the publisher's bias updates.  Critical
-                        # for cross-AC diagnostic: same SV + same signal
-                        # under CNES vs WHU produces different value snaps.
-                        # See docs/ssr-cross-ac-diagnostic-2026-04-25.md.
+                        # includes cb VALUES (rounded to mm) AND src_mount
+                        # so we re-emit whenever the publisher's bias
+                        # updates OR the source mount flips (e.g. dual-mount
+                        # CNES↔WHU last-write-wins flip).  Critical for
+                        # WHU stepwise bringup (I-122350 / I-003751): per-SV
+                        # per-signal applied bias-value with source attribution
+                        # is the diff signal we need.  See
+                        # docs/ssr-cross-ac-diagnostic-2026-04-25.md.
                         lk_cb = (sv, f1['sig_name'], f2['sig_name'])
                         avail_cb = tuple(sorted(ssr._code_bias.get(sv, {}).keys()))
                         cb_f1_q = round(cb_f1, 3) if cb_f1 is not None else None
                         cb_f2_q = round(cb_f2, 3) if cb_f2 is not None else None
-                        snap = (cb_f1_q, cb_f2_q, avail_cb)
-                        if ssr._cb_lookup_logged.get(lk_cb) != snap:
+                        cb_f1_src = (ssr._code_bias.get(sv, {}).get(rinex_f1[0]).src_mount
+                                     if cb_f1 is not None else None)
+                        cb_f2_src = (ssr._code_bias.get(sv, {}).get(rinex_f2[0]).src_mount
+                                     if cb_f2 is not None else None)
+                        snap = (cb_f1_q, cb_f2_q, cb_f1_src, cb_f2_src, avail_cb)
+                        # Heartbeat: re-emit every 60th invocation per-key
+                        # even if value unchanged, so steady-state biases
+                        # are visible in the log for diff/replay analysis
+                        # (Bravo's spec on I-122350 review).
+                        hb_count = ssr._cb_lookup_heartbeat.get(lk_cb, 0) + 1
+                        ssr._cb_lookup_heartbeat[lk_cb] = hb_count
+                        is_change = ssr._cb_lookup_logged.get(lk_cb) != snap
+                        is_heartbeat = (hb_count % 60) == 0
+                        if is_change or is_heartbeat:
                             log.info(
-                                "[CB_APPLIED] %s f1=%s→%s val=%sm "
-                                "f2=%s→%s val=%sm avail=%s",
+                                "[CB_APPLIED] %s f1=%s→%s val=%sm src=%s "
+                                "f2=%s→%s val=%sm src=%s avail=%s%s",
                                 sv, f1['sig_name'], rinex_f1[0],
                                 f"{cb_f1:+.3f}" if cb_f1 is not None else "MISS",
+                                cb_f1_src or "?",
                                 f2['sig_name'], rinex_f2[0],
                                 f"{cb_f2:+.3f}" if cb_f2 is not None else "MISS",
-                                list(avail_cb))
+                                cb_f2_src or "?",
+                                list(avail_cb),
+                                " hb" if (is_heartbeat and not is_change) else "")
                             ssr._cb_lookup_logged[lk_cb] = snap
 
                     # Apply SSR phase biases before IF combination.
@@ -973,12 +993,31 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                         # docs/ssr-cross-ac-diagnostic-2026-04-25.md.
                         if not hasattr(ssr, '_pb_lookup_logged'):
                             ssr._pb_lookup_logged = {}
+                        if not hasattr(ssr, '_pb_lookup_heartbeat'):
+                            ssr._pb_lookup_heartbeat = {}
                         lk = (sv, f1['sig_name'], f2['sig_name'])
                         avail_pb = tuple(sorted(ssr._phase_bias.get(sv, {}).keys()))
                         pb_f1_q = round(pb_f1, 3) if pb_f1 is not None else None
                         pb_f2_q = round(pb_f2, 3) if pb_f2 is not None else None
-                        snap_pb = (pb_f1_q, pb_f2_q, avail_pb)
-                        if ssr._pb_lookup_logged.get(lk) != snap_pb:
+                        # Source-mount tagging: phase biases are looked up
+                        # by code-signal first then phase-signal; reflect
+                        # the actual applied value's source.  Per I-122350
+                        # P1 / I-003751 stepwise bringup: cross-mount
+                        # last-write-wins is the diagnostic axis we need.
+                        def _pb_src(rinex):
+                            for k in (rinex[1], rinex[0]):
+                                bc = ssr._phase_bias.get(sv, {}).get(k)
+                                if bc is not None:
+                                    return bc.src_mount
+                            return None
+                        pb_f1_src = _pb_src(rinex_f1) if pb_f1 is not None else None
+                        pb_f2_src = _pb_src(rinex_f2) if pb_f2 is not None else None
+                        snap_pb = (pb_f1_q, pb_f2_q, pb_f1_src, pb_f2_src, avail_pb)
+                        hb_count = ssr._pb_lookup_heartbeat.get(lk, 0) + 1
+                        ssr._pb_lookup_heartbeat[lk] = hb_count
+                        is_change = ssr._pb_lookup_logged.get(lk) != snap_pb
+                        is_heartbeat = (hb_count % 60) == 0
+                        if is_change or is_heartbeat:
                             # peppar-mon contract:
                             # peppar_mon/log_reader.py:_PB_APPLIED_RE
                             # parses this format.  HIT vs MISS is
@@ -986,14 +1025,20 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                             # numeric value = HIT, literal "MISS" =
                             # MISS.  peppar-mon latches NL-capable
                             # constellations on first HIT-HIT.
+                            # ``src=`` field added 2026-05-02 (P1 of
+                            # I-122350); peppar-mon parser tolerates
+                            # the additional field.
                             log.info(
-                                "[PB_APPLIED] %s f1=%s→%s val=%sm "
-                                "f2=%s→%s val=%sm avail=%s",
+                                "[PB_APPLIED] %s f1=%s→%s val=%sm src=%s "
+                                "f2=%s→%s val=%sm src=%s avail=%s%s",
                                 sv, f1['sig_name'], rinex_f1[0],
                                 f"{pb_f1:+.3f}" if pb_f1 is not None else "MISS",
+                                pb_f1_src or "?",
                                 f2['sig_name'], rinex_f2[0],
                                 f"{pb_f2:+.3f}" if pb_f2 is not None else "MISS",
-                                list(avail_pb))
+                                pb_f2_src or "?",
+                                list(avail_pb),
+                                " hb" if (is_heartbeat and not is_change) else "")
                             ssr._pb_lookup_logged[lk] = snap_pb
 
                     pr_if = a1 * pr_f1 - a2 * pr_f2
@@ -1303,7 +1348,7 @@ def ntrip_reader(stream, beph, ssr, stop_event, label="NTRIP",
             # mount owns orbit/clock/ephemeris.
             if bias_only:
                 if identity in BIAS_MSG_TYPES:
-                    result = ssr.update_from_rtcm(msg_view)
+                    result = ssr.update_from_rtcm(msg_view, src_mount=label)
                     if n_total <= 5:
                         log.info(f"[{label}] bias routed: "
                                  f"{identity} → {result}")

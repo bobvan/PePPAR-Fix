@@ -240,14 +240,26 @@ class ClockCorrection:
 
 
 class BiasCorrection:
-    """SSR code or phase bias for one satellite, one signal."""
+    """SSR code or phase bias for one satellite, one signal.
+
+    ``src_mount`` tags which NTRIP mount delivered this value.  When
+    two mounts each emit a bias for the same (sv, signal) — e.g. a
+    dual-mount setup with CNES on the orbit/clock mount and WHU on
+    the bias mount — last-write-wins, and ``src_mount`` records the
+    winner.  Used by the IF-update bias-application logging
+    (``[CB_APPLIED]`` / ``[PB_APPLIED]``) to attribute applied
+    values per-(sv, signal, kind) per epoch — the core diagnostic
+    for the WHU stepwise bringup (I-003751-main, I-122350-main P1).
+    """
     __slots__ = ('signal_code', 'bias_m', 'rx_time', 'is_phase',
                  'integer_indicator', 'wl_indicator', 'disc_counter',
-                 'rx_mono', 'queue_remains', 'correlation_confidence')
+                 'rx_mono', 'queue_remains', 'correlation_confidence',
+                 'src_mount')
 
     def __init__(self, signal_code, bias_m, is_phase=False,
                  integer_indicator=0, wl_indicator=0, disc_counter=0,
-                 rx_mono=None, queue_remains=None, correlation_confidence=None):
+                 rx_mono=None, queue_remains=None, correlation_confidence=None,
+                 src_mount=None):
         self.signal_code = signal_code
         self.bias_m = bias_m
         self.is_phase = is_phase
@@ -258,6 +270,7 @@ class BiasCorrection:
         self.rx_mono = rx_mono
         self.queue_remains = queue_remains
         self.correlation_confidence = correlation_confidence
+        self.src_mount = src_mount
 
 
 class SSRState:
@@ -289,12 +302,17 @@ class SSRState:
     def n_clock(self):
         return len(self._clock)
 
-    def update_from_rtcm(self, msg):
+    def update_from_rtcm(self, msg, src_mount=None):
         """Ingest a decoded SSR RTCM message.
 
         Handles both IGS SSR (4076_*) and standard RTCM SSR (1057-1068, 1240-1263).
         Returns the correction type ('orbit', 'clock', 'code_bias', 'phase_bias')
         or None if not an SSR message.
+
+        ``src_mount`` (optional): NTRIP mountpoint that delivered this
+        message — propagated to ``BiasCorrection.src_mount`` for
+        bias-application logging.  When two mounts emit a bias for the
+        same (sv, signal), last-write-wins records the winner.
         """
         identity = str(getattr(msg, 'identity', ''))
 
@@ -343,11 +361,13 @@ class SSRState:
             self._last_clock_update_mono = rx_mono
         elif subtype == 'code_bias':
             self._parse_code_bias(msg, sys_prefix, n_sats,
-                                  rx_mono, queue_remains, correlation_confidence)
+                                  rx_mono, queue_remains, correlation_confidence,
+                                  src_mount=src_mount)
             self._last_bias_update_mono = rx_mono
         elif subtype == 'phase_bias':
             self._parse_phase_bias(msg, sys_prefix, n_sats,
-                                   rx_mono, queue_remains, correlation_confidence)
+                                   rx_mono, queue_remains, correlation_confidence,
+                                   src_mount=src_mount)
             self._last_bias_update_mono = rx_mono
 
         self._last_update_mono = rx_mono
@@ -518,7 +538,8 @@ class SSRState:
             )
 
     def _parse_code_bias(self, msg, sys_prefix, n_sats,
-                         rx_mono=None, queue_remains=None, correlation_confidence=None):
+                         rx_mono=None, queue_remains=None, correlation_confidence=None,
+                         src_mount=None):
         """Extract per-satellite code bias corrections.
 
         Standard RTCM SSR code bias fields (pyrtcm):
@@ -587,6 +608,7 @@ class SSRState:
                     rx_mono=rx_mono,
                     queue_remains=queue_remains,
                     correlation_confidence=correlation_confidence,
+                    src_mount=src_mount,
                 )
         # One-shot diagnostic: log a summary the first time any given
         # (identity, sys_prefix) pair is parsed, to expose the RTCM-vs-IGS
@@ -605,7 +627,8 @@ class SSRState:
             self._cb_parse_logged.add(lk)
 
     def _parse_phase_bias(self, msg, sys_prefix, n_sats,
-                          rx_mono=None, queue_remains=None, correlation_confidence=None):
+                          rx_mono=None, queue_remains=None, correlation_confidence=None,
+                          src_mount=None):
         """Extract per-satellite phase bias corrections.
 
         pyrtcm (as of 1.1.12) does not decode RTCM 1265-1270 phase bias
@@ -624,7 +647,8 @@ class SSRState:
                 self._parse_phase_bias_binary(
                     payload, sys_prefix,
                     rx_mono=rx_mono, queue_remains=queue_remains,
-                    correlation_confidence=correlation_confidence)
+                    correlation_confidence=correlation_confidence,
+                    src_mount=src_mount)
             return
 
         # pyrtcm-decoded path (IGS SSR 4076 subtypes)
@@ -655,11 +679,13 @@ class SSRState:
                     wl_ind=getattr(msg, f'IDF030_{i:02d}_{j:02d}', 0),
                     disc=getattr(msg, f'IDF031_{i:02d}_{j:02d}', 0),
                     rx_mono=rx_mono, queue_remains=queue_remains,
-                    correlation_confidence=correlation_confidence)
+                    correlation_confidence=correlation_confidence,
+                    src_mount=src_mount)
 
     def _parse_phase_bias_binary(self, payload, sys_prefix,
                                  rx_mono=None, queue_remains=None,
-                                 correlation_confidence=None):
+                                 correlation_confidence=None,
+                                 src_mount=None):
         """Decode RTCM 1265-1270 phase bias from raw payload bytes.
 
         Both RTCM SSR and some casters that wrap IGS-SSR-style content in
@@ -749,7 +775,8 @@ class SSRState:
                     _RTCM_SSR_SIGNAL_MAP,
                     int_ind=int_ind, wl_ind=wl_ind, disc=disc,
                     rx_mono=rx_mono, queue_remains=queue_remains,
-                    correlation_confidence=correlation_confidence)
+                    correlation_confidence=correlation_confidence,
+                    src_mount=src_mount)
 
         if n_stored > 0:
             if not hasattr(self, '_pb_binary_logged'):
@@ -764,7 +791,8 @@ class SSRState:
     def _store_phase_bias(self, prn, sys_prefix, sig_id_int, bias_m,
                           signal_map, int_ind=0, wl_ind=0, disc=0,
                           rx_mono=None, queue_remains=None,
-                          correlation_confidence=None):
+                          correlation_confidence=None,
+                          src_mount=None):
         """Store one phase bias correction.  Returns 1 if stored, 0 if skipped."""
         rinex_code = signal_map.get((sys_prefix, sig_id_int))
         if rinex_code is None:
@@ -791,6 +819,7 @@ class SSRState:
             rx_mono=rx_mono,
             queue_remains=queue_remains,
             correlation_confidence=correlation_confidence,
+            src_mount=src_mount,
         )
         return 1
 
