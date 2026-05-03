@@ -419,15 +419,65 @@ class SettingSvDropMonitorTest(unittest.TestCase):
 
     def test_drops_on_elev_weighted_resid(self):
         self._to_short("G11")
-        labels = [("G11", 'pr', 30.0)]   # above mask
-        # elev-weighted base at 30° = 3.0 * sin(45)/sin(30) ≈ 4.243 m.
-        # Mean 5 m exceeds it.
+        # PR breach plus IF breach: the gate fires.  Pass both
+        # residuals so the IF gate has data to evaluate.  IF=0.20m
+        # >> 0.05m threshold = legitimate wrong-integer pathology.
+        labels = [("G11", 'pr', 30.0), ("G11", 'phi', 30.0)]
         for e in range(3, 13):
-            self.m.ingest(e, [5.0], labels)
+            self.m.ingest(e, [5.0, 0.20], labels)
         events = self.m.evaluate(10)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]['reason'], 'elev_weighted_resid')
         self.assertIs(self.t.state("G11"), SvAmbState.FLOATING)
+
+    def test_if_clean_suppresses_pr_drop(self):
+        """I-161514, 2026-05-02: PR-multipath false positive.  PR
+        residual breaches the elev-weighted threshold, but the IF
+        residual is sub-cm — the carrier-phase integer is correct.
+        The gate must suppress the drop.  This is the canonical
+        same-second-wasted-evict pattern from day0501 overnight
+        (24/24 across TimeHat + MadHat)."""
+        self._to_short("G12")
+        labels = [("G12", 'pr', 30.0), ("G12", 'phi', 30.0)]
+        # PR mean 5.0 m exceeds threshold; IF mean 0.012 m ≪ 0.05 m
+        # threshold = integer is correct.
+        for e in range(3, 13):
+            self.m.ingest(e, [5.0, 0.012], labels)
+        events = self.m.evaluate(10)
+        self.assertEqual(len(events), 0,
+                         "PR breach with IF clean must NOT evict")
+        # SV stays in ANCHORING — not transitioned to FLOATING.
+        self.assertIs(self.t.state("G12"), SvAmbState.ANCHORING)
+
+    def test_if_breach_allows_pr_drop(self):
+        """Mirror of test_if_clean_suppresses_pr_drop: when the IF
+        residual is also breached, the gate doesn't suppress and
+        the eviction proceeds.  Real wrong-integer pathology has
+        IF >> 50mm."""
+        self._to_short("G13")
+        labels = [("G13", 'pr', 30.0), ("G13", 'phi', 30.0)]
+        # Both PR and IF breach: real integer pathology.
+        for e in range(3, 13):
+            self.m.ingest(e, [5.0, 0.15], labels)
+        events = self.m.evaluate(10)
+        self.assertEqual(len(events), 1,
+                         "PR + IF both breach → eviction must fire")
+        self.assertEqual(events[0]['reason'], 'elev_weighted_resid')
+        self.assertIs(self.t.state("G13"), SvAmbState.FLOATING)
+
+    def test_no_if_samples_falls_through_to_pr_only(self):
+        """Backward-compat: if no phi residuals are streamed (early-
+        arc state, monitor wired without IF labels, etc.), the gate
+        falls through to the legacy PR-only behaviour.  Do not
+        suppress what we can't classify."""
+        self._to_short("G14")
+        labels = [("G14", 'pr', 30.0)]   # PR only, no phi
+        for e in range(3, 13):
+            self.m.ingest(e, [5.0], labels)
+        events = self.m.evaluate(10)
+        self.assertEqual(len(events), 1,
+                         "no IF samples → legacy PR-only behavior")
+        self.assertEqual(events[0]['reason'], 'elev_weighted_resid')
 
     def test_ignores_non_nl_svs(self):
         # SV in FLOATING — not eligible.
@@ -525,12 +575,128 @@ class FixSetIntegrityMonitorTest(unittest.TestCase):
     def test_fires_when_sustained_rms_exceeds(self):
         self._to_short("G20")
         self._to_short("G21")
-        labels = [("G20", 'pr', 45.0), ("G21", 'pr', 45.0)]
+        # Pass both PR and phi residuals.  PR-RMS breaches at ~6.5m;
+        # IF-RMS at ~0.20m breaches the 0.05m gate too — real
+        # integer pathology.
+        labels = [
+            ("G20", 'pr', 45.0), ("G21", 'pr', 45.0),
+            ("G20", 'phi', 45.0), ("G21", 'phi', 45.0),
+        ]
         for e in range(3, 13):
-            self.alarm.ingest(e, [6.0, 7.0], labels)
+            self.alarm.ingest(e, [6.0, 7.0, 0.20, 0.20], labels)
         ev = self.alarm.evaluate(10)
         self.assertIsNotNone(ev)
         self.assertGreater(ev['window_rms_m'], 5.0)
+        # Event dict carries the IF fields (I-162353) for diagnostics.
+        self.assertIn('if_window_rms_m', ev)
+        self.assertGreater(ev['if_window_rms_m'], 0.05)
+
+    def test_window_rms_if_clean_suppresses(self):
+        """I-162353, 2026-05-02: PR-multipath false positive on the
+        fix-set RMS path.  PR-RMS over the window breaches threshold
+        but the IF-RMS is sub-cm — integer-clean PR storm.  The gate
+        must suppress.  Empirically 67% of TimeHat day0501 trips fit
+        this pattern (8 of 12, IF-RMS 4-80mm)."""
+        self._to_short("G24")
+        self._to_short("G25")
+        labels = [
+            ("G24", 'pr', 45.0), ("G25", 'pr', 45.0),
+            ("G24", 'phi', 45.0), ("G25", 'phi', 45.0),
+        ]
+        # PR-RMS ~6.5m breach; IF-RMS ~0.020m well under 0.05m gate.
+        for e in range(3, 13):
+            self.alarm.ingest(e, [6.0, 7.0, 0.018, 0.022], labels)
+        ev = self.alarm.evaluate(10)
+        self.assertIsNone(ev,
+                          "PR-RMS breach with IF-RMS clean must not trip")
+
+    def test_window_rms_no_if_samples_falls_through(self):
+        """Backward-compat: when no phi residuals are streamed
+        (early-arc state or test using PR-only labels), the gate
+        falls through to the legacy PR-only check.  Don't suppress
+        what we can't classify."""
+        self._to_short("G26")
+        self._to_short("G27")
+        labels = [("G26", 'pr', 45.0), ("G27", 'pr', 45.0)]
+        for e in range(3, 13):
+            self.alarm.ingest(e, [6.0, 7.0], labels)
+        ev = self.alarm.evaluate(10)
+        self.assertIsNotNone(ev,
+                             "no IF samples → legacy PR-only behavior")
+        # Event still emits, with if_* fields = None.
+        self.assertIsNone(ev['if_window_rms_m'])
+        self.assertEqual(ev['if_n_samples'], 0)
+
+    def test_window_rms_replay_timehat_day0501(self):
+        """Regression test against the TimeHat day0501morning
+        empirical trip table (I-162353 discuss line, 2026-05-02).
+
+        The 12 window_rms trips from a 21h overnight, classified by
+        the offline analysis script (window_rms_attribution.py) using
+        a 100mm IF-RMS truth threshold:
+          - 8 FALSE_POS (IF-RMS 4-80mm)  ← integer-clean PR storms
+          - 3 JUSTIFIED (IF-RMS 122-226mm) ← real integer pathology
+          - 1 AMBIGUOUS (n=0 NL samples; not modeled here)
+
+        Operational gate is 50mm (IF_STEP NEW scale, conservative
+        inner edge of the FALSE_POS / JUSTIFIED gap per Bravo's ack):
+          - IF < 50mm → trip suppressed (6 of 8 FALSE_POS suppressed)
+          - IF in 50-80mm → trip fires (2 FALSE_POS leak through;
+            accepted by Bravo's "conservative" framing — err on the
+            side of catching real trips, not suppressing them)
+          - IF ≥ 122mm → trip fires (3 of 3 JUSTIFIED kept)
+
+        Net under the 50mm gate: 5 trips of 11 cases (6 suppressed),
+        a 55% reduction in this empirical sample.  Locks in the
+        behavior so future tuning can't silently broaden the gate."""
+        cases = [
+            # (desc, pr_rms_m, if_rms_m, expected_trip under 50mm gate)
+            ('11:30:22 FP/IF=20mm',           5.3, 0.020, False),
+            ('14:15:12 JUSTIFIED/IF=226mm', 10.8, 0.226, True),
+            ('20:47:58 FP/IF=4mm',            5.6, 0.004, False),
+            ('22:04:52 JUSTIFIED/IF=122mm', 12.6, 0.122, True),
+            ('23:17:44 FP/IF=80mm leaked',    6.0, 0.080, True),
+            ('03:27:46 FP/IF=27mm',         12.3, 0.027, False),
+            ('04:44:40 JUSTIFIED/IF=201mm',   5.4, 0.201, True),
+            ('05:55:44 FP/IF=20mm',           7.5, 0.020, False),
+            ('06:39:56 FP/IF=15mm',           8.7, 0.015, False),
+            ('07:34:45 FP/IF=49mm',         10.6, 0.049, False),
+            ('09:19:53 FP/IF=72mm leaked',    5.3, 0.072, True),
+        ]
+        n_trips = 0
+        for desc, pr_rms, if_rms, expected_trip in cases:
+            with self.subTest(case=desc):
+                t = SvStateTracker()
+                m = FixSetIntegrityMonitor(
+                    t,
+                    rms_threshold_m=5.0,
+                    if_rms_threshold_m=0.05,
+                    min_samples_in_window=3,
+                    eval_every=1,
+                    cooldown_epochs=0,
+                )
+                # Pre-fill the histories directly with the documented
+                # window-mean values.  Direct internal-state access is
+                # acceptable in a regression unit test that pins the
+                # trip behavior against a frozen empirical dataset.
+                for _ in range(30):
+                    m._rms_hist.append(pr_rms)
+                    m._if_rms_hist.append(if_rms)
+                ev = m.evaluate(100)
+                if expected_trip:
+                    self.assertIsNotNone(
+                        ev, f"{desc}: expected trip, got None")
+                    self.assertEqual(ev['reason'], 'window_rms')
+                    n_trips += 1
+                else:
+                    self.assertIsNone(
+                        ev, f"{desc}: expected suppress, got {ev}")
+        # Quantitative pin: 5 of 11 modeled cases trip.
+        self.assertEqual(
+            n_trips, 5,
+            f"Empirical regression: expected 5 trips of 11, got {n_trips}. "
+            "If this number changes, the gate was retuned — update the "
+            "expected_trip column in the case table.")
 
     def test_suppressed_by_recent_per_sv_transition(self):
         self._to_short("G22")
