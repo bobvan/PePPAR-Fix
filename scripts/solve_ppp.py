@@ -473,9 +473,9 @@ class PPPFilter:
         sigma_y = self.rx_tcxo_adev_1s
         return (C * sigma_y) ** 2
 
-    def apply_ztd_tie(self, sigma_m: float) -> None:
+    def apply_ztd_tie(self, sigma_m: float, target_m: float = 0.0) -> None:
         """Apply a soft prior on the residual ZTD state as a rank-1 EKF
-        update (pseudo-measurement z=0, h=e_ZTD, R=σ²).
+        update (pseudo-measurement z=target_m, h=e_ZTD, R=σ²).
 
         Motivation: the (position-altitude, ZTD, clock, mean-ambiguity)
         tuple forms a near-null direction at typical receiver
@@ -485,10 +485,15 @@ class PPPFilter:
         and altitude 18m within 5 minutes despite stable lock).
 
         IDX_ZTD is the *residual* on top of Saastamoinen+GMF bulk
-        tropo, so a soft prior z=0 with σ ≈ 0.05 m says "the residual
-        should be small (Saastamoinen handles the bulk)".  Filter can
-        deviate when observations strongly support it.  This is an
-        *intentional* constraint on the null-mode, not a hard pin.
+        tropo.  target_m=0 (default) says "trust the 2.3 m apriori".
+        Passing a METAR-derived residual instead makes the soft prior
+        track real atmospheric pressure / temperature changes — see
+        I-024942-main and the apply_ztd_tie call in
+        peppar_fix_engine.run_steady_state.
+
+        Filter can deviate when observations strongly support it.
+        This is an *intentional* constraint on the null-mode, not a
+        hard pin.
 
         See docs/ssr-phase-bias-step-handling.md (the slip-detection
         side of the same family of issues) and Bravo's day0423 PRIDE
@@ -496,7 +501,7 @@ class PPPFilter:
         """
         if sigma_m is None or sigma_m <= 0:
             return
-        y = -float(self.x[IDX_ZTD])                     # z=0 minus state
+        y = float(target_m) - float(self.x[IDX_ZTD])
         S = float(self.P[IDX_ZTD, IDX_ZTD]) + sigma_m ** 2
         K = self.P[:, IDX_ZTD] / S
         self.x = self.x + K * y
@@ -1131,6 +1136,28 @@ class FixedPosFilter:
         Q[self.IDX_ISB_GAL, self.IDX_ISB_GAL] = 1e-6 * dt  # GAL ISB random walk
         Q[self.IDX_ISB_BDS, self.IDX_ISB_BDS] = 1e-6 * dt  # BDS ISB random walk
         self.P += Q
+
+    def apply_ztd_tie(self, sigma_m: float, target_m: float = 0.0) -> None:
+        """Soft prior on the residual ZTD state (rank-1 Kalman update,
+        z=target_m, h=e_ZTD, R=σ²).
+
+        Counters per-SV systematic-bias absorption (SSR phase-bias
+        substitution, antenna PCV miscorrection, multipath) that the
+        filter would otherwise pile into ZTD because position is
+        pinned and ZTD is the only state with elevation-dependent
+        geometry.  Pull toward a METAR-derived residual to track real
+        atmospheric pressure / temperature changes; target_m=0 keeps
+        the residual near the 2.3 m hydrostatic apriori.
+
+        See solve_ppp.PPPFilter.apply_ztd_tie for the full motivation.
+        """
+        if sigma_m is None or sigma_m <= 0:
+            return
+        y = float(target_m) - float(self.x[self.IDX_ZTD])
+        S = float(self.P[self.IDX_ZTD, self.IDX_ZTD]) + sigma_m ** 2
+        K = self.P[:, self.IDX_ZTD] / S
+        self.x = self.x + K * y
+        self.P = self.P - np.outer(K, self.P[self.IDX_ZTD, :])
 
     def compute_geometry(self, sv, sp3, t, clk_file, pr_m=None):
         """Compute corrected range and satellite clock for one SV."""

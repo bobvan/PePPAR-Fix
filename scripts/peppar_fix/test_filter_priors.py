@@ -305,5 +305,66 @@ class FixedPosFilterZtdSeedTest(unittest.TestCase):
         self.assertAlmostEqual(f.P[f.IDX_CLK, f.IDX_CLK], 1e18)
 
 
+class ApplyZtdTieTest(unittest.TestCase):
+    """apply_ztd_tie generalized to accept a non-zero target (I-172521)."""
+
+    _BASE_ECEF = np.array([157470.222, -4756189.544, 4232767.952])
+
+    def _init_pppfilter(self):
+        from solve_ppp import PPPFilter
+        f = PPPFilter()
+        f.initialize(self._BASE_ECEF, 0.0, 0.0, 0.0)
+        return f
+
+    def test_pppfilter_default_target_zero_unchanged(self):
+        # Backward compatibility: default target=0 still pulls toward 0.
+        f = self._init_pppfilter()
+        f.x[IDX_ZTD] = 0.5
+        f.P[IDX_ZTD, IDX_ZTD] = 0.1 ** 2
+        f.apply_ztd_tie(0.05)  # legacy call shape, σ=50mm
+        # State should pull toward 0, not stay at 0.5.
+        self.assertLess(abs(f.x[IDX_ZTD]), 0.5)
+
+    def test_pppfilter_target_pulls_toward_target(self):
+        f = self._init_pppfilter()
+        f.x[IDX_ZTD] = 0.5
+        f.P[IDX_ZTD, IDX_ZTD] = 0.1 ** 2
+        f.apply_ztd_tie(0.05, target_m=0.2)
+        # Should be pulled toward 0.2, not 0.
+        self.assertLess(abs(f.x[IDX_ZTD] - 0.2), abs(f.x[IDX_ZTD] - 0.0))
+        self.assertLess(abs(f.x[IDX_ZTD] - 0.2), 0.5 - 0.2)
+
+    def test_fixedposfilter_has_apply_ztd_tie(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF)
+        self.assertTrue(hasattr(f, 'apply_ztd_tie'))
+
+    def test_fixedposfilter_pulls_toward_target(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF, init_ztd_m=0.5,
+                           init_ztd_sigma_m=0.1)
+        f.apply_ztd_tie(0.05, target_m=0.2)
+        # Pulled toward 0.2, by ~K = 0.1²/(0.1² + 0.05²) ≈ 0.8.
+        # So x should land near 0.5 - 0.8*(0.5-0.2) = 0.26.
+        self.assertAlmostEqual(f.x[f.IDX_ZTD], 0.26, delta=0.02)
+
+    def test_fixedposfilter_zero_sigma_noop(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF, init_ztd_m=0.5)
+        f.apply_ztd_tie(0.0, target_m=0.1)  # σ=0 is a noop guard
+        self.assertAlmostEqual(f.x[f.IDX_ZTD], 0.5)
+
+    def test_fixedposfilter_tighter_sigma_pulls_harder(self):
+        from solve_ppp import FixedPosFilter
+        f1 = FixedPosFilter(self._BASE_ECEF, init_ztd_m=0.5,
+                            init_ztd_sigma_m=0.1)
+        f2 = FixedPosFilter(self._BASE_ECEF, init_ztd_m=0.5,
+                            init_ztd_sigma_m=0.1)
+        f1.apply_ztd_tie(0.20, target_m=0.0)  # loose σ
+        f2.apply_ztd_tie(0.05, target_m=0.0)  # tight σ
+        # f2 should be pulled closer to 0 than f1.
+        self.assertLess(f2.x[f2.IDX_ZTD], f1.x[f1.IDX_ZTD])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -137,6 +137,61 @@ def _seed_ztd_from_metar(args, lat_deg, alt_m, log):
     return residual_m, sigma_m
 
 
+def _periodic_ztd_tie(filt, args, lat_deg, alt_m, n_epochs, log):
+    """Refresh METAR + apply soft ZTD prior to bound per-SV bias absorption.
+
+    Called every --ztd-tie-interval-s epochs (default 300, matches
+    METAR cadence).  Fetches current weather, runs Saastamoinen for
+    the receiver site, and applies a soft Kalman update pulling the
+    filter's residual ZTD toward METAR truth with σ ≈ 100 mm.
+
+    METAR fetch failure is non-fatal: log + skip this cycle.  ZTD
+    state continues evolving from observations until the next tie.
+    """
+    sigma_mm = float(getattr(args, 'ztd_tie_sigma_mm', 100.0))
+    sigma_m = sigma_mm * 1e-3
+    if sigma_m <= 0:
+        return
+    station = getattr(args, 'init_ztd_station', None) or DEFAULT_STATION
+    try:
+        rec = fetch_latest_metar(station)
+    except MetarReadError as exc:
+        log.warning("[ZTD_TIE] epoch=%d METAR fetch failed (%s); skipping tie",
+                    n_epochs, exc)
+        return
+    age_s = metar_age_seconds(rec)
+    if age_s > 7200:
+        log.warning("[ZTD_TIE] epoch=%d METAR stale (%.0f min); skipping tie",
+                    n_epochs, age_s / 60.0)
+        return
+    try:
+        target_m, diag = metar_to_init_ztd_residual(
+            temp_C=rec['temp_C'], dewp_C=rec['dewp_C'],
+            altim_hPa=rec['altim_hPa'],
+            lat_deg=lat_deg, elev_m=alt_m,
+        )
+    except (ValueError, ZeroDivisionError) as exc:
+        log.warning("[ZTD_TIE] epoch=%d Saastamoinen failed (%s); skipping tie",
+                    n_epochs, exc)
+        return
+    pre_ztd_m = float(filt.x[filt.IDX_ZTD])
+    pre_sigma_m = math.sqrt(max(0.0,
+        float(filt.P[filt.IDX_ZTD, filt.IDX_ZTD])))
+    filt.apply_ztd_tie(sigma_m, target_m=target_m)
+    post_ztd_m = float(filt.x[filt.IDX_ZTD])
+    post_sigma_m = math.sqrt(max(0.0,
+        float(filt.P[filt.IDX_ZTD, filt.IDX_ZTD])))
+    log.info(
+        "[ZTD_TIE] epoch=%d %s age=%.0fmin target=%+.0fmm σ_tie=%.0fmm "
+        "ZTD %+.0f→%+.0fmm (Δ=%+.0f) σ %.0f→%.0fmm",
+        n_epochs, rec.get('station', station), age_s / 60.0,
+        target_m * 1000.0, sigma_mm,
+        pre_ztd_m * 1000.0, post_ztd_m * 1000.0,
+        (post_ztd_m - pre_ztd_m) * 1000.0,
+        pre_sigma_m * 1000.0, post_sigma_m * 1000.0,
+    )
+
+
 def _open_slip_csv(path):
     """Open the slip CSV file (header written once); return the csv.writer."""
     global _SLIP_CSV_FILE, _SLIP_CSV_WRITER
@@ -4114,6 +4169,15 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     dt_rx_ns, dt_rx_sigma,
                 )
 
+            # Periodic ZTD soft-tie from refreshed METAR — bounds the
+            # rate of ZTD-state drift driven by per-SV systematic-bias
+            # absorption (SSR phase-bias substitution L5I→L5Q,
+            # antenna PCV miscorrection, multipath).  See I-172521.
+            tie_interval = getattr(args, 'ztd_tie_interval_s', 300)
+            if (tie_interval and n_epochs > 0 and n_epochs % tie_interval == 0
+                    and hasattr(filt, 'apply_ztd_tie')):
+                _periodic_ztd_tie(filt, args, lat, alt, n_epochs, log)
+
             # Correction source
             source = 'SSR' if ssr.n_clock > 0 else 'broadcast'
             ts_str = gps_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:23]
@@ -7386,6 +7450,26 @@ Two-phase operation:
                           f"{DEFAULT_STATION}, ~7 km from UFO1).  Pick a "
                           f"station within ~50 km of the antenna for "
                           f"meaningful pressure/temperature similarity.")
+    pos.add_argument("--ztd-tie-interval-s", type=int, default=300,
+                     help="Apply a soft METAR-derived prior on the "
+                          "FixedPosFilter ZTD residual every N epochs "
+                          "(approx N seconds at 1 Hz; default 300, "
+                          "matches METAR report cadence).  Set to 0 to "
+                          "disable.  Bounds ZTD-state drift driven by "
+                          "per-SV systematic-bias absorption (SSR "
+                          "L5I→L5Q substitution, antenna PCV "
+                          "miscorrection, multipath); see I-172521.  "
+                          "Re-uses --init-ztd-station for the source "
+                          "airport.")
+    pos.add_argument("--ztd-tie-sigma-mm", type=float, default=100.0,
+                     help="1-σ uncertainty (mm) on the periodic ZTD "
+                          "tie target.  Default 100 mm — looser than "
+                          "the cold-start init prior (50 mm) because "
+                          "we're constraining drift rather than "
+                          "initialising.  Smaller → tighter pull "
+                          "(more rapid convergence to METAR but less "
+                          "tolerant of legitimate residual deviations); "
+                          "larger → softer.")
     pos.add_argument("--bootstrap-rms-k", type=float, default=2.0,
                      help="Phase-1 convergence requires PR-residual RMS < "
                           "k × SIGMA_P_IF.  Catches locally-consistent but "
