@@ -313,7 +313,8 @@ class PPPFilter:
         self.initialized = False
 
     def initialize(self, pos_ecef, clock_m, isb_gal=0.0, isb_bds=0.0,
-                   systems=None, pos_sigma_m=10.0, ztd_sigma_m=0.2):
+                   systems=None, pos_sigma_m=10.0, ztd_sigma_m=0.2,
+                   init_ztd_m=0.0):
         """Initialize filter state.
 
         systems: optional iterable of constellations that will feed
@@ -341,13 +342,20 @@ class PPPFilter:
         bias residuals (GPS L5Q, BDS B2a-I in CNES) into ZTD, producing
         the ZTD doom-loop / ztd_impossible / ztd_cycling integrity-trip
         cascade observed on TimeHat 2026-04-29 overnight (36/73 trips).
+
+        init_ztd_m: initial value (m) for the IDX_ZTD residual state.
+        Default 0.0 preserves prior behavior.  Engine callers can seed
+        from METAR-derived Saastamoinen ZTD minus the 2.3 m hydrostatic
+        apriori to start the filter close to atmospheric truth, avoiding
+        the multi-meter cold-start transient observed under pinned mode
+        on 2026-05-04 — see I-024942 + scripts/peppar_fix/saastamoinen.py.
         """
         self.x = np.zeros(N_BASE)
         self.x[:3] = pos_ecef
         self.x[IDX_CLK] = clock_m
         self.x[IDX_ISB_GAL] = isb_gal
         self.x[IDX_ISB_BDS] = isb_bds
-        self.x[IDX_ZTD] = 0.0  # residual ZTD (a priori model handles bulk)
+        self.x[IDX_ZTD] = float(init_ztd_m)  # residual ZTD (apriori handles bulk)
         self._ztd_sigma_m = float(ztd_sigma_m)
         self._pos_sigma_m_init = float(pos_sigma_m)
         self.P = np.diag([
@@ -1091,7 +1099,8 @@ class FixedPosFilter:
                 Saastamoinen-derived residual offset can be passed here
                 so the filter starts within physical envelope instead
                 of absorbing meters of clock-state error during cold
-                start.  See I-024942-main.
+                start.  See I-024942-main and
+                scripts/peppar_fix/saastamoinen.py.
             init_ztd_sigma_m: 1-σ uncertainty on the seed (default 0.5
                 m = legacy wide prior).  With METAR source: ~0.05 m
                 tightens the prior so the filter cannot drift ZTD past

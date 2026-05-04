@@ -168,8 +168,14 @@ class RinexWriter:
                  antenna_serial: str = "",
                  observer: str = "PePPAR Fix",
                  agency: str = "",
-                 interval_s: float = 1.0):
-        self._path = Path(path)
+                 interval_s: float = 1.0,
+                 decimate_s: float | None = None,
+                 host: str = ""):
+        # path is a template — supports {date} (UTC YYYYDDD), {host}.
+        # Plain paths (no braces) keep current behavior: one file per run,
+        # no rotation.  Daily rotation triggers when {date} appears.
+        self._path_tmpl = str(path)
+        self._host = host
         self._marker = marker_name
         self._approx_xyz = approx_xyz
         self._antenna_type = antenna_type
@@ -179,11 +185,43 @@ class RinexWriter:
         self._ant_serial = antenna_serial
         self._observer = observer
         self._agency = agency
-        self._interval = interval_s
-        self._fp = open(self._path, "w")
+        # If decimate_s is set, header advertises the decimated interval
+        # since that's what consumers actually see in the file.
+        self._decimate_s = float(decimate_s) if decimate_s else None
+        self._interval = (self._decimate_s if self._decimate_s
+                          else interval_s)
+        self._fp = None
+        self._path: Path | None = None
+        self._current_date: str | None = None  # YYYYDDD of current file
         self._header_written = False
         self._last_lock_ms: dict[tuple[str, str], int] = {}
+        self._last_written_dt: datetime | None = None
         self._epoch_count = 0
+
+    def _expand_path(self, epoch_dt: datetime) -> tuple[Path, str]:
+        """Expand path template against the epoch's UTC date.
+
+        Returns (resolved Path, YYYYDDD date string used).
+        """
+        utc = epoch_dt.astimezone(timezone.utc) if epoch_dt.tzinfo \
+            else epoch_dt.replace(tzinfo=timezone.utc)
+        date_str = utc.strftime("%Y%j")
+        expanded = self._path_tmpl.format(date=date_str, host=self._host)
+        p = Path(expanded)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p, date_str
+
+    def _open_for_date(self, epoch_dt: datetime) -> None:
+        """Open (or rotate to) the file for this epoch's UTC date."""
+        p, date_str = self._expand_path(epoch_dt)
+        self._path = p
+        self._current_date = date_str
+        self._fp = open(p, "w")
+        self._header_written = False
+        # Header rewritten with new TIME OF FIRST OBS for the new file.
+        # Lock-ms continuity across rollover doesn't propagate (next file's
+        # first epoch will see no LLI=1 even on a real slip — acceptable
+        # for daily-archive use).
 
     def _write_header(self, first_epoch: datetime) -> None:
         """Emit the RINEX 3.04 OBS header with TIME OF FIRST OBS set."""
@@ -248,7 +286,33 @@ class RinexWriter:
         SVs / signals not present are silently omitted (RINEX writer
         emits blank fields for any declared obs-type the SV didn't
         track this epoch).
+
+        If decimate_s was set on the writer, epochs less than that many
+        seconds after the previous written epoch are silently dropped
+        (the first epoch is always written).
+
+        If the path template contained ``{date}``, the writer rotates
+        files at UTC-midnight: the first epoch of a new UTC day closes
+        the current file and opens the next.
         """
+        # Decimation: skip if too soon since last write.
+        if (self._decimate_s is not None
+                and self._last_written_dt is not None):
+            interval = (epoch_dt - self._last_written_dt).total_seconds()
+            if interval < self._decimate_s:
+                return
+
+        # Rotation: open initial file or roll over at UTC-midnight when
+        # the template has {date}.
+        if self._fp is None:
+            self._open_for_date(epoch_dt)
+        else:
+            _, new_date = self._expand_path(epoch_dt)
+            if new_date != self._current_date:
+                self._fp.flush()
+                self._fp.close()
+                self._open_for_date(epoch_dt)
+
         f = self._fp
         if not self._header_written:
             self._write_header(epoch_dt)
@@ -301,6 +365,7 @@ class RinexWriter:
             line = sv + "".join(cells.get(c, " " * 16) for c in obs_codes)
             f.write(line + "\n")
         self._epoch_count += 1
+        self._last_written_dt = epoch_dt
         if self._epoch_count % 60 == 0:
             self._fp.flush()
 
@@ -378,6 +443,8 @@ def make_writer_from_args(args, log=None):
                 log.warning("RINEX writer: --known-pos parse failed "
                             "(%s); APPROX XYZ defaulting to 0,0,0", e)
 
+    import os
+    decimate_s = getattr(args, 'rinex_decimate_s', None)
     return RinexWriter(
         rinex_out,
         marker_name=getattr(args, 'peer_antenna_ref', '') or 'UFO1',
@@ -391,4 +458,6 @@ def make_writer_from_args(args, log=None):
         observer='PePPAR Fix engine',
         agency='lab',
         interval_s=1.0,
+        decimate_s=decimate_s,
+        host=os.uname().nodename.split('.')[0],
     )

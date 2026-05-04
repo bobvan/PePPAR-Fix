@@ -1,0 +1,78 @@
+# peppar-rawx.service — continuous F9P RAWX capture for offline PPP
+#
+# Reads RXM-RAWX + RXM-SFRBX + NAV-PVT from one or two F9Ps over USB
+# and dumps the raw UBX byte stream to hourly-rotated files for
+# offline PRIDE-PPP / RTKLIB processing.
+#
+# Designed for clkPoC3 (post-DO-decommission) where the lab's two
+# F9Ps live, sharing the UFO1 antenna via splitter.  Same data feeds:
+#   - PRIDE-PPP for an independent ARP cross-check vs OPUS
+#   - F9P RTK against CORS NTRIP (when not in this RAWX-only mode —
+#     the F9Ps can be reconfigured for RTK on demand without
+#     reflashing, but only one mode at a time per receiver)
+#
+# Install:
+#   sudo cp deploy/peppar-rawx.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now peppar-rawx.service
+#
+# Operational notes:
+#   - Restart-on-failure: 10-second back-off
+#   - Output dir lives under bob's home so no special perms needed
+#   - Stop with: sudo systemctl stop peppar-rawx.service
+#     (script handles SIGTERM cleanly, flushes + closes UBX files)
+#   - 1-hour rotation gives 24 files/day per F9P (~5-10 MB each).
+#     Concatenate the day's files for a 24h PRIDE input:
+#       cat ~/peppar-fix/data/f9p-rawx/F9P1-20260503T*.ubx > F9P1.day.ubx
+#   - To switch F9Ps to RTK temporarily: stop this service, run an
+#     RTK script manually, restart this service when done.
+
+[Unit]
+Description=PePPAR Fix — F9P RAWX continuous capture
+Documentation=file:///home/bob/peppar-fix/scripts/f9p_rawx_log.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bob
+Group=bob
+
+WorkingDirectory=/home/bob/peppar-fix
+
+# Capture both F9Ps on clkPoC3 (USB by-path identifies which is which
+# even when ttyACMx renumbers across reboots).  --duration 0 = run
+# until SIGTERM.
+#
+# Note: the by-path symlinks below are clkPoC3-specific.  If this
+# service is ever installed on a host with different USB topology,
+# override Environment lines via a drop-in or EnvironmentFile.
+
+Environment=R1_PORT=/dev/serial/by-path/platform-fe9c0000.xhci-usb-0:1.2:1.0
+Environment=R2_PORT=/dev/serial/by-path/platform-fe9c0000.xhci-usb-0:1.1:1.0
+Environment=OUT_DIR=/home/bob/peppar-fix/data/f9p-rawx
+
+ExecStartPre=/bin/mkdir -p ${OUT_DIR}
+ExecStart=/home/bob/peppar-fix/venv/bin/python \
+    /home/bob/peppar-fix/scripts/f9p_rawx_log.py \
+    --r1-port ${R1_PORT} --r1-tag F9P1 \
+    --r2-port ${R2_PORT} --r2-tag F9P2 \
+    --baud 38400 \
+    --rate-hz 1.0 \
+    --duration 0 \
+    --out-dir ${OUT_DIR} \
+    --rotate-hours 1 \
+    --report-every 600
+
+# Process management
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# No special privileges — F9Ps are accessible via dialout group,
+# which user bob is already in (per gear.md / usb-identification.md
+# rules).
+
+[Install]
+WantedBy=multi-user.target

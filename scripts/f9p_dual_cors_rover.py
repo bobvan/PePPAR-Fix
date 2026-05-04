@@ -357,19 +357,26 @@ def main() -> int:
     ap.add_argument("--r1-caster", required=True, help="rover 1 caster host")
     ap.add_argument("--r1-port-tcp", type=int, required=True,
                     help="rover 1 caster TCP port")
-    ap.add_argument("--r2-port", required=True, help="rover 2 serial port")
+    ap.add_argument("--r2-port", help="rover 2 serial port "
+                    "(omit for --single mode)")
     ap.add_argument("--r2-mount", help="rover 2 NTRIP mountpoint "
-                    "(omit for --shared mode)")
+                    "(omit for --shared or --single mode)")
     ap.add_argument("--r2-caster", help="rover 2 caster host "
-                    "(omit for --shared mode)")
+                    "(omit for --shared or --single mode)")
     ap.add_argument("--r2-port-tcp", type=int,
-                    help="rover 2 caster TCP port (omit for --shared mode)")
+                    help="rover 2 caster TCP port "
+                    "(omit for --shared or --single mode)")
     ap.add_argument("--shared", action="store_true",
                     help="open ONE NTRIP stream (using r1 caster/mount) "
                     "and broadcast to both F9P USB ports.  Use this when "
                     "the caster enforces a per-source-IP session limit "
                     "that prevents two simultaneous mountpoint streams "
                     "(observed on the lab's Leica Spider 7.10.1.168).")
+    ap.add_argument("--single", action="store_true",
+                    help="single-rover mode: only R1 runs.  Use this when "
+                    "only one F9P is wired (e.g. clkPoC3 post-2026-05-03 "
+                    "with one F9P removed) or for sequential per-mountpoint "
+                    "reproducibility runs.  No diff summary is produced.")
     ap.add_argument("--user", default=os.environ.get("NTRIP_USER"),
                     help="NTRIP user (or env NTRIP_USER)")
     ap.add_argument("--password", default=os.environ.get("NTRIP_PASS"),
@@ -394,30 +401,40 @@ def main() -> int:
                   "or set NTRIP_USER/NTRIP_PASS)")
         return 2
 
-    if not args.shared and (
+    if args.single and args.shared:
+        log.error("--single and --shared are mutually exclusive")
+        return 2
+    if args.single and args.r2_port:
+        log.warning("--single ignores --r2-port")
+    if not args.shared and not args.single and (
             args.r2_mount is None or args.r2_caster is None
-            or args.r2_port_tcp is None):
-        log.error("dual-mount mode requires --r2-mount, --r2-caster, "
-                  "and --r2-port-tcp (or pass --shared)")
+            or args.r2_port_tcp is None or args.r2_port is None):
+        log.error("dual-mount mode requires --r2-port, --r2-mount, "
+                  "--r2-caster, and --r2-port-tcp (or pass --shared / --single)")
         return 2
 
-    # Open both serial ports.
+    # Open serial ports (R2 only when not in single mode).
     log.info("Opening rover 1 %s @ %d", args.r1_port, args.baud)
     r1_ser = serial.Serial(args.r1_port, args.baud, timeout=0.1)
-    log.info("Opening rover 2 %s @ %d", args.r2_port, args.baud)
-    r2_ser = serial.Serial(args.r2_port, args.baud, timeout=0.1)
+    r2_ser = None
+    if not args.single:
+        log.info("Opening rover 2 %s @ %d", args.r2_port, args.baud)
+        r2_ser = serial.Serial(args.r2_port, args.baud, timeout=0.1)
 
     time.sleep(0.2)
     r1_ser.reset_input_buffer()
-    r2_ser.reset_input_buffer()
+    if r2_ser is not None:
+        r2_ser.reset_input_buffer()
 
     log.info("Configuring rover 1 (NTRIP→%s)", args.r1_mount)
     configure_rover(r1_ser)
-    log.info("Configuring rover 2 (NTRIP→%s)", args.r2_mount)
-    configure_rover(r2_ser)
+    if r2_ser is not None:
+        log.info("Configuring rover 2 (NTRIP→%s)", args.r2_mount)
+        configure_rover(r2_ser)
     time.sleep(1.0)
     r1_ser.reset_input_buffer()
-    r2_ser.reset_input_buffer()
+    if r2_ser is not None:
+        r2_ser.reset_input_buffer()
 
     # Build NTRIP streams (no auto-connect; the thread will connect).
     tls1 = True if args.tls else (args.r1_port_tcp == 443)
@@ -441,7 +458,19 @@ def main() -> int:
 
     stop = threading.Event()
 
-    if args.shared:
+    if args.single:
+        r1_label = f"R1 [{args.r1_mount}]"
+        threads = [
+            threading.Thread(target=ntrip_to_usb_thread,
+                             args=(args.r1_mount, s1,
+                                   [(r1_label, r1_ser, r1_stats)], stop),
+                             daemon=True, name="ntrip-r1"),
+            threading.Thread(target=monitor_thread,
+                             args=(r1_label, r1_ser, stop, r1_stats),
+                             daemon=True, name="mon-r1"),
+        ]
+        s2 = None
+    elif args.shared:
         # One NTRIP, broadcast to both F9Ps.
         r1_label = f"R1 [{args.r1_mount}]"
         r2_label = f"R2 [{args.r1_mount}]"  # same mount, different rover
@@ -495,7 +524,9 @@ def main() -> int:
             time.sleep(0.1)
             now = time.monotonic()
             if now >= next_report:
-                for label, st in (("R1", r1_stats), ("R2", r2_stats)):
+                rovers = (("R1", r1_stats),) if args.single \
+                    else (("R1", r1_stats), ("R2", r2_stats))
+                for label, st in rovers:
                     last = st["last"]
                     if last is not None:
                         log.info(
@@ -528,13 +559,15 @@ def main() -> int:
         for t in threads:
             t.join(timeout=2.0)
         r1_ser.close()
-        r2_ser.close()
+        if r2_ser is not None:
+            r2_ser.close()
 
     t_run = time.monotonic() - r1_stats["t_start"]
-    r2_mount_label = args.r1_mount if args.shared else args.r2_mount
     s1_summary = summarize_one(f"R1 [{args.r1_mount}]", r1_stats, t_run)
-    s2_summary = summarize_one(f"R2 [{r2_mount_label}]", r2_stats, t_run)
-    summarize_diff(s1_summary, s2_summary)
+    if not args.single:
+        r2_mount_label = args.r1_mount if args.shared else args.r2_mount
+        s2_summary = summarize_one(f"R2 [{r2_mount_label}]", r2_stats, t_run)
+        summarize_diff(s1_summary, s2_summary)
     return 0
 
 
