@@ -3914,7 +3914,14 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             # Exponential blend: 12 ps/epoch migration rate for 5m offset —
             # invisible to the servo (200× below PPS noise floor).
             # See docs/ppp-ar-design.md "Gradual position feed-in".
-            if ar_position is not None and ar_pos_lock is not None:
+            #
+            # Skipped under --pin-position: when the supplied known_pos is
+            # surveyed truth (sub-cm σ from OPUS-Static / PRIDE-PPP),
+            # AntPosEst's ~m-class estimate is strictly worse and blending
+            # it in degrades the pin.  Precursor to the full
+            # --surveyed-position mode (I-013342-main).
+            if (not getattr(args, 'pin_position', False)
+                    and ar_position is not None and ar_pos_lock is not None):
                 with ar_pos_lock:
                     ar_ecef = ar_position.get('ecef')
                     ar_sigma = ar_position.get('sigma')
@@ -7172,6 +7179,15 @@ Two-phase operation:
     pos = ap.add_argument_group("Position")
     pos.add_argument("--known-pos",
                      help="Known position as lat,lon,alt (skips bootstrap)")
+    pos.add_argument("--pin-position", action="store_true",
+                     help="Disable the slow AntPosEst→known_ecef blend in "
+                          "run_steady_state.  Use when --known-pos is a "
+                          "surveyed truth (sub-cm σ) that should NOT be "
+                          "drifted toward AntPosEst's ~m-class estimate.  "
+                          "Default off — preserves the warm-start refine "
+                          "behavior for rough-seed --known-pos use.  "
+                          "Precursor to the full --surveyed-position mode "
+                          "(I-013342-main).")
     pos.add_argument("--seed-pos",
                      help="Seed position for bootstrap (speeds convergence)")
     pos.add_argument("--sigma", type=float, default=3.0,
