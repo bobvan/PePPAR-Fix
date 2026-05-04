@@ -212,5 +212,43 @@ class Nav2AnchorTest(unittest.TestCase):
         np.testing.assert_allclose(f1.P, f2.P, atol=1e-12)
 
 
+class FixedPosFilterZtdSeedTest(unittest.TestCase):
+    """FixedPosFilter accepts init_ztd_m + init_ztd_sigma_m for the
+    I-024942-main METAR-seeded ZTD prior path and Main's manual
+    --init-ztd-mm validation flag.
+
+    Default behaviour preserved: 0 m residual ZTD, 0.5 m σ.
+    """
+
+    _BASE_ECEF = np.array([157470.222, -4756189.544, 4232767.952])
+
+    def test_default_ztd_zero_with_legacy_sigma(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF)
+        self.assertAlmostEqual(f.x[f.IDX_ZTD], 0.0)
+        self.assertAlmostEqual(f.P[f.IDX_ZTD, f.IDX_ZTD], 0.5 ** 2)
+
+    def test_seeded_ztd_value(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF, init_ztd_m=0.123)
+        self.assertAlmostEqual(f.x[f.IDX_ZTD], 0.123)
+
+    def test_tightened_sigma(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF, init_ztd_sigma_m=0.05)
+        self.assertAlmostEqual(f.P[f.IDX_ZTD, f.IDX_ZTD], 0.05 ** 2)
+
+    def test_seed_and_sigma_independent(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF,
+                           init_ztd_m=-0.3,
+                           init_ztd_sigma_m=0.05)
+        self.assertAlmostEqual(f.x[f.IDX_ZTD], -0.3)
+        self.assertAlmostEqual(f.P[f.IDX_ZTD, f.IDX_ZTD], 0.05 ** 2)
+        # Other states unchanged.
+        self.assertAlmostEqual(f.x[f.IDX_CLK], 0.0)
+        self.assertAlmostEqual(f.P[f.IDX_CLK, f.IDX_CLK], 1e18)
+
+
 if __name__ == "__main__":
     unittest.main()

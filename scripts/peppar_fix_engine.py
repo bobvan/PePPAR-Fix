@@ -3552,6 +3552,38 @@ class AntPosEstThread(threading.Thread):
 
 # ── Phase 2: Steady state ────────────────────────────────────────────── #
 
+
+def _fixed_pos_filter_init_ztd_kwargs(args):
+    """Translate --init-ztd-mm / --init-ztd-sigma-mm into FixedPosFilter
+    kwargs.  Empty dict if neither flag is set (legacy default behavior).
+
+    The mm-vs-m unit conversion happens here so the CLI surface speaks
+    millimeters (operator-friendly for ZTD physical envelope conversation
+    where ±300mm is the natural language) while the underlying filter
+    state is in meters (consistent with the rest of solve_ppp.py).
+
+    Companion to bravo's I-024942-main MetAR-seeded auto path: that
+    code computes a Saastamoinen-derived seed and passes it through the
+    same FixedPosFilter API.  This helper is the manual cross-check
+    alternative (and the path used when METAR is unavailable).
+    """
+    kw = {}
+    init_mm = getattr(args, 'init_ztd_mm', None)
+    init_sigma_mm = getattr(args, 'init_ztd_sigma_mm', None)
+    if init_mm is not None:
+        kw['init_ztd_m'] = float(init_mm) * 1e-3
+    if init_sigma_mm is not None:
+        kw['init_ztd_sigma_m'] = float(init_sigma_mm) * 1e-3
+    if kw:
+        log.info(
+            "FixedPosFilter ZTD seed: init=%+.0fmm σ=%.0fmm "
+            "(via --init-ztd-mm)",
+            (init_mm or 0.0),
+            (init_sigma_mm or 500.0),
+        )
+    return kw
+
+
 def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                      stop_event, qerr_store=None, out_w=None, nav2_store=None,
                      ape_sm=None, dfe_sm=None, ape_thread=None,
@@ -3570,7 +3602,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     # This makes sigma an honest convergence metric (starts large, shrinks
     # as filter converges) instead of instantly collapsing on the raw
     # receiver clock offset from pseudorange seeding.
-    filt = FixedPosFilter(known_ecef)
+    fpf_kwargs = _fixed_pos_filter_init_ztd_kwargs(args)
+    filt = FixedPosFilter(known_ecef, **fpf_kwargs)
     filt.x[filt.IDX_CLK] = 0.0
     filt.P[filt.IDX_CLK, filt.IDX_CLK] = 100.0 ** 2  # 100m ≈ 333ns 1σ
     filt.initialized = True  # skip pseudorange seeding
@@ -3963,7 +3996,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                             # filter state from known_ecef and continue.
                             log.info("Re-seeding FixedPosFilter from known_ecef "
                                      "(NAV2 consensus: antenna stable)")
-                            filt = FixedPosFilter(known_ecef)
+                            filt = FixedPosFilter(known_ecef, **fpf_kwargs)
                             prev_t = None
                             watchdog.reset()
                             if servo_ctx is not None:
@@ -7188,6 +7221,24 @@ Two-phase operation:
                           "behavior for rough-seed --known-pos use.  "
                           "Precursor to the full --surveyed-position mode "
                           "(I-013342-main).")
+    pos.add_argument("--init-ztd-mm", type=float, default=None,
+                     help="Manually seed FixedPosFilter ZTD residual "
+                          "at this value (millimetres) at filter init "
+                          "instead of the default 0.0.  Companion to "
+                          "--init-ztd-sigma-mm.  Use 0.0 ± 50.0 to ask "
+                          "'is the architecture sound under tight ZTD "
+                          "prior?' independently of any atmospheric-data "
+                          "source.  Bravo's I-024942-main MetAR-seeded "
+                          "path will use the same FixedPosFilter API "
+                          "with the Saastamoinen-derived value.")
+    pos.add_argument("--init-ztd-sigma-mm", type=float, default=None,
+                     help="1-σ uncertainty on --init-ztd-mm seed in "
+                          "millimetres.  Default: legacy 500 mm wide "
+                          "prior.  Tighter (e.g. 50) requires confidence "
+                          "in the seed value (METAR/Saastamoinen) and "
+                          "constrains the filter from drifting ZTD past "
+                          "physical envelope while clock state catches "
+                          "up.")
     pos.add_argument("--seed-pos",
                      help="Seed position for bootstrap (speeds convergence)")
     pos.add_argument("--sigma", type=float, default=3.0,

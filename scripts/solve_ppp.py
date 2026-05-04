@@ -1079,10 +1079,30 @@ class FixedPosFilter:
     IDX_ISB_BDS = 4
     N_STATES = 5
 
-    def __init__(self, pos_ecef):
+    def __init__(self, pos_ecef, init_ztd_m=0.0, init_ztd_sigma_m=0.5):
+        """Fixed-position PPP filter.
+
+        Args:
+            pos_ecef: pinned antenna position in ECEF metres.
+            init_ztd_m: initial residual ZTD seed in metres (default
+                0.0 = "trust the Saastamoinen+GMF bulk model, residual
+                starts at zero").  When METAR (or another atmospheric
+                source) provides a known T/P/e at the antenna, the
+                Saastamoinen-derived residual offset can be passed here
+                so the filter starts within physical envelope instead
+                of absorbing meters of clock-state error during cold
+                start.  See I-024942-main.
+            init_ztd_sigma_m: 1-σ uncertainty on the seed (default 0.5
+                m = legacy wide prior).  With METAR source: ~0.05 m
+                tightens the prior so the filter cannot drift ZTD past
+                physical envelope while clock state catches up.
+        """
         self.pos = np.array(pos_ecef)
         self.x = np.zeros(self.N_STATES)     # [clock, clock_rate, dZTD, isb_gal, isb_bds] in meters
-        self.P = np.diag([1e18, 1e6, 0.5**2, 1e8, 1e8])  # dZTD: 0.5m initial sigma
+        self.x[self.IDX_ZTD] = float(init_ztd_m)
+        self.P = np.diag([1e18, 1e6,
+                          float(init_ztd_sigma_m) ** 2,
+                          1e8, 1e8])
         self.prev_geo = {}  # sv → {rho_corr, sat_clk_m, phi_if_m, tropo}
         self.initialized = False  # Will seed clock from first epoch
 
