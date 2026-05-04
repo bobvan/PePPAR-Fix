@@ -1,13 +1,13 @@
 """Tests for the Saastamoinen + METAR ZTD-seed helpers (I-024942)."""
 from __future__ import annotations
 
+import io
 import math
 import os
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from tempfile import TemporaryDirectory
+from unittest import mock
 
 _SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SCRIPTS_DIR not in sys.path:
@@ -24,8 +24,8 @@ from peppar_fix.saastamoinen import (
 )
 from peppar_fix.metar import (
     MetarReadError,
+    fetch_latest_metar,
     metar_age_seconds,
-    read_latest_metar,
 )
 
 
@@ -144,55 +144,74 @@ class MetarToZtdTest(unittest.TestCase):
         self.assertAlmostEqual(diag['residual_m'], residual, places=6)
 
 
-class MetarReaderTest(unittest.TestCase):
-    """Test the cron-CSV reader against synthetic data."""
+class MetarFetchTest(unittest.TestCase):
+    """Test the HTTP fetch path against mocked aviationweather.gov responses."""
 
-    HEADER = "fetch_ts,report_ts,temp_C,dewp_C,altim_hPa,slp_hPa,raw_metar"
+    SAMPLE_RECORD = {
+        'icaoId': 'KDPA',
+        'reportTime': '2026-05-04T13:00:00.000Z',
+        'temp': 12.5,
+        'dewp': 7.0,
+        'altim': 1003.7,
+        'slp': 1003.5,
+        'rawOb': 'METAR KDPA 041300Z 21008KT 10SM CLR 12/07 A2964',
+    }
 
-    def _write_csv(self, tmpdir, body):
-        p = Path(tmpdir) / "kdpa.csv"
-        p.write_text(self.HEADER + "\n" + body)
-        return p
+    def _mock_response(self, payload, status=200):
+        body = (payload if isinstance(payload, (bytes, bytearray))
+                else __import__('json').dumps(payload).encode('utf-8'))
+        resp = mock.MagicMock()
+        resp.read.return_value = body
+        resp.status = status
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        return resp
 
-    def test_reads_last_row(self):
-        with TemporaryDirectory() as td:
-            now_iso = "2026-05-04T13:00:00Z"
-            body = (
-                f"2026-05-04T12:55:01Z,{now_iso},12.8,7.2,1003.8,1003.6,METAR1\n"
-                f"2026-05-04T13:00:01Z,{now_iso},12.5,7.0,1003.7,1003.5,METAR2\n"
-            )
-            p = self._write_csv(td, body)
-            rec = read_latest_metar(p)
-            self.assertAlmostEqual(rec['temp_C'], 12.5)
-            self.assertAlmostEqual(rec['dewp_C'], 7.0)
-            self.assertAlmostEqual(rec['altim_hPa'], 1003.7)
-            self.assertEqual(rec['raw_metar'], "METAR2")
-            self.assertEqual(rec['report_ts'].tzinfo, timezone.utc)
+    def test_parses_json_response(self):
+        with mock.patch('peppar_fix.metar.urllib.request.urlopen',
+                        return_value=self._mock_response([self.SAMPLE_RECORD])):
+            rec = fetch_latest_metar('KDPA')
+        self.assertAlmostEqual(rec['temp_C'], 12.5)
+        self.assertAlmostEqual(rec['dewp_C'], 7.0)
+        self.assertAlmostEqual(rec['altim_hPa'], 1003.7)
+        self.assertEqual(rec['station'], 'KDPA')
+        self.assertEqual(rec['report_ts'].tzinfo, timezone.utc)
 
-    def test_missing_file_raises(self):
-        with self.assertRaises(MetarReadError):
-            read_latest_metar("/nonexistent/path/kdpa.csv")
-
-    def test_empty_file_raises(self):
-        with TemporaryDirectory() as td:
-            p = Path(td) / "empty.csv"
-            p.write_text(self.HEADER + "\n")
+    def test_http_failure_raises(self):
+        import urllib.error
+        with mock.patch('peppar_fix.metar.urllib.request.urlopen',
+                        side_effect=urllib.error.URLError('unreachable')):
             with self.assertRaises(MetarReadError):
-                read_latest_metar(p)
+                fetch_latest_metar('KDPA')
 
-    def test_malformed_row_raises(self):
-        with TemporaryDirectory() as td:
-            body = "not-a-date,not-a-date,oops,7.2,1003.8,1003.6,METAR\n"
-            p = self._write_csv(td, body)
+    def test_timeout_raises(self):
+        with mock.patch('peppar_fix.metar.urllib.request.urlopen',
+                        side_effect=TimeoutError('slow')):
             with self.assertRaises(MetarReadError):
-                read_latest_metar(p)
+                fetch_latest_metar('KDPA')
 
-    def test_age_uses_report_not_fetch(self):
-        rec = {
-            'fetch_ts': datetime(2026, 5, 4, 13, 0, tzinfo=timezone.utc),
-            'report_ts': datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc),
-        }
-        # Fixed "now" 1 minute past fetch; age from REPORT is ~1h, not 1 min.
+    def test_empty_response_raises(self):
+        with mock.patch('peppar_fix.metar.urllib.request.urlopen',
+                        return_value=self._mock_response([])):
+            with self.assertRaises(MetarReadError):
+                fetch_latest_metar('KDPA')
+
+    def test_malformed_json_raises(self):
+        with mock.patch('peppar_fix.metar.urllib.request.urlopen',
+                        return_value=self._mock_response(b'not json')):
+            with self.assertRaises(MetarReadError):
+                fetch_latest_metar('KDPA')
+
+    def test_missing_field_raises(self):
+        bad = dict(self.SAMPLE_RECORD)
+        del bad['temp']
+        with mock.patch('peppar_fix.metar.urllib.request.urlopen',
+                        return_value=self._mock_response([bad])):
+            with self.assertRaises(MetarReadError):
+                fetch_latest_metar('KDPA')
+
+    def test_age_uses_report_ts(self):
+        rec = {'report_ts': datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)}
         now = datetime(2026, 5, 4, 13, 1, tzinfo=timezone.utc)
         self.assertAlmostEqual(metar_age_seconds(rec, now), 3660.0)
 

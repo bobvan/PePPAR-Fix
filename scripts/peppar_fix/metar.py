@@ -1,91 +1,95 @@
-"""METAR cron-CSV reader for METAR-seeded ZTD prior (I-024942).
+"""METAR HTTP fetcher for METAR-seeded ZTD prior (I-024942).
 
-The cron capture format produced by ~/met/cron/fetch.sh on TimeHat
-(live since 2026-05-04) is one row per fetch with columns:
-  fetch_ts, report_ts, temp_C, dewp_C, altim_hPa, slp_hPa, raw_metar
+The engine queries https://aviationweather.gov/api/data/metar at filter
+init to get a current temperature / dewpoint / altimeter reading from
+a nearby airport (KDPA for the lab, ~7 km from UFO1).  The returned
+weather feeds Saastamoinen so the IDX_ZTD residual state starts within
+physical envelope rather than absorbing meters of clock-state error
+during cold start.
 
-Each row is the latest decoded KDPA METAR.  Multiple fetch_ts can
-share the same report_ts when the cron polls more frequently than
-KDPA reports.
-
-This module reads the *latest* row, parses the numeric weather
-fields, and offers freshness checking.  Spatial correction from
-KDPA→site is handled by the caller via saastamoinen.metar_to_*
-which take site lat/elev directly — KDPA's coordinates aren't
-recorded in the CSV (would require a sibling lookup if we ever
-add multi-site METAR sources).
+HTTP-only by design: no cron, no local CSV, no per-host file setup.
+This makes --init-ztd-from-met work on a fresh host with nothing more
+than network connectivity (which the engine already requires for
+NTRIP / SSR).  On HTTP failure the engine logs and falls back to a
+wide ZTD prior — METAR is bonus information, not a hard dependency.
 """
 from __future__ import annotations
 
-import csv
+import json
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
 
 
-DEFAULT_KDPA_CSV = Path("/home/bob/met/kdpa.csv")
+DEFAULT_STATION = "KDPA"
+DEFAULT_TIMEOUT_S = 5.0
+API_URL = "https://aviationweather.gov/api/data/metar?ids={station}&format=json"
 
 
 class MetarReadError(Exception):
-    """Raised when METAR file is missing, empty, or malformed."""
+    """Raised when METAR fetch / parse fails."""
 
 
-def read_latest_metar(path: str | Path = DEFAULT_KDPA_CSV) -> dict:
-    """Read the last complete row from a METAR cron CSV.
+def fetch_latest_metar(station: str = DEFAULT_STATION,
+                       timeout: float = DEFAULT_TIMEOUT_S) -> dict:
+    """Fetch the latest METAR for `station` from aviationweather.gov.
 
     Returns dict with keys:
-      fetch_ts (datetime, UTC), report_ts (datetime, UTC),
-      temp_C, dewp_C, altim_hPa, slp_hPa, raw_metar
-    Numeric fields are float.
+      report_ts (datetime, UTC), temp_C, dewp_C, altim_hPa,
+      slp_hPa (may be None), raw_metar, station
 
-    Raises MetarReadError if the file doesn't exist, is empty,
-    or the last row can't be parsed.
+    Raises MetarReadError on network failure, HTTP error, JSON parse
+    failure, empty response, or any required field missing / non-
+    numeric.  Caller is expected to handle the exception by logging
+    and falling back to the legacy wide ZTD prior.
     """
-    p = Path(path)
-    if not p.is_file():
-        raise MetarReadError(f"METAR file not found: {p}")
-    last = None
+    url = API_URL.format(station=station)
     try:
-        with open(p, newline='') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                last = row
-    except OSError as exc:
-        raise MetarReadError(f"reading {p}: {exc}") from exc
-    if last is None:
-        raise MetarReadError(f"no rows in {p}")
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            body = resp.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise MetarReadError(f"HTTP fetch failed for {station}: {exc}") from exc
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise MetarReadError(f"JSON parse failed: {exc}") from exc
+    if not isinstance(data, list) or not data:
+        raise MetarReadError(f"empty METAR response for {station}")
+    rec = data[0]
     try:
         return {
-            'fetch_ts': _parse_iso(last['fetch_ts']),
-            'report_ts': _parse_iso(last['report_ts']),
-            'temp_C': float(last['temp_C']),
-            'dewp_C': float(last['dewp_C']),
-            'altim_hPa': float(last['altim_hPa']),
-            'slp_hPa': float(last['slp_hPa']) if last.get('slp_hPa') else None,
-            'raw_metar': last.get('raw_metar', ''),
+            'report_ts': _parse_iso(rec['reportTime']),
+            'temp_C': float(rec['temp']),
+            'dewp_C': float(rec['dewp']),
+            'altim_hPa': float(rec['altim']),
+            'slp_hPa': float(rec['slp']) if rec.get('slp') is not None else None,
+            'raw_metar': rec.get('rawOb', ''),
+            'station': rec.get('icaoId', station),
         }
-    except (KeyError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
         raise MetarReadError(
-            f"malformed METAR row in {p}: {exc} (row={last!r})") from exc
+            f"malformed METAR record for {station}: {exc} "
+            f"(rec={rec!r})") from exc
 
 
 def metar_age_seconds(record: dict, now: datetime | None = None) -> float:
-    """Age of the METAR *report* (not fetch) in seconds.
+    """Age of the METAR *report* in seconds.
 
-    Using report_ts means we don't reward stale data just because
-    cron retrieved it recently.  KDPA reports hourly with occasional
-    SPECIs; ages above ~3600 s mean cron isn't keeping up.
+    Using report_ts (not fetch time) means we don't reward stale data
+    just because the API returned it recently.  KDPA reports hourly
+    with occasional SPECIs; ages above ~3600 s mean we're seeing a
+    delayed report (rare in practice when querying online).
     """
     now = now or datetime.now(timezone.utc)
     return (now - record['report_ts']).total_seconds()
 
 
 def _parse_iso(s: str) -> datetime:
-    """Parse the ISO-8601 timestamps the cron emits.
+    """Parse the ISO-8601 timestamps the API emits.
 
-    Accepts both 'Z' suffix and milliseconds variants; the cron has
-    been observed to emit:
-      2026-05-04T01:56:20Z
-      2026-05-04T02:00:00.000Z
+    Accepts 'Z' suffix.  API observed to emit:
+      2026-05-04T14:00:00.000Z
+      2026-05-04T13:56:24.992Z
     """
     s = s.strip()
     if s.endswith('Z'):
