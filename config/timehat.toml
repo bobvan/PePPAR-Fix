@@ -4,7 +4,7 @@
 # when any USB device is added/removed).  Bind to the physical USB
 # port via /dev/serial/by-path — only breaks if the F9T's USB cable
 # is moved to a different port.  See docs/lab-operations.md §12.
-serial = "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:1:1.0"
+serial = "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:2:1.0"
 baud = 115200
 ubx_port = "USB"
 receiver = "f9t-l5"
