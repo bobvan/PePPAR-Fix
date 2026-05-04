@@ -7611,8 +7611,14 @@ Two-phase operation:
                           "project_mad_outlier_rejection_landed_20260426.md.")
     pos.add_argument("--timeout", type=int, default=3600,
                      help="Bootstrap timeout in seconds (default: 3600)")
-    pos.add_argument("--watchdog-threshold", type=float, default=0.5,
-                     help="Position watchdog threshold in meters (default: 0.5)")
+    pos.add_argument("--watchdog-threshold", type=float, default=10.0,
+                     help="Position watchdog threshold in meters (default: "
+                          "10.0).  Watchdog trips when PR residual RMS "
+                          "exceeds max(baseline*3, baseline+threshold) for "
+                          "10 consecutive epochs.  10 m corresponds to a "
+                          "30 ns time error — the bound below which we "
+                          "tolerate riding through transient sky/SSR "
+                          "noise without re-seeding a converged filter.")
 
     # Serial
     serial = ap.add_argument_group("Serial")

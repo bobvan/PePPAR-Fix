@@ -10,7 +10,7 @@ class PositionWatchdog:
     When the implied position shift exceeds threshold, stops servo steering.
     """
 
-    def __init__(self, threshold_m=0.5, window=30, alarm_count=10):
+    def __init__(self, threshold_m=10.0, window=30, alarm_count=10):
         self.threshold_m = threshold_m
         self.window = window
         self.alarm_count = alarm_count
