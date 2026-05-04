@@ -7450,26 +7450,32 @@ Two-phase operation:
                           f"{DEFAULT_STATION}, ~7 km from UFO1).  Pick a "
                           f"station within ~50 km of the antenna for "
                           f"meaningful pressure/temperature similarity.")
-    pos.add_argument("--ztd-tie-interval-s", type=int, default=300,
+    pos.add_argument("--ztd-tie-interval-s", type=int, default=60,
                      help="Apply a soft METAR-derived prior on the "
                           "FixedPosFilter ZTD residual every N epochs "
-                          "(approx N seconds at 1 Hz; default 300, "
-                          "matches METAR report cadence).  Set to 0 to "
-                          "disable.  Bounds ZTD-state drift driven by "
-                          "per-SV systematic-bias absorption (SSR "
-                          "L5I→L5Q substitution, antenna PCV "
-                          "miscorrection, multipath); see I-172521.  "
-                          "Re-uses --init-ztd-station for the source "
-                          "airport.")
-    pos.add_argument("--ztd-tie-sigma-mm", type=float, default=100.0,
+                          "(approx N seconds at 1 Hz; default 60).  "
+                          "Set to 0 to disable.  Bounds ZTD-state "
+                          "drift driven by per-SV systematic-bias "
+                          "absorption (SSR L5I→L5Q substitution, "
+                          "antenna PCV miscorrection, multipath); see "
+                          "I-172521.  More frequent than the 5-min "
+                          "METAR report cadence is fine — the cached "
+                          "report just gets re-applied, which still "
+                          "compounds the soft pull against the "
+                          "per-epoch bias-absorption walk.  Re-uses "
+                          "--init-ztd-station for the source airport.")
+    pos.add_argument("--ztd-tie-sigma-mm", type=float, default=30.0,
                      help="1-σ uncertainty (mm) on the periodic ZTD "
-                          "tie target.  Default 100 mm — looser than "
-                          "the cold-start init prior (50 mm) because "
-                          "we're constraining drift rather than "
-                          "initialising.  Smaller → tighter pull "
-                          "(more rapid convergence to METAR but less "
-                          "tolerant of legitimate residual deviations); "
-                          "larger → softer.")
+                          "tie target.  Default 30 mm — matches the "
+                          "METAR + Saastamoinen + spatial-coherence "
+                          "error budget (1 hPa → 2 mm ZHD; "
+                          "Saastamoinen model ~1-3 cm; nearby airport "
+                          "spatial coherence ~1 cm).  Smaller → "
+                          "tighter pull (more rapid convergence but "
+                          "may damp legitimate atmospheric tracking); "
+                          "larger → softer (filter dominates and the "
+                          "tie becomes nearly a noop, since the "
+                          "filter's σ is bias-polluted not honest).")
     pos.add_argument("--bootstrap-rms-k", type=float, default=2.0,
                      help="Phase-1 convergence requires PR-residual RMS < "
                           "k × SIGMA_P_IF.  Catches locally-consistent but "
