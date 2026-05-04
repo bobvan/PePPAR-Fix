@@ -313,7 +313,8 @@ class PPPFilter:
         self.initialized = False
 
     def initialize(self, pos_ecef, clock_m, isb_gal=0.0, isb_bds=0.0,
-                   systems=None, pos_sigma_m=10.0, ztd_sigma_m=0.2):
+                   systems=None, pos_sigma_m=10.0, ztd_sigma_m=0.2,
+                   init_ztd_m=0.0):
         """Initialize filter state.
 
         systems: optional iterable of constellations that will feed
@@ -341,13 +342,20 @@ class PPPFilter:
         bias residuals (GPS L5Q, BDS B2a-I in CNES) into ZTD, producing
         the ZTD doom-loop / ztd_impossible / ztd_cycling integrity-trip
         cascade observed on TimeHat 2026-04-29 overnight (36/73 trips).
+
+        init_ztd_m: initial value (m) for the IDX_ZTD residual state.
+        Default 0.0 preserves prior behavior.  Engine callers can seed
+        from METAR-derived Saastamoinen ZTD minus the 2.3 m hydrostatic
+        apriori to start the filter close to atmospheric truth, avoiding
+        the multi-meter cold-start transient observed under pinned mode
+        on 2026-05-04 — see I-024942 + scripts/peppar_fix/saastamoinen.py.
         """
         self.x = np.zeros(N_BASE)
         self.x[:3] = pos_ecef
         self.x[IDX_CLK] = clock_m
         self.x[IDX_ISB_GAL] = isb_gal
         self.x[IDX_ISB_BDS] = isb_bds
-        self.x[IDX_ZTD] = 0.0  # residual ZTD (a priori model handles bulk)
+        self.x[IDX_ZTD] = float(init_ztd_m)  # residual ZTD (apriori handles bulk)
         self._ztd_sigma_m = float(ztd_sigma_m)
         self._pos_sigma_m_init = float(pos_sigma_m)
         self.P = np.diag([
@@ -1079,10 +1087,25 @@ class FixedPosFilter:
     IDX_ISB_BDS = 4
     N_STATES = 5
 
-    def __init__(self, pos_ecef):
+    def __init__(self, pos_ecef, init_ztd_m=0.0, init_ztd_sigma_m=0.5):
+        """Construct fixed-position clock+ZTD filter.
+
+        init_ztd_m: initial residual ZTD (m) on top of the engine's
+        2.3 m hydrostatic apriori.  Default 0.0 preserves prior
+        behavior.  Engine callers can seed from METAR via
+        scripts/peppar_fix/saastamoinen.metar_to_init_ztd_residual to
+        avoid the multi-meter cold-start ZTD transient observed under
+        --pin-position on 2026-05-04 — see I-024942.
+
+        init_ztd_sigma_m: 1-σ on the initial ZTD prior (m).  Default
+        0.5 preserves prior behavior; with METAR seeding 0.05 (50 mm)
+        is appropriate.
+        """
         self.pos = np.array(pos_ecef)
         self.x = np.zeros(self.N_STATES)     # [clock, clock_rate, dZTD, isb_gal, isb_bds] in meters
-        self.P = np.diag([1e18, 1e6, 0.5**2, 1e8, 1e8])  # dZTD: 0.5m initial sigma
+        self.x[self.IDX_ZTD] = float(init_ztd_m)
+        ztd_sigma = float(init_ztd_sigma_m)
+        self.P = np.diag([1e18, 1e6, ztd_sigma**2, 1e8, 1e8])
         self.prev_geo = {}  # sv → {rho_corr, sat_clk_m, phi_if_m, tropo}
         self.initialized = False  # Will seed clock from first epoch
 

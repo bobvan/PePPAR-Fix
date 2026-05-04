@@ -67,6 +67,11 @@ from peppar_fix.wl_phase_admission_gate import WlPhaseAdmissionGate
 from peppar_fix.wl_readmission_gate import WlReAdmissionGate
 from peppar_fix.anchoring_sv_promoter import AnchoringSvPromoter
 from peppar_fix.nl_diag import NlDiagLogger
+from peppar_fix.saastamoinen import metar_to_init_ztd_residual
+from peppar_fix.metar import (
+    DEFAULT_KDPA_CSV, MetarReadError,
+    metar_age_seconds, read_latest_metar,
+)
 
 
 # Cycle-slip CSV sink, shared between Phase-1 (run_bootstrap) and Phase-2
@@ -75,6 +80,55 @@ from peppar_fix.nl_diag import NlDiagLogger
 # phases run in series.
 _SLIP_CSV_FILE = None
 _SLIP_CSV_WRITER = None
+
+
+def _seed_ztd_from_metar(args, lat_deg, alt_m, log):
+    """Compute init_ztd_m + init_ztd_sigma_m from latest METAR.
+
+    Returns (init_ztd_m, init_ztd_sigma_m).  On any METAR-read or
+    Saastamoinen failure, logs a warning and returns (0.0, 0.5)
+    — equivalent to leaving --init-ztd-from-met unset.
+
+    This deliberately does NOT abort the engine: METAR is bonus
+    information; the filter without it converges as it always has
+    (just slowly under --pin-position).  Operators see a single
+    [INIT_ZTD] log line either way.
+    """
+    path = getattr(args, 'init_ztd_from', None) or DEFAULT_KDPA_CSV
+    sigma_mm = float(getattr(args, 'init_ztd_sigma_mm', 50.0))
+    sigma_m = sigma_mm * 1e-3
+    try:
+        rec = read_latest_metar(path)
+    except MetarReadError as exc:
+        log.warning("[INIT_ZTD] METAR read failed (%s); falling back "
+                    "to ztd=0 σ=200mm default", exc)
+        return 0.0, 0.2
+    age_s = metar_age_seconds(rec)
+    if age_s > 7200:  # 2 h
+        log.warning("[INIT_ZTD] METAR stale (age=%.0f min); falling "
+                    "back to ztd=0 σ=200mm default", age_s / 60.0)
+        return 0.0, 0.2
+    try:
+        residual_m, diag = metar_to_init_ztd_residual(
+            temp_C=rec['temp_C'],
+            dewp_C=rec['dewp_C'],
+            altim_hPa=rec['altim_hPa'],
+            lat_deg=lat_deg,
+            elev_m=alt_m,
+        )
+    except (ValueError, ZeroDivisionError) as exc:
+        log.warning("[INIT_ZTD] Saastamoinen compute failed (%s); "
+                    "falling back to ztd=0 σ=200mm default", exc)
+        return 0.0, 0.2
+    log.info(
+        "[INIT_ZTD] METAR T=%.1fC dewp=%.1fC altim=%.1fhPa age=%.0fmin "
+        "→ Pstation=%.1fhPa e=%.1fhPa ZHD=%.3fm ZWD=%.3fm ZTD=%.3fm "
+        "residual=%+.0fmm σ=%.0fmm",
+        diag['temp_C'], diag['dewp_C'], diag['altim_hPa'], age_s / 60.0,
+        diag['P_station_hPa'], diag['e_hPa'], diag['zhd_m'],
+        diag['zwd_m'], diag['ztd_m'], residual_m * 1000.0, sigma_mm,
+    )
+    return residual_m, sigma_m
 
 
 def _open_slip_csv(path):
@@ -3565,12 +3619,27 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     lat, lon, alt = ecef_to_lla(known_ecef[0], known_ecef[1], known_ecef[2])
     log.info(f"Position: {lat:.6f}, {lon:.6f}, {alt:.1f}m")
 
+    # Compute METAR-seeded ZTD residual when --init-ztd-from-met is set.
+    # Default 0.0 preserves prior behavior.  See I-024942 and 2026-05-04
+    # overnight: under --pin-position the cold-start ZTD spent hours
+    # walking back from multi-meter values because the wide ztd_sigma
+    # prior centered at 0 absorbed clock-state error that had nowhere
+    # else to go.  METAR-derived Saastamoinen seed lands the filter
+    # within physical envelope at epoch 1.
+    init_ztd_m = 0.0
+    init_ztd_sigma_m = 0.5  # FixedPosFilter prior default
+    if getattr(args, 'init_ztd_from_met', False) or getattr(args, 'init_ztd_from', None):
+        init_ztd_m, init_ztd_sigma_m = _seed_ztd_from_metar(
+            args, lat, alt, log)
+
     # Seed filter at dt_rx=0 — bootstrap guarantees PHC is within ±10µs
     # of truth, so the receiver clock residual at the PPS edge is near zero.
     # This makes sigma an honest convergence metric (starts large, shrinks
     # as filter converges) instead of instantly collapsing on the raw
     # receiver clock offset from pseudorange seeding.
-    filt = FixedPosFilter(known_ecef)
+    filt = FixedPosFilter(known_ecef,
+                          init_ztd_m=init_ztd_m,
+                          init_ztd_sigma_m=init_ztd_sigma_m)
     filt.x[filt.IDX_CLK] = 0.0
     filt.P[filt.IDX_CLK, filt.IDX_CLK] = 100.0 ** 2  # 100m ≈ 333ns 1σ
     filt.initialized = True  # skip pseudorange seeding
@@ -7220,6 +7289,30 @@ Two-phase operation:
                           "reported hAcc exceeds this threshold (NAV2 too "
                           "noisy to trust as a continuous position witness).  "
                           "Default 3 m matches Bravo's SO_POS hAcc gate.")
+    pos.add_argument("--init-ztd-from-met",
+                     action="store_true", default=False,
+                     help="Seed FixedPosFilter ZTD state from latest METAR "
+                          "via Saastamoinen, using ~/met/kdpa.csv (or path "
+                          "from --init-ztd-from).  Avoids the multi-meter "
+                          "ZTD cold-start transient that pin-position mode "
+                          "exposes (see I-024942 + 2026-05-04 overnight "
+                          "findings).  Default off — preserves current "
+                          "init_ztd_m=0 behavior.  Mutually exclusive with "
+                          "--init-ztd-mm (manual seed).")
+    pos.add_argument("--init-ztd-from", default=None, metavar="PATH",
+                     help="Path to METAR cron CSV (columns: fetch_ts, "
+                          "report_ts, temp_C, dewp_C, altim_hPa, slp_hPa, "
+                          "raw_metar).  Implies --init-ztd-from-met.  "
+                          "Default ~/met/kdpa.csv when --init-ztd-from-met "
+                          "is set without an explicit path.")
+    pos.add_argument("--init-ztd-sigma-mm", type=float, default=50.0,
+                     metavar="MM",
+                     help="1-σ on the seeded ZTD residual (mm).  Default "
+                          "50 mm captures METAR uncertainty + spatial "
+                          "coherence (KDPA→UFO1 6 km horiz, 25 m vert) + "
+                          "Saastamoinen model error.  Only effective when "
+                          "--init-ztd-from-met is set; for free-init runs "
+                          "the existing ztd_sigma_m=200 mm default applies.")
     pos.add_argument("--bootstrap-rms-k", type=float, default=2.0,
                      help="Phase-1 convergence requires PR-residual RMS < "
                           "k × SIGMA_P_IF.  Catches locally-consistent but "
