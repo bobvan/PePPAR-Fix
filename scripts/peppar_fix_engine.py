@@ -3984,14 +3984,31 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
 
             # Extract ZTD and ISBs for logging
             dztd_m = 0.0
+            dztd_sigma_m = 0.0
             if hasattr(filt, 'IDX_ZTD') and filt.x.shape[0] > filt.IDX_ZTD:
                 dztd_m = filt.x[filt.IDX_ZTD]
+                dztd_sigma_m = math.sqrt(max(0,
+                    filt.P[filt.IDX_ZTD, filt.IDX_ZTD]))
             isb_gal_ns = 0.0
             isb_bds_ns = 0.0
             if hasattr(filt, 'IDX_ISB_GAL') and filt.x.shape[0] > filt.IDX_ISB_GAL:
                 isb_gal_ns = filt.x[filt.IDX_ISB_GAL] / C * 1e9
             if hasattr(filt, 'IDX_ISB_BDS') and filt.x.shape[0] > getattr(filt, 'IDX_ISB_BDS', 999):
                 isb_bds_ns = filt.x[filt.IDX_ISB_BDS] / C * 1e9
+
+            # Periodic FixedPosFilter ZTD log emit — exposes the pinned
+            # filter's ZTD state independently of the parallel AntPosEst
+            # PPPFilter reporting.  Needed to evaluate I-175546-main
+            # hypothesis "does pinning position settle ZTD?"  Cadence:
+            # every 30 epochs (~30s at 1 Hz) to keep volume modest.
+            if n_epochs % 30 == 0:
+                log.info(
+                    "[FIXEDPOS_ZTD] epoch=%d ZTD=%+.0f±%.0fmm "
+                    "dt_rx=%+.3fns σ=%.4fns",
+                    n_epochs,
+                    dztd_m * 1000.0, dztd_sigma_m * 1000.0,
+                    dt_rx_ns, dt_rx_sigma,
+                )
 
             # Correction source
             source = 'SSR' if ssr.n_clock > 0 else 'broadcast'
