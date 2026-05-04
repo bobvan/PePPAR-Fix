@@ -7783,7 +7783,17 @@ Two-phase operation:
                           "For offline cross-engine verification (PRIDE "
                           "PPP-AR, RTKLIB) — see "
                           "docs/ssr-cross-ac-diagnostic-2026-04-25.md.  "
-                          "Off by default (no overhead).")
+                          "Off by default (no overhead).  "
+                          "Path supports {date} (UTC YYYYDDD) and {host} "
+                          "interpolation; using {date} enables UTC-midnight "
+                          "rotation (one file per day) for I-013307's daily "
+                          "PRIDE pipeline.")
+    out.add_argument("--rinex-decimate-s", type=float, default=None,
+                     help="Decimate RINEX output to this interval in seconds "
+                          "(engine continues to run its PPP filter at full "
+                          "rate; only the writer skips epochs).  Standard "
+                          "PRIDE / RTKLIB input rate is 30 s.  Default: no "
+                          "decimation — every engine epoch written.")
     out.add_argument("--duration", type=int, default=None,
                      help="Run duration in seconds (0 = unlimited)")
     out.add_argument("--gate-stats", help="Optional JSON output for strict sink gate statistics")

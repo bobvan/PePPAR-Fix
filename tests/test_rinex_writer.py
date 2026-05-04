@@ -267,5 +267,101 @@ def test_make_writer_known_pos_parse_failure_doesnt_raise(tmp_path):
     w.close()
 
 
+def _writer_with_template(tmp_path, decimate_s=None):
+    return RinexWriter(
+        str(tmp_path / "{host}-{date}.obs"),
+        marker_name="UFO1",
+        approx_xyz=(157470.222, -4756189.544, 4232767.952),
+        antenna_type="SFESPK6618H     NONE",
+        host="madhat",
+        decimate_s=decimate_s,
+    )
+
+
+def _stub_obs():
+    """Smallest non-empty raw_obs that produces a written epoch."""
+    return {"G16": {"GPS-L1CA": {"pr": 21000000.0, "cp": 110000000.0,
+                                  "cno": 45.0, "half_cyc": True,
+                                  "lock_ms": 60000}}}
+
+
+def test_path_template_expansion(tmp_path):
+    w = _writer_with_template(tmp_path)
+    epoch = datetime(2026, 5, 4, 14, 0, 0, tzinfo=timezone.utc)
+    w.write_epoch(epoch, _stub_obs())
+    w.close()
+    expected = tmp_path / "madhat-2026124.obs"  # DOY 124 = May 4
+    assert expected.exists(), f"path template not expanded; files: {list(tmp_path.iterdir())}"
+
+
+def test_utc_midnight_rotation(tmp_path):
+    """Two epochs straddling UTC midnight produce two files with the
+    same writer instance.  Rotation is automatic — caller doesn't have
+    to do anything special."""
+    w = _writer_with_template(tmp_path)
+    # 23:59:30 UTC May 4 → DOY 124
+    w.write_epoch(datetime(2026, 5, 4, 23, 59, 30, tzinfo=timezone.utc),
+                  _stub_obs())
+    # 00:00:00 UTC May 5 → DOY 125 — should rotate
+    w.write_epoch(datetime(2026, 5, 5, 0, 0, 0, tzinfo=timezone.utc),
+                  _stub_obs())
+    w.close()
+    files = sorted(p.name for p in tmp_path.iterdir() if p.suffix == ".obs")
+    assert files == ["madhat-2026124.obs", "madhat-2026125.obs"], files
+    # Both files have full headers (END OF HEADER + at least one epoch).
+    for fn in files:
+        text = (tmp_path / fn).read_text()
+        assert "END OF HEADER" in text
+        assert "> 2026" in text  # at least one epoch line
+
+
+def test_decimation_drops_close_epochs(tmp_path):
+    """decimate_s = 30 means epochs less than 30s apart are dropped
+    after the first.  The first epoch is ALWAYS written."""
+    w = _writer_with_template(tmp_path, decimate_s=30.0)
+    base = datetime(2026, 5, 4, 14, 0, 0, tzinfo=timezone.utc)
+    # 4 epochs at 1s intervals — only first should be written
+    for i in range(4):
+        from datetime import timedelta
+        w.write_epoch(base + timedelta(seconds=i), _stub_obs())
+    # then jump 30s → second epoch written
+    from datetime import timedelta
+    w.write_epoch(base + timedelta(seconds=30), _stub_obs())
+    # then 35s → third (because 35-30 = 5s < 30s no, wait: last_written is at +30, +35-30=5 < 30 → dropped)
+    w.write_epoch(base + timedelta(seconds=35), _stub_obs())
+    # +60 → fourth written (60-30 = 30s ≥ 30)
+    w.write_epoch(base + timedelta(seconds=60), _stub_obs())
+    w.close()
+    text = (tmp_path / "madhat-2026124.obs").read_text()
+    epoch_lines = [ln for ln in text.splitlines() if ln.startswith("> ")]
+    assert len(epoch_lines) == 3, f"expected 3 epochs (0, 30, 60), got {len(epoch_lines)}: {epoch_lines}"
+
+
+def test_decimation_first_epoch_always_written(tmp_path):
+    """Even with aggressive decimation, the first epoch must be
+    written so the file has a header + first obs."""
+    w = _writer_with_template(tmp_path, decimate_s=300.0)
+    epoch = datetime(2026, 5, 4, 14, 0, 0, tzinfo=timezone.utc)
+    w.write_epoch(epoch, _stub_obs())
+    w.close()
+    text = (tmp_path / "madhat-2026124.obs").read_text()
+    assert "END OF HEADER" in text
+    assert "> 2026  5  4 14  0" in text
+
+
+def test_decimation_header_interval(tmp_path):
+    """Header INTERVAL should reflect decimated rate, not 1Hz, since
+    that's what consumers see in the file."""
+    w = _writer_with_template(tmp_path, decimate_s=30.0)
+    w.write_epoch(datetime(2026, 5, 4, 14, 0, 0, tzinfo=timezone.utc),
+                  _stub_obs())
+    w.close()
+    text = (tmp_path / "madhat-2026124.obs").read_text()
+    interval_line = [ln for ln in text.splitlines() if "INTERVAL" in ln]
+    assert interval_line, f"no INTERVAL line: {text[:500]}"
+    # "    30.000" with INTERVAL marker
+    assert "30.000" in interval_line[0]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
