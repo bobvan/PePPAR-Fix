@@ -28,3 +28,12 @@ systems = "gps,gal"
 
 # TICC #2: chA = PEROUT (i226 PPS OUT), chB = GNSS PPS.
 ticc_port = "/dev/ticc2"
+
+
+# RINEX archival for I-013307 daily PRIDE pipeline.
+# Path templates {date} (UTC YYYYDDD) and {host}; {date} triggers
+# UTC-midnight rotation.  Decimation to 30 s matches PRIDE/RTKLIB
+# standard input; engine continues to consume RAWX at 1 Hz for its
+# own PPP filter — decimation is writer-side only.
+rinex_out = "data/rinex/{host}-{date}.obs"
+rinex_decimate_s = 30.0

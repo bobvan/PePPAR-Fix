@@ -7111,6 +7111,8 @@ def _apply_host_config(args):
         "ar_elev_mask_deg": ("ar_elev_mask",         float),
         "pmc_uds":          ("pmc",              str),
         "pmc_domain":       ("pmc_domain",       int),
+        "rinex_out":        ("rinex_out",        str),
+        "rinex_decimate_s": ("rinex_decimate_s", float),
     }
 
     for toml_key, (dest, conv) in _MAP.items():
