@@ -97,6 +97,77 @@ class ResidualSplitTest(unittest.TestCase):
         self.assertEqual(len(f.last_resid_pr), f.last_n_pr)
         self.assertEqual(len(f.last_resid_td), 0)
 
+    def test_interleaved_rows_split_correctly(self):
+        """Regression: PR and TD rows are appended INTERLEAVED per-SV
+        in the construction loop (PR for SV1, TD for SV1, PR for SV2,
+        ...).  An earlier slicing of ``post_resid[:n_pr]`` /
+        ``post_resid[n_pr:]`` was wrong — those slices grabbed mixed
+        domains.  This test exercises a multi-SV scenario where n_pr
+        and n_td are both > 1 and the row order matters.
+
+        Setup: 4 SVs, second epoch (so prev_geo populated and all 4
+        contribute both PR and TD rows).  In the buggy slicing,
+        last_resid_pr would contain a mix of PR and TD residuals
+        (rows 0, 1, 2, 3 = SV1_PR, SV1_TD, SV2_PR, SV2_TD).  In the
+        correct slicing, last_resid_pr contains only the 4 PR rows
+        (positions 0, 2, 4, 6) and last_resid_td contains only the
+        4 TD rows (positions 1, 3, 5, 7).
+
+        Distinguishing test: PR residuals are O(m) by construction
+        (clock + ISB + ZTD couplings on the m-scale code observable),
+        TD residuals are O(mm) (carrier-phase difference).  After
+        the Kalman update both get smaller, but PR row magnitudes
+        stay an order of magnitude above TD row magnitudes for
+        well-conditioned cases.  We assert this ratio explicitly.
+        """
+        f = FixedPosFilter(_BASE_ECEF)
+        f.x[FixedPosFilter.IDX_CLK] = 0.0
+        f.P[FixedPosFilter.IDX_CLK, FixedPosFilter.IDX_CLK] = 100.0 ** 2
+        f.initialized = True
+        f.prev_clock = 0.0
+        # Build 4 SVs at varied elevations so geometry is well
+        # conditioned.  Each gets its own sat_pos via a stubbed sp3.
+        sat_positions = {
+            "G01": _sat_pos_above_site(60.0, az_deg=0.0),
+            "G02": _sat_pos_above_site(45.0, az_deg=90.0),
+            "G03": _sat_pos_above_site(30.0, az_deg=180.0),
+            "G04": _sat_pos_above_site(70.0, az_deg=270.0),
+        }
+        sp3 = MagicMock()
+        sp3.sat_position = MagicMock(
+            side_effect=lambda sv, t_tx: (
+                np.asarray(sat_positions[sv], dtype=float), 0.0))
+        # First epoch: populate prev_geo for all 4 SVs.
+        ranges = {sv: float(np.linalg.norm(sat_positions[sv] - _BASE_ECEF))
+                  for sv in sat_positions}
+        obs1 = [_make_obs(sv, "gps", ranges[sv], phi_if_m=ranges[sv])
+                for sv in sat_positions]
+        t = datetime(2026, 5, 5, 12, 0, 0, tzinfo=timezone.utc)
+        f.update(obs1, sp3, t, clk_file=None)
+        # Second epoch: all 4 SVs now produce both PR and TD rows.
+        obs2 = [_make_obs(sv, "gps",
+                          ranges[sv] + 0.5,         # PR with m-scale offset
+                          phi_if_m=ranges[sv] + 0.001)  # CP with mm-scale offset
+                for sv in sat_positions]
+        t2 = t + timedelta(seconds=1)
+        f.update(obs2, sp3, t2, clk_file=None)
+        # Both lists should be length 4; bug or fix, this stays equal.
+        self.assertEqual(f.last_n_pr, 4)
+        self.assertEqual(f.last_n_td, 4)
+        self.assertEqual(len(f.last_resid_pr), 4)
+        self.assertEqual(len(f.last_resid_td), 4)
+        # Distinguishing assertion: PR residuals' scale should clearly
+        # exceed TD residuals' scale.  Under the buggy slicing,
+        # last_resid_pr would be a mix of PR-scale and TD-scale rows,
+        # making this RMS comparison fail.
+        pr_rms = float(np.sqrt(np.mean(f.last_resid_pr ** 2)))
+        td_rms = float(np.sqrt(np.mean(f.last_resid_td ** 2)))
+        # PR is m-scale; TD is mm-scale.  Allow generous safety margin.
+        self.assertGreater(pr_rms, 10 * td_rms,
+            f"PR-scale RMS ({pr_rms:.4f}m) should be >>10× TD-scale "
+            f"RMS ({td_rms:.4f}m).  If they're comparable, last_resid_pr "
+            f"and last_resid_td are mixing rows — slicing bug.")
+
     def test_split_attribute_lengths_match_counts(self):
         """After any update, len(last_resid_pr) == last_n_pr,
         len(last_resid_td) == last_n_td."""

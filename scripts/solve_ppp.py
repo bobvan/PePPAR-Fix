@@ -1161,6 +1161,13 @@ class FixedPosFilter:
 
     def update(self, observations, sp3, t, clk_file=None):
         H_rows, z_rows, R_diag = [], [], []
+        # Per-row indices tracked during construction so post_resid can
+        # be split into pure-PR and pure-TD-CP residual vectors for
+        # the I-145915 watchdog redesign.  The construction loop below
+        # appends rows interleaved PER-SV, NOT block-ordered:
+        #   [SV1_PR, SV1_TD?, SV2_PR, SV2_TD?, …]
+        # so post_resid[:n_pr] does NOT yield the PR rows alone.
+        pr_idx, td_idx = [], []
         n_pr = 0
         n_td = 0
         current_geo = {}
@@ -1261,6 +1268,7 @@ class FixedPosFilter:
             h_pr[self.IDX_ZTD] = m_wet
             if isb_idx is not None:
                 h_pr[isb_idx] = 1.0
+            pr_idx.append(len(H_rows))
             H_rows.append(h_pr)
             z_rows.append(dz_pr)
             R_diag.append((SIGMA_P_IF / w) ** 2)
@@ -1284,6 +1292,7 @@ class FixedPosFilter:
                 h_td[0] = 1.0
                 h_td[self.IDX_ZTD] = m_wet  # ZTD change maps through wet MF
                 # ISB cancels in time difference (constant bias)
+                td_idx.append(len(H_rows))
                 H_rows.append(h_td)
                 z_rows.append(dz_td)
                 sigma_td = 0.3 / max(0.2, elev_factor)
@@ -1309,12 +1318,16 @@ class FixedPosFilter:
         except np.linalg.LinAlgError:
             self.prev_geo = current_geo
             self.prev_clock = self.x[0]
-            # Pre-fit residuals (z is innovation pre-update); split by
-            # PR-rows-first / TD-CP-rows-last per H_rows ordering.
+            # Pre-fit residuals (z is innovation pre-update); split via
+            # the per-row index lists tracked during construction.
+            # Cannot use z[:n_pr] / z[n_pr:n_pr+n_td] — rows are
+            # interleaved per-SV.
             self.last_n_pr = n_pr
             self.last_n_td = n_td
-            self.last_resid_pr = z[:n_pr].copy()
-            self.last_resid_td = z[n_pr:n_pr + n_td].copy()
+            self.last_resid_pr = (z[pr_idx].copy() if pr_idx
+                                  else np.array([]))
+            self.last_resid_td = (z[td_idx].copy() if td_idx
+                                  else np.array([]))
             return n_pr, z, n_td
 
         self.x = self.x + K @ z
@@ -1329,13 +1342,18 @@ class FixedPosFilter:
         self.prev_clock = self.x[0]
 
         # Domain-split residuals for the watchdog + diagnostic logging.
-        # Row ordering inside H_rows / z_rows / post_resid is PR rows
-        # first (loop body lines above), TD-CP rows last (added inside
-        # the `if self.initialized and obs has phi_if_m` block).
+        # H_rows is INTERLEAVED per-SV ([SV1_PR, SV1_TD?, SV2_PR, ...])
+        # because the construction loop appends each SV's PR row then
+        # its (optional) TD row before moving to the next SV.
+        # post_resid[:n_pr] would NOT yield the PR rows alone — it'd
+        # be a mix of early-SVs' PR + TD rows.  Use the per-row index
+        # lists tracked at append time instead.
         self.last_n_pr = n_pr
         self.last_n_td = n_td
-        self.last_resid_pr = post_resid[:n_pr].copy()
-        self.last_resid_td = post_resid[n_pr:n_pr + n_td].copy()
+        self.last_resid_pr = (post_resid[pr_idx].copy() if pr_idx
+                              else np.array([]))
+        self.last_resid_td = (post_resid[td_idx].copy() if td_idx
+                              else np.array([]))
 
         return n_pr + n_td, post_resid, n_td
 
