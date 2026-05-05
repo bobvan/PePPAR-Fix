@@ -3900,11 +3900,15 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     filt.predict(dt)
             prev_t = gps_time
 
-            # EKF update
-            n_used, resid, n_td = filt.update(
+            # EKF update — returns per-domain residuals so the
+            # watchdog can trip on TD-CP-domain growth without being
+            # spoofed by PR-domain noise (multipath / SSR latency /
+            # code-bias drift).  See I-145915 / time-filter-pr-cp-port.md.
+            n_pr, resid_pr, n_td, resid_td = filt.update(
                 observations, corrections, gps_time,
                 clk_file=corrections,
             )
+            n_used = n_pr + n_td
 
             if n_used < 4:
                 skip_stats["too_few_meas"] += 1
@@ -3930,9 +3934,23 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                                  "(AR σ=%.3fm)",
                                  float(np.linalg.norm(delta)), step_mm, ar_sigma)
 
-            # Watchdog with NAV2 position consensus
-            resid_rms = float(np.sqrt(np.mean(resid ** 2))) if len(resid) > 0 else 0.0
-            watchdog.update(resid_rms, n_used)
+            # Watchdog: trip on TD-CP-domain RMS only (sub-cm noise
+            # floor; movement-sensitive).  PR-domain RMS goes to a
+            # separate diagnostic-only PR_DISTURBANCE log so multipath
+            # / SSR-latency / code-bias-drift events are still visible
+            # in postmortem without re-seeding the filter.
+            resid_pr_rms = (float(np.sqrt(np.mean(resid_pr ** 2)))
+                            if len(resid_pr) > 0 else 0.0)
+            resid_td_rms = (float(np.sqrt(np.mean(resid_td ** 2)))
+                            if len(resid_td) > 0 else 0.0)
+            watchdog.update(resid_td_rms, n_used)
+            if (resid_pr_rms > watchdog.pr_disturbance_threshold_m
+                    and resid_pr_rms > 3.0 * resid_td_rms):
+                log.warning(
+                    "[PR_DISTURBANCE] resid_pr_rms=%.2fm "
+                    "resid_td_rms=%.3fm (PR-domain noise; "
+                    "watchdog gated on TD-CP)",
+                    resid_pr_rms, resid_td_rms)
             if watchdog.alarmed:
                 # Before giving up: check NAV2 secondary engine position.
                 # If NAV2 agrees with known_ecef, the antenna hasn't moved
@@ -4347,8 +4365,9 @@ def _bootstrap_measure_freq_and_clock(args, timestamper, known_ecef, obs_queue,
             filt.predict(dt)
         prev_t = gps_time
 
-        n_used, resid, n_td = filt.update(
+        n_pr, resid_pr, n_td, resid_td = filt.update(
             observations, corrections, gps_time, clk_file=corrections)
+        n_used = n_pr + n_td
         if n_used < 4:
             continue
 
@@ -7447,8 +7466,15 @@ Two-phase operation:
                           "project_mad_outlier_rejection_landed_20260426.md.")
     pos.add_argument("--timeout", type=int, default=3600,
                      help="Bootstrap timeout in seconds (default: 3600)")
-    pos.add_argument("--watchdog-threshold", type=float, default=0.5,
-                     help="Position watchdog threshold in meters (default: 0.5)")
+    pos.add_argument("--watchdog-threshold", type=float, default=0.05,
+                     help="Position watchdog threshold in meters of "
+                          "TD-CP-domain residual RMS (default: 0.05).  "
+                          "Post-I-145915, the watchdog trips only on "
+                          "carrier-phase residuals (sub-cm noise floor); "
+                          "pre-I-145915 the default was 0.5 m for the "
+                          "mixed PR + TD-CP RMS path that's no longer used.  "
+                          "PR-domain disturbances surface as PR_DISTURBANCE "
+                          "log warnings instead of watchdog trips.")
 
     # Serial
     serial = ap.add_argument_group("Serial")

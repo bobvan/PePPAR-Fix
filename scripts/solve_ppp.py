@@ -1152,6 +1152,14 @@ class FixedPosFilter:
 
     def update(self, observations, sp3, t, clk_file=None):
         H_rows, z_rows, R_diag = [], [], []
+        # Per-row indices into post_resid so callers can split PR-domain
+        # vs TD-CP-domain residuals separately.  Required for the
+        # PR/CP-split watchdog (I-145915 / docs/time-filter-pr-cp-port.md):
+        # PR rows have m-scale floor, TD-CP rows have sub-cm floor — RMS
+        # over the mixed vector is dominated by PR and trips on PR-domain
+        # noise.  Keeping per-row indices lets the engine compute
+        # resid_pr_rms and resid_td_rms separately.
+        pr_idx, td_idx = [], []
         n_pr = 0
         n_td = 0
         current_geo = {}
@@ -1252,6 +1260,7 @@ class FixedPosFilter:
             h_pr[self.IDX_ZTD] = m_wet
             if isb_idx is not None:
                 h_pr[isb_idx] = 1.0
+            pr_idx.append(len(H_rows))
             H_rows.append(h_pr)
             z_rows.append(dz_pr)
             R_diag.append((SIGMA_P_IF / w) ** 2)
@@ -1275,6 +1284,7 @@ class FixedPosFilter:
                 h_td[0] = 1.0
                 h_td[self.IDX_ZTD] = m_wet  # ZTD change maps through wet MF
                 # ISB cancels in time difference (constant bias)
+                td_idx.append(len(H_rows))
                 H_rows.append(h_td)
                 z_rows.append(dz_td)
                 sigma_td = 0.3 / max(0.2, elev_factor)
@@ -1284,7 +1294,7 @@ class FixedPosFilter:
         if n_pr < 1:
             self.prev_geo = current_geo
             self.prev_clock = self.x[0]
-            return 0, np.array([]), 0
+            return 0, np.array([]), 0, np.array([])
 
         H = np.array(H_rows)
         z = np.array(z_rows)
@@ -1296,7 +1306,12 @@ class FixedPosFilter:
         except np.linalg.LinAlgError:
             self.prev_geo = current_geo
             self.prev_clock = self.x[0]
-            return n_pr, z, n_td
+            # Filter math broke; return innovation split for caller
+            # logging visibility but the watchdog should not trip on
+            # pre-filter noise — caller gates this case via n_pr/n_td.
+            resid_pr = z[pr_idx] if pr_idx else np.array([])
+            resid_td = z[td_idx] if td_idx else np.array([])
+            return n_pr, resid_pr, n_td, resid_td
 
         self.x = self.x + K @ z
         I_KH = np.eye(self.N_STATES) - K @ H
@@ -1309,7 +1324,16 @@ class FixedPosFilter:
         self.prev_geo = current_geo
         self.prev_clock = self.x[0]
 
-        return n_pr + n_td, post_resid, n_td
+        # Split post_resid into PR-domain and TD-CP-domain rows.
+        # Rows are interleaved per-SV in the construction loop above
+        # (SV1_PR, SV1_TD, SV2_PR, ...) — pr_idx and td_idx index into
+        # them, so resid_pr[i] is the PR residual for the i-th SV that
+        # contributed a PR row, etc.  Callers (engine watchdog,
+        # I-145915 PR/CP-split) compute RMS over each domain
+        # separately and trip only on TD-CP-domain growth.
+        resid_pr = post_resid[pr_idx] if pr_idx else np.array([])
+        resid_td = post_resid[td_idx] if td_idx else np.array([])
+        return n_pr, resid_pr, n_td, resid_td
 
 
 # ── LS init (multi-GNSS, IF pseudorange) ─────────────────────────────────── #
