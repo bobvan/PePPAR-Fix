@@ -4,7 +4,7 @@ from peppar_fix.ptp_device import PtpDevice
 from peppar_fix.servo import PIServo
 from peppar_fix.error_sources import ErrorSource, compute_error_sources, PPPCalibration, CarrierPhaseTracker, ppp_qerr
 from peppar_fix.discipline import DisciplineScheduler
-from peppar_fix.watchdog import PositionWatchdog
+from peppar_fix.watchdog import PositionWatchdog, PositionWatchdogProposed
 from peppar_fix.correlation_gate import (
     CorrectionFreshnessGate,
     StrictCorrelationGate,
@@ -28,6 +28,7 @@ __all__ = [
     'PPPCalibration', 'CarrierPhaseTracker', 'ppp_qerr',
     'DisciplineScheduler',
     'PositionWatchdog',
+    'PositionWatchdogProposed',
     'StrictCorrelationGate',
     'CorrectionFreshnessGate',
     'match_pps_event_from_history',

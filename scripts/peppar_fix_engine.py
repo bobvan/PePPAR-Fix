@@ -181,6 +181,7 @@ from ticc import Ticc
 from peppar_fix import (
     CorrectionFreshnessGate,
     PositionWatchdog,
+    PositionWatchdogProposed,
     StrictCorrelationGate,
     TimebaseRelationEstimator,
     PPPCalibration,
@@ -3576,6 +3577,26 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     filt.initialized = True  # skip pseudorange seeding
     filt.prev_clock = 0.0
     watchdog = PositionWatchdog(threshold_m=args.watchdog_threshold)
+    # Shadow gate: TD-CP-only watchdog runs in parallel for I-145915
+    # bake-in.  Verdict logged per epoch but does NOT drive engine
+    # behavior until charlie's owner change flips it active.  See
+    # docs/time-filter-pr-cp-port.md + scripts/peppar_fix/watchdog.py.
+    watchdog_proposed = PositionWatchdogProposed(
+        threshold_m=0.05,                       # 50 mm TD-CP gate
+        pr_threshold_m=args.watchdog_threshold, # match active gate
+    )
+    # Counters for the [FIXEDPOS_RESID_SUMMARY] line at engine exit.
+    resid_log_stats = {
+        'epochs': 0,
+        'active_trips': 0,        # PositionWatchdog alarm transitions
+        'proposed_trips': 0,      # PositionWatchdogProposed alarm transitions
+        'pr_disturbances': 0,     # PR_DISTURBANCE flag epochs
+        'both_alarmed': 0,        # both gates simultaneously alarmed
+        'only_active': 0,         # active alarmed, proposed not
+        'only_proposed': 0,       # proposed alarmed, active not
+    }
+    _prev_active_alarmed = False
+    _prev_proposed_alarmed = False
     correction_gate = CorrectionFreshnessGate()
 
     # Optional servo setup (PTP imports only loaded when needed)
@@ -3932,7 +3953,55 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
 
             # Watchdog with NAV2 position consensus
             resid_rms = float(np.sqrt(np.mean(resid ** 2))) if len(resid) > 0 else 0.0
+
+            # PR / TD-CP residual split — populated by FixedPosFilter.update()
+            # via instance attributes (I-145915).  Falls back to safe defaults
+            # when the residual vector is empty.
+            n_pr_used = int(getattr(filt, 'last_n_pr', 0))
+            n_td_used = int(getattr(filt, 'last_n_td', 0))
+            r_pr = getattr(filt, 'last_resid_pr', np.array([]))
+            r_td = getattr(filt, 'last_resid_td', np.array([]))
+            resid_pr_rms = (float(np.sqrt(np.mean(r_pr ** 2)))
+                            if len(r_pr) > 0 else 0.0)
+            resid_td_rms = (float(np.sqrt(np.mean(r_td ** 2)))
+                            if len(r_td) > 0 else 0.0)
+
+            # Shadow watchdog evaluation (no behavior change today).
+            td_ok, pr_disturbance = watchdog_proposed.update(
+                resid_pr_rms, resid_td_rms, n_used)
+            resid_log_stats['epochs'] += 1
+            if pr_disturbance:
+                resid_log_stats['pr_disturbances'] += 1
+            # Trip-transition counters for the summary at exit.
+            if watchdog_proposed.alarmed and not _prev_proposed_alarmed:
+                resid_log_stats['proposed_trips'] += 1
+            _prev_proposed_alarmed = watchdog_proposed.alarmed
+
+            # Per-epoch instrumentation line.  Sparse cadence to keep
+            # the log readable; the bake-in goal is operator-visible
+            # divergence between the two gates, not high-frequency
+            # diagnostics.  Heartbeat every 60 epochs; always log
+            # transition events (alarm / clear / pr_disturbance).
+            _heartbeat = (n_epochs % 60 == 0)
+            if _heartbeat or pr_disturbance:
+                log.info(
+                    "[FIXEDPOS_RESID] n_pr=%d resid_pr_rms=%.3fm "
+                    "n_td=%d resid_td_rms=%.4fm "
+                    "active_alarmed=%s proposed_alarmed=%s%s",
+                    n_pr_used, resid_pr_rms, n_td_used, resid_td_rms,
+                    watchdog.alarmed, watchdog_proposed.alarmed,
+                    " PR_DISTURBANCE" if pr_disturbance else "",
+                )
+
             watchdog.update(resid_rms, n_used)
+            # Trip-transition counter for active gate.
+            if watchdog.alarmed and not _prev_active_alarmed:
+                resid_log_stats['active_trips'] += 1
+                if watchdog_proposed.alarmed:
+                    resid_log_stats['both_alarmed'] += 1
+                else:
+                    resid_log_stats['only_active'] += 1
+            _prev_active_alarmed = watchdog.alarmed
             if watchdog.alarmed:
                 # Before giving up: check NAV2 secondary engine position.
                 # If NAV2 agrees with known_ecef, the antenna hasn't moved
@@ -3959,6 +4028,9 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                             filt = FixedPosFilter(known_ecef)
                             prev_t = None
                             watchdog.reset()
+                            watchdog_proposed.reset()
+                            _prev_active_alarmed = False
+                            _prev_proposed_alarmed = False
                             if servo_ctx is not None:
                                 # Purge stale servo state so the servo
                                 # doesn't act on the corrupted dt_rx
@@ -4077,6 +4149,16 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
 
     elapsed = time.time() - start_time
     log.info(f"Steady state complete: {elapsed:.0f}s, {n_epochs} epochs")
+    # I-145915 bake-in summary — side-by-side gate verdicts.
+    rs = resid_log_stats
+    log.info(
+        "[FIXEDPOS_RESID_SUMMARY] epochs=%d active_trips=%d "
+        "proposed_trips=%d both_alarmed=%d only_active=%d "
+        "pr_disturbances=%d "
+        "(only_active = trips that would have STAYED under proposed gate)",
+        rs['epochs'], rs['active_trips'], rs['proposed_trips'],
+        rs['both_alarmed'], rs['only_active'], rs['pr_disturbances'],
+    )
     return gate_stats
 
 

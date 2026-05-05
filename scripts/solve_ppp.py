@@ -1085,6 +1085,15 @@ class FixedPosFilter:
         self.P = np.diag([1e18, 1e6, 0.5**2, 1e8, 1e8])  # dZTD: 0.5m initial sigma
         self.prev_geo = {}  # sv → {rho_corr, sat_clk_m, phi_if_m, tropo}
         self.initialized = False  # Will seed clock from first epoch
+        # Per-epoch residual breakdown — populated by update().  Lets
+        # the watchdog distinguish PR-domain noise (m-scale floor:
+        # code multipath + SSR latency) from TD-CP-domain residuals
+        # (sub-cm, real filter mismatch).  See I-145915 PR/CP
+        # residual-gating port + docs/time-filter-pr-cp-port.md.
+        self.last_n_pr = 0
+        self.last_n_td = 0
+        self.last_resid_pr = np.array([])
+        self.last_resid_td = np.array([])
 
     def predict(self, dt):
         if dt <= 0:
@@ -1284,6 +1293,10 @@ class FixedPosFilter:
         if n_pr < 1:
             self.prev_geo = current_geo
             self.prev_clock = self.x[0]
+            self.last_n_pr = 0
+            self.last_n_td = 0
+            self.last_resid_pr = np.array([])
+            self.last_resid_td = np.array([])
             return 0, np.array([]), 0
 
         H = np.array(H_rows)
@@ -1296,6 +1309,12 @@ class FixedPosFilter:
         except np.linalg.LinAlgError:
             self.prev_geo = current_geo
             self.prev_clock = self.x[0]
+            # Pre-fit residuals (z is innovation pre-update); split by
+            # PR-rows-first / TD-CP-rows-last per H_rows ordering.
+            self.last_n_pr = n_pr
+            self.last_n_td = n_td
+            self.last_resid_pr = z[:n_pr].copy()
+            self.last_resid_td = z[n_pr:n_pr + n_td].copy()
             return n_pr, z, n_td
 
         self.x = self.x + K @ z
@@ -1308,6 +1327,15 @@ class FixedPosFilter:
         # Store for next epoch's time differencing
         self.prev_geo = current_geo
         self.prev_clock = self.x[0]
+
+        # Domain-split residuals for the watchdog + diagnostic logging.
+        # Row ordering inside H_rows / z_rows / post_resid is PR rows
+        # first (loop body lines above), TD-CP rows last (added inside
+        # the `if self.initialized and obs has phi_if_m` block).
+        self.last_n_pr = n_pr
+        self.last_n_td = n_td
+        self.last_resid_pr = post_resid[:n_pr].copy()
+        self.last_resid_td = post_resid[n_pr:n_pr + n_td].copy()
 
         return n_pr + n_td, post_resid, n_td
 
