@@ -16,6 +16,7 @@ from peppar_fix.event_time import (
     merge_correlation_confidence,
 )
 from peppar_fix.timebase_estimator import TimebaseRelationEstimator
+from peppar_fix.tropo_state import TropoState, TropoTarget
 from peppar_fix import receiver
 from peppar_fix import receiver_state
 from peppar_fix import do_state
@@ -35,6 +36,7 @@ __all__ = [
     'estimate_correlation_confidence',
     'merge_correlation_confidence',
     'TimebaseRelationEstimator',
+    'TropoState', 'TropoTarget',
     'receiver',
     'receiver_state',
 ]

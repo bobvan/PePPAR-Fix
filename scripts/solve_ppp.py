@@ -465,9 +465,9 @@ class PPPFilter:
         sigma_y = self.rx_tcxo_adev_1s
         return (C * sigma_y) ** 2
 
-    def apply_ztd_tie(self, sigma_m: float) -> None:
+    def apply_ztd_tie(self, sigma_m: float, target_m: float = 0.0) -> None:
         """Apply a soft prior on the residual ZTD state as a rank-1 EKF
-        update (pseudo-measurement z=0, h=e_ZTD, R=σ²).
+        update (pseudo-measurement z=target_m, h=e_ZTD, R=σ²).
 
         Motivation: the (position-altitude, ZTD, clock, mean-ambiguity)
         tuple forms a near-null direction at typical receiver
@@ -476,11 +476,16 @@ class PPPFilter:
         and the filter wanders (day0426 smoke runs: ZTD swung 1.7m
         and altitude 18m within 5 minutes despite stable lock).
 
-        IDX_ZTD is the *residual* on top of Saastamoinen+GMF bulk
-        tropo, so a soft prior z=0 with σ ≈ 0.05 m says "the residual
-        should be small (Saastamoinen handles the bulk)".  Filter can
-        deviate when observations strongly support it.  This is an
-        *intentional* constraint on the null-mode, not a hard pin.
+        IDX_ZTD is the *residual* on top of the Saastamoinen+GMF bulk
+        tropo.  target_m=0 (default) says "the residual should be
+        small — Saastamoinen handles the bulk."  Engine callers can
+        instead pass a METAR-derived residual (Saastamoinen ZTD
+        minus the engine's 2.3 m apriori) to track real atmosphere
+        per I-132038 ZTD-target unification.
+
+        Filter can deviate when observations strongly support it.
+        This is an *intentional* constraint on the null-mode, not a
+        hard pin.
 
         See docs/ssr-phase-bias-step-handling.md (the slip-detection
         side of the same family of issues) and Bravo's day0423 PRIDE
@@ -488,7 +493,7 @@ class PPPFilter:
         """
         if sigma_m is None or sigma_m <= 0:
             return
-        y = -float(self.x[IDX_ZTD])                     # z=0 minus state
+        y = float(target_m) - float(self.x[IDX_ZTD])
         S = float(self.P[IDX_ZTD, IDX_ZTD]) + sigma_m ** 2
         K = self.P[:, IDX_ZTD] / S
         self.x = self.x + K * y
@@ -1085,6 +1090,27 @@ class FixedPosFilter:
         self.P = np.diag([1e18, 1e6, 0.5**2, 1e8, 1e8])  # dZTD: 0.5m initial sigma
         self.prev_geo = {}  # sv → {rho_corr, sat_clk_m, phi_if_m, tropo}
         self.initialized = False  # Will seed clock from first epoch
+
+    def apply_ztd_tie(self, sigma_m: float, target_m: float = 0.0) -> None:
+        """Soft prior on the residual ZTD state — rank-1 EKF update with
+        pseudo-measurement z=target_m, h=e_ZTD, R=σ².
+
+        Mirror of PPPFilter.apply_ztd_tie (see that docstring for the
+        null-mode-direction motivation).  target_m defaults to 0
+        (residual should stay near zero on top of the engine's 2.3 m
+        hydrostatic apriori).  Engine callers can pass a METAR-derived
+        residual to track real atmospheric pressure / temperature
+        changes — see I-132038 ZTD-target unification: both the position
+        filter and time filter tie to the same shared TropoState.target_m
+        every epoch so they model a consistent atmosphere.
+        """
+        if sigma_m is None or sigma_m <= 0:
+            return
+        y = float(target_m) - float(self.x[self.IDX_ZTD])
+        S = float(self.P[self.IDX_ZTD, self.IDX_ZTD]) + sigma_m ** 2
+        K = self.P[:, self.IDX_ZTD] / S
+        self.x = self.x + K * y
+        self.P = self.P - np.outer(K, self.P[self.IDX_ZTD, :])
 
     def predict(self, dt):
         if dt <= 0:
