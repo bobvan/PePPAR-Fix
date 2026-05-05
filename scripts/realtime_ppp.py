@@ -134,16 +134,21 @@ BIAS_MSG_TYPES = CODE_BIAS_MSG_TYPES | PHASE_BIAS_MSG_TYPES
 # TIM 2.25 at MadHat 2026-04-19.  Legacy BDS-2 signals (B1I, B2I, B3I) are
 # unaffected — they are reported in native cycles like GPS and GAL.
 #
-# B2a-I and B2a-Q are confirmed.  B1C is plausibly the same and listed here
-# tentatively so a GF-DIAG on a B1C-tracking receiver will produce clean
-# numbers if the quirk extends to it; drop from the set if diagnostics show
-# B1C in native cycles.
+# B2a-I and B2a-Q are confirmed on F9T.  B1C/B2a (B1CP/B1CD/B2aP/B2aD)
+# are listed here tentatively so a GF-DIAG on a B1C-tracking receiver
+# (NEO-F10T) will produce clean numbers if the quirk extends to that
+# chipset; drop entries here if diagnostics show native cycles.
 _LAMBDA_L1 = C / F_L1
 _BDS_L1_REF_CYCLES = {
     'BDS-B2aI', 'BDS-B2aQ',
     'BDS-B1C', 'BDS-B1CD', 'BDS-B1CP',  # tentative — not lab-confirmed yet
+    'BDS-B2aP', 'BDS-B2aD',              # F10 chipset BDS-3 modernized
 }
 
+# B1C sits at the L1 carrier (1575.42 MHz); B2a sits at the L5 carrier
+# (1176.45 MHz).  Wavelengths and IF coefficients reuse the GPS L1/L5
+# constants exactly — the carriers are identical, only the modulation
+# differs.
 SIG_WAVELENGTH = {
     'GPS-L1CA': C / F_L1,
     'GPS-L2CL': C / F_L2,
@@ -160,6 +165,10 @@ SIG_WAVELENGTH = {
     'BDS-B2I': C / F_B2I,
     'BDS-B2aI': C / F_L5,
     'BDS-B2aQ': C / F_L5,
+    'BDS-B1CP': C / F_L1,
+    'BDS-B1CD': C / F_L1,
+    'BDS-B2aP': C / F_L5,
+    'BDS-B2aD': C / F_L5,
 }
 
 IF_PAIR_PARAMS = {
@@ -169,6 +178,7 @@ IF_PAIR_PARAMS = {
     ('GAL-E1C', 'GAL-E5aQ'): ('E', ALPHA_L1, ALPHA_L5),
     ('BDS-B1I', 'BDS-B2I'): ('C', ALPHA_B1I_B2I, ALPHA_B2I),
     ('BDS-B1I', 'BDS-B2aI'): ('C', ALPHA_B1I, ALPHA_B2A),
+    ('BDS-B1CP', 'BDS-B2aP'): ('C', ALPHA_L1, ALPHA_L5),
 }
 
 
