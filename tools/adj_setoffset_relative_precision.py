@@ -59,18 +59,36 @@ def _parse_ptp_clock_time(buf, offset):
     return sec * 1_000_000_000 + nsec
 
 
-def read_phc_precise(fd):
-    """Returns (phc_ns, sys_realtime_ns, mono_raw_ns) atomically.
+CLOCK_MONOTONIC_RAW = 4
 
-    Uses PTP_SYS_OFFSET_PRECISE which kernel-correlates PHC with
-    sys_realtime + mono_raw via cross-timestamping.
+
+def read_phc_precise(fd):
+    """Returns (phc_ns, sys_realtime_ns, mono_raw_ns).
+
+    Tries PTP_SYS_OFFSET_PRECISE (kernel cross-timestamp) first.
+    Falls back to user-space sandwiched clock_gettime calls — read
+    MONO_RAW, then PHC, then MONO_RAW; interpolate MONO mid-point.
+    User-space cross-timestamp uncertainty is the read latency
+    bracket (~tens of ns typically), much smaller than per-call
+    PHC drift.
     """
     import fcntl
+    import time as _time
     buf = bytearray(PTP_SYS_OFFSET_PRECISE_SIZE)
-    fcntl.ioctl(fd, PTP_SYS_OFFSET_PRECISE, buf, True)
-    return (_parse_ptp_clock_time(buf, 0),
-            _parse_ptp_clock_time(buf, 16),
-            _parse_ptp_clock_time(buf, 32))
+    try:
+        fcntl.ioctl(fd, PTP_SYS_OFFSET_PRECISE, buf, True)
+        return (_parse_ptp_clock_time(buf, 0),
+                _parse_ptp_clock_time(buf, 16),
+                _parse_ptp_clock_time(buf, 32))
+    except OSError:
+        pass
+    # Fallback: bracket the PHC read with two MONO_RAW reads.
+    phc_clkid = (~fd << 3) | 3
+    mono_pre = _time.clock_gettime_ns(CLOCK_MONOTONIC_RAW)
+    phc = _time.clock_gettime_ns(phc_clkid)
+    mono_post = _time.clock_gettime_ns(CLOCK_MONOTONIC_RAW)
+    sys_now = _time.clock_gettime_ns(_time.CLOCK_REALTIME)
+    return (phc, sys_now, (mono_pre + mono_post) // 2)
 
 
 def adj_setoffset(fd, offset_ns):
