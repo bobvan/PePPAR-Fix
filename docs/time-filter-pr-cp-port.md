@@ -122,29 +122,58 @@ disturbances so we still see them.
 
 **Engine change** (`scripts/peppar_fix_engine.py:run_steady_state`):
 
-The `filt.update()` already returns `n_pr` and `n_td` counts
-separately (line 1212 in `solve_ppp.py`).  Plumb the residual
-*splits* alongside, then feed PR-row RMS and TD-CP-row RMS to the
-watchdog as separate signals.  Trip on TD-CP-row RMS exceeding the
-limit; log a `[PR_DISTURBANCE]` WARNING when PR-row RMS exceeds
-limit but TD-CP is fine (so we still see the multipath/SSR/code-bias
-events for postmortem).
+The `filt.update()` currently returns `(n_used, post_resid, n_td)`
+where n_used = n_pr + n_td (charlie 2026-05-05 verification).
+**PR rows and TD-CP rows are interleaved per-SV in `post_resid`**,
+not block-separated — the construction loop appends per SV in
+order `[SV1_PR, SV1_TD, SV2_PR, SV2_TD, ...]`, with TD rows present
+only when the SV has a valid time-difference.  We can't slice;
+we need to track row indices during construction.
+
+Inside `FixedPosFilter.update`, accumulate `pr_row_idx` and `td_row_idx`
+lists alongside `H_rows` / `z_rows`.  After the Kalman update,
+slice `post_resid` by these index lists to get the two residual
+streams.  Three return paths in `update()` need updating:
 
 ```python
-# inside FixedPosFilter.update — already computes residuals per-row
-# expose them via the return tuple:
-return n_pr, post_resid_pr, n_td, post_resid_td  # was: n_pr, post_resid, n_td
+# main return at line 1312
+return n_used, post_resid_pr, post_resid_td, n_td
 
+# cold-start guard at line 1287
+return 0, np.array([]), np.array([]), 0
+
+# LinAlgError fallback at line 1299
+# returns z (innovation, pre-filter), not post_resid.  For the
+# watchdog purpose we want post-fit residuals; on LinAlgError
+# return empty arrays so the trip indicator does not fire on
+# pre-filter innovation.
+return n_used, np.array([]), np.array([]), n_td
+```
+
+Caller blast radius — only TWO sites for FixedPosFilter in
+`scripts/peppar_fix_engine.py`: lines 3904 (`run_steady_state`
+main loop) and 4350 (a second steady_state path).  PPPFilter
+has its own different signature (third element is a dict, not
+int) at lines 1369 and 2606 — those are NOT in scope for this
+port; grep carefully.
+
+```python
 # in the engine:
-n_pr, resid_pr, n_td, resid_td = filt.update(...)
-resid_pr_rms  = float(np.sqrt(np.mean(resid_pr  ** 2))) if len(resid_pr)  else 0.0
-resid_td_rms  = float(np.sqrt(np.mean(resid_td  ** 2))) if len(resid_td)  else 0.0
+n_used, resid_pr, resid_td, n_td = filt.update(...)
+resid_pr_rms = float(np.sqrt(np.mean(resid_pr ** 2))) if len(resid_pr) else 0.0
+resid_td_rms = float(np.sqrt(np.mean(resid_td ** 2))) if len(resid_td) else 0.0
 watchdog.update(resid_td_rms, n_used)        # CP-domain witness drives the trip
 if resid_pr_rms > resid_pr_disturbance_threshold:
     log.warning("[PR_DISTURBANCE] resid_pr_rms=%.1f m  resid_td_rms=%.3f m "
                 "(PR multipath/code-bias; not tripping watchdog)",
                 resid_pr_rms, resid_td_rms)
 ```
+
+**Cold-start gating.**  In the first ~60 epochs after FixedPosFilter
+is constructed, residuals haven't converged and TD-CP residuals can
+be larger than steady-state.  Watchdog must not trip during this
+baseline-learning window — check via `filt.initialized` flag or an
+epoch counter.  Charlie is covering this in unit tests.
 
 **Watchdog change** (`scripts/peppar_fix/watchdog.py`): rename
 internal field `threshold_m` to `threshold_td_m` for clarity (the
