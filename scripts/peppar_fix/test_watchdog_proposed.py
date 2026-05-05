@@ -153,5 +153,123 @@ class ResetTest(unittest.TestCase):
                         "fresh post-reset epoch is during learn-in, no trip")
 
 
+class AutoClearTest(unittest.TestCase):
+    """Auto-clear semantics added 2026-05-05.  Once a disturbance ends
+    and TD-CP residuals fall back below threshold for `release_count`
+    consecutive epochs, the alarm clears so the gate is ready to flag
+    the next disturbance.  Without this the gate latched permanently
+    after a brief reacquire transient on clkPoC3 even though residuals
+    recovered to baseline within seconds."""
+
+    def test_alarm_clears_after_release_count_clean_epochs(self):
+        wd = PositionWatchdogProposed(threshold_m=0.05, alarm_count=10,
+                                      release_count=30)
+        _learn_baseline(wd, pr_rms=0.5, td_rms=0.005)
+        # Trip on sustained TD-CP elevation.
+        for _ in range(15):
+            wd.update(0.5, 1.0, 12)
+        self.assertTrue(wd.alarmed, "trips after 10 elevated epochs")
+        # Residuals back to clean for less than release_count epochs:
+        # alarm should NOT clear yet.
+        for _ in range(29):
+            td_ok, _ = wd.update(0.5, 0.005, 12)
+        self.assertTrue(wd.alarmed, "still latched at release_count - 1")
+        self.assertFalse(td_ok)
+        # One more clean epoch hits release_count → alarm clears.
+        td_ok, _ = wd.update(0.5, 0.005, 12)
+        self.assertFalse(wd.alarmed, "auto-cleared at release_count")
+        self.assertTrue(td_ok)
+
+    def test_re_trip_after_auto_clear(self):
+        # Verify the gate can detect a SECOND disturbance after the
+        # first one cleared — exactly the scenario where the original
+        # latch failed (proposed gate latched and missed any later
+        # event).
+        wd = PositionWatchdogProposed(threshold_m=0.05, alarm_count=10,
+                                      release_count=30)
+        _learn_baseline(wd, pr_rms=0.5, td_rms=0.005)
+        # First trip + auto-clear.
+        for _ in range(15):
+            wd.update(0.5, 1.0, 12)
+        self.assertTrue(wd.alarmed)
+        for _ in range(30):
+            wd.update(0.5, 0.005, 12)
+        self.assertFalse(wd.alarmed)
+        # Second elevation should trip again.
+        for _ in range(15):
+            wd.update(0.5, 1.0, 12)
+        self.assertTrue(wd.alarmed, "second disturbance trips post-clear")
+
+    def test_brief_below_threshold_does_not_clear(self):
+        # If residuals dip below threshold for fewer than release_count
+        # epochs and then go back over, the alarm stays latched and
+        # the dip doesn't reset bad_count progress toward re-asserting.
+        wd = PositionWatchdogProposed(threshold_m=0.05, alarm_count=10,
+                                      release_count=30)
+        _learn_baseline(wd, pr_rms=0.5, td_rms=0.005)
+        for _ in range(15):
+            wd.update(0.5, 1.0, 12)
+        self.assertTrue(wd.alarmed)
+        # Brief dip (5 clean epochs) then back to elevated:
+        for _ in range(5):
+            wd.update(0.5, 0.005, 12)
+        self.assertTrue(wd.alarmed, "brief dip < release_count, still alarmed")
+        for _ in range(5):
+            wd.update(0.5, 1.0, 12)
+        self.assertTrue(wd.alarmed, "back over threshold, still alarmed")
+
+    def test_below_count_resets_when_residual_re_elevates(self):
+        # Internal bookkeeping: if the dip-then-spike pattern doesn't
+        # accumulate clean-epoch credit toward release, the gate must
+        # require a fresh 30 clean epochs after the second spike.
+        wd = PositionWatchdogProposed(threshold_m=0.05, alarm_count=10,
+                                      release_count=30)
+        _learn_baseline(wd, pr_rms=0.5, td_rms=0.005)
+        for _ in range(15):
+            wd.update(0.5, 1.0, 12)
+        self.assertTrue(wd.alarmed)
+        # Dip 20 (would have been close to release), then spike 1 ep,
+        # then dip 29.  After dip-spike-dip sequence the second dip
+        # alone (29 < 30) must NOT clear.
+        for _ in range(20):
+            wd.update(0.5, 0.005, 12)
+        wd.update(0.5, 1.0, 12)            # one over-threshold epoch
+        for _ in range(29):
+            wd.update(0.5, 0.005, 12)
+        self.assertTrue(wd.alarmed, "below_count was reset by spike")
+        # One more clean epoch (now 30 since spike) → clear.
+        wd.update(0.5, 0.005, 12)
+        self.assertFalse(wd.alarmed)
+
+
+class FloorTest(unittest.TestCase):
+    """The floor bump (threshold_m default 0.05 → 0.50) lets the gate
+    tolerate normal cycle-slip cleanup and reacquire transients on
+    clean-baseline receivers.  The original 50 mm floor caused
+    clkPoC3 (F10T, baseline ~3 mm) to false-trip on a 60 s reacquire."""
+
+    def test_default_floor_is_500mm(self):
+        wd = PositionWatchdogProposed()
+        self.assertEqual(wd.threshold_m, 0.50)
+
+    def test_clean_baseline_500mm_floor_passes_short_transient(self):
+        # Simulate the clkPoC3 reacquire profile (TD-CP residual decays
+        # from hundreds of metres back to ~0.2 m over ~10 epochs)
+        # against the new 500 mm floor.  Without the bump the gate
+        # tripped at 10 elevated epochs; with the bump it should not.
+        wd = PositionWatchdogProposed()  # default threshold_m=0.50
+        _learn_baseline(wd, pr_rms=5.0, td_rms=0.003)
+        # Reacquire transient — residuals high but decaying.  Most are
+        # well over 500 mm floor for the first ~6 epochs.
+        for td in [620.0, 280.0, 90.0, 35.0, 16.0, 8.0, 4.5, 3.0, 2.0,
+                   0.4, 0.21, 0.18, 0.15, 0.12, 0.08]:
+            wd.update(5.0, td, 12)
+        # Last several epochs at 0.4-0.08 m are below the 500 mm floor
+        # → bad_count resets; only the first 9 over-threshold epochs
+        # accumulated, fewer than alarm_count=10.  No trip.
+        self.assertFalse(wd.alarmed,
+                         "500 mm floor + decaying transient → no trip")
+
+
 if __name__ == "__main__":
     unittest.main()

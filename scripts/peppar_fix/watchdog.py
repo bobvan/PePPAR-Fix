@@ -85,35 +85,51 @@ class PositionWatchdog:
 class PositionWatchdogProposed:
     """Shadow watchdog that gates on TD-CP-row RMS only.
 
-    Mirror of PositionWatchdog's baseline-then-trip-window logic but
-    fed the carrier-phase-domain residual instead of the combined
-    one.  Trips trigger an _alarmed state but NEVER drive engine
-    behavior during the bake-in window — they're emitted to the log
-    for offline comparison against PositionWatchdog's verdict.
+    Reframed 2026-05-05: this is a "trust the position right now?"
+    detector, not an "antenna moved permanently" classifier.  Trips
+    on any sustained TD-CP-domain disturbance (real ARP move, RF
+    loss, sustained multipath) so the engine can mute PPS during
+    the disturbance.  The cause is a diagnostic, not a gating
+    concern.
 
-    threshold_m default 0.05 (50 mm) reflects TD-CP residuals
-    typically being two orders of magnitude tighter than PR
-    residuals at IGS-class quality.  baseline×3 multiplier is the
-    same shape as PositionWatchdog so behavior is comparable up
-    to the threshold floor.
+    Two semantic changes from the original draft:
 
-    A separate "PR_DISTURBANCE" verdict surfaces when the PR-row
-    RMS is high (would have tripped the current gate) but the
-    TD-CP-row RMS is fine — the case the redesign is built around.
-    Threshold for PR_DISTURBANCE matches PositionWatchdog's gate
-    on the PR-row signal alone.
+    1.  Floor raised 50 mm → 500 mm in max(baseline×3, baseline +
+        threshold_m).  A clean F10T baseline of ~3 mm gave a 53 mm
+        gate floor that tripped on a 60 s reacquire transient
+        (clkPoC3 2026-05-05).  Bumping the floor to 500 mm lets
+        normal cycle-slip cleanup pass; sustained TD-CP residuals
+        beyond half a meter are real disturbances either way.
+        One bump, no further tuning — even with a higher floor,
+        a 30 s outage might trip while a 90 s one might not, and
+        that's fine: the gate is correct to mute PPS during *any*
+        sustained disturbance.
+
+    2.  Auto-clear: once `alarm_count` consecutive over-threshold
+        epochs trip the latch, `release_count` consecutive
+        under-threshold epochs clear it.  Without auto-clear the
+        gate latched permanently after a brief reacquire on
+        2026-05-05 even though residuals recovered to baseline
+        within seconds.  The gate is now event-driven, not
+        permanent.  reset() still exists for explicit re-init.
+
+    The companion PR_DISTURBANCE shadow (PR-row RMS over its own
+    baseline gate) is unchanged — still informational, still
+    captures cases where PR explodes but TD-CP is fine.
     """
 
-    def __init__(self, threshold_m=0.05, window=30, alarm_count=10,
-                 pr_threshold_m=0.5):
+    def __init__(self, threshold_m=0.50, window=30, alarm_count=10,
+                 release_count=30, pr_threshold_m=0.5):
         self.threshold_m = threshold_m
         self.pr_threshold_m = pr_threshold_m
         self.window = window
         self.alarm_count = alarm_count
+        self.release_count = release_count
         # TD-CP-domain trip state.
         self._td_residuals = []
         self._td_baseline_rms = None
         self._td_bad_count = 0
+        self._td_below_count = 0
         self._alarmed = False
         # PR-domain shadow (for PR_DISTURBANCE logging only).
         self._pr_residuals = []
@@ -160,17 +176,23 @@ class PositionWatchdogProposed:
                        self._td_baseline_rms + self.threshold_m)
         if resid_td_rms > td_limit:
             self._td_bad_count += 1
+            self._td_below_count = 0
             if (self._td_bad_count >= self.alarm_count
                     and not self._alarmed):
                 self._alarmed = True
             return (not self._alarmed), pr_disturbance
+        # Residual back below threshold: count toward auto-clear.
         self._td_bad_count = 0
-        return True, pr_disturbance
+        self._td_below_count += 1
+        if self._alarmed and self._td_below_count >= self.release_count:
+            self._alarmed = False
+        return (not self._alarmed), pr_disturbance
 
     def reset(self):
         """Reset both TD-CP and PR shadow baselines."""
         self._alarmed = False
         self._td_bad_count = 0
+        self._td_below_count = 0
         self._td_baseline_rms = None
         self._td_residuals = []
         self._pr_baseline_rms = None
