@@ -4809,20 +4809,30 @@ def _do_bootstrap_phc(args, ptp, pps_freq_ppb, pps_freq_unc,
             log.info("Step: residual=%+.0f ns, attempts=%d, %s",
                      residual, attempts, "ACCEPTED" if met else "DEADLINE")
 
-        # Verify via next PPS edge
+        # Verify via next PPS edge — pure PHC-domain measurement.
+        # v_sub_ns = signed nanoseconds from the nearest PHC integer
+        # second to the PPS edge.  Previously we computed v_target from
+        # CLOCK_REALTIME which is freerunning on these hosts (no NTP /
+        # PTP / ts2phc), accumulating ~600 ppb rate offset from the PHC
+        # TCXO during the 3-second verify wait; that drift was being
+        # reported as "phi_0" with µs-scale magnitude that did not
+        # reflect the actual ADJ_SETOFFSET step precision (which the
+        # tools/adj_setoffset_relative_precision characterization shows
+        # is ~50 ns median / ~200 ns p95 on i226 once the offset has
+        # propagated).  Using only v_sub_ns gives the real residual.
+        # The remaining ±4 ns F9T qErr offset is uncorrected here; when
+        # the engine threads qErr through to this point, subtract it.
+        # See I-013346-main.
         ptp.enable_extts(extts_ch, rising_edge=True)
         evt = ptp.read_one_rising_edge(timeout_s=3.0)
         if evt is not None:
-            v_realtime_ns = time.clock_gettime_ns(time.CLOCK_REALTIME)
-            v_sec, v_nsec = evt[0], evt[1]
-            v_rounded = v_sec if v_nsec < 500_000_000 else v_sec + 1
-            v_target = round(v_realtime_ns / 1_000_000_000) + offset_s
-            v_epoch_off = v_rounded - v_target
+            v_nsec = evt[1]
             v_sub_ns = (v_nsec if v_nsec < 500_000_000
                         else v_nsec - 1_000_000_000)
-            phi_0 = v_epoch_off * 1_000_000_000 + v_sub_ns
-            log.info("PPS verify: phi_0 = %+.0f ns (epoch_offset=%d)",
-                     phi_0, v_epoch_off)
+            phi_0 = v_sub_ns
+            log.info("PPS verify: phi_0 = %+.0f ns "
+                     "(PHC offset from F9T PPS edge; ±4 ns qErr "
+                     "uncorrected)", phi_0)
         else:
             log.warning("No PPS event — assuming step landed at 0")
             phi_0 = 0
