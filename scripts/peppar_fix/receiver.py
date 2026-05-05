@@ -331,7 +331,7 @@ class F10TDriver(ReceiverDriver):
     """
     name = "NEO-F10T"
     protver = "42"
-    default_baud = 115200
+    default_baud = 38400  # F10T datasheet default; configure_uart_baud can raise it
     supports_timing_mode = False
     supports_l5_health_override = False
     signal_names = F10T_SIGNAL_NAMES
