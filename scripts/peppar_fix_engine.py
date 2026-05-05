@@ -4790,6 +4790,13 @@ def _do_bootstrap_phc(args, ptp, pps_freq_ppb, pps_freq_unc,
         try:
             log.info("Stepping PHC by %+.0f ns (ADJ_SETOFFSET)", -phase_error_ns)
             ptp.adj_setoffset(-phase_error_ns)
+            # ADJ_SETOFFSET on i226 has ~1.7 µs late-application
+            # propagation delay that decays in <1 ms.  Sleep 1 ms so any
+            # subsequent readback / verify sees the offset fully applied.
+            # Characterisation: tools/adj_setoffset_relative_precision.py
+            # shows median/p95 drops from 1777/1906 ns at wait=0 to
+            # 57/200 ns at wait=1 ms.
+            time.sleep(0.001)
         except OSError as e:
             log.warning("ADJ_SETOFFSET failed (%s), falling back to optimal stopping", e)
             pps_anchor_ns = target_sec * 1_000_000_000
