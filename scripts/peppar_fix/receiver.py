@@ -243,6 +243,14 @@ class ReceiverDriver:
     signal_names = SIGNAL_NAMES
     sys_map = SYS_MAP
     if_pairs = ()
+    # Set of signal names whose cpMes the receiver reports in L1-reference
+    # cycles instead of native carrier cycles.  Populated per-driver from
+    # lab measurements — wrong-direction membership applies a 25%-class
+    # bias to carrier phase that the filter dumps into clock + ZTD over
+    # tens of seconds.  Verified on clkPoC3 2026-05-05 that F10T's TIM
+    # 3.01 reports native cycles (empty set is correct for F10T); F9T's
+    # TIM 2.25 quirk is captured in F9TDriver.
+    bds_l1_ref_cycles = frozenset()
 
     def signal_name(self, gnss_id, sig_id):
         return self.signal_names.get((gnss_id, sig_id))
@@ -269,6 +277,10 @@ class F9TDriver(ReceiverDriver):
         ('GAL', 'GAL-E1C', 'GAL-E5aQ', 'E'),
         ('BDS', 'BDS-B1I', 'BDS-B2I', 'C'),
     )
+    # F9T TIM 2.25 reports BDS-3 modernized cpMes in L1-reference cycles.
+    # The L1/L2 profile doesn't track B2a but the set is harmless if
+    # included since the receiver wouldn't emit those signals anyway.
+    bds_l1_ref_cycles = frozenset({'BDS-B2aI', 'BDS-B2aQ'})
 
     def build_tmode_fixed_msg(self, ecef):
         _ensure_imports()

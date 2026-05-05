@@ -127,23 +127,22 @@ PHASE_BIAS_MSG_TYPES = {
 BIAS_MSG_TYPES = CODE_BIAS_MSG_TYPES | PHASE_BIAS_MSG_TYPES
 
 
-# u-blox F9T reports BDS-3 modernized-signal cpMes in L1-reference cycles
-# (i.e. the reported cycle count, when scaled by λ_L1, equals the geometric
-# path).  To obtain native-carrier cycles, multiply the reported cpMes by
-# (λ_L1 / λ_native) = F_native/F_L1.  Verified empirically on ZED-F9T
-# TIM 2.25 at MadHat 2026-04-19.  Legacy BDS-2 signals (B1I, B2I, B3I) are
-# unaffected — they are reported in native cycles like GPS and GAL.
+# Some u-blox firmware variants report BDS-3 modernized-signal cpMes
+# in L1-reference cycles (i.e. the reported cycle count, when scaled by
+# λ_L1, equals the geometric path).  To obtain native-carrier cycles,
+# multiply the reported cpMes by (λ_L1 / λ_native) = F_native/F_L1.
 #
-# B2a-I and B2a-Q are confirmed on F9T.  B1C/B2a (B1CP/B1CD/B2aP/B2aD)
-# are listed here tentatively so a GF-DIAG on a B1C-tracking receiver
-# (NEO-F10T) will produce clean numbers if the quirk extends to that
-# chipset; drop entries here if diagnostics show native cycles.
+# This is per-driver because the quirk is firmware-specific:
+#   - F9T TIM 2.25: BDS-B2aI, BDS-B2aQ in L1-ref cycles (lab-confirmed
+#     MadHat 2026-04-19).  Legacy BDS-2 signals are in native cycles.
+#   - F10T TIM 3.01: native cycles for everything (lab-confirmed
+#     clkPoC3 2026-05-05 via the GPS+GAL-vs-GPS+GAL+BDS A/B —
+#     applying the F9T correction caused 25%-class carrier-phase bias
+#     that compounded into ZTD blow-up of >50 m within a minute).
+#
+# The active set comes from driver.bds_l1_ref_cycles; this λ_L1 lookup
+# stays in module scope because the correction math doesn't change.
 _LAMBDA_L1 = C / F_L1
-_BDS_L1_REF_CYCLES = {
-    'BDS-B2aI', 'BDS-B2aQ',
-    'BDS-B1C', 'BDS-B1CD', 'BDS-B1CP',  # tentative — not lab-confirmed yet
-    'BDS-B2aP', 'BDS-B2aD',              # F10 chipset BDS-3 modernized
-}
 
 # B1C sits at the L1 carrier (1575.42 MHz); B2a sits at the L5 carrier
 # (1176.45 MHz).  Wavelengths and IF coefficients reuse the GPS L1/L5
@@ -640,6 +639,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
     # Signal name mapping from receiver driver
     SIG_NAMES = driver.signal_names
     SYS_MAP = driver.sys_map
+    bds_l1_ref_cycles = driver.bds_l1_ref_cycles
 
     pair_config = getattr(driver, 'if_pairs', None) or IF_PAIRS
     sig_lookup = {}
@@ -784,7 +784,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                     # consumer (GF slip detector, MW wide-lane, IF
                     # ambiguity, integer resolution) sees the physical
                     # quantity it was designed for.
-                    if cp is not None and cp_valid and sig_name in _BDS_L1_REF_CYCLES:
+                    if cp is not None and cp_valid and sig_name in bds_l1_ref_cycles:
                         # cp_native = cp_L1 * (f_native / f_L1)
                         #           = cp_L1 * λ_L1 / λ_native
                         cp *= _LAMBDA_L1 / SIG_WAVELENGTH[sig_name]
