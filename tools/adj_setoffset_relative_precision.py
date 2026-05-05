@@ -154,12 +154,22 @@ def main():
                     help="Number of trials (default 200)")
     ap.add_argument("--offset-range-us", type=float, default=100.0,
                     help="Random offset uniform in ±range µs (default 100)")
+    ap.add_argument("--wait-ms", type=float, default=0.0,
+                    help="Sleep between syscall and readback (default 0). "
+                         "Set non-zero to test whether the systematic "
+                         "ADJ_SETOFFSET propagation delay decays with time.")
+    ap.add_argument("--pre-bias-ns", type=int, default=0,
+                    help="Add this to every requested offset to compensate "
+                         "for the systematic late-application. After "
+                         "characterising the systematic, set to its "
+                         "negative (e.g. +1737 if signed mean is -1737).")
     ap.add_argument("--restore", action="store_true", default=True,
                     help="Apply -offset after each test to leave PHC ~unchanged")
     args = ap.parse_args()
 
     fd = os.open(args.ptp_dev, os.O_RDWR)
     try:
+        import time as _time
         residuals_ns = []
         offsets_used_ns = []
         elapsed_mono_ns = []
@@ -168,7 +178,9 @@ def main():
             offset_ns = int(random.uniform(-args.offset_range_us * 1000.0,
                                            args.offset_range_us * 1000.0))
             phc_a, _sys_a, mono_a = read_phc_precise(fd)
-            adj_setoffset(fd, offset_ns)
+            adj_setoffset(fd, offset_ns + args.pre_bias_ns)
+            if args.wait_ms > 0:
+                _time.sleep(args.wait_ms / 1000.0)
             phc_b, _sys_b, mono_b = read_phc_precise(fd)
 
             elapsed_mono = mono_b - mono_a
@@ -180,7 +192,7 @@ def main():
             elapsed_mono_ns.append(elapsed_mono)
 
             if args.restore:
-                adj_setoffset(fd, -offset_ns)
+                adj_setoffset(fd, -(offset_ns + args.pre_bias_ns))
 
         abs_res = [abs(r) for r in residuals_ns]
         abs_res.sort()
