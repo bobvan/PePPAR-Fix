@@ -191,7 +191,14 @@ class DOFreqEst:
         # z_ticc = -φ_phc - qerr(φ_tcxo) → φ_phc = -z - qerr(φ_tcxo)
         # Must happen before any Kalman update so the first innovation
         # is near zero and doesn't corrupt the rx TCXO state.
-        if self._need_phc_seed:
+        #
+        # no-gnss-pps experiment: when offset_ns is None there is no
+        # TICC measurement available — leave φ_phc at its initial
+        # value (the constructor's default) and let the LQR / PPP
+        # path develop the state.  The seed is purely a numerical
+        # convenience to avoid a large first-epoch innovation; the
+        # dynamics handle the rest.
+        if self._need_phc_seed and offset_ns is not None:
             self.x[2] = -offset_ns - _qerr(self.x[0], self.tick_ns)
             # Reduce P[2,2] to match TICC measurement accuracy (~3 ns).
             # This prevents TICC innovations from leaking too much into
@@ -234,15 +241,26 @@ class DOFreqEst:
             P_pred = P_pred - np.outer(K_ppp.flatten(), K_ppp.flatten()) * S_ppp
 
         # ── Kalman update 2: raw TICC (nonlinear) ──
-        z_ticc = offset_ns
-        h_pred = self._h_ticc(x_pred)
-        innov_ticc = z_ticc - h_pred
-        H_ticc = self._H_ticc(x_pred)
-        S_ticc = (H_ticc @ P_pred @ H_ticc.T + self.R_ticc).item()
-        K_ticc = (P_pred @ H_ticc.T) / S_ticc
+        # no-gnss-pps experiment: when offset_ns is None this update
+        # is skipped — the EKF runs PPP-only.  φ_phc and f_phc become
+        # observable only through the dynamics (F propagation of the
+        # PPP-constrained x[0]/x[1] into x[2]/x[3]) and the LQR's
+        # control feedback.  This is the existence-proof setting:
+        # can the engine drive the DO using nothing but the PPP
+        # carrier-phase clock estimate?
+        if offset_ns is not None:
+            z_ticc = offset_ns
+            h_pred = self._h_ticc(x_pred)
+            innov_ticc = z_ticc - h_pred
+            H_ticc = self._H_ticc(x_pred)
+            S_ticc = (H_ticc @ P_pred @ H_ticc.T + self.R_ticc).item()
+            K_ticc = (P_pred @ H_ticc.T) / S_ticc
 
-        self.x = x_pred + K_ticc.flatten() * innov_ticc
-        self.P = P_pred - np.outer(K_ticc.flatten(), K_ticc.flatten()) * S_ticc
+            self.x = x_pred + K_ticc.flatten() * innov_ticc
+            self.P = P_pred - np.outer(K_ticc.flatten(), K_ticc.flatten()) * S_ticc
+        else:
+            self.x = x_pred
+            self.P = P_pred
 
         # ── LQR control ──
         # Only L[2] (φ_phc) and L[3] (f_phc) are nonzero.

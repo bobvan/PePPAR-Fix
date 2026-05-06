@@ -6403,21 +6403,26 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         if mode_gain_floor is not None:
             gain_scale = max(gain_scale, mode_gain_floor)
 
-        # DOFreqEst EKF: pass raw TICC (no qErr) + PPP dt_rx.
-        # Use actual wall-clock elapsed time, not n_samples — the EKF's
-        # process model must match real elapsed time for correct prediction.
-        # This lets the scheduler interval float above 1 without breaking
-        # the EKF, reducing actuation noise at short tau.
+        # no-gnss-pps experiment: hardwire offset_ns=None so the
+        # DOFreqEst EKF skips its TICC-based seed and TICC measurement
+        # update — the servo runs on PPP dt_rx alone.  This is the
+        # actual existence-proof test that the source-competition
+        # lockout was *supposed* to be (but turned out to be cosmetic
+        # because servo.update was hardcoded to consume pps_err_ticc_ns).
+        # See docs/no-gnss-pps-experiment.md.
+        #
+        # The previous else-branch ("hold previous frequency when
+        # pps_err_ticc_ns is None") was the source of the post-chB-
+        # disconnect drift observed 2026-05-06 — the engine wasn't
+        # holding lock, it was holding a stale adjfine while the DO
+        # free-ran.  Now we always call servo.update; the EKF's PPP
+        # update and dynamics produce the new adjfine.
         now_mono = time.monotonic()
         dt_actual = now_mono - ctx['last_correction_mono']
         ctx['last_correction_mono'] = now_mono
-        if pps_err_ticc_ns is not None:
-            adjfine_ppb = -servo.update(
-                pps_err_ticc_ns, dt=dt_actual,
-                dt_rx_ns=dt_rx_ns, dt_rx_sigma_ns=dt_rx_sigma)
-        else:
-            # No TICC measurement this epoch — hold previous frequency.
-            adjfine_ppb = ctx['adjfine_ppb']
+        adjfine_ppb = -servo.update(
+            None, dt=dt_actual,
+            dt_rx_ns=dt_rx_ns, dt_rx_sigma_ns=dt_rx_sigma)
         max_track_ppb = min(
             ctx['caps']['max_adj'],
             args.track_max_ppb if args.track_max_ppb is not None else ctx['caps']['max_adj'],
