@@ -117,7 +117,7 @@ class DOFreqEst:
         else:
             self.P = np.diag([1e6, 100.0**2, 1000.0**2, 100.0**2])
 
-        # LQR: only PHC states are controllable
+        # LQR: only DO states are controllable (x[2] = DO phase, x[3] = DO freq)
         # L[2] = phase gain (negative: positive φ_do = late → more u
         #         → more adjfine → speed up → reduce lateness)
         # L[3] = freq cancellation
@@ -289,6 +289,16 @@ class DOFreqEst:
         # The qerr() inside h_ticc uses the filter's own x[0] estimate
         # — no externally-matched qErr stream consumed here.  This is
         # what makes TICC robust to FIFO-matching failures.
+        #
+        # Linearization contract (per docs/dofreq-est-measurement-ladder.md
+        # "Sequential update order"): TICC runs LAST so qerr(x[0]) is
+        # linearized at the post-PPP x[0] — when PPP is converged this
+        # gives P[0,0] ≪ 1 ns², well inside one F9T tick interval (8 ns)
+        # and the qerr Jacobian is well-defined.  When PPP is degraded
+        # or skipped, the pre-update x[0] uncertainty can straddle a
+        # tick boundary and the Jacobian sign-flip can pollute the
+        # update; R_ticc inflation is the absorbing mechanism.  Do NOT
+        # reorder this arm in front of the linear arms.
         if ticc_diff_ns is not None:
             R_ticc = (np.array([[ticc_sigma_ns ** 2]])
                       if ticc_sigma_ns is not None else self.R_ticc)

@@ -19,8 +19,8 @@ measurement contributes information weighted by its sigma.
 EKF state vector x:
   x[0] = rx_tcxo phase offset from GPS time   (ns)
   x[1] = rx_tcxo frequency offset from GPS    (parts per billion)
-  x[2] = DO PHC phase offset from GPS time    (ns)
-  x[3] = DO PHC frequency offset from GPS     (parts per billion)
+  x[2] = DO phase offset from GPS time        (ns)
+  x[3] = DO frequency offset from GPS         (parts per billion)
 
 Measurement arms, each gated on availability:
   z_ppp     :  observes  x[0]                       σ ~ 0.1 ns      RAWX → PPP filter dt_rx
@@ -99,25 +99,30 @@ lockout-only form.  Its findings shape this design.
 ```
 x[0] = rx_tcxo phase offset from GPS time, ns
 x[1] = rx_tcxo frequency offset from GPS rate, ppb
-x[2] = PHC phase offset from GPS time, ns
-x[3] = PHC frequency offset from GPS rate, ppb
+x[2] = DO phase offset from GPS time, ns
+x[3] = DO frequency offset from GPS rate, ppb
 ```
 
 Two independent crystals, two phase + frequency states each.  The
 F-matrix dynamics include:
 - `dx[0]/dt = x[1]` (rx_tcxo phase walks at its frequency offset)
-- `dx[2]/dt = x[3]` (PHC phase walks at its frequency offset)
+- `dx[2]/dt = x[3]` (DO phase walks at its frequency offset)
 
 There is no direct dynamical coupling between the two crystals — the
-PHC's frequency state evolves independently of the rx_tcxo's.  The
+DO's frequency state evolves independently of the rx_tcxo's.  The
 *only* coupling is through measurements that observe both clocks.
+
+(Per CLAUDE.md glossary: "PHC" is reserved for the Linux PTP Hardware
+Clock API specifically.  PiFace's DO is an OCXO+DAC — not a PHC at
+all.  We use "DO" for the disciplined oscillator regardless of how
+it's actuated.)
 
 Process noise (Q matrix) carries the random-walk uncertainty growth
 of each state.  TCXO physics gives reasonable priors:
 - Q[0,0]: rx_tcxo phase walk per second from frequency uncertainty
 - Q[1,1]: rx_tcxo frequency drift (temperature, aging)
-- Q[2,2]: PHC phase walk per second from frequency uncertainty
-- Q[3,3]: PHC frequency drift (temperature, aging)
+- Q[2,2]: DO phase walk per second from frequency uncertainty
+- Q[3,3]: DO frequency drift (temperature, aging)
 
 These are tunable from oscillator characterization.  The current
 code uses literature-typical TCXO values; an OCXO-grade DO would
@@ -188,7 +193,7 @@ H_extint = [0, 0, 1, 0]
 R_extint = (TIM-TM2 accEst)² ≈ (5–10 ns)²
 ```
 
-**Observes:** PHC phase offset from GPS time, directly and linearly.
+**Observes:** DO phase offset from GPS time, directly and linearly.
 
 **Source:** TIM-TM2 message from the F9T after wiring DO PPS to
 F9T EXTINT pin.  Each DO PPS edge generates one TIM-TM2 message
@@ -217,7 +222,7 @@ H_ticc varies (nonlinear due to qerr modulo arithmetic)
 R_ticc ≈ (60 ps + filter uncertainty in qerr prediction)²
 ```
 
-**Observes:** the difference between PHC PPS edge and rx_tcxo PPS
+**Observes:** the difference between DO PPS edge and rx_tcxo PPS
 edge.  In our filter's terms, this couples `x[0]` and `x[2]` via the
 nonlinear qerr() modulo function.
 
@@ -243,6 +248,20 @@ during TICC dropouts, observability when F9T PPS isn't wired to
 TICC chB.  The two are *complementary* in the EKF formulation;
 running both costs nothing and information adds up.
 
+**Linearization caveat (Bravo review 2026-05-06):** the qerr()
+Jacobian `∂qerr/∂x[0]` flips sign locally near each tick boundary
+(every 8 ns).  When PPP has contracted P[0,0] ≪ 1 ns² (the
+common-case PPP-converged regime) the linearization point sits
+well inside one tick interval and the Jacobian is well-defined.
+When PPP is degraded (P[0,0] ~ ns², or PPP arm skipped for many
+epochs) the post-PPP x[0] uncertainty can straddle a tick boundary
+and the Jacobian sign-flip can pollute the TICC update.  R_ticc
+inflation absorbs this in practice, but it's a pre-known failure
+mode for ablation runs F (PPP+qErr+TICC, no EXTINT) under PPP-
+degraded conditions.  Sequential update order (PPP → qErr → EXTINT
+→ TICC) ensures TICC's linearization happens at the most-recent
+x[0] estimate, minimizing exposure.
+
 ### Sequential update order
 
 Sequential Kalman updates aren't strictly commutative when state
@@ -264,10 +283,46 @@ Today's DOFreqEst code already orders PPP-then-TICC.  Adding qErr
 between PPP and TICC, and EXTINT between qErr and TICC, follows the
 same logic.
 
+### Invariant for future arms: well-conditioned Jacobian
+
+Each measurement arm must observe a function of `x` whose Jacobian
+is well-conditioned at the current state estimate.  Today's four
+arms satisfy this:
+
+- z_ppp, z_qerr, z_extint are linear: H is constant, condition
+  number = 1 by construction.
+- z_ticc is nonlinear in qerr() but linearized at the filter's
+  post-PPP x[0]; the qerr() Jacobian is bounded everywhere except
+  the tick-boundary discontinuities (8 ns spacing on the F9T's
+  125 MHz clock), and PPP-converged regimes keep x[0] uncertainty
+  far inside a single tick interval.
+
+Future arms (e.g., White-Rabbit syntonic phase, on-chip TDC, ptp4l
+offset-from-master) need to clear the same bar before being added
+to the ladder.  Cheap pre-flight checks:
+
+1.  **Symbolic Jacobian inspection** — write H(x) explicitly,
+    check for discontinuities, sign flips, or singular regions
+    inside the operating envelope.
+2.  **Numerical condition number** — at expected steady-state x,
+    compute κ(H).  A condition number above ~10² is a yellow flag;
+    above ~10⁴ the arm is borderline-unobservable in the directions
+    its information matters most.
+3.  **Tick / wraparound boundaries** — any modulo, fractional, or
+    integer-rounding behavior in the measurement model needs to
+    be checked for sign consistency across the boundary.
+
+Arms that fail any of these should either be reformulated (if the
+underlying physical observation is salvageable) or deferred until
+the model can be stabilized.  Adding a poorly-conditioned arm
+can poison the EKF state estimate even when its sigma is large —
+because covariance propagation cares about *direction* in state
+space, not just magnitude.
+
 ## Why this is not source competition
 
 **Source competition (old):** every estimator produces an
-estimate of the *same* thing (the PHC's offset from GPS time).
+estimate of the *same* thing (the DO's offset from GPS time).
 Engine picks one to drive actuation.  Mutually exclusive
 contributors.  Cost: cosmetic; benefit: robust handover when one
 estimator degrades.  Failure mode: hidden pseudo-redundancy because
@@ -282,7 +337,7 @@ information use under known-noise assumptions.  Failure mode: a
 measurement with the wrong noise model contaminates the state
 estimate proportionally.
 
-The old code had four "sources" all observing the same PHC offset
+The old code had four "sources" all observing the same DO offset
 because there was no explicit state-space; the picking-best-source
 heuristic was a poor man's Bayesian fusion.  Putting the EKF state
 explicitly in front of the measurement layer makes the fusion
