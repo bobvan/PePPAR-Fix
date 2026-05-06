@@ -6411,11 +6411,9 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         # See docs/dofreq-est-measurement-ladder.md.  Each arm gated on
         # availability inside servo.update; predict step always runs.
         #
-        # Wired today: Arm 1 (PPP) and Arm 3 (TIM-TM2 → x[2]).
-        # Pending:    Arm 2 (qErr-as-frequency), Arm 4 (TICC).
-        # TICC arm is intentionally None even though pps_err_ticc_ns
-        # is computed upstream — until the new measurement model is
-        # proven end-to-end, we don't feed TICC back in.
+        # Wired today: Arm 1 (PPP), Arm 3 (TIM-TM2 → x[2]),
+        #              Arm 4 (TICC chA-chB → couple x[0], x[2]).
+        # Pending:    Arm 2 (qErr-as-frequency).
         extint_phase_ns = None
         extint_sigma_ns = None
         _ext = ctx.get('extint_store')
@@ -6426,6 +6424,17 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                 # accEst is reported as integer ns by the F9T;
                 # treat it as the 1-σ for the Kalman update.
                 extint_sigma_ns = float(max(_acc, 1))
+        # Arm 4: pps_err_ticc_ns is already negated upstream so the
+        # sign matches DOFreqEst's z_ticc = -x[2] - qerr(x[0]) model.
+        # ticc_confidence is per-measurement σ in ns from the TICC
+        # tracker.  --no-ticc gates the arm off for ablation.
+        ticc_diff_ns = None
+        ticc_sigma_ns = None
+        if (not getattr(args, 'no_ticc', False)
+                and pps_err_ticc_ns is not None
+                and ticc_confidence is not None):
+            ticc_diff_ns = pps_err_ticc_ns
+            ticc_sigma_ns = float(max(ticc_confidence, 0.001))
         now_mono = time.monotonic()
         dt_actual = now_mono - ctx['last_correction_mono']
         ctx['last_correction_mono'] = now_mono
@@ -6435,7 +6444,8 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             qerr_freq_ppb=None, qerr_freq_sigma_ppb=None,
             extint_phase_ns=extint_phase_ns,
             extint_sigma_ns=extint_sigma_ns,
-            ticc_diff_ns=None, ticc_sigma_ns=None,
+            ticc_diff_ns=ticc_diff_ns,
+            ticc_sigma_ns=ticc_sigma_ns,
         )
         max_track_ppb = min(
             ctx['caps']['max_adj'],
@@ -8067,6 +8077,15 @@ Two-phase operation:
                             "useful for ablation runs comparing PPP-only "
                             "to PPP+EXTINT performance.  See "
                             "docs/dofreq-est-measurement-ladder.md.")
+    servo.add_argument("--no-ticc", action="store_true",
+                       help="Disable DOFreqEst Arm 4 (TICC chA-chB → "
+                            "couple x[0] and x[2]).  When set, the EKF "
+                            "arm 4 stays None even if --ticc-port is "
+                            "configured — TICC measurements are still "
+                            "logged and used for diagnostics, but not "
+                            "fed to the servo.  Used for ablation runs "
+                            "comparing TIM-TM2-only against TICC+TIM-TM2 "
+                            "performance.")
     servo.add_argument("--do-char-file", default="data/do_characterization.json",
                        help="Path to DO characterization JSON (read at startup)")
     servo.add_argument("--do-label", default=None,
