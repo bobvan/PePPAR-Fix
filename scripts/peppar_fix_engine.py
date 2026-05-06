@@ -3673,7 +3673,8 @@ class AntPosEstThread(threading.Thread):
 def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                      stop_event, qerr_store=None, out_w=None, nav2_store=None,
                      ape_sm=None, dfe_sm=None, ape_thread=None,
-                     ar_position=None, ar_pos_lock=None):
+                     ar_position=None, ar_pos_lock=None,
+                     extint_store=None):
     """Run FixedPosFilter for clock estimation with optional servo.
 
     This is the steady-state phase: position is known, we estimate clock
@@ -7323,6 +7324,7 @@ def run(args):
                 ape_thread=ape_thread,
                 ar_position=_ar_position,
                 ar_pos_lock=_ar_pos_lock,
+                extint_store=extint_store,
             )
             # run_steady_state returns an int exit code on error,
             # or a gate_stats dict on normal completion.
