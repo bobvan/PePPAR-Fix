@@ -40,23 +40,23 @@ Group=bob
 
 WorkingDirectory=/home/bob/peppar-fix
 
-# Capture both F9Ps on clkPoC3 (USB by-path identifies which is which
-# even when ttyACMx renumbers across reboots).  --duration 0 = run
-# until SIGTERM.
+# Capture the surviving F9P on clkPoC3.  The 1.2:1.0 USB port now
+# holds a NEO-F10T (FTDI D30GD1PE) since the antenna-swap reshuffle,
+# not a u-blox; only the F9P at 1.1:1.0 is suitable for RAWX logging.
+# The earlier --r2-port arg is gone — re-add when a second F9P is
+# actually wired up.  --duration 0 = run until SIGTERM.
 #
-# Note: the by-path symlinks below are clkPoC3-specific.  If this
+# Note: the by-path symlink below is clkPoC3-specific.  If this
 # service is ever installed on a host with different USB topology,
 # override Environment lines via a drop-in or EnvironmentFile.
 
-Environment=R1_PORT=/dev/serial/by-path/platform-fe9c0000.xhci-usb-0:1.2:1.0
-Environment=R2_PORT=/dev/serial/by-path/platform-fe9c0000.xhci-usb-0:1.1:1.0
+Environment=R1_PORT=/dev/serial/by-path/platform-fe9c0000.xhci-usb-0:1.1:1.0
 Environment=OUT_DIR=/home/bob/peppar-fix/data/f9p-rawx
 
 ExecStartPre=/bin/mkdir -p ${OUT_DIR}
 ExecStart=/home/bob/peppar-fix/venv/bin/python \
     /home/bob/peppar-fix/scripts/f9p_rawx_log.py \
     --r1-port ${R1_PORT} --r1-tag F9P1 \
-    --r2-port ${R2_PORT} --r2-tag F9P2 \
     --baud 38400 \
     --rate-hz 1.0 \
     --duration 0 \
