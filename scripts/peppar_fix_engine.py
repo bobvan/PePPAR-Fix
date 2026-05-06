@@ -6940,7 +6940,27 @@ def run(args):
     # --no-extint is set we don't allocate the store and don't enable
     # the F9T's TIM-TM2 message — the EKF arm stays gated off cleanly
     # (consume_latest returns None forever).
-    extint_store = None if args.no_extint else TimTm2Store()
+    extint_store = None
+    extint_log_f = None
+    if not args.no_extint:
+        _ext_log_writer = None
+        if getattr(args, 'extint_log', None):
+            try:
+                extint_log_f = open(args.extint_log, 'w', newline='')
+                _ext_log_writer = csv.writer(extint_log_f)
+                _ext_log_writer.writerow([
+                    'host_timestamp', 'host_monotonic',
+                    'wn', 'tow_ms', 'tow_sub_ms_ns',
+                    'acc_est_ns', 'phase_residual_ns', 'count', 'flags',
+                ])
+                extint_log_f.flush()
+                log.info("TIM-TM2 CSV log: %s", args.extint_log)
+            except OSError as e:
+                log.error("Failed to open extint_log %s: %s", args.extint_log, e)
+                _ext_log_writer = None
+                extint_log_f = None
+        extint_store = TimTm2Store(log_writer=_ext_log_writer,
+                                   log_file=extint_log_f)
 
     # Enable NAV2 secondary engine and TIM-TM2 emission on the F9T.
     # This is done here (before serial_reader starts) because the
@@ -8184,6 +8204,18 @@ Two-phase operation:
                            "of servo state; lets post-processing redo the "
                            "qErr ↔ TICC chB matching the engine does in "
                            "real time, without sawtooth dewrap heuristics.")
+    ticc.add_argument("--extint-log", default=None,
+                      help="Optional raw TIM-TM2 CSV log path for the "
+                           "gnss-phase-experiment.  Each row captures "
+                           "one TIM-TM2 message from the F9T with "
+                           "(host_timestamp, host_monotonic, wn, tow_ms, "
+                           "tow_sub_ms_ns, acc_est_ns, phase_residual_ns, "
+                           "count, flags).  Pair with --ticc-log to "
+                           "post-hoc compare TIM-TM2 (DOFreqEst Arm 3) "
+                           "against TICC chA-chB (Arm 4) and quantify "
+                           "their static offset + dynamic noise — the "
+                           "ablation matrix from "
+                           "docs/dofreq-est-measurement-ladder.md.")
     ticc.add_argument("--ticc-baud", type=int, default=115200,
                       help="TICC baud rate (default: 115200)")
     ticc.add_argument("--ticc-phc-channel", choices=["chA", "chB"], default="chA",
