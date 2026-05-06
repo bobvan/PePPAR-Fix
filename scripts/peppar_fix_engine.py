@@ -5118,6 +5118,43 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
             dt_rx_ns, dt_rx_series, stop_event)
 
 
+def _load_timestamper_bias(args, key):
+    """Read state/dos/<do_uid>.json and return the bias_ns for a key.
+
+    Returns None when the file or key is absent — bias correction
+    becomes a no-op for that arm.  Static calibration per
+    docs/dofreq-est-measurement-ladder.md: characterize once, persist,
+    use forever (until cabling / reference / chain changes).  The
+    engine never auto-recalibrates; that's a separate operator-driven
+    tool (scripts/calibrate_timestampers.py).
+    """
+    do_uid = _resolve_do_uid(args)
+    if not do_uid:
+        return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(here)
+    path = os.path.join(repo_root, "state", "dos", f"{do_uid}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        ts = data.get("timestampers", {}).get(key)
+        if ts is None:
+            return None
+        bias = ts.get("bias_ns")
+        if bias is None:
+            return None
+        log.info("Timestamper bias loaded: %s = %+.3f ns "
+                 "(calibrated_at=%s)",
+                 key, float(bias), ts.get("calibrated_at", "unknown"))
+        return float(bias)
+    except (OSError, ValueError, TypeError) as e:
+        log.warning("Failed to read timestamper bias for %s from %s: %s",
+                    key, path, e)
+        return None
+
+
 def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     """Set up servo (PHC-based or TICC-only).
 
@@ -5678,6 +5715,8 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         'scheduler': scheduler,
         'qerr_store': qerr_store,
         'extint_store': extint_store,
+        'bias_extint_ns': _load_timestamper_bias(args, "extint:default"),
+        'bias_ticc_ns':   _load_timestamper_bias(args, "ticc_diff:default"),
         'qerr_alignment': qerr_alignment,
         'pps_queue': pps_queue,
         'pps_history': pps_history,
@@ -6435,6 +6474,21 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                 and ticc_confidence is not None):
             ticc_diff_ns = pps_err_ticc_ns
             ticc_sigma_ns = float(max(ticc_confidence, 0.001))
+        # Static-bias correction per timestamper: subtract the
+        # operator-calibrated offset before the EKF sees the
+        # measurement.  Calibrated values come from
+        # state/dos/<do_uid>.json (see scripts/calibrate_timestampers.py
+        # and docs/dofreq-est-measurement-ladder.md).  When no
+        # calibration has been recorded the bias entries are None and
+        # this is a no-op.  This keeps every arm pointed at the same
+        # physical x[2] = 0 so ablation runs converge to the same
+        # truth and P[2,2] is a real σ-vs-reference.
+        _bias_ext = ctx.get('bias_extint_ns')
+        if extint_phase_ns is not None and _bias_ext is not None:
+            extint_phase_ns -= _bias_ext
+        _bias_ticc = ctx.get('bias_ticc_ns')
+        if ticc_diff_ns is not None and _bias_ticc is not None:
+            ticc_diff_ns -= _bias_ticc
         now_mono = time.monotonic()
         dt_actual = now_mono - ctx['last_correction_mono']
         ctx['last_correction_mono'] = now_mono
