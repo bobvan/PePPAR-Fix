@@ -333,12 +333,38 @@ def compute_error_sources(pps_error_ns, qerr_ns, dt_rx_ns, dt_rx_sigma_ns,
     else:
         inflation_var = 0.0
 
-    sources.append(ErrorSource('PPS', pps_error_ns, pps_confidence))
+    # ── no-gnss-pps experiment ──────────────────────────────────── #
+    # Branch hypothesis: F9T PPS edge timing is not needed for clock
+    # discipline.  Carrier-phase-derived clock (PPP dt_rx) is the
+    # only steering source.  All sources that consume the F9T PPS
+    # edge — PPS, PPS+qErr, TICC (which is qErr-corrected via the
+    # caller), PPS+PPP — get a hardwired huge confidence so they
+    # cannot win the source competition.  They stay in the source
+    # list to preserve existing engine fallback paths (logging,
+    # holdover handoff) but never become `best`.
+    #
+    # Why this shape vs. removing the sources entirely: we want to
+    # be able to A/B against the prior behavior with minimal code
+    # change, and we want the engine's downstream consumers (source-
+    # change logging, scheduler accumulation, status emit) to still
+    # see the source list non-empty when carrier is unavailable.
+    #
+    # Branch fate: this lockout is the experiment.  If the lab test
+    # (cold-boot with F9T PPS physically disconnected from the
+    # TICC, DO PPS agreement vs otcBob1 within ~100 ns) succeeds,
+    # the lockout is justified and merges to main — at which point
+    # the lockout becomes a removal of these branches entirely.
+    # If it fails, the branch is abandoned.  See
+    # docs/no-gnss-pps-experiment.md.
+    _GNSS_PPS_SUPPRESS_NS = 1.0e6
+
+    sources.append(ErrorSource('PPS', pps_error_ns,
+                               _GNSS_PPS_SUPPRESS_NS))
 
     if qerr_ns is not None:
         sources.append(ErrorSource('PPS+qErr',
                                    pps_error_ns + qerr_ns,
-                                   qerr_confidence))
+                                   _GNSS_PPS_SUPPRESS_NS))
 
     if (carrier_tracker is not None and carrier_tracker.initialized
             and dt_rx_sigma_ns is not None
@@ -355,15 +381,14 @@ def compute_error_sources(pps_error_ns, qerr_ns, dt_rx_ns, dt_rx_sigma_ns,
         # Sanity: qerr_ppp must be within ±tick/2 (by construction it is,
         # but guard against numerical edge cases).
         if abs(qerr_ppp_ns) <= tick_ns / 2 + 0.1:
-            ppp_sigma = math.sqrt(dt_rx_sigma_ns ** 2 + inflation_var)
             sources.append(ErrorSource('PPS+PPP',
                                        pps_error_ns + qerr_ppp_ns,
-                                       ppp_sigma))
+                                       _GNSS_PPS_SUPPRESS_NS))
 
     if ticc_error_ns is not None and ticc_confidence is not None:
         sources.append(ErrorSource('TICC',
                                    ticc_error_ns,
-                                   ticc_confidence))
+                                   _GNSS_PPS_SUPPRESS_NS))
 
     sources.sort(key=lambda s: s.confidence_ns)
     return sources
