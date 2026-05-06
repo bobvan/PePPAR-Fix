@@ -292,6 +292,7 @@ def _compute_sv_ipp_szas(filt, azimuths, elevations, gps_time):
     return out
 from ntrip_client import NtripStream
 from realtime_ppp import serial_reader, ntrip_reader, QErrStore, Nav2PositionStore
+from peppar_fix.extint_reader import TimTm2Store
 from ticc import Ticc
 from peppar_fix import (
     CorrectionFreshnessGate,
@@ -3795,7 +3796,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
         pps_backoff = 5
         servo_result = None
         for pps_attempt in range(1, pps_max_retries + 1):
-            servo_result = _setup_servo(args, known_ecef, qerr_store, ptp=ptp)
+            servo_result = _setup_servo(args, known_ecef, qerr_store,
+                                        extint_store=extint_store, ptp=ptp)
             if not isinstance(servo_result, int) or servo_result != 3:
                 break
             if pps_attempt < pps_max_retries:
@@ -5115,7 +5117,7 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
             dt_rx_ns, dt_rx_series, stop_event)
 
 
-def _setup_servo(args, known_ecef, qerr_store, ptp=None):
+def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     """Set up servo (PHC-based or TICC-only).
 
     Returns context dict on success, or an int exit code on failure:
@@ -5674,6 +5676,7 @@ def _setup_servo(args, known_ecef, qerr_store, ptp=None):
         'servo': servo,
         'scheduler': scheduler,
         'qerr_store': qerr_store,
+        'extint_store': extint_store,
         'qerr_alignment': qerr_alignment,
         'pps_queue': pps_queue,
         'pps_history': pps_history,
@@ -6407,12 +6410,21 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         # See docs/dofreq-est-measurement-ladder.md.  Each arm gated on
         # availability inside servo.update; predict step always runs.
         #
-        # Today only Arm 1 (PPP) is wired.  Arms 2 (qErr-as-frequency),
-        # 3 (TIM-TM2), and 4 (TICC) are passed None and will be wired
-        # progressively as the rest of the refactor lands.  TICC arm
-        # is intentionally None on this branch even though pps_err_ticc_ns
-        # is computed upstream — until the refactor proves out the new
-        # measurement model end-to-end, we don't feed TICC back in.
+        # Wired today: Arm 1 (PPP) and Arm 3 (TIM-TM2 → x[2]).
+        # Pending:    Arm 2 (qErr-as-frequency), Arm 4 (TICC).
+        # TICC arm is intentionally None even though pps_err_ticc_ns
+        # is computed upstream — until the new measurement model is
+        # proven end-to-end, we don't feed TICC back in.
+        extint_phase_ns = None
+        extint_sigma_ns = None
+        _ext = ctx.get('extint_store')
+        if _ext is not None:
+            sample = _ext.consume_latest()
+            if sample is not None:
+                extint_phase_ns, _acc = sample
+                # accEst is reported as integer ns by the F9T;
+                # treat it as the 1-σ for the Kalman update.
+                extint_sigma_ns = float(max(_acc, 1))
         now_mono = time.monotonic()
         dt_actual = now_mono - ctx['last_correction_mono']
         ctx['last_correction_mono'] = now_mono
@@ -6420,7 +6432,8 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             dt=dt_actual,
             dt_rx_ns=dt_rx_ns, dt_rx_sigma_ns=dt_rx_sigma,
             qerr_freq_ppb=None, qerr_freq_sigma_ppb=None,
-            extint_phase_ns=None, extint_sigma_ns=None,
+            extint_phase_ns=extint_phase_ns,
+            extint_sigma_ns=extint_sigma_ns,
             ticc_diff_ns=None, ticc_sigma_ns=None,
         )
         max_track_ppb = min(
@@ -6912,12 +6925,18 @@ def run(args):
     # position fix for the position-consensus watchdog.
     nav2_store = Nav2PositionStore()
 
-    # Enable NAV2 secondary engine on the F9T if not already on.
+    # gnss-phase-experiment: TIM-TM2 store for DOFreqEst Arm 3.  When
+    # --no-extint is set we don't allocate the store and don't enable
+    # the F9T's TIM-TM2 message — the EKF arm stays gated off cleanly
+    # (consume_latest returns None forever).
+    extint_store = None if args.no_extint else TimTm2Store()
+
+    # Enable NAV2 secondary engine and TIM-TM2 emission on the F9T.
     # This is done here (before serial_reader starts) because the
     # ensure_receiver step only runs the full config when dual-freq
     # observations are missing — if the F9T was already configured
-    # for L5 from a previous run, the NAV2 keys would never be sent.
-    # This quick config burst is harmless if NAV2 is already enabled.
+    # for L5 from a previous run, these keys would never be sent.
+    # The config burst is harmless if values are already correct.
     try:
         from peppar_fix.receiver import send_cfg, PORT_SUFFIX
         from peppar_fix.gnss_stream import open_gnss
@@ -6925,13 +6944,18 @@ def run(args):
         _nav2_ser, _ = open_gnss(args.serial, args.baud)
         _nav2_ubr = _UBR(_nav2_ser, protfilter=2)
         _pname = PORT_SUFFIX.get(args.port_type, "USB")
-        _nav2_ok = send_cfg(_nav2_ser, _nav2_ubr, {
+        _cfg_keys = {
             "CFG_NAV2_OUT_ENABLED": 1,
             f"CFG_MSGOUT_UBX_NAV2_PVT_{_pname}": 5,
-        }, "NAV2 secondary engine enable")
+        }
+        if extint_store is not None:
+            _cfg_keys[f"CFG_MSGOUT_UBX_TIM_TM2_{_pname}"] = 1
+        _nav2_ok = send_cfg(_nav2_ser, _nav2_ubr, _cfg_keys,
+                            "NAV2 + TIM-TM2 enable")
         _nav2_ser.close()
         if _nav2_ok:
-            log.info("NAV2 secondary engine enabled (position consensus)")
+            extras = ", TIM-TM2" if extint_store is not None else ""
+            log.info(f"NAV2 secondary engine enabled (position consensus){extras}")
         else:
             log.warning("NAV2 config failed (position consensus unavailable)")
     except Exception as e:
@@ -6969,7 +6993,8 @@ def run(args):
     t_serial = threading.Thread(
         target=serial_reader,
         args=(args.serial, args.baud, obs_queue, stop_event, beph, systems, ssr),
-        kwargs={**serial_kwargs, 'driver': driver, 'nav2_store': nav2_store},
+        kwargs={**serial_kwargs, 'driver': driver, 'nav2_store': nav2_store,
+                'extint_store': extint_store},
         daemon=True,
     )
     t_serial.start()
@@ -8032,6 +8057,14 @@ Two-phase operation:
     servo.add_argument("--no-carrier", action="store_true",
                        help="Disable PPP Carrier Phase servo drive "
                             "(Carrier source disabled, PPS+PPP still available)")
+    servo.add_argument("--no-extint", action="store_true",
+                       help="Disable DOFreqEst Arm 3 (TIM-TM2 → x[2]).  "
+                            "When set, the engine does not allocate a "
+                            "TimTm2Store, does not enable TIM-TM2 emission "
+                            "on the F9T, and the EKF arm 3 stays None — "
+                            "useful for ablation runs comparing PPP-only "
+                            "to PPP+EXTINT performance.  See "
+                            "docs/dofreq-est-measurement-ladder.md.")
     servo.add_argument("--do-char-file", default="data/do_characterization.json",
                        help="Path to DO characterization JSON (read at startup)")
     servo.add_argument("--do-label", default=None,
