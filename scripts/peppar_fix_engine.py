@@ -6403,26 +6403,26 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         if mode_gain_floor is not None:
             gain_scale = max(gain_scale, mode_gain_floor)
 
-        # no-gnss-pps experiment: hardwire offset_ns=None so the
-        # DOFreqEst EKF skips its TICC-based seed and TICC measurement
-        # update — the servo runs on PPP dt_rx alone.  This is the
-        # actual existence-proof test that the source-competition
-        # lockout was *supposed* to be (but turned out to be cosmetic
-        # because servo.update was hardcoded to consume pps_err_ticc_ns).
-        # See docs/no-gnss-pps-experiment.md.
+        # gnss-phase-experiment: four-arm Kalman fusion in DOFreqEst.
+        # See docs/dofreq-est-measurement-ladder.md.  Each arm gated on
+        # availability inside servo.update; predict step always runs.
         #
-        # The previous else-branch ("hold previous frequency when
-        # pps_err_ticc_ns is None") was the source of the post-chB-
-        # disconnect drift observed 2026-05-06 — the engine wasn't
-        # holding lock, it was holding a stale adjfine while the DO
-        # free-ran.  Now we always call servo.update; the EKF's PPP
-        # update and dynamics produce the new adjfine.
+        # Today only Arm 1 (PPP) is wired.  Arms 2 (qErr-as-frequency),
+        # 3 (TIM-TM2), and 4 (TICC) are passed None and will be wired
+        # progressively as the rest of the refactor lands.  TICC arm
+        # is intentionally None on this branch even though pps_err_ticc_ns
+        # is computed upstream — until the refactor proves out the new
+        # measurement model end-to-end, we don't feed TICC back in.
         now_mono = time.monotonic()
         dt_actual = now_mono - ctx['last_correction_mono']
         ctx['last_correction_mono'] = now_mono
         adjfine_ppb = -servo.update(
-            None, dt=dt_actual,
-            dt_rx_ns=dt_rx_ns, dt_rx_sigma_ns=dt_rx_sigma)
+            dt=dt_actual,
+            dt_rx_ns=dt_rx_ns, dt_rx_sigma_ns=dt_rx_sigma,
+            qerr_freq_ppb=None, qerr_freq_sigma_ppb=None,
+            extint_phase_ns=None, extint_sigma_ns=None,
+            ticc_diff_ns=None, ticc_sigma_ns=None,
+        )
         max_track_ppb = min(
             ctx['caps']['max_adj'],
             args.track_max_ppb if args.track_max_ppb is not None else ctx['caps']['max_adj'],
