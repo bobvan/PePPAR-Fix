@@ -592,13 +592,18 @@ class Nav2PositionStore:
 
 def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                    ssr=None, qerr_store=None, config_queue=None, driver=None,
-                   raw_callback=None, nav2_store=None, rinex_writer=None):
+                   raw_callback=None, nav2_store=None, rinex_writer=None,
+                   extint_store=None):
     """Read UBX messages from a GNSS device.
 
     Puts (timestamp, observations_list) tuples onto obs_queue for each
     RXM-RAWX epoch. Also feeds RXM-SFRBX to broadcast ephemeris.
     If qerr_store is provided, extracts TIM-TP qErr and stores it.
     If nav2_store is provided, captures NAV2-PVT for position consensus.
+    If extint_store is provided, captures TIM-TM2 (DO PPS edge times
+    from the F9T's GPS-time solution) for the gnss-phase-experiment
+    EKF Arm 3.  Requires the F9T to be configured with
+    CFG-MSGOUT-UBX_TIM_TM2_<port>=1 and DO PPS wired to F9T EXTINT.
 
     Args:
         systems: set of system names to include (e.g. {'gps', 'gal', 'bds'}).
@@ -613,6 +618,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
              Defaults to F9TDriver for backward compatibility.
         raw_callback: optional callable(parsed_msg) called with each
              RXM-RAWX message for raw observation access (e.g. NTRIP caster).
+        extint_store: TimTm2Store instance for DOFreqEst Arm 3 ingest.
     """
     try:
         from pyubx2 import UBXReader
@@ -720,6 +726,15 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
             # NAV2-PVT: secondary navigation engine position fix
             if msg_id == 'NAV2-PVT' and nav2_store is not None:
                 nav2_store.update(parsed)
+
+            # gnss-phase-experiment Arm 3: DO PPS edge time from
+            # F9T's GPS-time solution.  See peppar_fix/extint_reader.py
+            # and docs/dofreq-est-measurement-ladder.md.  Only fires
+            # if the F9T is configured to emit TIM-TM2 AND DO PPS is
+            # wired to F9T EXTINT.  No-op when those preconditions
+            # don't hold (extint_store is None or no messages arrive).
+            if msg_id == 'TIM-TM2' and extint_store is not None:
+                extint_store.update(parsed)
 
             if msg_id == 'RXM-RAWX':
                 # Fire raw callback before IF processing (for NTRIP caster)
