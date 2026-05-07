@@ -25,7 +25,12 @@ TIMESTAMPER_STATE_DIR = os.path.join(_REPO_ROOT, "state", "timestampers")
 # These are safe starting points — real characterization will be better.
 DEFAULTS = {
     "ticc": {
-        "measurement_noise_ns": 0.178,   # TICC #1 calibration 2026-03-19
+        # TAPR spec: <60 ps single-shot resolution.  Confirmed by the
+        # 2026-05-07 TEE2 calibration of TICC #4/#5 (0.14-0.24 ns
+        # per-TICC floor when paired through a tee, on the order of the
+        # TAPR spec; see timelab/calibration.md "Run TEE2").  Earlier
+        # 0.178 ns default was conservative and pre-Rb-reference.
+        "measurement_noise_ns": 0.060,   # TAPR spec + TEE2 cross-validation
         "resolution_ps": 60,
     },
     "extts_igc": {

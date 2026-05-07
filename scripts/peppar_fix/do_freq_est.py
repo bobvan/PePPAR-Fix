@@ -55,7 +55,7 @@ class DOFreqEst:
     returns ppb.  Also takes dt_rx_ns for PPP carrier-phase fusion.
     """
 
-    def __init__(self, sigma_ticc_ns=0.178,
+    def __init__(self, sigma_ticc_ns=0.060,
                  sigma_do_phase_ns=0.92, sigma_do_freq_ppb=0.01,
                  sigma_tcxo_phase_ns=2.0, sigma_tcxo_freq_ppb=0.1,
                  tick_ns=8.0,
