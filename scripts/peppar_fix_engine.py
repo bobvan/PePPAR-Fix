@@ -299,6 +299,7 @@ from peppar_fix import (
     PositionWatchdogProposed,
     StrictCorrelationGate,
     TimebaseRelationEstimator,
+    TropoState,
     PPPCalibration,
     CarrierPhaseTracker,
     estimator_sample_weight,
@@ -1490,6 +1491,12 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
 
         # Soft ZTD-residual prior (engine flag --ztd-tie-sigma).  Same
         # mechanism as the AntPosEstThread loop applies post-update.
+        # Phase-1 ties to target_m=0 (default) — the unified TropoState
+        # introduced in I-132038 only matters for the cross-filter
+        # consistency between AntPosEstThread.PPPFilter and steady-state
+        # FixedPosFilter, which both run after Phase-1.  Phase-1 is a
+        # short transient with one filter; METAR target seed isn't
+        # load-bearing for its convergence.
         _ztd_tie = getattr(args, "ztd_tie_sigma", None)
         if _ztd_tie:
             filt.apply_ztd_tie(_ztd_tie)
@@ -1758,7 +1765,8 @@ class AntPosEstThread(threading.Thread):
                  ztd_tie_sigma=None,
                  pos_sigma_m=10.0,
                  nav2_anchor_enabled=True,
-                 nav2_anchor_max_hacc_m=3.0):
+                 nav2_anchor_max_hacc_m=3.0,
+                 tropo_state=None):
         super().__init__(daemon=True, name="AntPosEst")
         # Phase 3 wind-up (Wu 1993): per-SV cumulative wind-up tracker
         # + carrier-phase correction applied before filter.update().
@@ -1776,6 +1784,10 @@ class AntPosEstThread(threading.Thread):
                                if ztd_tie_sigma is not None
                                and float(ztd_tie_sigma) > 0
                                else None)
+        # Shared zenith-tropo target (cross-thread).  None preserves
+        # pre-unification behavior (target=0).  See I-132038 +
+        # peppar_fix/tropo_state.py.
+        self._tropo_state = tropo_state
         self._gmf_provider = None  # built lazily on first epoch with
                                     # usable position (needs rcv lat/lon)
         # ANTEX parser + receiver antenna type (Phase 2 of obs-model
@@ -2726,11 +2738,22 @@ class AntPosEstThread(threading.Thread):
                 continue
 
             # Soft prior on residual ZTD (post-update rank-1 EKF
-            # pseudo-measurement z=0).  Constrains the position-altitude/
-            # ZTD/clock null-mode that otherwise lets the filter wander
-            # m-scale.  No-op when self._ztd_tie_sigma is None or <= 0.
+            # pseudo-measurement z=target_m, h=e_ZTD, R=σ²).
+            # Constrains the position-altitude / ZTD / clock null-mode
+            # that otherwise lets the filter wander m-scale.  No-op
+            # when self._ztd_tie_sigma is None or <= 0.
+            #
+            # Target: when a shared TropoState is wired in (METAR
+            # refresh path), pull toward the same atmospheric value
+            # the FixedPosFilter is using — see I-132038 ZTD-target
+            # unification.  When TropoState is absent, fall back to
+            # target=0 (the pre-unification default).
             if getattr(self, "_ztd_tie_sigma", None):
-                filt.apply_ztd_tie(self._ztd_tie_sigma)
+                _tropo_target_m = 0.0
+                if getattr(self, "_tropo_state", None) is not None:
+                    _tropo_target_m = self._tropo_state.get().target_m
+                filt.apply_ztd_tie(self._ztd_tie_sigma,
+                                    target_m=_tropo_target_m)
 
             # NAV2 continuous covariance update (post-update 3D EKF
             # variance-weighted measurement).  Per Bob's directive
@@ -7221,6 +7244,14 @@ def run(args):
         _ar_position = {'ecef': None, 'sigma': None}
         _ar_pos_lock = threading.Lock()
 
+        # Shared zenith-tropo target.  AntPosEstThread reads it every
+        # epoch to feed PPPFilter.apply_ztd_tie's target_m.  When a
+        # METAR refresh path writes to it, both filters end up tied to
+        # the same atmospheric residual (I-132038).  Cold-start cache
+        # holds target=0 / valid=False so the AntPosEst tie behaves
+        # exactly as it did pre-unification until METAR arrives.
+        tropo_state = TropoState()
+
         def _position_improved(ecef, sigma_m):
             lat, lon, alt = ecef_to_lla(ecef[0], ecef[1], ecef[2])
             log.info("AntPosEst position improved: σ=%.3fm (%.6f, %.6f, %.1f)",
@@ -7266,6 +7297,7 @@ def run(args):
                 getattr(args, "nav2_soft_anchor", True)),
             nav2_anchor_max_hacc_m=float(
                 getattr(args, "nav2_anchor_max_hacc_m", 3.0)),
+            tropo_state=tropo_state,
         )
         ape_thread.start()
 

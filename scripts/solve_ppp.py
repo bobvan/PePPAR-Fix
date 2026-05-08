@@ -484,12 +484,14 @@ class PPPFilter:
         and the filter wanders (day0426 smoke runs: ZTD swung 1.7m
         and altitude 18m within 5 minutes despite stable lock).
 
-        IDX_ZTD is the *residual* on top of Saastamoinen+GMF bulk
-        tropo.  target_m=0 (default) says "trust the 2.3 m apriori".
-        Passing a METAR-derived residual instead makes the soft prior
-        track real atmospheric pressure / temperature changes — see
-        I-024942-main and the apply_ztd_tie call in
-        peppar_fix_engine.run_steady_state.
+        IDX_ZTD is the *residual* on top of the Saastamoinen+GMF bulk
+        tropo.  target_m=0 (default) says "trust the 2.3 m apriori —
+        residual should stay near zero."  Engine callers can pass a
+        METAR-derived residual (Saastamoinen ZTD minus the engine's
+        2.3 m apriori) to track real atmosphere per I-024942-main
+        (METAR seeding) + I-132038 (cross-filter target unification).
+        See peppar_fix_engine.run_steady_state's apply_ztd_tie call
+        and peppar_fix.tropo_state.TropoState.
 
         Filter can deviate when observations strongly support it.
         This is an *intentional* constraint on the null-mode, not a
@@ -1128,6 +1130,27 @@ class FixedPosFilter:
         self.last_n_td = 0
         self.last_resid_pr = np.array([])
         self.last_resid_td = np.array([])
+
+    def apply_ztd_tie(self, sigma_m: float, target_m: float = 0.0) -> None:
+        """Soft prior on the residual ZTD state — rank-1 EKF update with
+        pseudo-measurement z=target_m, h=e_ZTD, R=σ².
+
+        Mirror of PPPFilter.apply_ztd_tie (see that docstring for the
+        null-mode-direction motivation).  target_m defaults to 0
+        (residual should stay near zero on top of the engine's 2.3 m
+        hydrostatic apriori).  Engine callers can pass a METAR-derived
+        residual to track real atmospheric pressure / temperature
+        changes — see I-132038 ZTD-target unification: both the position
+        filter and time filter tie to the same shared TropoState.target_m
+        every epoch so they model a consistent atmosphere.
+        """
+        if sigma_m is None or sigma_m <= 0:
+            return
+        y = float(target_m) - float(self.x[self.IDX_ZTD])
+        S = float(self.P[self.IDX_ZTD, self.IDX_ZTD]) + sigma_m ** 2
+        K = self.P[:, self.IDX_ZTD] / S
+        self.x = self.x + K * y
+        self.P = self.P - np.outer(K, self.P[self.IDX_ZTD, :])
 
     def predict(self, dt):
         if dt <= 0:
