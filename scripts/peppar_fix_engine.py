@@ -137,17 +137,25 @@ def _seed_ztd_from_metar(args, lat_deg, alt_m, log):
     return residual_m, sigma_m
 
 
-def _periodic_ztd_tie(filt, args, lat_deg, alt_m, n_epochs, log):
-    """Refresh METAR + apply soft ZTD prior to bound per-SV bias absorption.
+def _refresh_tropo_state(tropo_state, args, lat_deg, alt_m, n_epochs, log):
+    """Refresh METAR + write the resulting (target_m, sigma_m) into
+    the shared TropoState.  Both filters' ZTD ties read from there
+    every epoch (I-132038 unification).
 
-    Called every --ztd-tie-interval-s epochs (default 300, matches
+    Called every --ztd-tie-interval-s epochs (default 60, matching
     METAR cadence).  Fetches current weather, runs Saastamoinen for
-    the receiver site, and applies a soft Kalman update pulling the
-    filter's residual ZTD toward METAR truth with σ ≈ 100 mm.
+    the receiver site, and updates TropoState.  Both PPPFilter
+    (in AntPosEstThread) and FixedPosFilter (in run_steady_state)
+    read tropo_state.get().target_m every epoch and apply the
+    soft prior with that target — same atmosphere model in both
+    filters.
 
-    METAR fetch failure is non-fatal: log + skip this cycle.  ZTD
-    state continues evolving from observations until the next tie.
+    METAR fetch / Saastamoinen failure is non-fatal: log + leave
+    TropoState's previous valid value in place.  Filters keep tying
+    to the last known target until the next refresh succeeds.
     """
+    if tropo_state is None:
+        return
     sigma_mm = float(getattr(args, 'ztd_tie_sigma_mm', 100.0))
     sigma_m = sigma_mm * 1e-3
     if sigma_m <= 0:
@@ -156,13 +164,13 @@ def _periodic_ztd_tie(filt, args, lat_deg, alt_m, n_epochs, log):
     try:
         rec = fetch_latest_metar(station)
     except MetarReadError as exc:
-        log.warning("[ZTD_TIE] epoch=%d METAR fetch failed (%s); skipping tie",
-                    n_epochs, exc)
+        log.warning("[ZTD_REFRESH] epoch=%d METAR fetch failed (%s); "
+                    "keeping previous target", n_epochs, exc)
         return
     age_s = metar_age_seconds(rec)
     if age_s > 7200:
-        log.warning("[ZTD_TIE] epoch=%d METAR stale (%.0f min); skipping tie",
-                    n_epochs, age_s / 60.0)
+        log.warning("[ZTD_REFRESH] epoch=%d METAR stale (%.0f min); "
+                    "keeping previous target", n_epochs, age_s / 60.0)
         return
     try:
         target_m, diag = metar_to_init_ztd_residual(
@@ -171,24 +179,19 @@ def _periodic_ztd_tie(filt, args, lat_deg, alt_m, n_epochs, log):
             lat_deg=lat_deg, elev_m=alt_m,
         )
     except (ValueError, ZeroDivisionError) as exc:
-        log.warning("[ZTD_TIE] epoch=%d Saastamoinen failed (%s); skipping tie",
-                    n_epochs, exc)
+        log.warning("[ZTD_REFRESH] epoch=%d Saastamoinen failed (%s); "
+                    "keeping previous target", n_epochs, exc)
         return
-    pre_ztd_m = float(filt.x[filt.IDX_ZTD])
-    pre_sigma_m = math.sqrt(max(0.0,
-        float(filt.P[filt.IDX_ZTD, filt.IDX_ZTD])))
-    filt.apply_ztd_tie(sigma_m, target_m=target_m)
-    post_ztd_m = float(filt.x[filt.IDX_ZTD])
-    post_sigma_m = math.sqrt(max(0.0,
-        float(filt.P[filt.IDX_ZTD, filt.IDX_ZTD])))
+    prev = tropo_state.get()
+    tropo_state.set(target_m=target_m, sigma_m=sigma_m, valid=True,
+                    metar_age_s=age_s, epoch=n_epochs)
     log.info(
-        "[ZTD_TIE] epoch=%d %s age=%.0fmin target=%+.0fmm σ_tie=%.0fmm "
-        "ZTD %+.0f→%+.0fmm (Δ=%+.0f) σ %.0f→%.0fmm",
+        "[ZTD_REFRESH] epoch=%d %s age=%.0fmin target=%+.0fmm "
+        "(prev=%+.0fmm Δ=%+.0fmm) σ_tie=%.0fmm",
         n_epochs, rec.get('station', station), age_s / 60.0,
-        target_m * 1000.0, sigma_mm,
-        pre_ztd_m * 1000.0, post_ztd_m * 1000.0,
-        (post_ztd_m - pre_ztd_m) * 1000.0,
-        pre_sigma_m * 1000.0, post_sigma_m * 1000.0,
+        target_m * 1000.0, prev.target_m * 1000.0,
+        (target_m - prev.target_m) * 1000.0,
+        sigma_mm,
     )
 
 
@@ -3695,7 +3698,8 @@ class AntPosEstThread(threading.Thread):
 def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                      stop_event, qerr_store=None, out_w=None, nav2_store=None,
                      ape_sm=None, dfe_sm=None, ape_thread=None,
-                     ar_position=None, ar_pos_lock=None):
+                     ar_position=None, ar_pos_lock=None,
+                     tropo_state=None):
     """Run FixedPosFilter for clock estimation with optional servo.
 
     This is the steady-state phase: position is known, we estimate clock
@@ -4264,14 +4268,33 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     dt_rx_ns, dt_rx_sigma,
                 )
 
-            # Periodic ZTD soft-tie from refreshed METAR — bounds the
-            # rate of ZTD-state drift driven by per-SV systematic-bias
-            # absorption (SSR phase-bias substitution L5I→L5Q,
-            # antenna PCV miscorrection, multipath).  See I-172521.
-            tie_interval = getattr(args, 'ztd_tie_interval_s', 300)
+            # Periodic METAR refresh into shared TropoState.  Cadence
+            # stays at --ztd-tie-interval-s (matches METAR cadence —
+            # KDPA hourly with occasional SPECIs, plus our cron).
+            # Engine I-132038 unification: refresh writes the target
+            # once every interval; every-epoch tie below reads it.
+            tie_interval = getattr(args, 'ztd_tie_interval_s', 60)
             if (tie_interval and n_epochs > 0 and n_epochs % tie_interval == 0
-                    and hasattr(filt, 'apply_ztd_tie')):
-                _periodic_ztd_tie(filt, args, lat, alt, n_epochs, log)
+                    and tropo_state is not None):
+                _refresh_tropo_state(tropo_state, args, lat, alt,
+                                      n_epochs, log)
+
+            # Per-epoch ZTD tie on FixedPosFilter, reading the shared
+            # TropoState.  Mirrors the AntPosEstThread.PPPFilter tie
+            # (same target_m, same cadence) so both filters track the
+            # same atmosphere — see docs/ ... I-132038 ZTD-target
+            # unification.  When TropoState has no valid METAR yet
+            # (cold-start window), tt.target_m == 0.0 — same as the
+            # pre-unification default.  Sigma comes from TropoState
+            # (set by the periodic refresh) or falls back to the
+            # ztd_tie_sigma_mm CLI default.
+            if (tropo_state is not None and hasattr(filt, 'apply_ztd_tie')):
+                tt = tropo_state.get()
+                _tie_sigma_m = (tt.sigma_m if tt.valid
+                                else float(getattr(args, 'ztd_tie_sigma_mm',
+                                                   100.0)) * 1e-3)
+                if _tie_sigma_m > 0:
+                    filt.apply_ztd_tie(_tie_sigma_m, target_m=tt.target_m)
 
             # Correction source
             source = 'SSR' if ssr.n_clock > 0 else 'broadcast'
@@ -7325,6 +7348,7 @@ def run(args):
                 ape_thread=ape_thread,
                 ar_position=_ar_position,
                 ar_pos_lock=_ar_pos_lock,
+                tropo_state=tropo_state,
             )
             # run_steady_state returns an int exit code on error,
             # or a gate_stats dict on normal completion.
