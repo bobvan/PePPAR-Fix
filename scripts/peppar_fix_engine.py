@@ -441,11 +441,15 @@ class RxTcxoTracker:
     """
 
     TICK_NS = 8.0  # 125 MHz = 8 ns period
-    WRAP_THRESHOLD_NS = 4.0  # detect wrap when |Δ| > half tick
-    # At 3 ns/s TCXO drift, normal deltas are ~3 ns and wrap deltas are
-    # ~5 ns.  Threshold must be between these: drift < threshold < tick-drift.
-    # Half-tick (4.0) works for drift rates up to ~3.5 ns/s.  Beyond that,
-    # use frequency-aided unwrapping (not yet implemented).
+    WRAP_THRESHOLD_NS = 4.0  # half-tick threshold for fallback unwrap
+    # Two unwrap modes:
+    #   1. Half-tick threshold (fallback): correct only for |drift| <
+    #      TICK_NS/(2·dt) ≈ 3.5 ns/s at 1 Hz sampling.
+    #   2. Frequency-aided: pass predicted_drift_ns_per_s to update();
+    #      uses round((expected - raw)/TICK_NS) to recover integer-tick
+    #      count. Correct for any drift as long as the predictor's
+    #      uncertainty is < 4 ns/s ≈ 4 ppb.
+    # Mode 2 is required for F9T rx TCXOs which run at 100s of ppb.
 
     def __init__(self, freq_window=30):
         self._prev_qerr_ns = None
@@ -462,8 +466,26 @@ class RxTcxoTracker:
         self._synth_qerr_buf = deque(maxlen=10)
         self._rx_tcxo_phase = None
 
-    def update(self, qerr_ns):
-        """Feed one qErr sample (nanoseconds).  Returns unwrapped phase in ns."""
+    def update(self, qerr_ns, predicted_drift_ns_per_s=None, dt=1.0):
+        """Feed one qErr sample (nanoseconds).  Returns unwrapped phase in ns.
+
+        Args:
+            qerr_ns: F9T's qErr value, in [-4, +4] ns (the 8-ns sawtooth
+                quantization residual).
+            predicted_drift_ns_per_s: optional rx TCXO frequency-offset
+                predictor (typically PPP dt_rx rate).  Enables
+                frequency-aided unwrap that handles arbitrary drift.
+                Without it, falls back to half-tick threshold (correct
+                only for drift < TICK_NS/(2·dt) ≈ 3.5 ppb at 1 Hz).
+            dt: time elapsed since previous sample, in seconds (default 1.0).
+
+        Returns:
+            Unwrapped cumulative phase since first sample, in ns.
+
+        Per docs/dofreq-est-measurement-ladder.md "Arm 2".  The slope
+        of the returned phase IS rx TCXO frequency offset in ppb,
+        consumable by DOFreqEst.update(qerr_freq_ppb=...).
+        """
         if self._prev_qerr_ns is None:
             self._prev_qerr_ns = qerr_ns
             self._accumulated_ns = 0.0
@@ -471,15 +493,25 @@ class RxTcxoTracker:
             self._n = 1
             return self._accumulated_ns
 
-        delta = qerr_ns - self._prev_qerr_ns
-        # Detect wraps: if the TCXO drifts past a tick boundary,
-        # qErr jumps by ~±8 ns.  Correct for it.
-        if delta > self.WRAP_THRESHOLD_NS:
-            delta -= self.TICK_NS
-        elif delta < -self.WRAP_THRESHOLD_NS:
-            delta += self.TICK_NS
+        raw_delta = qerr_ns - self._prev_qerr_ns
 
-        self._accumulated_ns += delta
+        if predicted_drift_ns_per_s is not None:
+            # Frequency-aided unwrap.  Recover the integer-tick count
+            # such that raw_delta + n*TICK_NS ≈ expected_delta.
+            # Robust as long as |predictor noise| < TICK_NS/2 = 4 ns/s.
+            expected_delta = predicted_drift_ns_per_s * dt
+            n_ticks = round((expected_delta - raw_delta) / self.TICK_NS)
+            true_delta = raw_delta + n_ticks * self.TICK_NS
+        else:
+            # Half-tick fallback.
+            if raw_delta > self.WRAP_THRESHOLD_NS:
+                true_delta = raw_delta - self.TICK_NS
+            elif raw_delta < -self.WRAP_THRESHOLD_NS:
+                true_delta = raw_delta + self.TICK_NS
+            else:
+                true_delta = raw_delta
+
+        self._accumulated_ns += true_delta
         self._prev_qerr_ns = qerr_ns
         self._phase_buf.append(self._accumulated_ns)
         self._n += 1
@@ -6192,7 +6224,21 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     # Prefer TICC-matched qErr (more precise epoch), fall back to EXTTS
     _qerr_for_rx_tcxo = qerr_for_ticc_pps_ns if qerr_for_ticc_pps_ns is not None else qerr_for_extts_pps_ns
     if _qerr_for_rx_tcxo is not None:
-        unwrapped_ns = rx_tcxo.update(_qerr_for_rx_tcxo)
+        # Frequency-aided unwrap: predict next qErr from dt_rx rate
+        # (PPP carrier-phase has no 8-ns sawtooth ambiguity).  Without
+        # this, F9T rx TCXOs at 100s of ppb defeat the half-tick
+        # threshold and the unwrap goes wrong.
+        # See docs/dofreq-est-measurement-ladder.md §"Arm 2".
+        predicted_drift = None
+        if dt_rx_ns is not None and dt_rx_sigma is not None and dt_rx_sigma < 2.0:
+            prev_dt_rx = ctx.get('prev_dt_rx_for_unwrap')
+            if prev_dt_rx is not None:
+                # Single-sample dt_rx rate: sigma ~0.14 ns/s, well within
+                # the 4-ns/s ambiguity bound.  No smoothing needed.
+                predicted_drift = dt_rx_ns - prev_dt_rx
+            ctx['prev_dt_rx_for_unwrap'] = dt_rx_ns
+        unwrapped_ns = rx_tcxo.update(_qerr_for_rx_tcxo,
+                                      predicted_drift_ns_per_s=predicted_drift)
         _rx_tcxo_freq, freq_n = rx_tcxo.freq_ns_per_s()
         # Synthesize phase: dt_rx resolves tick, qErr gives sub-tick
         if dt_rx_ns is not None and dt_rx_sigma is not None and dt_rx_sigma < 2.0:
