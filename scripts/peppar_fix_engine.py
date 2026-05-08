@@ -8158,14 +8158,15 @@ Two-phase operation:
                        help="DO frequency random walk (ppb/epoch). Lower = "
                             "more stable frequency estimate, less wander. "
                             "Default 0.01 from ADEV characterization.")
-    servo.add_argument("--kalman-sigma-tcxo-freq", type=float, default=0.5,
+    servo.add_argument("--kalman-sigma-tcxo-freq", type=float, default=0.1,
                        help="rx TCXO frequency random walk (ppb/epoch).  "
-                            "Was 0.1 default before Arm 2 frequency-aided "
-                            "unwrap exposed real rx_TCXO wander of 5-8 ppb "
-                            "on minute-scale; 0.5 ppb/epoch is the realistic "
-                            "Q value per bravo's analysis (real wander = "
-                            "(6 ppb)²/60s ≈ 0.6 ppb²/s).  Tunable for "
-                            "iteration; per-host value belongs in TOML "
+                            "Default 0.1 — empirically better than the 0.5 "
+                            "value bravo's variance-matching math suggested.  "
+                            "Tighter Q[1,1] means the filter SMOOTHS rx_TCXO "
+                            "wander rather than chasing it; chasing it via "
+                            "larger Q[1,1] degrades long-τ TDEV (PiFace "
+                            "2026-05-08: τ=100s 1.117→1.758 ns at Q=0.5).  "
+                            "Tunable; per-host value belongs in TOML "
                             "host-config eventually.")
     servo.add_argument("--track-kp", type=float, default=0.3,
                        help="PI servo Kp gain (default: 0.3)")
