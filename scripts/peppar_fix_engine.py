@@ -5476,8 +5476,8 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         sigma_ticc_ns=sigma_ticc,
         sigma_do_phase_ns=0.92,
         sigma_do_freq_ppb=args.kalman_sigma_freq,
-        sigma_tcxo_phase_ns=2.0,    # rx TCXO (F9T) PPS TDEV(1s)
-        sigma_tcxo_freq_ppb=0.1,    # rx TCXO drift rate
+        sigma_tcxo_phase_ns=2.0,                          # rx TCXO PPS TDEV(1s)
+        sigma_tcxo_freq_ppb=args.kalman_sigma_tcxo_freq,  # rx TCXO drift rate
         max_ppb=caps['max_adj'],
         initial_freq=current_adj,
         initial_dt_rx_ns=bootstrap_dt_rx_ns,
@@ -5485,9 +5485,10 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
              "sigma_do=[0.92 ns, %.4f ppb], "
-             "sigma_tcxo=[2.0 ns, 0.1 ppb], "
+             "sigma_tcxo=[2.0 ns, %.3f ppb], "
              "initial_freq=%.1f ppb, base_freq=%s, tcxo_init=%s",
-             sigma_ticc, args.kalman_sigma_freq, current_adj,
+             sigma_ticc, args.kalman_sigma_freq,
+             args.kalman_sigma_tcxo_freq, current_adj,
              f"{bootstrap_base_freq:.1f}" if bootstrap_base_freq else "None",
              bootstrap_dt_rx_ns is not None)
     scheduler = DisciplineScheduler(
@@ -8157,6 +8158,15 @@ Two-phase operation:
                        help="DO frequency random walk (ppb/epoch). Lower = "
                             "more stable frequency estimate, less wander. "
                             "Default 0.01 from ADEV characterization.")
+    servo.add_argument("--kalman-sigma-tcxo-freq", type=float, default=0.5,
+                       help="rx TCXO frequency random walk (ppb/epoch).  "
+                            "Was 0.1 default before Arm 2 frequency-aided "
+                            "unwrap exposed real rx_TCXO wander of 5-8 ppb "
+                            "on minute-scale; 0.5 ppb/epoch is the realistic "
+                            "Q value per bravo's analysis (real wander = "
+                            "(6 ppb)²/60s ≈ 0.6 ppb²/s).  Tunable for "
+                            "iteration; per-host value belongs in TOML "
+                            "host-config eventually.")
     servo.add_argument("--track-kp", type=float, default=0.3,
                        help="PI servo Kp gain (default: 0.3)")
     servo.add_argument("--track-ki", type=float, default=0.1,
