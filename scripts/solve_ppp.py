@@ -1128,6 +1128,15 @@ class FixedPosFilter:
     CATASTROPHIC_PR_BASELINE_FLOOR_M = 5.0
     CATASTROPHIC_HISTORY_MAX = 10
     CATASTROPHIC_HISTORY_MIN = 5
+    # Engine-integration cascade limit (Note A — bravo follow-up).  When
+    # _consecutive_catastrophic_rejects reaches this value, the engine
+    # exits with code 5 so the wrapper can re-bootstrap with a fresh
+    # filter state.  Same shape as the existing 30-outlier servo cascade.
+    # 30 epochs at 1 Hz = ~30 s of sustained corruption — transient F9T
+    # serial bursts clear in < 5 s; longer means the DO has been free-
+    # running unmonitored long enough to warrant exit.
+    CATASTROPHIC_REJECT_LIMIT = 30
+
 
     def __init__(self, pos_ecef, init_ztd_m=0.0, init_ztd_sigma_m=0.5):
         """Fixed-position PPP filter.

@@ -3969,6 +3969,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
         "obs_dropped_expired": 0,
         "obs_dropped_queued": 0,
         "ticc_missing_pair": 0,
+        "catastrophic": 0,    # FixedPosFilter catastrophic-reject (Note B)
         "consumption_alarm": False,
     }
     # PPP-AR belongs in AntPosEst (the background PPPFilter that refines
@@ -4208,6 +4209,49 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 observations, corrections, gps_time,
                 clk_file=corrections,
             )
+
+            # Catastrophic-reject cascade (I-202649 v2 + Note A engine
+            # integration).  The filter rejects an epoch via the
+            # residual-consistency gate by returning n_used=0 *and*
+            # incrementing _consecutive_catastrophic_rejects.  An n_used=0
+            # return without that counter advancing is the regular
+            # n_pr<1 path (geometry / SP3 / clk_file gate); only the
+            # gated-reject case bumps the counter.
+            #
+            # On individual rejects, log the count to skip_stats so
+            # operators see catastrophic activity at engine exit (Note B).
+            # On sustained rejects (>= filter's CATASTROPHIC_REJECT_LIMIT
+            # consecutive), exit for wrapper-driven re-bootstrap — same
+            # shape as the existing 30-outlier servo cascade.  Sustained
+            # catastrophic rejects mean F9T input has lost integrity for
+            # long enough that the DO has been free-running unmonitored;
+            # better to clockClass-degrade and let the wrapper start
+            # fresh than to keep skipping epochs forever.
+            n_consec_cat = getattr(
+                filt, '_consecutive_catastrophic_rejects', 0)
+            if n_used == 0 and n_consec_cat > 0:
+                skip_stats["catastrophic"] += 1
+                cat_limit = getattr(
+                    filt, 'CATASTROPHIC_REJECT_LIMIT', 30)
+                if n_consec_cat >= cat_limit:
+                    log.error(
+                        "  %d consecutive catastrophic rejects "
+                        "(>= limit %d) — F9T input stream lost "
+                        "integrity.  Exiting for re-bootstrap "
+                        "(exit code 5).",
+                        n_consec_cat, cat_limit,
+                    )
+                    if dfe_sm is not None:
+                        dfe_sm.transition(
+                            DOFreqEstState.HOLDOVER,
+                            f"{n_consec_cat} consecutive catastrophic rejects",
+                        )
+                    if servo_ctx is not None:
+                        _set_clock_class(servo_ctx, "freerun")
+                        servo_ctx['phc_diverged'] = True
+                    return 5
+                # Below the limit: skip this epoch and continue.
+                continue
 
             if n_used < 4:
                 skip_stats["too_few_meas"] += 1
