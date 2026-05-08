@@ -300,8 +300,27 @@ class DOFreqEst:
         # update; R_ticc inflation is the absorbing mechanism.  Do NOT
         # reorder this arm in front of the linear arms.
         if ticc_diff_ns is not None:
-            R_ticc = (np.array([[ticc_sigma_ns ** 2]])
-                      if ticc_sigma_ns is not None else self.R_ticc)
+            R_base = (ticc_sigma_ns ** 2 if ticc_sigma_ns is not None
+                      else float(self.R_ticc[0, 0]))
+            # State-dependent linearization-error inflation (I-131253
+            # bravo follow-up).  Standard EKF S = H·P·H^T + R captures
+            # first-order linearization uncertainty; what's missing is
+            # qerr()'s second-order error near tick boundaries.  When
+            # σ(x[0]) is well below the tick interval, qerr() is locally
+            # linear and R_lin → 0.  When σ(x[0]) approaches or exceeds
+            # the tick, qerr() bounces between adjacent ticks within ±σ
+            # and the prediction can be off by up to tick/2 even with
+            # the correct state — which the linear Jacobian doesn't see.
+            # R_lin absorbs that variance, capped at the half-tick worst
+            # case.  Degrades gracefully: PPP-converged sub-ns σ → no
+            # change; multi-tick σ → R_lin ≈ (tick/2)² which de-rates
+            # Arm 4 to tick-floor accuracy and lets Arm 3 (EXTINT) carry
+            # x[2] in that regime as designed.
+            sigma_x0 = math.sqrt(max(0.0, float(P_pred[0, 0])))
+            tick_third = self.tick_ns / 3.0
+            R_lin = ((self.tick_ns / 2.0) ** 2 *
+                     min(1.0, (sigma_x0 / tick_third) ** 2))
+            R_ticc = np.array([[R_base + R_lin]])
             h_pred = self._h_ticc(x_pred)
             H_ticc = self._H_ticc(x_pred)
             S = (H_ticc @ P_pred @ H_ticc.T + R_ticc).item()
