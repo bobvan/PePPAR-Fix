@@ -6571,7 +6571,14 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             _slope, _sigma, _n = ctx['rx_tcxo'].freq_ppb_with_sigma()
             if _slope is not None and _sigma is not None and _n >= 10:
                 qerr_freq_ppb = _slope
-                qerr_freq_sigma_ppb = max(_sigma, 0.005)  # floor: 5 fppb
+                # Floor on Arm 2 sigma.  Default 1.0 ppb — accounts for
+                # rx_TCXO frequency wander within the slope window (real
+                # F9T TCXOs wander 5-8 ppb on minute-scale timescales, so
+                # OLS slope sigma assuming white-phase qErr noise — which
+                # would be ~50 fppb — undersells the actual uncertainty
+                # by 1000x).  Tunable via --qerr-freq-sigma-floor for
+                # experimentation.
+                qerr_freq_sigma_ppb = max(_sigma, args.qerr_freq_sigma_floor)
         adjfine_ppb = -servo.update(
             dt=dt_actual,
             dt_rx_ns=dt_rx_ns, dt_rx_sigma_ns=dt_rx_sigma,
@@ -8223,6 +8230,13 @@ Two-phase operation:
     servo.add_argument("--no-carrier", action="store_true",
                        help="Disable PPP Carrier Phase servo drive "
                             "(Carrier source disabled, PPS+PPP still available)")
+    servo.add_argument("--qerr-freq-sigma-floor", type=float, default=1.0,
+                       help="Lower bound on Arm 2's qerr_freq_sigma_ppb in "
+                            "ppb (default 1.0).  Captures real rx_TCXO "
+                            "frequency wander within the slope window that "
+                            "OLS-derived sigma misses.  Smaller = filter "
+                            "trusts Arm 2 more.  See "
+                            "docs/dofreq-est-measurement-ladder.md §Arm 2.")
     servo.add_argument("--no-qerr-arm", action="store_true",
                        help="Disable DOFreqEst Arm 2 (qErr slope → x[1] = "
                             "rx TCXO frequency).  When set, the EKF runs "
