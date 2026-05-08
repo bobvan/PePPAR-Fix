@@ -453,10 +453,20 @@ class RxTcxoTracker:
 
     def __init__(self, freq_window=30):
         self._prev_qerr_ns = None
+        self._prev_t_s = None
         self._accumulated_ns = 0.0  # unwrapped phase
         self._n = 0
-        # Ring buffer for frequency estimation (slope of unwrapped phase)
+        # Ring buffers for frequency estimation (slope of unwrapped phase
+        # against actual sample timestamps).  _t_buf parallel to _phase_buf;
+        # both have the same length after every update().  When the caller
+        # supplies an absolute timestamp via update(t_s=...), the slope is
+        # computed against real time differences — the natural handling for
+        # variable-cadence raw qErr streams from QErrStore (TIM-TP at 1 Hz
+        # by default but can configure higher).  When t_s is omitted, _t_buf
+        # synthesizes uniform 1 s spacing from `dt` for backward compat
+        # with the legacy fixed-cadence path.
         self._phase_buf = deque(maxlen=freq_window)
+        self._t_buf = deque(maxlen=freq_window)
         # For dt_rx cross-validation (rate comparison, not absolute)
         self._prev_dt_rx = None
         self._dt_rx_calibrated = False
@@ -466,30 +476,44 @@ class RxTcxoTracker:
         self._synth_qerr_buf = deque(maxlen=10)
         self._rx_tcxo_phase = None
 
-    def update(self, qerr_ns, predicted_drift_ns_per_s=None, dt=1.0):
+    def update(self, qerr_ns, t_s=None, predicted_drift_ns_per_s=None,
+               dt=1.0):
         """Feed one qErr sample (nanoseconds).  Returns unwrapped phase in ns.
 
         Args:
             qerr_ns: F9T's qErr value, in [-4, +4] ns (the 8-ns sawtooth
                 quantization residual).
+            t_s: optional absolute sample timestamp in seconds (e.g.
+                CLOCK_MONOTONIC from the TIM-TP arrival).  When given,
+                slope LS uses real time differences and `dt` is derived
+                as t_s − prev_t_s.  When None (legacy callers), uses
+                the explicit `dt` arg below and synthesizes uniform t.
             predicted_drift_ns_per_s: optional rx TCXO frequency-offset
                 predictor (typically PPP dt_rx rate).  Enables
                 frequency-aided unwrap that handles arbitrary drift.
                 Without it, falls back to half-tick threshold (correct
                 only for drift < TICK_NS/(2·dt) ≈ 3.5 ppb at 1 Hz).
-            dt: time elapsed since previous sample, in seconds (default 1.0).
+            dt: time elapsed since previous sample, in seconds (default
+                1.0).  Ignored when t_s is supplied — derived from the
+                t_s difference instead.
 
         Returns:
             Unwrapped cumulative phase since first sample, in ns.
 
         Per docs/dofreq-est-measurement-ladder.md "Arm 2".  The slope
-        of the returned phase IS rx TCXO frequency offset in ppb,
-        consumable by DOFreqEst.update(qerr_freq_ppb=...).
+        of the returned phase IS rx TCXO frequency offset in ppb
+        (= ns/s), consumable by DOFreqEst.update(qerr_freq_ppb=...).
         """
+        # Derive elapsed dt from absolute timestamps when available.
+        if t_s is not None and self._prev_t_s is not None:
+            dt = max(0.0, float(t_s - self._prev_t_s))
+
         if self._prev_qerr_ns is None:
             self._prev_qerr_ns = qerr_ns
+            self._prev_t_s = t_s if t_s is not None else 0.0
             self._accumulated_ns = 0.0
             self._phase_buf.append(self._accumulated_ns)
+            self._t_buf.append(self._prev_t_s)
             self._n = 1
             return self._accumulated_ns
 
@@ -513,9 +537,48 @@ class RxTcxoTracker:
 
         self._accumulated_ns += true_delta
         self._prev_qerr_ns = qerr_ns
+        # Advance _prev_t_s by either the absolute timestamp or by dt.
+        # Synthetic time is fine for legacy callers; the slope LS uses
+        # whatever spacing _t_buf holds.
+        new_t_s = t_s if t_s is not None else self._prev_t_s + dt
+        self._prev_t_s = new_t_s
         self._phase_buf.append(self._accumulated_ns)
+        self._t_buf.append(new_t_s)
         self._n += 1
         return self._accumulated_ns
+
+    def update_from_qerr_store(self, qerr_store, predicted_drift_ns_per_s=None):
+        """Drain new qErr samples from QErrStore and feed each into the
+        tracker.  The tracker's slope LS uses each sample's TIM-TP
+        host_time as its x-axis, so variable-cadence streams are
+        handled correctly.
+
+        Replaces the legacy per-edge feed where the engine matched a
+        single qErr to each PPS edge via QErrStore.match_pps_mono and
+        called update(matched_qerr_ns).  The new path is robust to
+        FIFO drift across PPS gaps — see I-151540 Item 7 + Bravo's
+        2026-05-08 review note.
+
+        Args:
+            qerr_store: a QErrStore instance.
+            predicted_drift_ns_per_s: optional rx TCXO frequency
+                predictor (typically PPP dt_rx rate).  Same constant
+                value applied to every drained sample's unwrap math —
+                fine in practice because TCXO drift evolves slowly
+                (~ppb/s at most) compared to TIM-TP cadence (1 Hz
+                typically).
+
+        Returns:
+            (n_drained, last_phase_ns) — number of samples consumed
+            this call, and the unwrapped phase after the final sample
+            (or self._accumulated_ns if zero drained).
+        """
+        floor = self._prev_t_s if self._prev_t_s is not None else 0.0
+        samples = qerr_store.drain_since(floor)
+        for host_time, qerr_ns in samples:
+            self.update(qerr_ns, t_s=host_time,
+                        predicted_drift_ns_per_s=predicted_drift_ns_per_s)
+        return len(samples), self._accumulated_ns
 
     def freq_ns_per_s(self):
         """Estimate rx TCXO frequency offset in ns/s from recent window.
@@ -545,11 +608,22 @@ class RxTcxoTracker:
         if n < 5:
             return None, None, 0
         phases = list(self._phase_buf)
-        # Centered indices for stable slope sigma calculation.
-        t_mean = (n - 1) / 2.0
+        # Use _t_buf timestamps as the regression x-axis when available.
+        # Variable-cadence raw qErr streams (per-TIM-TP host_time) need
+        # real time differences for the slope to come out in ns/s.
+        # When _t_buf was synthesized from `dt` arg, t_buf entries are
+        # uniform — same answer the legacy index-based regression gave.
+        if len(self._t_buf) == n:
+            ts = list(self._t_buf)
+        else:
+            # Backward-compat shim: should not happen post-refactor but
+            # protects against any caller that pre-populated _phase_buf
+            # without going through update().
+            ts = list(range(n))
+        t_mean = sum(ts) / n
         y_mean = sum(phases) / n
-        sxx = sum((i - t_mean) ** 2 for i in range(n))
-        sxy = sum((i - t_mean) * (phases[i] - y_mean) for i in range(n))
+        sxx = sum((t - t_mean) ** 2 for t in ts)
+        sxy = sum((ts[i] - t_mean) * (phases[i] - y_mean) for i in range(n))
         if sxx <= 0:
             return None, None, 0
         slope = sxy / sxx
@@ -557,7 +631,8 @@ class RxTcxoTracker:
         # Residual variance about the linear fit; (n-2) DoF.
         if n <= 2:
             return slope, float("inf"), n
-        ss_resid = sum((phases[i] - intercept - slope * i) ** 2 for i in range(n))
+        ss_resid = sum((phases[i] - intercept - slope * ts[i]) ** 2
+                        for i in range(n))
         var_resid = ss_resid / (n - 2)
         sigma_slope = math.sqrt(max(var_resid, 0.0) / sxx)
         return slope, sigma_slope, n
@@ -6189,28 +6264,45 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     _rx_tcxo_discrep = None
     _rx_tcxo_freq = None
     _rx_tcxo_phase = None
-    # Prefer TICC-matched qErr (more precise epoch), fall back to EXTTS
-    _qerr_for_rx_tcxo = qerr_for_ticc_pps_ns if qerr_for_ticc_pps_ns is not None else qerr_for_extts_pps_ns
-    if _qerr_for_rx_tcxo is not None:
-        # Frequency-aided unwrap: predict next qErr from dt_rx rate
-        # (PPP carrier-phase has no 8-ns sawtooth ambiguity).  Without
-        # this, F9T rx TCXOs at 100s of ppb defeat the half-tick
-        # threshold and the unwrap goes wrong.
-        # See docs/dofreq-est-measurement-ladder.md §"Arm 2".
-        predicted_drift = None
-        if dt_rx_ns is not None and dt_rx_sigma is not None and dt_rx_sigma < 2.0:
-            prev_dt_rx = ctx.get('prev_dt_rx_for_unwrap')
-            if prev_dt_rx is not None:
-                # Single-sample dt_rx rate: sigma ~0.14 ns/s, well within
-                # the 4-ns/s ambiguity bound.  No smoothing needed.
-                predicted_drift = dt_rx_ns - prev_dt_rx
-            ctx['prev_dt_rx_for_unwrap'] = dt_rx_ns
-        unwrapped_ns = rx_tcxo.update(_qerr_for_rx_tcxo,
-                                      predicted_drift_ns_per_s=predicted_drift)
+    # Frequency-aided unwrap: predict next qErr from dt_rx rate
+    # (PPP carrier-phase has no 8-ns sawtooth ambiguity).  Without
+    # this, F9T rx TCXOs at 100s of ppb defeat the half-tick
+    # threshold and the unwrap goes wrong.
+    # See docs/dofreq-est-measurement-ladder.md §"Arm 2".
+    predicted_drift = None
+    if dt_rx_ns is not None and dt_rx_sigma is not None and dt_rx_sigma < 2.0:
+        prev_dt_rx = ctx.get('prev_dt_rx_for_unwrap')
+        if prev_dt_rx is not None:
+            # Single-sample dt_rx rate: sigma ~0.14 ns/s, well within
+            # the 4-ns/s ambiguity bound.  No smoothing needed.
+            predicted_drift = dt_rx_ns - prev_dt_rx
+        ctx['prev_dt_rx_for_unwrap'] = dt_rx_ns
+    # Drain raw TIM-TP stream and feed sample-by-sample (I-151540
+    # Item 7).  Each TIM-TP message has its own host_time timestamp;
+    # variable-cadence handled correctly by the tracker's t_s-aware
+    # slope LS.  Replaces the legacy per-PPS-edge feed via
+    # match_pps_mono(qerr_for_*_pps_ns), which was vulnerable to
+    # FIFO sequence breaks across PPS gaps (the failure mode behind
+    # qVIR=0 cascades on PiFace post-antenna-swap).
+    qerr_store = ctx.get('qerr_store')
+    n_drained = 0
+    unwrapped_ns = rx_tcxo.accumulated_phase_ns()
+    if qerr_store is not None:
+        n_drained, unwrapped_ns = rx_tcxo.update_from_qerr_store(
+            qerr_store, predicted_drift_ns_per_s=predicted_drift)
+    if n_drained > 0 or rx_tcxo.n_samples > 0:
         _rx_tcxo_freq, freq_n = rx_tcxo.freq_ns_per_s()
-        # Synthesize phase: dt_rx resolves tick, qErr gives sub-tick
-        if dt_rx_ns is not None and dt_rx_sigma is not None and dt_rx_sigma < 2.0:
-            _rx_tcxo_phase = rx_tcxo.phase_ns(dt_rx_ns, _qerr_for_rx_tcxo)
+        # Synthesize phase: dt_rx resolves tick, qErr gives sub-tick.
+        # phase_ns retains its per-edge interface — synthesized phase
+        # at the current epoch is computed from the last matched qErr,
+        # not from the raw stream (different consumer; see Bravo's
+        # I-151540 review note for the multiple-consumers finding).
+        _qerr_for_synth = (qerr_for_ticc_pps_ns
+                            if qerr_for_ticc_pps_ns is not None
+                            else qerr_for_extts_pps_ns)
+        if (dt_rx_ns is not None and dt_rx_sigma is not None
+                and dt_rx_sigma < 2.0 and _qerr_for_synth is not None):
+            _rx_tcxo_phase = rx_tcxo.phase_ns(dt_rx_ns, _qerr_for_synth)
             discrep, cal = rx_tcxo.cross_validate_dt_rx(dt_rx_ns)
             if cal:
                 _rx_tcxo_discrep = discrep
@@ -6218,17 +6310,17 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                 synth_str = f"synth={_rx_tcxo_phase:.1f}ns " if _rx_tcxo_phase is not None else ""
                 if cal and discrep is not None:
                     log.info("  [%d] rx_tcxo: unwrapped=%.1f ns, "
-                             "%sfreq=%.3f ns/s (%d samples), "
+                             "%sfreq=%.3f ns/s (%d samples, %d new), "
                              "dt_rx rate discrepancy=%+.2f ns/s",
                              n_epochs, unwrapped_ns, synth_str,
                              _rx_tcxo_freq if _rx_tcxo_freq is not None else 0.0,
-                             freq_n, discrep)
+                             freq_n, n_drained, discrep)
                 elif not cal:
                     log.info("  [%d] rx_tcxo: unwrapped=%.1f ns, "
-                             "%sfreq=%.3f ns/s (%d samples), calibrating",
+                             "%sfreq=%.3f ns/s (%d samples, %d new), calibrating",
                              n_epochs, unwrapped_ns, synth_str,
                              _rx_tcxo_freq if _rx_tcxo_freq is not None else 0.0,
-                             freq_n)
+                             freq_n, n_drained)
 
     # ── Litmus test 1: EXTTS PPS + qErr ──
     # Uses qerr_for_extts_pps_ns matched to the EXTTS PPS epoch.

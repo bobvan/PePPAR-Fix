@@ -346,6 +346,33 @@ class QErrStore:
                 return None, None
             return latest["qerr_ns"], latest["tow_ms"]
 
+    def drain_since(self, host_time_floor):
+        """Return [(host_time, qerr_ns), ...] for every retained sample
+        whose host_time is strictly greater than ``host_time_floor``,
+        in monotonic order.
+
+        Used by RxTcxoTracker.update_from_qerr_store to walk the raw
+        TIM-TP stream sample-by-sample for slope LS — replacing the
+        per-PPS-edge match_pps_mono path that was vulnerable to FIFO
+        sequence breaks across PPS gaps (see I-151540 Item 7).
+
+        The store is bounded (maxlen samples); a consumer that lags
+        beyond that horizon will see only the most-recent maxlen
+        samples on its next call.  At default maxlen=128 and
+        F9T-typical 1 Hz TIM-TP, that's ~2 minutes of headroom —
+        plenty for any reasonable servo cadence.
+
+        Caller maintains its own floor (typically the host_time of
+        the last sample it consumed) and passes it on each call.
+        ``host_time_floor=0.0`` returns every retained sample.
+        """
+        with self._lock:
+            return [
+                (s["host_time"], s["qerr_ns"])
+                for s in self._samples
+                if s["host_time"] > host_time_floor
+            ]
+
     def snapshot(self, max_age_s=2.0):
         """Return latest qErr sample metadata or Nones if stale/unavailable."""
         with self._lock:
