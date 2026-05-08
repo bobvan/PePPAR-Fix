@@ -5226,7 +5226,6 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     gate_stats = None
     try:
         from peppar_fix import DisciplineScheduler
-        from peppar_fix import compute_error_sources
         from peppar_fix.timestamper_state import TimestamperParams
     except ImportError:
         log.error("peppar_fix library not available for servo")
@@ -5723,7 +5722,6 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             'pps_qerr_plus_var_ns2', 'pps_qerr_plus_ratio',
             'pps_qerr_minus_var_ns2', 'pps_qerr_minus_ratio',
             'carrier_error_ns',
-            'source', 'source_error_ns', 'source_confidence_ns',
             'adjfine_ppb', 'phase', 'n_meas', 'gain_scale',
             'discipline_interval', 'n_accumulated', 'watchdog_alarm',
             'tracking_mode', 'time_to_zero_s',
@@ -5766,7 +5764,6 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         'gain_scale': 1.0,
         'tmode_set': False,
         'position_saved': False,
-        'compute_error_sources': compute_error_sources,
         'ppp_cal': PPPCalibration(tick_ns=8.0, min_samples=10),
         'rx_tcxo': RxTcxoTracker(freq_window=30),
         'dt_rx_buffer': deque(maxlen=30),
@@ -5966,8 +5963,7 @@ def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
     # The TDC PFD measures PPS vs DPLL output.
     # Positive = output behind PPS = need to speed up.
     # Use TDC as the sole error source with 50 ps confidence.
-    from peppar_fix.error_sources import ErrorSource
-    source = ErrorSource('CM_TDC', phase_ns, 0.050)
+    cm_tdc_confidence_ns = 0.050
 
     TRACK_OUTLIER_NS = args.track_outlier_ns
     if TRACK_OUTLIER_NS is not None and abs(phase_ns) > TRACK_OUTLIER_NS:
@@ -5981,7 +5977,7 @@ def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
     else:
         ctx['consecutive_outliers'] = 0
 
-    scheduler.accumulate(source.error_ns, source.confidence_ns, source.name)
+    scheduler.accumulate(phase_ns, cm_tdc_confidence_ns, 'CM_TDC')
 
     if scheduler.should_correct():
         avg_error, avg_confidence, n_samples = scheduler.flush()
@@ -6052,7 +6048,6 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     pps_queue = ctx['pps_queue']
     ticc_tracker = ctx.get('ticc_tracker')
     log_w = ctx['log_w']
-    compute_error_sources = ctx['compute_error_sources']
     skip_stats = ctx.get('skip_stats')
 
     BASE_KP = args.track_kp
@@ -6305,11 +6300,6 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             lvl("  [%s] EXTTS qVIR: Δvar(pps)/Δvar(pps+qErr) = %.2f (%s)",
                 n_epochs, qerr_plus_ratio, label)
 
-    # ── Unified error source selection ──
-    # All available sources (PPS, PPS+qErr, Carrier, TICC) compete on
-    # equal terms via compute_error_sources().  TICC data is passed when
-    # available — no separate ticc_drive path.
-
     # Feed PPP calibration: compare PPP-derived qerr against TIM-TP
     # qErr for the first ~10 epochs to determine the constant offset.
     ppp_cal = ctx['ppp_cal']
@@ -6319,50 +6309,6 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         if done:
             log.info(f"  PPP calibration done: offset={ppp_cal.offset_ns:+.3f}ns "
                      f"({ppp_cal._n} samples)")
-    # Correction age drives sigma inflation on Carrier and PPS+PPP.
-    # When NTRIP goes stale, those sources lose competition gracefully
-    # to PPS+qErr / PPS instead of dying.
-    corr_age_for_inflation = None
-    if corr_snapshot is not None:
-        ages = [a for a in (corr_snapshot.get("broadcast_age_s"),
-                            corr_snapshot.get("ssr_age_s"))
-                if a is not None]
-        if ages:
-            corr_age_for_inflation = max(ages)
-
-    # Build TICC+qErr corrected error for the TICC source competition.
-    # pps_err_ticc_ns is the raw TICC diff; apply qErr to get the
-    # qErr-corrected value that compute_error_sources() will use.
-    _ts = ctx.get('ts_params')
-    _ticc_for_sources = pps_err_ticc_ns
-    _ticc_conf_for_sources = ticc_confidence
-    if pps_err_ticc_ns is not None:
-        _ticc_conf_for_sources = (_ts.qerr_confidence_ns
-                                  if _ts else args.ticc_confidence_ns)
-        # Apply qErr correction to TICC measurement
-        if qerr_for_ticc_pps_ns is not None:
-            _ticc_for_sources = pps_err_ticc_ns + qerr_for_ticc_pps_ns
-        elif qerr_for_extts_pps_ns is not None:
-            _ticc_for_sources = pps_err_ticc_ns + qerr_for_extts_pps_ns
-
-    sources = compute_error_sources(
-        pps_err_extts_ns,
-        None if args.no_qerr else qerr_for_extts_pps_ns,
-        dt_rx_ns,
-        dt_rx_sigma,
-        pps_confidence=_ts.pps_confidence_ns if _ts else 20.0,
-        qerr_confidence=_ts.qerr_confidence_ns if _ts else 3.0,
-        carrier_max_sigma=args.carrier_max_sigma_ns,
-        ppp_cal=None if args.no_ppp else ppp_cal,
-        carrier_tracker=(None if getattr(args, 'no_carrier', False)
-                         else ctx.get('carrier_tracker')),
-        corr_age_s=corr_age_for_inflation,
-        corr_staleness_ns_per_s=getattr(
-            args, 'corr_staleness_ns_per_s', 0.1),
-        ticc_error_ns=_ticc_for_sources,
-        ticc_confidence=_ticc_conf_for_sources,
-    )
-    best = sources[0]
 
     # No warmup or step phases — PHC bootstrap handles phase and frequency.
     # PI tracking from epoch 1.
@@ -6375,9 +6321,13 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     mode_time_to_zero_s = None
     mode_gain_floor = None
 
+    # Outlier check on the raw observed PPS phase error (PHC fractional
+    # offset).  This is what the system actually sees epoch-to-epoch;
+    # the EKF state estimate (servo.x[2]) lags by the filter's response
+    # and can hide a sustained step.
     if (
         TRACK_OUTLIER_NS is not None and
-        abs(best.error_ns) > TRACK_OUTLIER_NS and
+        abs(pps_err_extts_ns) > TRACK_OUTLIER_NS and
         not scheduler._converging
     ):
         ctx['consecutive_outliers'] += 1
@@ -6391,19 +6341,27 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                                 "30 consecutive outliers")
             ctx['phc_diverged'] = True
             return "outlier"
-        log.warning(f"  Outlier: {best}, skipping ({ctx['consecutive_outliers']}/30)")
+        log.warning(f"  Outlier: pps_err={pps_err_extts_ns:+.0f}ns, "
+                    f"skipping ({ctx['consecutive_outliers']}/30)")
         return "outlier"
     else:
         ctx['consecutive_outliers'] = 0
 
-    scheduler.accumulate(best.error_ns, best.confidence_ns, best.name)
+    # Scheduler input: |x[2]| is the EKF's DO-phase-vs-GPS-time estimate,
+    # the direct one-to-one replacement for the old source-mux output.
+    # σ comes from sqrt(P[2,2]) — the filter's own uncertainty in x[2].
+    scheduler.accumulate(
+        abs(servo.estimated_phase_ns),
+        max(servo.phase_uncertainty_ns, 0.001),
+        'EKF',
+    )
 
     # Feed in-band noise estimator (before correction decision)
     noise_est = ctx.get('noise_estimator')
     if noise_est is not None:
         # will_correct is a lookahead — True if scheduler will flush this epoch
         will_correct = scheduler.should_correct()
-        noise_est.feed(best.error_ns, ctx['adjfine_ppb'], will_correct)
+        noise_est.feed(pps_err_extts_ns, ctx['adjfine_ppb'], will_correct)
 
     # Three-stage clockClass promotion: 248 (boot) → 52 (PHC bootstrapped,
     # set by wrapper after bootstrap) → 6 (servo settled).  Demote back
@@ -6417,8 +6375,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
 
     if TRACK_RESTEP_NS is not None and not args.freerun:
         # Use pps_err_extts_ns (raw PHC fractional offset) for the restep
-        # check, not best.error_ns which includes the filter's dt_rx.
-        # After a step, dt_rx is stale and large while the filter
+        # check.  After a step, dt_rx is stale and large while the filter
         # reconverges — checking it would cause spurious resteps.
         if abs(pps_err_extts_ns) >= TRACK_RESTEP_NS:
             ctx['tracking_large_error_count'] += 1
@@ -6559,20 +6516,15 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         scheduler.compute_adaptive_interval(avg_confidence)
 
         if n_epochs % 10 == 0:
-            mode_suffix = ''
-            ct = ctx.get('carrier_tracker')
-            if (ct is not None and ct.initialized
-                    and best.name == 'Carrier' and n_epochs % 60 == 0):
-                mode_suffix += (f" anchor_resid={ct.anchor_residual_ns:+.1f}ns")
-            log.info(f"  [{n_epochs}] {best.name}: "
+            log.info(f"  [{n_epochs}] EKF: "
                      f"err={avg_error:+.1f}ns (avg {n_samples}) "
                      f"adj={adjfine_ppb:+.1f}ppb "
                      f"gain={gain_scale:.2f}x "
-                     f"interval={scheduler.interval}{mode_suffix}")
+                     f"interval={scheduler.interval}")
     else:
         if n_epochs % 10 == 0:
-            log.info(f"  [{n_epochs}] {best.name}: "
-                     f"err={best.error_ns:+.1f}ns "
+            log.info(f"  [{n_epochs}] EKF: "
+                     f"err={servo.estimated_phase_ns:+.1f}ns "
                      f"coast ({scheduler.n_accumulated}/{scheduler.interval}) "
                      f"adj={ctx['adjfine_ppb']:+.1f}ppb")
 
@@ -6593,7 +6545,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                pps_err_ticc_ns, ticc_age_s, ticc_confidence,
                pps_var_ns2, pps_qerr_plus_var_ns2, qerr_plus_ratio,
                pps_qerr_minus_var_ns2, qerr_minus_ratio,
-               carrier_error_ns, best,
+               carrier_error_ns,
                ctx['adjfine_ppb'], ctx['phase'], n_used,
                ctx['gain_scale'], scheduler, isb_gal_ns, isb_bds_ns,
                ctx.get('tracking_mode'), mode_time_to_zero_s,
@@ -6613,7 +6565,7 @@ def _log_servo(log_w, log_f, ts_str, gps_unix_sec, phc_sec, phc_nsec,
                pps_err_ticc_ns, ticc_age_s, ticc_confidence,
                pps_var_ns2, pps_qerr_plus_var_ns2, qerr_plus_ratio,
                pps_qerr_minus_var_ns2, qerr_minus_ratio,
-               carrier_error_ns, best,
+               carrier_error_ns,
                adjfine_ppb, phase, n_used, gain_scale, scheduler,
                isb_gal_ns, isb_bds_ns, tracking_mode, time_to_zero_s,
                phc_gettime_ns=None,
@@ -6655,7 +6607,6 @@ def _log_servo(log_w, log_f, ts_str, gps_unix_sec, phc_sec, phc_nsec,
         f'{pps_qerr_minus_var_ns2:.3f}' if pps_qerr_minus_var_ns2 is not None else '',
         f'{qerr_minus_ratio:.3f}' if qerr_minus_ratio is not None else '',
         f'{carrier_error_ns:.3f}' if carrier_error_ns is not None else '',
-        best.name, f'{best.error_ns:.3f}', f'{best.confidence_ns:.3f}',
         f'{adjfine_ppb:.3f}', phase, n_used, f'{gain_scale:.3f}',
         scheduler.interval, scheduler.n_accumulated, 0,
         tracking_mode or '',
