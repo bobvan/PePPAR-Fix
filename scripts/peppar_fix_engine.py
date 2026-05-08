@@ -6321,13 +6321,22 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     mode_time_to_zero_s = None
     mode_gain_floor = None
 
-    # Outlier check on the raw observed PPS phase error (PHC fractional
-    # offset).  This is what the system actually sees epoch-to-epoch;
-    # the EKF state estimate (servo.x[2]) lags by the filter's response
-    # and can hide a sustained step.
+    # Outlier check on the raw observed phase error.  Prefer the TICC
+    # chA-chB diff when present — it's the direct "DO PPS vs GNSS PPS"
+    # measurement, valid in both PHC mode (chA driven by PEROUT) and
+    # TICC-only mode (chA driven by DAC-steered OCXO).  Fall back to
+    # EXTTS PHC fractional offset on hosts without a TICC.  Don't use
+    # the EKF state x[2] — it lags by the filter's response and can
+    # hide a sustained step.  Don't use pps_err_extts_ns alone — on
+    # TICC-only hosts phc_nsec is synthesized as 0 so the EXTTS signal
+    # is identically 0 and the outlier detector silently disables.
+    outlier_observable_ns = (
+        pps_err_ticc_ns if pps_err_ticc_ns is not None
+        else pps_err_extts_ns
+    )
     if (
         TRACK_OUTLIER_NS is not None and
-        abs(pps_err_extts_ns) > TRACK_OUTLIER_NS and
+        abs(outlier_observable_ns) > TRACK_OUTLIER_NS and
         not scheduler._converging
     ):
         ctx['consecutive_outliers'] += 1
@@ -6341,7 +6350,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                                 "30 consecutive outliers")
             ctx['phc_diverged'] = True
             return "outlier"
-        log.warning(f"  Outlier: pps_err={pps_err_extts_ns:+.0f}ns, "
+        log.warning(f"  Outlier: pps_err={outlier_observable_ns:+.0f}ns, "
                     f"skipping ({ctx['consecutive_outliers']}/30)")
         return "outlier"
     else:
