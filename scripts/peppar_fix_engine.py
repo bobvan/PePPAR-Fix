@@ -2894,6 +2894,13 @@ class AntPosEstThread(threading.Thread):
                     f"{_pr:+.3f}m" if _pr is not None else "?",
                     f"{_phi:+.4f}m" if _phi is not None else "?",
                 )
+                # Feed the AnchoringSvPromoter's IF-resid gate (I-224945).
+                # Only ANCHORING SVs accumulate; the call is a no-op
+                # for ANCHORED ones (gate has already passed).
+                if _phi is not None:
+                    self._promoter.ingest_if_resid(
+                        _sv, _phi, self._n_epochs,
+                    )
             # ZTD state for the integrity monitor's ztd_impossible
             # trigger.  PPPFilter carries a ZTD residual state; if
             # the filter has absorbed position error into ZTD past
