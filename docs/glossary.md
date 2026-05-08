@@ -69,6 +69,27 @@ listed first.
 | **PEROUT** | Periodic Output.  Linux PTP subsystem feature: generates a periodic pulse (e.g., 1 PPS) from the PHC clock. |
 | **TDC** | Time-to-Digital Converter.  Hardware that converts a time interval to a digital measurement (used in ClockMatrix). |
 
+## Position state and engine start tiers
+
+The engine's startup behaviour is gated on what the receiver-state
+file (`state/receivers/<uid>.json` + `state/arp/<uid>.json`) knows
+about the antenna reference point and its uncertainty σ_arp.  Three
+tiers, in order of decreasing seed quality:
+
+| Tier | Definition | What the engine does |
+|------|------------|---------------------|
+| **Cold start** | No ARP history for this receiver.  No `state/arp/<uid>.json` (or σ_arp = ∞). | Seed PPPFilter from the first NAV2 fix.  No pinning.  Time filter starts in re-survey mode (FixedPosFilter not used until σ_arp tightens). |
+| **Warm start** | ARP exists but σ_arp ≥ pin_threshold (~10 cm).  Survey not converged. | Sanity-check stored ARP against first NAV2 fix.  If sane, seed both filters from the stored ARP; otherwise from NAV2.  No pinning; AntPosEst continues to refine. |
+| **Hot start** | ARP exists with σ_arp < pin_threshold.  Survey converged. | Seed FixedPosFilter from the stored ARP and **pin position**.  Seed PPPFilter from the same ARP and watch for movement (1–10 m ARP-shift detector). |
+
+Replaces the older two-tier "cold/warm" (= no-position/have-position)
+language: today's two-tier "warm start" splits into the new "warm"
+and "hot" based on σ_arp vs pin_threshold.  Old usages in
+`docs/phc-bootstrap.md` and surrounding code referring to "warm
+start" map onto either new "warm" or new "hot" depending on whether
+their referenced position file met today's pin threshold; treat
+those references as "warm-or-hot" until they're updated.
+
 ## Servo and control
 
 | Term | Definition |

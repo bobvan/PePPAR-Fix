@@ -313,7 +313,8 @@ class PPPFilter:
         self.initialized = False
 
     def initialize(self, pos_ecef, clock_m, isb_gal=0.0, isb_bds=0.0,
-                   systems=None, pos_sigma_m=10.0, ztd_sigma_m=0.2):
+                   systems=None, pos_sigma_m=10.0, ztd_sigma_m=0.2,
+                   init_ztd_m=0.0):
         """Initialize filter state.
 
         systems: optional iterable of constellations that will feed
@@ -341,13 +342,20 @@ class PPPFilter:
         bias residuals (GPS L5Q, BDS B2a-I in CNES) into ZTD, producing
         the ZTD doom-loop / ztd_impossible / ztd_cycling integrity-trip
         cascade observed on TimeHat 2026-04-29 overnight (36/73 trips).
+
+        init_ztd_m: initial value (m) for the IDX_ZTD residual state.
+        Default 0.0 preserves prior behavior.  Engine callers can seed
+        from METAR-derived Saastamoinen ZTD minus the 2.3 m hydrostatic
+        apriori to start the filter close to atmospheric truth, avoiding
+        the multi-meter cold-start transient observed under pinned mode
+        on 2026-05-04 — see I-024942 + scripts/peppar_fix/saastamoinen.py.
         """
         self.x = np.zeros(N_BASE)
         self.x[:3] = pos_ecef
         self.x[IDX_CLK] = clock_m
         self.x[IDX_ISB_GAL] = isb_gal
         self.x[IDX_ISB_BDS] = isb_bds
-        self.x[IDX_ZTD] = 0.0  # residual ZTD (a priori model handles bulk)
+        self.x[IDX_ZTD] = float(init_ztd_m)  # residual ZTD (apriori handles bulk)
         self._ztd_sigma_m = float(ztd_sigma_m)
         self._pos_sigma_m_init = float(pos_sigma_m)
         self.P = np.diag([
@@ -465,9 +473,9 @@ class PPPFilter:
         sigma_y = self.rx_tcxo_adev_1s
         return (C * sigma_y) ** 2
 
-    def apply_ztd_tie(self, sigma_m: float) -> None:
+    def apply_ztd_tie(self, sigma_m: float, target_m: float = 0.0) -> None:
         """Apply a soft prior on the residual ZTD state as a rank-1 EKF
-        update (pseudo-measurement z=0, h=e_ZTD, R=σ²).
+        update (pseudo-measurement z=target_m, h=e_ZTD, R=σ²).
 
         Motivation: the (position-altitude, ZTD, clock, mean-ambiguity)
         tuple forms a near-null direction at typical receiver
@@ -477,10 +485,15 @@ class PPPFilter:
         and altitude 18m within 5 minutes despite stable lock).
 
         IDX_ZTD is the *residual* on top of Saastamoinen+GMF bulk
-        tropo, so a soft prior z=0 with σ ≈ 0.05 m says "the residual
-        should be small (Saastamoinen handles the bulk)".  Filter can
-        deviate when observations strongly support it.  This is an
-        *intentional* constraint on the null-mode, not a hard pin.
+        tropo.  target_m=0 (default) says "trust the 2.3 m apriori".
+        Passing a METAR-derived residual instead makes the soft prior
+        track real atmospheric pressure / temperature changes — see
+        I-024942-main and the apply_ztd_tie call in
+        peppar_fix_engine.run_steady_state.
+
+        Filter can deviate when observations strongly support it.
+        This is an *intentional* constraint on the null-mode, not a
+        hard pin.
 
         See docs/ssr-phase-bias-step-handling.md (the slip-detection
         side of the same family of issues) and Bravo's day0423 PRIDE
@@ -488,7 +501,7 @@ class PPPFilter:
         """
         if sigma_m is None or sigma_m <= 0:
             return
-        y = -float(self.x[IDX_ZTD])                     # z=0 minus state
+        y = float(target_m) - float(self.x[IDX_ZTD])
         S = float(self.P[IDX_ZTD, IDX_ZTD]) + sigma_m ** 2
         K = self.P[:, IDX_ZTD] / S
         self.x = self.x + K * y
@@ -1079,12 +1092,42 @@ class FixedPosFilter:
     IDX_ISB_BDS = 4
     N_STATES = 5
 
-    def __init__(self, pos_ecef):
+    def __init__(self, pos_ecef, init_ztd_m=0.0, init_ztd_sigma_m=0.5):
+        """Fixed-position PPP filter.
+
+        Args:
+            pos_ecef: pinned antenna position in ECEF metres.
+            init_ztd_m: initial residual ZTD seed in metres (default
+                0.0 = "trust the Saastamoinen+GMF bulk model, residual
+                starts at zero").  When METAR (or another atmospheric
+                source) provides a known T/P/e at the antenna, the
+                Saastamoinen-derived residual offset can be passed here
+                so the filter starts within physical envelope instead
+                of absorbing meters of clock-state error during cold
+                start.  See I-024942-main and
+                scripts/peppar_fix/saastamoinen.py.
+            init_ztd_sigma_m: 1-σ uncertainty on the seed (default 0.5
+                m = legacy wide prior).  With METAR source: ~0.05 m
+                tightens the prior so the filter cannot drift ZTD past
+                physical envelope while clock state catches up.
+        """
         self.pos = np.array(pos_ecef)
         self.x = np.zeros(self.N_STATES)     # [clock, clock_rate, dZTD, isb_gal, isb_bds] in meters
-        self.P = np.diag([1e18, 1e6, 0.5**2, 1e8, 1e8])  # dZTD: 0.5m initial sigma
+        self.x[self.IDX_ZTD] = float(init_ztd_m)
+        self.P = np.diag([1e18, 1e6,
+                          float(init_ztd_sigma_m) ** 2,
+                          1e8, 1e8])
         self.prev_geo = {}  # sv → {rho_corr, sat_clk_m, phi_if_m, tropo}
         self.initialized = False  # Will seed clock from first epoch
+        # Per-epoch residual breakdown — populated by update().  Lets
+        # the watchdog distinguish PR-domain noise (m-scale floor:
+        # code multipath + SSR latency) from TD-CP-domain residuals
+        # (sub-cm, real filter mismatch).  See I-145915 PR/CP
+        # residual-gating port + docs/time-filter-pr-cp-port.md.
+        self.last_n_pr = 0
+        self.last_n_td = 0
+        self.last_resid_pr = np.array([])
+        self.last_resid_td = np.array([])
 
     def predict(self, dt):
         if dt <= 0:
@@ -1102,6 +1145,28 @@ class FixedPosFilter:
         Q[self.IDX_ISB_GAL, self.IDX_ISB_GAL] = 1e-6 * dt  # GAL ISB random walk
         Q[self.IDX_ISB_BDS, self.IDX_ISB_BDS] = 1e-6 * dt  # BDS ISB random walk
         self.P += Q
+
+    def apply_ztd_tie(self, sigma_m: float, target_m: float = 0.0) -> None:
+        """Soft prior on the residual ZTD state (rank-1 Kalman update,
+        z=target_m, h=e_ZTD, R=σ²).
+
+        Counters per-SV systematic-bias absorption (SSR phase-bias
+        substitution, antenna PCV miscorrection, multipath) that the
+        filter would otherwise pile into ZTD because position is
+        pinned and ZTD is the only state with elevation-dependent
+        geometry.  Pull toward a METAR-derived residual to track real
+        atmospheric pressure / temperature changes; target_m=0 keeps
+        the residual near the 2.3 m hydrostatic apriori.
+
+        See solve_ppp.PPPFilter.apply_ztd_tie for the full motivation.
+        """
+        if sigma_m is None or sigma_m <= 0:
+            return
+        y = float(target_m) - float(self.x[self.IDX_ZTD])
+        S = float(self.P[self.IDX_ZTD, self.IDX_ZTD]) + sigma_m ** 2
+        K = self.P[:, self.IDX_ZTD] / S
+        self.x = self.x + K * y
+        self.P = self.P - np.outer(K, self.P[self.IDX_ZTD, :])
 
     def compute_geometry(self, sv, sp3, t, clk_file, pr_m=None):
         """Compute corrected range and satellite clock for one SV."""
@@ -1152,6 +1217,13 @@ class FixedPosFilter:
 
     def update(self, observations, sp3, t, clk_file=None):
         H_rows, z_rows, R_diag = [], [], []
+        # Per-row indices tracked during construction so post_resid can
+        # be split into pure-PR and pure-TD-CP residual vectors for
+        # the I-145915 watchdog redesign.  The construction loop below
+        # appends rows interleaved PER-SV, NOT block-ordered:
+        #   [SV1_PR, SV1_TD?, SV2_PR, SV2_TD?, …]
+        # so post_resid[:n_pr] does NOT yield the PR rows alone.
+        pr_idx, td_idx = [], []
         n_pr = 0
         n_td = 0
         current_geo = {}
@@ -1252,6 +1324,7 @@ class FixedPosFilter:
             h_pr[self.IDX_ZTD] = m_wet
             if isb_idx is not None:
                 h_pr[isb_idx] = 1.0
+            pr_idx.append(len(H_rows))
             H_rows.append(h_pr)
             z_rows.append(dz_pr)
             R_diag.append((SIGMA_P_IF / w) ** 2)
@@ -1275,6 +1348,7 @@ class FixedPosFilter:
                 h_td[0] = 1.0
                 h_td[self.IDX_ZTD] = m_wet  # ZTD change maps through wet MF
                 # ISB cancels in time difference (constant bias)
+                td_idx.append(len(H_rows))
                 H_rows.append(h_td)
                 z_rows.append(dz_td)
                 sigma_td = 0.3 / max(0.2, elev_factor)
@@ -1284,6 +1358,10 @@ class FixedPosFilter:
         if n_pr < 1:
             self.prev_geo = current_geo
             self.prev_clock = self.x[0]
+            self.last_n_pr = 0
+            self.last_n_td = 0
+            self.last_resid_pr = np.array([])
+            self.last_resid_td = np.array([])
             return 0, np.array([]), 0
 
         H = np.array(H_rows)
@@ -1296,6 +1374,16 @@ class FixedPosFilter:
         except np.linalg.LinAlgError:
             self.prev_geo = current_geo
             self.prev_clock = self.x[0]
+            # Pre-fit residuals (z is innovation pre-update); split via
+            # the per-row index lists tracked during construction.
+            # Cannot use z[:n_pr] / z[n_pr:n_pr+n_td] — rows are
+            # interleaved per-SV.
+            self.last_n_pr = n_pr
+            self.last_n_td = n_td
+            self.last_resid_pr = (z[pr_idx].copy() if pr_idx
+                                  else np.array([]))
+            self.last_resid_td = (z[td_idx].copy() if td_idx
+                                  else np.array([]))
             return n_pr, z, n_td
 
         self.x = self.x + K @ z
@@ -1308,6 +1396,20 @@ class FixedPosFilter:
         # Store for next epoch's time differencing
         self.prev_geo = current_geo
         self.prev_clock = self.x[0]
+
+        # Domain-split residuals for the watchdog + diagnostic logging.
+        # H_rows is INTERLEAVED per-SV ([SV1_PR, SV1_TD?, SV2_PR, ...])
+        # because the construction loop appends each SV's PR row then
+        # its (optional) TD row before moving to the next SV.
+        # post_resid[:n_pr] would NOT yield the PR rows alone — it'd
+        # be a mix of early-SVs' PR + TD rows.  Use the per-row index
+        # lists tracked at append time instead.
+        self.last_n_pr = n_pr
+        self.last_n_td = n_td
+        self.last_resid_pr = (post_resid[pr_idx].copy() if pr_idx
+                              else np.array([]))
+        self.last_resid_td = (post_resid[td_idx].copy() if td_idx
+                              else np.array([]))
 
         return n_pr + n_td, post_resid, n_td
 

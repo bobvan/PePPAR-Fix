@@ -55,7 +55,7 @@ class DOFreqEst:
     returns ppb.  Also takes dt_rx_ns for PPP carrier-phase fusion.
     """
 
-    def __init__(self, sigma_ticc_ns=0.178,
+    def __init__(self, sigma_ticc_ns=0.060,
                  sigma_do_phase_ns=0.92, sigma_do_freq_ppb=0.01,
                  sigma_tcxo_phase_ns=2.0, sigma_tcxo_freq_ppb=0.1,
                  tick_ns=8.0,
@@ -117,7 +117,7 @@ class DOFreqEst:
         else:
             self.P = np.diag([1e6, 100.0**2, 1000.0**2, 100.0**2])
 
-        # LQR: only PHC states are controllable
+        # LQR: only DO states are controllable (x[2] = DO phase, x[3] = DO freq)
         # L[2] = phase gain (negative: positive φ_do = late → more u
         #         → more adjfine → speed up → reduce lateness)
         # L[3] = freq cancellation
@@ -167,16 +167,45 @@ class DOFreqEst:
         else:
             return np.array([[0.0, 0.0, -1.0, 0.0]])
 
-    def update(self, offset_ns, dt=1.0,
-               dt_rx_ns=None, dt_rx_sigma_ns=None):
-        """Process one epoch.
+    def update(self, *,
+               dt=1.0,
+               dt_rx_ns=None, dt_rx_sigma_ns=None,
+               qerr_freq_ppb=None, qerr_freq_sigma_ppb=None,
+               extint_phase_ns=None, extint_sigma_ns=None,
+               ticc_diff_ns=None, ticc_sigma_ns=None):
+        """Process one epoch with up to four conditional measurement arms.
+
+        Per docs/dofreq-est-measurement-ladder.md.  All arms are
+        keyword-only.  Each arm is gated on its own availability;
+        the predict step always runs.  Order: PPP → qErr → EXTINT
+        → TICC, chosen so the linear arms run before the nonlinear
+        TICC update at the most recent state estimate.
+
+        Arm 1 (PPP)     observes  x[0] = rx TCXO phase from GPS
+        Arm 2 (qErr)    observes  x[1] = rx TCXO frequency from GPS rate
+        Arm 3 (EXTINT)  observes  x[2] = DO phase from GPS
+        Arm 4 (TICC)    observes  -x[2] - qerr(x[0])  (nonlinear coupling)
 
         Args:
-            offset_ns: RAW ticc_diff_ns (before qErr correction).
-                = -(PEROUT - PPS) = -φ_phc - qerr(φ_tcxo) + noise.
             dt: seconds since last correction.
-            dt_rx_ns: PPP carrier-phase dt_rx (ns).
-            dt_rx_sigma_ns: 1-sigma uncertainty of dt_rx (~0.1 ns).
+            dt_rx_ns, dt_rx_sigma_ns:
+                Arm 1 — PPP carrier-phase dt_rx and its 1-σ (~0.1 ns).
+            qerr_freq_ppb, qerr_freq_sigma_ppb:
+                Arm 2 — slope of unwrapped TIM-TP qErr stream as a
+                direct rx-TCXO-frequency observation.  No FIFO edge
+                matching required (this arm is on time-averaged
+                qErr, not per-edge correction).
+            extint_phase_ns, extint_sigma_ns:
+                Arm 3 — DO PPS phase from GPS time, from TIM-TM2
+                (DO PPS wired to F9T EXTINT).  Sigma typically
+                accEst from the message itself (~5–15 ns).
+            ticc_diff_ns, ticc_sigma_ns:
+                Arm 4 — TICC chA-chB raw differential (DO PPS edge
+                vs rx TCXO PPS edge), no external qErr correction.
+                The qerr() correction is computed from the filter's
+                own state estimate of x[0], not from a separately-
+                matched qErr stream.  Sigma defaults to the
+                constructor's R_ticc if not provided.
 
         Returns:
             Frequency in ppb to apply via adjfine.
@@ -187,17 +216,23 @@ class DOFreqEst:
             self.F[2, 3] = -dt
             self.B[2] = -dt
 
-        # ── Seed φ_phc from first TICC measurement ──
-        # z_ticc = -φ_phc - qerr(φ_tcxo) → φ_phc = -z - qerr(φ_tcxo)
-        # Must happen before any Kalman update so the first innovation
-        # is near zero and doesn't corrupt the rx TCXO state.
+        # ── Seed x[2] from first available DO-phase measurement ──
+        # The seed avoids a large first-epoch innovation that would
+        # otherwise corrupt other states via covariance correlations.
+        # Prefer EXTINT (linear, σ ~ ns) over TICC (nonlinear, σ ~ sub-ns
+        # but only valid once x[0] is well-known via PPP) — but use
+        # whichever arrives first.  If neither arrives, leave x[2] at
+        # its constructor default and let the LQR develop it.
         if self._need_phc_seed:
-            self.x[2] = -offset_ns - _qerr(self.x[0], self.tick_ns)
-            # Reduce P[2,2] to match TICC measurement accuracy (~3 ns).
-            # This prevents TICC innovations from leaking too much into
-            # x[3] via P[2,3] correlation.
-            self.P[2, 2] = 10.0 ** 2
-            self._need_phc_seed = False
+            if extint_phase_ns is not None:
+                self.x[2] = extint_phase_ns
+                self.P[2, 2] = max(extint_sigma_ns ** 2 if extint_sigma_ns
+                                   else 100.0, 100.0)
+                self._need_phc_seed = False
+            elif ticc_diff_ns is not None:
+                self.x[2] = -ticc_diff_ns - _qerr(self.x[0], self.tick_ns)
+                self.P[2, 2] = 10.0 ** 2
+                self._need_phc_seed = False
 
         # ── Adaptive Q: boost during pull-in ──
         do_phase_abs = abs(self.x[2])
@@ -216,33 +251,85 @@ class DOFreqEst:
         x_pred = self.F @ self.x + self.B * self._last_u
         P_pred = self.F @ self.P @ self.F.T + Q_scaled * dt
 
-        # ── Sequential updates: PPP first, then TICC ──
-        # Order matters!  TICC H=[-1,0,-1,0] creates P[0,2] correlation.
-        # If PPP H=[1,0,0,0] runs after TICC, K_ppp[2] = P[2,0]/S ≈ -1,
-        # which applies the PPP innovation to x[2] and destroys the PHC
-        # state.  PPP first keeps P[0,2]=0 so K_ppp[2]=0.  Then TICC
-        # correctly directs its innovation to x[2] (since PPP pinned x[0]).
-
-        # ── Kalman update 1: PPP dt_rx (linear) ──
+        # ── Arm 1: PPP dt_rx (linear, observes x[0]) ──
+        # Order rationale: PPP first keeps x[0] tightly constrained
+        # before nonlinear TICC linearizes around it.
         if dt_rx_ns is not None and dt_rx_sigma_ns is not None:
-            R_ppp = np.array([[dt_rx_sigma_ns ** 2]])
-            innov_ppp = dt_rx_ns - (self.H_ppp @ x_pred).item()
-            S_ppp = (self.H_ppp @ P_pred @ self.H_ppp.T + R_ppp).item()
-            K_ppp = (P_pred @ self.H_ppp.T) / S_ppp
+            x_pred, P_pred = self._kalman_linear_update(
+                x_pred, P_pred,
+                z=dt_rx_ns,
+                H=self.H_ppp,
+                R=dt_rx_sigma_ns ** 2,
+            )
 
-            x_pred = x_pred + K_ppp.flatten() * innov_ppp
-            P_pred = P_pred - np.outer(K_ppp.flatten(), K_ppp.flatten()) * S_ppp
+        # ── Arm 2: qErr-as-frequency (linear, observes x[1]) ──
+        # Slope of unwrapped qErr time series.  No FIFO edge matching:
+        # qErr is treated as a time-averaged property of rx TCXO
+        # frequency, not as an edge-by-edge correction.
+        if qerr_freq_ppb is not None and qerr_freq_sigma_ppb is not None:
+            x_pred, P_pred = self._kalman_linear_update(
+                x_pred, P_pred,
+                z=qerr_freq_ppb,
+                H=np.array([[0.0, 1.0, 0.0, 0.0]]),
+                R=qerr_freq_sigma_ppb ** 2,
+            )
 
-        # ── Kalman update 2: raw TICC (nonlinear) ──
-        z_ticc = offset_ns
-        h_pred = self._h_ticc(x_pred)
-        innov_ticc = z_ticc - h_pred
-        H_ticc = self._H_ticc(x_pred)
-        S_ticc = (H_ticc @ P_pred @ H_ticc.T + self.R_ticc).item()
-        K_ticc = (P_pred @ H_ticc.T) / S_ticc
+        # ── Arm 3: EXTINT (linear, observes x[2]) ──
+        # DO PPS edge timestamped by F9T via TIM-TM2.  Independent
+        # of TICC; can stand alone as the only x[2] observer.
+        if extint_phase_ns is not None and extint_sigma_ns is not None:
+            x_pred, P_pred = self._kalman_linear_update(
+                x_pred, P_pred,
+                z=extint_phase_ns,
+                H=np.array([[0.0, 0.0, 1.0, 0.0]]),
+                R=extint_sigma_ns ** 2,
+            )
 
-        self.x = x_pred + K_ticc.flatten() * innov_ticc
-        self.P = P_pred - np.outer(K_ticc.flatten(), K_ticc.flatten()) * S_ticc
+        # ── Arm 4: TICC (nonlinear, couples x[0] and x[2]) ──
+        # The qerr() inside h_ticc uses the filter's own x[0] estimate
+        # — no externally-matched qErr stream consumed here.  This is
+        # what makes TICC robust to FIFO-matching failures.
+        #
+        # Linearization contract (per docs/dofreq-est-measurement-ladder.md
+        # "Sequential update order"): TICC runs LAST so qerr(x[0]) is
+        # linearized at the post-PPP x[0] — when PPP is converged this
+        # gives P[0,0] ≪ 1 ns², well inside one F9T tick interval (8 ns)
+        # and the qerr Jacobian is well-defined.  When PPP is degraded
+        # or skipped, the pre-update x[0] uncertainty can straddle a
+        # tick boundary and the Jacobian sign-flip can pollute the
+        # update; R_ticc inflation is the absorbing mechanism.  Do NOT
+        # reorder this arm in front of the linear arms.
+        if ticc_diff_ns is not None:
+            R_base = (ticc_sigma_ns ** 2 if ticc_sigma_ns is not None
+                      else float(self.R_ticc[0, 0]))
+            # State-dependent linearization-error inflation (I-131253
+            # bravo follow-up).  Standard EKF S = H·P·H^T + R captures
+            # first-order linearization uncertainty; what's missing is
+            # qerr()'s second-order error near tick boundaries.  When
+            # σ(x[0]) is well below the tick interval, qerr() is locally
+            # linear and R_lin → 0.  When σ(x[0]) approaches or exceeds
+            # the tick, qerr() bounces between adjacent ticks within ±σ
+            # and the prediction can be off by up to tick/2 even with
+            # the correct state — which the linear Jacobian doesn't see.
+            # R_lin absorbs that variance, capped at the half-tick worst
+            # case.  Degrades gracefully: PPP-converged sub-ns σ → no
+            # change; multi-tick σ → R_lin ≈ (tick/2)² which de-rates
+            # Arm 4 to tick-floor accuracy and lets Arm 3 (EXTINT) carry
+            # x[2] in that regime as designed.
+            sigma_x0 = math.sqrt(max(0.0, float(P_pred[0, 0])))
+            tick_third = self.tick_ns / 3.0
+            R_lin = ((self.tick_ns / 2.0) ** 2 *
+                     min(1.0, (sigma_x0 / tick_third) ** 2))
+            R_ticc = np.array([[R_base + R_lin]])
+            h_pred = self._h_ticc(x_pred)
+            H_ticc = self._H_ticc(x_pred)
+            S = (H_ticc @ P_pred @ H_ticc.T + R_ticc).item()
+            K = (P_pred @ H_ticc.T) / S
+            x_pred = x_pred + K.flatten() * (ticc_diff_ns - h_pred)
+            P_pred = P_pred - np.outer(K.flatten(), K.flatten()) * S
+
+        self.x = x_pred
+        self.P = P_pred
 
         # ── LQR control ──
         # Only L[2] (φ_phc) and L[3] (f_phc) are nonzero.
@@ -255,6 +342,19 @@ class DOFreqEst:
         self._last_u = u
         self.freq = adjfine
         return self.freq
+
+    def _kalman_linear_update(self, x_pred, P_pred, *, z, H, R):
+        """One linear Kalman measurement update.
+
+        Sequential update helper for arms 1/2/3 (the linear arms).
+        H is (1×4), z and R are scalars.  Returns updated (x, P).
+        """
+        innov = z - (H @ x_pred).item()
+        S = (H @ P_pred @ H.T + R).item()
+        K = (P_pred @ H.T) / S
+        x_new = x_pred + K.flatten() * innov
+        P_new = P_pred - np.outer(K.flatten(), K.flatten()) * S
+        return x_new, P_new
 
     def reset(self, current_freq):
         self.x = np.array([0.0, 0.0, 0.0, 0.0])

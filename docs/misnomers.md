@@ -258,6 +258,77 @@ The other trip reasons (`ztd_impossible`, `ztd_cycling`,
 `anchor_collapse`) read filter state, not residuals — leave alone.
 ~40 LOC; see `I-162353-main`.
 
+### `SettingSvDropMonitor` — name + architectural seam — Misleading
+
+**Where**: `scripts/peppar_fix/setting_sv_drop_monitor.py`, class
+`SettingSvDropMonitor`.
+**Claim**: "Setting-SV drop monitor — graceful drop as SVs descend
+through the retirement elevation band."  Name implies the monitor's
+job is to retire SVs that are descending into multipath-prone low
+elevations.
+**Actual** — two issues:
+
+  1. **Direction-agnostic.**  The trigger is "elev in 18-30° band
+     AND PR breach AND IF breach."  It fires equally on rising,
+     descending, or stable SVs in that band.  Empirically (day0502
+     night, 11 same-second wasted-evict events) ~45% of triggers
+     hit *rising* SVs transiting the band on their way up — the
+     opposite of "setting."  The mechanism docstring is honest
+     ("removes a member whose observations are becoming too noisy
+     to participate in the self-consistency check") but the name
+     encourages a wrong mental model.
+
+  2. **Per-SV-absolute vs per-SV-vs-cohort architectural seam.**
+     The trigger compares this SV's own rolling residual mean to
+     a fixed elev-weighted threshold (3 m PR base, 50 mm IF base).
+     Sibling per-SV monitors `IF_STEP` and `GF_STEP` instead use
+     cohort-relative thresholds (this SV's residual minus the
+     cohort median, fixed-tier ±50 mm/100 mm).  The cohort-relative
+     family auto-tunes for the antenna's specific multipath-vs-elev
+     curve; the absolute family does not.  At noisy sites the
+     absolute threshold over-fires on the whole fix set; at quiet
+     sites it under-fires.  The fixed elev-weighted shape (1/sin)
+     captures the *form* of the multipath curve but not the *level*
+     for a given antenna mount.
+
+**Why it matters**: today's empirical case (8 of 12 overnight
+window_rms trips at 80mm-IF, 11/11 same-second wasted-evicts on
+rising/stable SVs in band) shows the absolute-threshold family
+generates wasted action — wasted re-inits and wasted evictions
+where the cohort-relative family wouldn't have fired.  Bob's
+mental model: "I only care if observations are noisy or clean.
+I want clean ones in the filter regardless of elevation.  Elevation
+is an *explanation* for why noise might be there, not the metric
+I trip on."
+
+**Proposed**: rename + cohort-relative redesign.  Candidates:
+  - `LowElevNoiseDropMonitor` (acknowledges the band gate stays
+    but drops "setting").
+  - `BandNoiseDropMonitor` (Bob's framing — band-restricted noise
+    filter for NL members).
+  - `CohortNoiseDropMonitor` (architectural rename if we go full
+    cohort-relative and drop the band gate).
+
+The third is the deepest redesign: replace the elev-band gate AND
+the absolute threshold with "drop if rolling-mean PR AND IF
+residuals are > K × cohort median for sustained N epochs."
+Elevation drops out of the trigger entirely — it remains only as
+an explanation of why some SVs sit higher in the cohort.  Risks
+worth designing through: small fix sets (cohort median jitter at
+n_cohort < 4), correlated multipath (whole-set ride-through),
+catastrophic-event detection (kept by the existing whole-set
+window_rms alarm).
+
+**Notes**: tonight's IF-gate (I-161514, commit 3bba60e) is the
+narrow scope-fix on the existing absolute-threshold path; the
+cohort-relative redesign is a separate, larger architectural
+decision tracked here for now.  See `docs/sv-lifecycle-and-pfr-split.md`
+for the design intent ("noisy-member removal, before degraded
+input pulls the set off").  See empirical evidence in
+`/tmp/evict-waste-night/elev_trajectory.py` (post-hoc tool that
+classifies each event as EXPECTED / UNEXPECTED-rising /
+UNEXPECTED-stable / AMBIGUOUS).
+
 ### `FalseFixMonitor` — Dangerous (already self-flagged)
 
 **Where**: `scripts/peppar_fix/false_fix_monitor.py:166`

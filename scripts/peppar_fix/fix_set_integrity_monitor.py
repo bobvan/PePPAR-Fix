@@ -112,6 +112,7 @@ class FixSetIntegrityMonitor:
         pos_consensus_sustained_epochs: int = 30,
         ztd_consensus_threshold_m: float = 0.10,
         ztd_consensus_sustained_epochs: int = 60,
+        if_rms_threshold_m: float = 0.05,
     ) -> None:
         self._tracker = tracker
         # Reference to AntPosEst state machine — used to read the
@@ -127,6 +128,16 @@ class FixSetIntegrityMonitor:
         self._suppress_window = int(suppress_if_monitors_fired_within)
         self._anchor_collapse_epochs = int(anchor_collapse_epochs)
         self._rms_hist: deque = deque(maxlen=int(window_epochs))
+        # IF (carrier-phase) RMS history parallel to the PR history
+        # above.  Used by the window_rms trigger's IF gate (I-162353,
+        # 2026-05-02): only trip on PR-RMS breach when the IF-RMS
+        # also breaches.  PR-multipath storms with sub-cm IF
+        # residuals are integer-clean; tripping on them produces a
+        # full filter re-init with no integer pathology to recover
+        # from (8/12 = 67% of TimeHat day0501 trips).  See
+        # docs/misnomers.md "Residual-domain mismatch" pattern.
+        self._if_rms_hist: deque = deque(maxlen=int(window_epochs))
+        self._if_rms_threshold = float(if_rms_threshold_m)
         self._last_trip_epoch: int = -10**9
         # First epoch at which we observed zero long-term anchors on
         # a filter that has ever been ANCHORED.  None whenever
@@ -180,26 +191,36 @@ class FixSetIntegrityMonitor:
     # ── Data intake ─────────────────────────────────────────────── #
 
     def ingest(self, epoch: int, resid, labels) -> None:
-        """Absorb PR residuals across all NL members for this epoch.
+        """Absorb PR and phi residuals across all NL members for this epoch.
 
-        Computes single-epoch RMS across SVs currently in either
-        ANCHORING or ANCHORED (the fix set).  SVs outside
-        the fix set are excluded.
+        Computes single-epoch RMS for each kind across SVs currently
+        in either ANCHORING or ANCHORED (the fix set).  SVs outside
+        the fix set are excluded.  Both histories are kept so the
+        window_rms trip can gate on PR breach AND IF (carrier-phase)
+        breach — see I-162353 and docs/misnomers.md "Residual-domain
+        mismatch" pattern.
         """
         if resid is None:
             return
-        vals: list[float] = []
+        pr_vals: list[float] = []
+        if_vals: list[float] = []
         nl_states = {SvAmbState.ANCHORING, SvAmbState.ANCHORED}
         for lab, r in zip(labels, resid):
             sv, kind = lab[0], lab[1]
-            if kind != 'pr':
+            if kind not in ('pr', 'phi'):
                 continue
             if self._tracker.state(sv) not in nl_states:
                 continue
-            vals.append(abs(float(r)))
-        if vals:
-            rms = math.sqrt(sum(v * v for v in vals) / len(vals))
-            self._rms_hist.append(rms)
+            if kind == 'pr':
+                pr_vals.append(abs(float(r)))
+            else:  # 'phi'
+                if_vals.append(abs(float(r)))
+        if pr_vals:
+            self._rms_hist.append(
+                math.sqrt(sum(v * v for v in pr_vals) / len(pr_vals)))
+        if if_vals:
+            self._if_rms_hist.append(
+                math.sqrt(sum(v * v for v in if_vals) / len(if_vals)))
 
     # ── Evaluation ──────────────────────────────────────────────── #
 
@@ -406,6 +427,27 @@ class FixSetIntegrityMonitor:
         if window_mean <= self._threshold:
             return None
 
+        # IF-RMS gate (I-162353, 2026-05-02): require the carrier-phase
+        # RMS over the same window to also exceed if_rms_threshold_m.
+        # PR-multipath storms with sub-cm IF residuals are integer-
+        # clean — full filter re-init has no integer pathology to
+        # recover from.  Empirically (TimeHat day0501) 8 of 12 trips
+        # had IF-RMS in 4-80 mm; only 3 had IF-RMS at 122-226 mm
+        # (real integer pathology).  When no IF samples are
+        # available (early-arc state), fall through to the legacy
+        # PR-only check rather than gating on absent data.
+        if len(self._if_rms_hist) >= self._min_samples:
+            if_window_mean = sum(self._if_rms_hist) / len(self._if_rms_hist)
+            if if_window_mean <= self._if_rms_threshold:
+                log.info(
+                    "[FIX_SET_INTEGRITY] suppressed: window-RMS PR=%.2fm "
+                    "> %.2fm but IF=%.3fm ≤ %.3fm — integer-clean PR-"
+                    "multipath storm, no re-init",
+                    window_mean, self._threshold,
+                    if_window_mean, self._if_rms_threshold,
+                )
+                return None
+
         # Suppress if a per-SV monitor fired recently: look for any
         # SV that transitioned to FLOATING within the suppress window.
         # (Setting-SV drops and false-fix rejections both land in FLOATING.)
@@ -423,11 +465,20 @@ class FixSetIntegrityMonitor:
                     return None
 
         latest = self._rms_hist[-1]
+        if_latest = (self._if_rms_hist[-1]
+                     if self._if_rms_hist else None)
+        if_window_mean_for_event = (
+            sum(self._if_rms_hist) / len(self._if_rms_hist)
+            if self._if_rms_hist else None
+        )
         return {
             'reason': 'window_rms',
             'rms_m': latest,
             'window_rms_m': window_mean,
             'n_samples': len(self._rms_hist),
+            'if_rms_m': if_latest,
+            'if_window_rms_m': if_window_mean_for_event,
+            'if_n_samples': len(self._if_rms_hist),
         }
 
     def record_trip(self, epoch: int) -> None:
@@ -442,6 +493,7 @@ class FixSetIntegrityMonitor:
         """
         self._last_trip_epoch = int(epoch)
         self._rms_hist.clear()
+        self._if_rms_hist.clear()
         self._anchor_collapse_since = None
         self._ztd_above_since = None
         self._pos_consensus_above_since = None

@@ -171,7 +171,11 @@ def required_messages(minimal=False):
 # Port ID mapping
 PORT_SUFFIX = {0: "I2C", 1: "UART1", 2: "UART2", 3: "USB", 4: "SPI"}
 
-SIGNAL_NAMES = {
+# GPS and Galileo sigIds are stable across u-blox F9 and F10 chipsets.
+# BDS sigIds COLLIDE between the two — see F9T_BDS_SIG_NAMES vs
+# F10_BDS_SIG_NAMES below.  Drivers compose their own signal_names
+# table from these pieces so per-receiver dispatch is automatic.
+_GPS_GAL_SIG_NAMES = {
     (0, 0): "GPS-L1CA",
     (0, 3): "GPS-L2CL",
     (0, 4): "GPS-L2CM",
@@ -183,10 +187,42 @@ SIGNAL_NAMES = {
     (2, 4): "GAL-E5aQ",
     (2, 5): "GAL-E5bI",
     (2, 6): "GAL-E5bQ",
-    (3, 0): "BDS-B1I",
-    (3, 5): "BDS-B2aI",
-    (3, 2): "BDS-B2I",
 }
+
+# F9T BDS sigId mapping — empirically validated on ZED-F9T-20B (TIM 2.25)
+# during the 2026-04-19 BDS AR success on MadHat + clkPoC3.  Note this
+# differs from the ZED-F9T-10B Interface Description (UBX-20033631),
+# which lists (3, 5)=B1C and (3, 7)=B2a — we keep the lab-validated
+# mapping as ground truth for TIM 2.25 firmware.
+F9T_BDS_SIG_NAMES = {
+    (3, 0): "BDS-B1I",
+    (3, 2): "BDS-B2I",
+    (3, 5): "BDS-B2aI",
+}
+
+# F10 chipset BDS sigId mapping — per F10 SPG 6.00 Interface Description
+# (UBX-23002975) and F9 HPG 1.51 (UBXDOC-963802114-13124).  Both docs
+# agree on the same table for the F10 family (NEO-F10N, NEO-F10T) and
+# the F9P family.  CRITICAL: (3, 5) means B1Cp on F10 but B2aI on F9T —
+# same UBX wire bytes, different carrier frequency.
+F10_BDS_SIG_NAMES = {
+    (3, 0): "BDS-B1I",     # B1I D1
+    (3, 1): "BDS-B1ID2",   # B1I D2
+    (3, 2): "BDS-B2I",     # B2I D1 (BDS-2 only; not on L5-only RF)
+    (3, 3): "BDS-B2ID2",   # B2I D2
+    (3, 4): "BDS-B3I",     # B3I D1 (1268.52 MHz; not on F10N/T RF)
+    (3, 5): "BDS-B1CP",    # B1C pilot — collides with F9T B2aI
+    (3, 6): "BDS-B1CD",    # B1C data
+    (3, 7): "BDS-B2aP",    # B2a pilot — collides with F9T B2I
+    (3, 8): "BDS-B2aD",    # B2a data
+    (3, 10): "BDS-B3ID2",  # B3I D2
+}
+
+SIGNAL_NAMES = dict(_GPS_GAL_SIG_NAMES)
+SIGNAL_NAMES.update(F9T_BDS_SIG_NAMES)
+
+F10T_SIGNAL_NAMES = dict(_GPS_GAL_SIG_NAMES)
+F10T_SIGNAL_NAMES.update(F10_BDS_SIG_NAMES)
 
 SYS_MAP = {
     0: "gps",
@@ -207,6 +243,14 @@ class ReceiverDriver:
     signal_names = SIGNAL_NAMES
     sys_map = SYS_MAP
     if_pairs = ()
+    # Set of signal names whose cpMes the receiver reports in L1-reference
+    # cycles instead of native carrier cycles.  Populated per-driver from
+    # lab measurements — wrong-direction membership applies a 25%-class
+    # bias to carrier phase that the filter dumps into clock + ZTD over
+    # tens of seconds.  Verified on clkPoC3 2026-05-05 that F10T's TIM
+    # 3.01 reports native cycles (empty set is correct for F10T); F9T's
+    # TIM 2.25 quirk is captured in F9TDriver.
+    bds_l1_ref_cycles = frozenset()
 
     def signal_name(self, gnss_id, sig_id):
         return self.signal_names.get((gnss_id, sig_id))
@@ -233,6 +277,10 @@ class F9TDriver(ReceiverDriver):
         ('GAL', 'GAL-E1C', 'GAL-E5aQ', 'E'),
         ('BDS', 'BDS-B1I', 'BDS-B2I', 'C'),
     )
+    # F9T TIM 2.25 reports BDS-3 modernized cpMes in L1-reference cycles.
+    # The L1/L2 profile doesn't track B2a but the set is harmless if
+    # included since the receiver wouldn't emit those signals anyway.
+    bds_l1_ref_cycles = frozenset({'BDS-B2aI', 'BDS-B2aQ'})
 
     def build_tmode_fixed_msg(self, ecef):
         _ensure_imports()
@@ -286,11 +334,24 @@ class F9TL2E5bDriver(F9TDriver):
 
 
 class F10TDriver(ReceiverDriver):
+    """L5-band timing receiver: GPS L1+L5, GAL E1+E5a, BDS B1C+B2a.
+
+    NEO-F10T-00B-01 ships TIM 3.02 firmware (PROTVER 42).  Tracks the
+    BDS-3 modernized B1C and B2a signals — NOT the legacy B1I/B2I
+    that the F9T family tracks.  See F10_BDS_SIG_NAMES for the sigId
+    table and the collision with F9T at gnssId=3, sigId=5.
+    """
     name = "NEO-F10T"
-    protver = "32"
-    default_baud = 115200
+    protver = "42"
+    default_baud = 38400  # F10T datasheet default; configure_uart_baud can raise it
     supports_timing_mode = False
     supports_l5_health_override = False
+    signal_names = F10T_SIGNAL_NAMES
+    if_pairs = (
+        ('GPS', 'GPS-L1CA', 'GPS-L5Q', 'G'),
+        ('GAL', 'GAL-E1C', 'GAL-E5aQ', 'E'),
+        ('BDS', 'BDS-B1CP', 'BDS-B2aP', 'C'),
+    )
 
 
 def get_driver(name):

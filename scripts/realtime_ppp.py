@@ -127,23 +127,27 @@ PHASE_BIAS_MSG_TYPES = {
 BIAS_MSG_TYPES = CODE_BIAS_MSG_TYPES | PHASE_BIAS_MSG_TYPES
 
 
-# u-blox F9T reports BDS-3 modernized-signal cpMes in L1-reference cycles
-# (i.e. the reported cycle count, when scaled by λ_L1, equals the geometric
-# path).  To obtain native-carrier cycles, multiply the reported cpMes by
-# (λ_L1 / λ_native) = F_native/F_L1.  Verified empirically on ZED-F9T
-# TIM 2.25 at MadHat 2026-04-19.  Legacy BDS-2 signals (B1I, B2I, B3I) are
-# unaffected — they are reported in native cycles like GPS and GAL.
+# Some u-blox firmware variants report BDS-3 modernized-signal cpMes
+# in L1-reference cycles (i.e. the reported cycle count, when scaled by
+# λ_L1, equals the geometric path).  To obtain native-carrier cycles,
+# multiply the reported cpMes by (λ_L1 / λ_native) = F_native/F_L1.
 #
-# B2a-I and B2a-Q are confirmed.  B1C is plausibly the same and listed here
-# tentatively so a GF-DIAG on a B1C-tracking receiver will produce clean
-# numbers if the quirk extends to it; drop from the set if diagnostics show
-# B1C in native cycles.
+# This is per-driver because the quirk is firmware-specific:
+#   - F9T TIM 2.25: BDS-B2aI, BDS-B2aQ in L1-ref cycles (lab-confirmed
+#     MadHat 2026-04-19).  Legacy BDS-2 signals are in native cycles.
+#   - F10T TIM 3.01: native cycles for everything (lab-confirmed
+#     clkPoC3 2026-05-05 via the GPS+GAL-vs-GPS+GAL+BDS A/B —
+#     applying the F9T correction caused 25%-class carrier-phase bias
+#     that compounded into ZTD blow-up of >50 m within a minute).
+#
+# The active set comes from driver.bds_l1_ref_cycles; this λ_L1 lookup
+# stays in module scope because the correction math doesn't change.
 _LAMBDA_L1 = C / F_L1
-_BDS_L1_REF_CYCLES = {
-    'BDS-B2aI', 'BDS-B2aQ',
-    'BDS-B1C', 'BDS-B1CD', 'BDS-B1CP',  # tentative — not lab-confirmed yet
-}
 
+# B1C sits at the L1 carrier (1575.42 MHz); B2a sits at the L5 carrier
+# (1176.45 MHz).  Wavelengths and IF coefficients reuse the GPS L1/L5
+# constants exactly — the carriers are identical, only the modulation
+# differs.
 SIG_WAVELENGTH = {
     'GPS-L1CA': C / F_L1,
     'GPS-L2CL': C / F_L2,
@@ -160,6 +164,10 @@ SIG_WAVELENGTH = {
     'BDS-B2I': C / F_B2I,
     'BDS-B2aI': C / F_L5,
     'BDS-B2aQ': C / F_L5,
+    'BDS-B1CP': C / F_L1,
+    'BDS-B1CD': C / F_L1,
+    'BDS-B2aP': C / F_L5,
+    'BDS-B2aD': C / F_L5,
 }
 
 IF_PAIR_PARAMS = {
@@ -169,6 +177,7 @@ IF_PAIR_PARAMS = {
     ('GAL-E1C', 'GAL-E5aQ'): ('E', ALPHA_L1, ALPHA_L5),
     ('BDS-B1I', 'BDS-B2I'): ('C', ALPHA_B1I_B2I, ALPHA_B2I),
     ('BDS-B1I', 'BDS-B2aI'): ('C', ALPHA_B1I, ALPHA_B2A),
+    ('BDS-B1CP', 'BDS-B2aP'): ('C', ALPHA_L1, ALPHA_L5),
 }
 
 
@@ -583,13 +592,18 @@ class Nav2PositionStore:
 
 def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                    ssr=None, qerr_store=None, config_queue=None, driver=None,
-                   raw_callback=None, nav2_store=None, rinex_writer=None):
+                   raw_callback=None, nav2_store=None, rinex_writer=None,
+                   extint_store=None):
     """Read UBX messages from a GNSS device.
 
     Puts (timestamp, observations_list) tuples onto obs_queue for each
     RXM-RAWX epoch. Also feeds RXM-SFRBX to broadcast ephemeris.
     If qerr_store is provided, extracts TIM-TP qErr and stores it.
     If nav2_store is provided, captures NAV2-PVT for position consensus.
+    If extint_store is provided, captures TIM-TM2 (DO PPS edge times
+    from the F9T's GPS-time solution) for the gnss-phase-experiment
+    EKF Arm 3.  Requires the F9T to be configured with
+    CFG-MSGOUT-UBX_TIM_TM2_<port>=1 and DO PPS wired to F9T EXTINT.
 
     Args:
         systems: set of system names to include (e.g. {'gps', 'gal', 'bds'}).
@@ -604,6 +618,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
              Defaults to F9TDriver for backward compatibility.
         raw_callback: optional callable(parsed_msg) called with each
              RXM-RAWX message for raw observation access (e.g. NTRIP caster).
+        extint_store: TimTm2Store instance for DOFreqEst Arm 3 ingest.
     """
     try:
         from pyubx2 import UBXReader
@@ -630,6 +645,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
     # Signal name mapping from receiver driver
     SIG_NAMES = driver.signal_names
     SYS_MAP = driver.sys_map
+    bds_l1_ref_cycles = driver.bds_l1_ref_cycles
 
     pair_config = getattr(driver, 'if_pairs', None) or IF_PAIRS
     sig_lookup = {}
@@ -711,6 +727,15 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
             if msg_id == 'NAV2-PVT' and nav2_store is not None:
                 nav2_store.update(parsed)
 
+            # gnss-phase-experiment Arm 3: DO PPS edge time from
+            # F9T's GPS-time solution.  See peppar_fix/extint_reader.py
+            # and docs/dofreq-est-measurement-ladder.md.  Only fires
+            # if the F9T is configured to emit TIM-TM2 AND DO PPS is
+            # wired to F9T EXTINT.  No-op when those preconditions
+            # don't hold (extint_store is None or no messages arrive).
+            if msg_id == 'TIM-TM2' and extint_store is not None:
+                extint_store.update(parsed)
+
             if msg_id == 'RXM-RAWX':
                 # Fire raw callback before IF processing (for NTRIP caster)
                 if raw_callback is not None:
@@ -774,7 +799,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                     # consumer (GF slip detector, MW wide-lane, IF
                     # ambiguity, integer resolution) sees the physical
                     # quantity it was designed for.
-                    if cp is not None and cp_valid and sig_name in _BDS_L1_REF_CYCLES:
+                    if cp is not None and cp_valid and sig_name in bds_l1_ref_cycles:
                         # cp_native = cp_L1 * (f_native / f_L1)
                         #           = cp_L1 * λ_L1 / λ_native
                         cp *= _LAMBDA_L1 / SIG_WAVELENGTH[sig_name]
@@ -1345,12 +1370,18 @@ def ntrip_reader(stream, beph, ssr, stop_event, label="NTRIP",
 
             # Route to appropriate handler.  In bias_only mode, reject
             # everything except the bias message subset — the primary
-            # mount owns orbit/clock/ephemeris.
+            # mount owns orbit/clock/ephemeris.  AND filter the
+            # secondary-mount bias writes to gap-fill signals only:
+            # cross-AC datum mixing on shared (SV, signal) breaks AR
+            # because LAMBDA expects integer ambiguities in a single
+            # datum but the persistent AC datum offset is non-integer.
+            # See docs/ac-datum-mixing.md and ssr_corrections.GAP_FILL_SIGNALS.
             if bias_only:
                 if identity in BIAS_MSG_TYPES:
-                    result = ssr.update_from_rtcm(msg_view, src_mount=label)
+                    result = ssr.update_from_rtcm(
+                        msg_view, src_mount=label, gap_fill_only=True)
                     if n_total <= 5:
-                        log.info(f"[{label}] bias routed: "
+                        log.info(f"[{label}] bias routed (gap-fill only): "
                                  f"{identity} → {result}")
                 else:
                     n_skipped_non_phase_bias += 1
@@ -1359,7 +1390,16 @@ def ntrip_reader(stream, beph, ssr, stop_event, label="NTRIP",
                 if prn and beph.n_satellites % 10 == 0:
                     log.debug(f"[{label}] {beph.summary()}")
             elif identity in SSR_MSG_TYPES or identity.startswith('4076_'):
-                result = ssr.update_from_rtcm(msg_view)
+                # I-122350-main P1 follow-up: pass label as src_mount on
+                # the primary-mount path too.  Without this, every bias
+                # delivered by the primary mount tags src=? in
+                # [CB_APPLIED] / [PB_APPLIED] (only the bias_only
+                # secondary-mount path was plumbing src_mount, which
+                # makes the dual-mount diagnostic asymmetric — CNES
+                # biases unlabelled, WHU biases labelled).  Also
+                # confirmed against TimeHat day0502-cnes-baseline log
+                # (184/184 entries with src=?).
+                result = ssr.update_from_rtcm(msg_view, src_mount=label)
                 if n_total <= 5:
                     log.info(f"[{label}] SSR routed: {identity} → {result}")
 

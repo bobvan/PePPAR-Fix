@@ -67,6 +67,11 @@ from peppar_fix.wl_phase_admission_gate import WlPhaseAdmissionGate
 from peppar_fix.wl_readmission_gate import WlReAdmissionGate
 from peppar_fix.anchoring_sv_promoter import AnchoringSvPromoter
 from peppar_fix.nl_diag import NlDiagLogger
+from peppar_fix.saastamoinen import metar_to_init_ztd_residual
+from peppar_fix.metar import (
+    DEFAULT_STATION, MetarReadError,
+    fetch_latest_metar, metar_age_seconds,
+)
 
 
 # Cycle-slip CSV sink, shared between Phase-1 (run_bootstrap) and Phase-2
@@ -75,6 +80,116 @@ from peppar_fix.nl_diag import NlDiagLogger
 # phases run in series.
 _SLIP_CSV_FILE = None
 _SLIP_CSV_WRITER = None
+
+
+def _seed_ztd_from_metar(args, lat_deg, alt_m, log):
+    """Compute init_ztd_m + init_ztd_sigma_m from latest METAR.
+
+    Returns (init_ztd_m, init_ztd_sigma_m).  On any METAR-fetch or
+    Saastamoinen failure, logs a warning and returns (0.0, 0.2) —
+    equivalent to leaving --init-ztd-from-met unset.
+
+    This deliberately does NOT abort the engine: METAR is bonus
+    information; the filter without it converges as it always has
+    (just slowly under --pin-position).  Operators see a single
+    [INIT_ZTD] log line either way.
+    """
+    station = getattr(args, 'init_ztd_station', None) or DEFAULT_STATION
+    # When --init-ztd-sigma-mm isn't specified, the METAR-auto path
+    # uses 50 mm (captures METAR uncertainty + spatial coherence +
+    # Saastamoinen model error).  The manual --init-ztd-mm path
+    # interprets unset sigma as the legacy 500 mm wide prior.
+    sigma_mm_arg = getattr(args, 'init_ztd_sigma_mm', None)
+    sigma_mm = float(sigma_mm_arg) if sigma_mm_arg is not None else 50.0
+    sigma_m = sigma_mm * 1e-3
+    try:
+        rec = fetch_latest_metar(station)
+    except MetarReadError as exc:
+        log.warning("[INIT_ZTD] METAR fetch failed (%s); falling back "
+                    "to ztd=0 σ=200mm default", exc)
+        return 0.0, 0.2
+    age_s = metar_age_seconds(rec)
+    if age_s > 7200:  # 2 h
+        log.warning("[INIT_ZTD] METAR stale (age=%.0f min); falling "
+                    "back to ztd=0 σ=200mm default", age_s / 60.0)
+        return 0.0, 0.2
+    try:
+        residual_m, diag = metar_to_init_ztd_residual(
+            temp_C=rec['temp_C'],
+            dewp_C=rec['dewp_C'],
+            altim_hPa=rec['altim_hPa'],
+            lat_deg=lat_deg,
+            elev_m=alt_m,
+        )
+    except (ValueError, ZeroDivisionError) as exc:
+        log.warning("[INIT_ZTD] Saastamoinen compute failed (%s); "
+                    "falling back to ztd=0 σ=200mm default", exc)
+        return 0.0, 0.2
+    log.info(
+        "[INIT_ZTD] %s T=%.1fC dewp=%.1fC altim=%.1fhPa age=%.0fmin "
+        "→ Pstation=%.1fhPa e=%.1fhPa ZHD=%.3fm ZWD=%.3fm ZTD=%.3fm "
+        "residual=%+.0fmm σ=%.0fmm",
+        rec.get('station', station),
+        diag['temp_C'], diag['dewp_C'], diag['altim_hPa'], age_s / 60.0,
+        diag['P_station_hPa'], diag['e_hPa'], diag['zhd_m'],
+        diag['zwd_m'], diag['ztd_m'], residual_m * 1000.0, sigma_mm,
+    )
+    return residual_m, sigma_m
+
+
+def _periodic_ztd_tie(filt, args, lat_deg, alt_m, n_epochs, log):
+    """Refresh METAR + apply soft ZTD prior to bound per-SV bias absorption.
+
+    Called every --ztd-tie-interval-s epochs (default 300, matches
+    METAR cadence).  Fetches current weather, runs Saastamoinen for
+    the receiver site, and applies a soft Kalman update pulling the
+    filter's residual ZTD toward METAR truth with σ ≈ 100 mm.
+
+    METAR fetch failure is non-fatal: log + skip this cycle.  ZTD
+    state continues evolving from observations until the next tie.
+    """
+    sigma_mm = float(getattr(args, 'ztd_tie_sigma_mm', 100.0))
+    sigma_m = sigma_mm * 1e-3
+    if sigma_m <= 0:
+        return
+    station = getattr(args, 'init_ztd_station', None) or DEFAULT_STATION
+    try:
+        rec = fetch_latest_metar(station)
+    except MetarReadError as exc:
+        log.warning("[ZTD_TIE] epoch=%d METAR fetch failed (%s); skipping tie",
+                    n_epochs, exc)
+        return
+    age_s = metar_age_seconds(rec)
+    if age_s > 7200:
+        log.warning("[ZTD_TIE] epoch=%d METAR stale (%.0f min); skipping tie",
+                    n_epochs, age_s / 60.0)
+        return
+    try:
+        target_m, diag = metar_to_init_ztd_residual(
+            temp_C=rec['temp_C'], dewp_C=rec['dewp_C'],
+            altim_hPa=rec['altim_hPa'],
+            lat_deg=lat_deg, elev_m=alt_m,
+        )
+    except (ValueError, ZeroDivisionError) as exc:
+        log.warning("[ZTD_TIE] epoch=%d Saastamoinen failed (%s); skipping tie",
+                    n_epochs, exc)
+        return
+    pre_ztd_m = float(filt.x[filt.IDX_ZTD])
+    pre_sigma_m = math.sqrt(max(0.0,
+        float(filt.P[filt.IDX_ZTD, filt.IDX_ZTD])))
+    filt.apply_ztd_tie(sigma_m, target_m=target_m)
+    post_ztd_m = float(filt.x[filt.IDX_ZTD])
+    post_sigma_m = math.sqrt(max(0.0,
+        float(filt.P[filt.IDX_ZTD, filt.IDX_ZTD])))
+    log.info(
+        "[ZTD_TIE] epoch=%d %s age=%.0fmin target=%+.0fmm σ_tie=%.0fmm "
+        "ZTD %+.0f→%+.0fmm (Δ=%+.0f) σ %.0f→%.0fmm",
+        n_epochs, rec.get('station', station), age_s / 60.0,
+        target_m * 1000.0, sigma_mm,
+        pre_ztd_m * 1000.0, post_ztd_m * 1000.0,
+        (post_ztd_m - pre_ztd_m) * 1000.0,
+        pre_sigma_m * 1000.0, post_sigma_m * 1000.0,
+    )
 
 
 def _open_slip_csv(path):
@@ -177,10 +292,12 @@ def _compute_sv_ipp_szas(filt, azimuths, elevations, gps_time):
     return out
 from ntrip_client import NtripStream
 from realtime_ppp import serial_reader, ntrip_reader, QErrStore, Nav2PositionStore
+from peppar_fix.extint_reader import TimTm2Store
 from ticc import Ticc
 from peppar_fix import (
     CorrectionFreshnessGate,
     PositionWatchdog,
+    PositionWatchdogProposed,
     StrictCorrelationGate,
     TimebaseRelationEstimator,
     PPPCalibration,
@@ -324,11 +441,15 @@ class RxTcxoTracker:
     """
 
     TICK_NS = 8.0  # 125 MHz = 8 ns period
-    WRAP_THRESHOLD_NS = 4.0  # detect wrap when |Δ| > half tick
-    # At 3 ns/s TCXO drift, normal deltas are ~3 ns and wrap deltas are
-    # ~5 ns.  Threshold must be between these: drift < threshold < tick-drift.
-    # Half-tick (4.0) works for drift rates up to ~3.5 ns/s.  Beyond that,
-    # use frequency-aided unwrapping (not yet implemented).
+    WRAP_THRESHOLD_NS = 4.0  # half-tick threshold for fallback unwrap
+    # Two unwrap modes:
+    #   1. Half-tick threshold (fallback): correct only for |drift| <
+    #      TICK_NS/(2·dt) ≈ 3.5 ns/s at 1 Hz sampling.
+    #   2. Frequency-aided: pass predicted_drift_ns_per_s to update();
+    #      uses round((expected - raw)/TICK_NS) to recover integer-tick
+    #      count. Correct for any drift as long as the predictor's
+    #      uncertainty is < 4 ns/s ≈ 4 ppb.
+    # Mode 2 is required for F9T rx TCXOs which run at 100s of ppb.
 
     def __init__(self, freq_window=30):
         self._prev_qerr_ns = None
@@ -345,8 +466,26 @@ class RxTcxoTracker:
         self._synth_qerr_buf = deque(maxlen=10)
         self._rx_tcxo_phase = None
 
-    def update(self, qerr_ns):
-        """Feed one qErr sample (nanoseconds).  Returns unwrapped phase in ns."""
+    def update(self, qerr_ns, predicted_drift_ns_per_s=None, dt=1.0):
+        """Feed one qErr sample (nanoseconds).  Returns unwrapped phase in ns.
+
+        Args:
+            qerr_ns: F9T's qErr value, in [-4, +4] ns (the 8-ns sawtooth
+                quantization residual).
+            predicted_drift_ns_per_s: optional rx TCXO frequency-offset
+                predictor (typically PPP dt_rx rate).  Enables
+                frequency-aided unwrap that handles arbitrary drift.
+                Without it, falls back to half-tick threshold (correct
+                only for drift < TICK_NS/(2·dt) ≈ 3.5 ppb at 1 Hz).
+            dt: time elapsed since previous sample, in seconds (default 1.0).
+
+        Returns:
+            Unwrapped cumulative phase since first sample, in ns.
+
+        Per docs/dofreq-est-measurement-ladder.md "Arm 2".  The slope
+        of the returned phase IS rx TCXO frequency offset in ppb,
+        consumable by DOFreqEst.update(qerr_freq_ppb=...).
+        """
         if self._prev_qerr_ns is None:
             self._prev_qerr_ns = qerr_ns
             self._accumulated_ns = 0.0
@@ -354,15 +493,25 @@ class RxTcxoTracker:
             self._n = 1
             return self._accumulated_ns
 
-        delta = qerr_ns - self._prev_qerr_ns
-        # Detect wraps: if the TCXO drifts past a tick boundary,
-        # qErr jumps by ~±8 ns.  Correct for it.
-        if delta > self.WRAP_THRESHOLD_NS:
-            delta -= self.TICK_NS
-        elif delta < -self.WRAP_THRESHOLD_NS:
-            delta += self.TICK_NS
+        raw_delta = qerr_ns - self._prev_qerr_ns
 
-        self._accumulated_ns += delta
+        if predicted_drift_ns_per_s is not None:
+            # Frequency-aided unwrap.  Recover the integer-tick count
+            # such that raw_delta + n*TICK_NS ≈ expected_delta.
+            # Robust as long as |predictor noise| < TICK_NS/2 = 4 ns/s.
+            expected_delta = predicted_drift_ns_per_s * dt
+            n_ticks = round((expected_delta - raw_delta) / self.TICK_NS)
+            true_delta = raw_delta + n_ticks * self.TICK_NS
+        else:
+            # Half-tick fallback.
+            if raw_delta > self.WRAP_THRESHOLD_NS:
+                true_delta = raw_delta - self.TICK_NS
+            elif raw_delta < -self.WRAP_THRESHOLD_NS:
+                true_delta = raw_delta + self.TICK_NS
+            else:
+                true_delta = raw_delta
+
+        self._accumulated_ns += true_delta
         self._prev_qerr_ns = qerr_ns
         self._phase_buf.append(self._accumulated_ns)
         self._n += 1
@@ -374,20 +523,44 @@ class RxTcxoTracker:
         Returns (freq_ns_per_s, n_samples) or (None, 0) if insufficient data.
         At 1 Hz sampling, each index step = 1 second.
         """
+        slope, sigma, n = self._slope_with_sigma()
+        if slope is None:
+            return None, 0
+        return slope, n
+
+    def freq_ppb_with_sigma(self):
+        """Same slope as freq_ns_per_s, but also returns slope sigma.
+
+        slope sigma comes from residual variance about the linear fit
+        divided by sxx — standard textbook OLS sigma.  In ppb (= ns/s).
+
+        Returns (slope_ppb, sigma_ppb, n_samples) or (None, None, 0).
+        Used by Arm 2 of the four-arm Kalman fusion to pass rx TCXO
+        frequency observations into DOFreqEst.update(qerr_freq_ppb=...).
+        """
+        return self._slope_with_sigma()
+
+    def _slope_with_sigma(self):
         n = len(self._phase_buf)
         if n < 5:
-            return None, 0
-        # Simple linear regression: phase = a + b*t
+            return None, None, 0
         phases = list(self._phase_buf)
-        sx = n * (n - 1) / 2
-        sxx = n * (n - 1) * (2 * n - 1) / 6
-        sy = sum(phases)
-        sxy = sum(i * v for i, v in enumerate(phases))
-        denom = n * sxx - sx * sx
-        if abs(denom) < 1e-10:
-            return None, 0
-        slope = (n * sxy - sx * sy) / denom
-        return slope, n
+        # Centered indices for stable slope sigma calculation.
+        t_mean = (n - 1) / 2.0
+        y_mean = sum(phases) / n
+        sxx = sum((i - t_mean) ** 2 for i in range(n))
+        sxy = sum((i - t_mean) * (phases[i] - y_mean) for i in range(n))
+        if sxx <= 0:
+            return None, None, 0
+        slope = sxy / sxx
+        intercept = y_mean - slope * t_mean
+        # Residual variance about the linear fit; (n-2) DoF.
+        if n <= 2:
+            return slope, float("inf"), n
+        ss_resid = sum((phases[i] - intercept - slope * i) ** 2 for i in range(n))
+        var_resid = ss_resid / (n - 2)
+        sigma_slope = math.sqrt(max(var_resid, 0.0) / sxx)
+        return slope, sigma_slope, n
 
     def accumulated_phase_ns(self):
         """Return current unwrapped accumulated phase in ns."""
@@ -3552,10 +3725,12 @@ class AntPosEstThread(threading.Thread):
 
 # ── Phase 2: Steady state ────────────────────────────────────────────── #
 
+
 def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                      stop_event, qerr_store=None, out_w=None, nav2_store=None,
                      ape_sm=None, dfe_sm=None, ape_thread=None,
-                     ar_position=None, ar_pos_lock=None):
+                     ar_position=None, ar_pos_lock=None,
+                     extint_store=None):
     """Run FixedPosFilter for clock estimation with optional servo.
 
     This is the steady-state phase: position is known, we estimate clock
@@ -3565,17 +3740,69 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     lat, lon, alt = ecef_to_lla(known_ecef[0], known_ecef[1], known_ecef[2])
     log.info(f"Position: {lat:.6f}, {lon:.6f}, {alt:.1f}m")
 
-    # Seed filter at dt_rx=0 — bootstrap guarantees PHC is within ±10µs
-    # of truth, so the receiver clock residual at the PPS edge is near zero.
-    # This makes sigma an honest convergence metric (starts large, shrinks
-    # as filter converges) instead of instantly collapsing on the raw
-    # receiver clock offset from pseudorange seeding.
-    filt = FixedPosFilter(known_ecef)
-    filt.x[filt.IDX_CLK] = 0.0
-    filt.P[filt.IDX_CLK, filt.IDX_CLK] = 100.0 ** 2  # 100m ≈ 333ns 1σ
-    filt.initialized = True  # skip pseudorange seeding
+    # Compute METAR-seeded ZTD residual when --init-ztd-from-met is set.
+    # Default 0.0 preserves prior behavior.  See I-024942 and 2026-05-04
+    # overnight: under --pin-position the cold-start ZTD spent hours
+    # walking back from multi-meter values because the wide ztd_sigma
+    # prior centered at 0 absorbed clock-state error that had nowhere
+    # else to go.  METAR-derived Saastamoinen seed lands the filter
+    # within physical envelope at epoch 1.
+    init_ztd_m = 0.0
+    init_ztd_sigma_m = 0.5  # FixedPosFilter prior default
+    # Manual override (--init-ztd-mm) takes precedence over METAR.  Useful
+    # for the architectural-validation cross-check where the operator
+    # wants to disentangle "is the filter behaving correctly under tight
+    # ZTD prior?" from "is Saastamoinen-from-METAR producing the right
+    # seed value?"  When neither flag is set, legacy default behavior
+    # (0 m residual, 0.5 m σ wide prior) is preserved.
+    if getattr(args, 'init_ztd_mm', None) is not None:
+        init_ztd_m = float(args.init_ztd_mm) * 1e-3
+        if getattr(args, 'init_ztd_sigma_mm', None) is not None:
+            init_ztd_sigma_m = float(args.init_ztd_sigma_mm) * 1e-3
+        log.info(
+            "FixedPosFilter ZTD seed (manual): init=%+.0fmm σ=%.0fmm",
+            args.init_ztd_mm,
+            args.init_ztd_sigma_mm
+            if args.init_ztd_sigma_mm is not None else 500.0,
+        )
+    elif getattr(args, 'init_ztd_from_met', False):
+        init_ztd_m, init_ztd_sigma_m = _seed_ztd_from_metar(
+            args, lat, alt, log)
+
+    # Let FixedPosFilter's first-epoch PR seed run — bootstrap aligns
+    # the host PHC to GPS, but the F9T's *internal* receiver clock
+    # (the one stamping RXM-RAWX, hence dt_rx) can still be tens of ms
+    # off from GPS.  Seeding x[CLK]=0 with σ=100m forced the Kalman
+    # update to absorb millions of metres of clock-error during cold
+    # start and, with a tight ZTD prior, bled into the ZTD state
+    # (observed 2026-05-04: ZTD walked +32mm → -4494mm in 30 epochs).
+    # The first-epoch median-PR seed inside FixedPosFilter.update()
+    # places x[CLK] near truth before the Kalman gain attacks ZTD.
+    filt = FixedPosFilter(known_ecef,
+                          init_ztd_m=init_ztd_m,
+                          init_ztd_sigma_m=init_ztd_sigma_m)
     filt.prev_clock = 0.0
     watchdog = PositionWatchdog(threshold_m=args.watchdog_threshold)
+    # Shadow gate: TD-CP-only watchdog runs in parallel for I-145915
+    # bake-in.  Verdict logged per epoch but does NOT drive engine
+    # behavior until charlie's owner change flips it active.  See
+    # docs/time-filter-pr-cp-port.md + scripts/peppar_fix/watchdog.py.
+    watchdog_proposed = PositionWatchdogProposed(
+        threshold_m=0.05,                       # 50 mm TD-CP gate
+        pr_threshold_m=args.watchdog_threshold, # match active gate
+    )
+    # Counters for the [FIXEDPOS_RESID_SUMMARY] line at engine exit.
+    resid_log_stats = {
+        'epochs': 0,
+        'active_trips': 0,        # PositionWatchdog alarm transitions
+        'proposed_trips': 0,      # PositionWatchdogProposed alarm transitions
+        'pr_disturbances': 0,     # PR_DISTURBANCE flag epochs
+        'both_alarmed': 0,        # both gates simultaneously alarmed
+        'only_active': 0,         # active alarmed, proposed not
+        'only_proposed': 0,       # proposed alarmed, active not
+    }
+    _prev_active_alarmed = False
+    _prev_proposed_alarmed = False
     correction_gate = CorrectionFreshnessGate()
 
     # Optional servo setup (PTP imports only loaded when needed)
@@ -3626,7 +3853,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
         pps_backoff = 5
         servo_result = None
         for pps_attempt in range(1, pps_max_retries + 1):
-            servo_result = _setup_servo(args, known_ecef, qerr_store, ptp=ptp)
+            servo_result = _setup_servo(args, known_ecef, qerr_store,
+                                        extint_store=extint_store, ptp=ptp)
             if not isinstance(servo_result, int) or servo_result != 3:
                 break
             if pps_attempt < pps_max_retries:
@@ -3914,7 +4142,14 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             # Exponential blend: 12 ps/epoch migration rate for 5m offset —
             # invisible to the servo (200× below PPS noise floor).
             # See docs/ppp-ar-design.md "Gradual position feed-in".
-            if ar_position is not None and ar_pos_lock is not None:
+            #
+            # Skipped under --pin-position: when the supplied known_pos is
+            # surveyed truth (sub-cm σ from OPUS-Static / PRIDE-PPP),
+            # AntPosEst's ~m-class estimate is strictly worse and blending
+            # it in degrades the pin.  Precursor to the full
+            # --surveyed-position mode (I-013342-main).
+            if (not getattr(args, 'pin_position', False)
+                    and ar_position is not None and ar_pos_lock is not None):
                 with ar_pos_lock:
                     ar_ecef = ar_position.get('ecef')
                     ar_sigma = ar_position.get('sigma')
@@ -3932,7 +4167,55 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
 
             # Watchdog with NAV2 position consensus
             resid_rms = float(np.sqrt(np.mean(resid ** 2))) if len(resid) > 0 else 0.0
+
+            # PR / TD-CP residual split — populated by FixedPosFilter.update()
+            # via instance attributes (I-145915).  Falls back to safe defaults
+            # when the residual vector is empty.
+            n_pr_used = int(getattr(filt, 'last_n_pr', 0))
+            n_td_used = int(getattr(filt, 'last_n_td', 0))
+            r_pr = getattr(filt, 'last_resid_pr', np.array([]))
+            r_td = getattr(filt, 'last_resid_td', np.array([]))
+            resid_pr_rms = (float(np.sqrt(np.mean(r_pr ** 2)))
+                            if len(r_pr) > 0 else 0.0)
+            resid_td_rms = (float(np.sqrt(np.mean(r_td ** 2)))
+                            if len(r_td) > 0 else 0.0)
+
+            # Shadow watchdog evaluation (no behavior change today).
+            td_ok, pr_disturbance = watchdog_proposed.update(
+                resid_pr_rms, resid_td_rms, n_used)
+            resid_log_stats['epochs'] += 1
+            if pr_disturbance:
+                resid_log_stats['pr_disturbances'] += 1
+            # Trip-transition counters for the summary at exit.
+            if watchdog_proposed.alarmed and not _prev_proposed_alarmed:
+                resid_log_stats['proposed_trips'] += 1
+            _prev_proposed_alarmed = watchdog_proposed.alarmed
+
+            # Per-epoch instrumentation line.  Sparse cadence to keep
+            # the log readable; the bake-in goal is operator-visible
+            # divergence between the two gates, not high-frequency
+            # diagnostics.  Heartbeat every 60 epochs; always log
+            # transition events (alarm / clear / pr_disturbance).
+            _heartbeat = (n_epochs % 60 == 0)
+            if _heartbeat or pr_disturbance:
+                log.info(
+                    "[FIXEDPOS_RESID] n_pr=%d resid_pr_rms=%.3fm "
+                    "n_td=%d resid_td_rms=%.4fm "
+                    "active_alarmed=%s proposed_alarmed=%s%s",
+                    n_pr_used, resid_pr_rms, n_td_used, resid_td_rms,
+                    watchdog.alarmed, watchdog_proposed.alarmed,
+                    " PR_DISTURBANCE" if pr_disturbance else "",
+                )
+
             watchdog.update(resid_rms, n_used)
+            # Trip-transition counter for active gate.
+            if watchdog.alarmed and not _prev_active_alarmed:
+                resid_log_stats['active_trips'] += 1
+                if watchdog_proposed.alarmed:
+                    resid_log_stats['both_alarmed'] += 1
+                else:
+                    resid_log_stats['only_active'] += 1
+            _prev_active_alarmed = watchdog.alarmed
             if watchdog.alarmed:
                 # Before giving up: check NAV2 secondary engine position.
                 # If NAV2 agrees with known_ecef, the antenna hasn't moved
@@ -3956,9 +4239,16 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                             # filter state from known_ecef and continue.
                             log.info("Re-seeding FixedPosFilter from known_ecef "
                                      "(NAV2 consensus: antenna stable)")
-                            filt = FixedPosFilter(known_ecef)
+                            filt = FixedPosFilter(
+                                known_ecef,
+                                init_ztd_m=init_ztd_m,
+                                init_ztd_sigma_m=init_ztd_sigma_m,
+                            )
                             prev_t = None
                             watchdog.reset()
+                            watchdog_proposed.reset()
+                            _prev_active_alarmed = False
+                            _prev_proposed_alarmed = False
                             if servo_ctx is not None:
                                 # Purge stale servo state so the servo
                                 # doesn't act on the corrupted dt_rx
@@ -3984,14 +4274,40 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
 
             # Extract ZTD and ISBs for logging
             dztd_m = 0.0
+            dztd_sigma_m = 0.0
             if hasattr(filt, 'IDX_ZTD') and filt.x.shape[0] > filt.IDX_ZTD:
                 dztd_m = filt.x[filt.IDX_ZTD]
+                dztd_sigma_m = math.sqrt(max(0,
+                    filt.P[filt.IDX_ZTD, filt.IDX_ZTD]))
             isb_gal_ns = 0.0
             isb_bds_ns = 0.0
             if hasattr(filt, 'IDX_ISB_GAL') and filt.x.shape[0] > filt.IDX_ISB_GAL:
                 isb_gal_ns = filt.x[filt.IDX_ISB_GAL] / C * 1e9
             if hasattr(filt, 'IDX_ISB_BDS') and filt.x.shape[0] > getattr(filt, 'IDX_ISB_BDS', 999):
                 isb_bds_ns = filt.x[filt.IDX_ISB_BDS] / C * 1e9
+
+            # Periodic FixedPosFilter ZTD log emit — exposes the pinned
+            # filter's ZTD state independently of the parallel AntPosEst
+            # PPPFilter reporting.  Needed to evaluate I-175546-main
+            # hypothesis "does pinning position settle ZTD?"  Cadence:
+            # every 30 epochs (~30s at 1 Hz) to keep volume modest.
+            if n_epochs % 30 == 0:
+                log.info(
+                    "[FIXEDPOS_ZTD] epoch=%d ZTD=%+.0f±%.0fmm "
+                    "dt_rx=%+.3fns σ=%.4fns",
+                    n_epochs,
+                    dztd_m * 1000.0, dztd_sigma_m * 1000.0,
+                    dt_rx_ns, dt_rx_sigma,
+                )
+
+            # Periodic ZTD soft-tie from refreshed METAR — bounds the
+            # rate of ZTD-state drift driven by per-SV systematic-bias
+            # absorption (SSR phase-bias substitution L5I→L5Q,
+            # antenna PCV miscorrection, multipath).  See I-172521.
+            tie_interval = getattr(args, 'ztd_tie_interval_s', 300)
+            if (tie_interval and n_epochs > 0 and n_epochs % tie_interval == 0
+                    and hasattr(filt, 'apply_ztd_tie')):
+                _periodic_ztd_tie(filt, args, lat, alt, n_epochs, log)
 
             # Correction source
             source = 'SSR' if ssr.n_clock > 0 else 'broadcast'
@@ -4077,6 +4393,16 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
 
     elapsed = time.time() - start_time
     log.info(f"Steady state complete: {elapsed:.0f}s, {n_epochs} epochs")
+    # I-145915 bake-in summary — side-by-side gate verdicts.
+    rs = resid_log_stats
+    log.info(
+        "[FIXEDPOS_RESID_SUMMARY] epochs=%d active_trips=%d "
+        "proposed_trips=%d both_alarmed=%d only_active=%d "
+        "pr_disturbances=%d "
+        "(only_active = trips that would have STAYED under proposed gate)",
+        rs['epochs'], rs['active_trips'], rs['proposed_trips'],
+        rs['both_alarmed'], rs['only_active'], rs['pr_disturbances'],
+    )
     return gate_stats
 
 
@@ -4324,7 +4650,6 @@ def _bootstrap_measure_freq_and_clock(args, timestamper, known_ecef, obs_queue,
     log.info("Running %d-epoch FixedPosFilter for clock estimate...",
              args.bootstrap_epochs)
     filt = FixedPosFilter(known_ecef)
-    filt.initialized = True
     prev_t = None
     dt_rx_ns = None
     dt_rx_sigma_ns = None
@@ -4606,6 +4931,13 @@ def _do_bootstrap_phc(args, ptp, pps_freq_ppb, pps_freq_unc,
         try:
             log.info("Stepping PHC by %+.0f ns (ADJ_SETOFFSET)", -phase_error_ns)
             ptp.adj_setoffset(-phase_error_ns)
+            # ADJ_SETOFFSET on i226 has ~1.7 µs late-application
+            # propagation delay that decays in <1 ms.  Sleep 1 ms so any
+            # subsequent readback / verify sees the offset fully applied.
+            # Characterisation: tools/adj_setoffset_relative_precision.py
+            # shows median/p95 drops from 1777/1906 ns at wait=0 to
+            # 57/200 ns at wait=1 ms.
+            time.sleep(0.001)
         except OSError as e:
             log.warning("ADJ_SETOFFSET failed (%s), falling back to optimal stopping", e)
             pps_anchor_ns = target_sec * 1_000_000_000
@@ -4618,20 +4950,30 @@ def _do_bootstrap_phc(args, ptp, pps_freq_ppb, pps_freq_unc,
             log.info("Step: residual=%+.0f ns, attempts=%d, %s",
                      residual, attempts, "ACCEPTED" if met else "DEADLINE")
 
-        # Verify via next PPS edge
+        # Verify via next PPS edge — pure PHC-domain measurement.
+        # v_sub_ns = signed nanoseconds from the nearest PHC integer
+        # second to the PPS edge.  Previously we computed v_target from
+        # CLOCK_REALTIME which is freerunning on these hosts (no NTP /
+        # PTP / ts2phc), accumulating ~600 ppb rate offset from the PHC
+        # TCXO during the 3-second verify wait; that drift was being
+        # reported as "phi_0" with µs-scale magnitude that did not
+        # reflect the actual ADJ_SETOFFSET step precision (which the
+        # tools/adj_setoffset_relative_precision characterization shows
+        # is ~50 ns median / ~200 ns p95 on i226 once the offset has
+        # propagated).  Using only v_sub_ns gives the real residual.
+        # The remaining ±4 ns F9T qErr offset is uncorrected here; when
+        # the engine threads qErr through to this point, subtract it.
+        # See I-013346-main.
         ptp.enable_extts(extts_ch, rising_edge=True)
         evt = ptp.read_one_rising_edge(timeout_s=3.0)
         if evt is not None:
-            v_realtime_ns = time.clock_gettime_ns(time.CLOCK_REALTIME)
-            v_sec, v_nsec = evt[0], evt[1]
-            v_rounded = v_sec if v_nsec < 500_000_000 else v_sec + 1
-            v_target = round(v_realtime_ns / 1_000_000_000) + offset_s
-            v_epoch_off = v_rounded - v_target
+            v_nsec = evt[1]
             v_sub_ns = (v_nsec if v_nsec < 500_000_000
                         else v_nsec - 1_000_000_000)
-            phi_0 = v_epoch_off * 1_000_000_000 + v_sub_ns
-            log.info("PPS verify: phi_0 = %+.0f ns (epoch_offset=%d)",
-                     phi_0, v_epoch_off)
+            phi_0 = v_sub_ns
+            log.info("PPS verify: phi_0 = %+.0f ns "
+                     "(PHC offset from F9T PPS edge; ±4 ns qErr "
+                     "uncorrected)", phi_0)
         else:
             log.warning("No PPS event — assuming step landed at 0")
             phi_0 = 0
@@ -4832,7 +5174,44 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
             dt_rx_ns, dt_rx_series, stop_event)
 
 
-def _setup_servo(args, known_ecef, qerr_store, ptp=None):
+def _load_timestamper_bias(args, key):
+    """Read state/dos/<do_uid>.json and return the bias_ns for a key.
+
+    Returns None when the file or key is absent — bias correction
+    becomes a no-op for that arm.  Static calibration per
+    docs/dofreq-est-measurement-ladder.md: characterize once, persist,
+    use forever (until cabling / reference / chain changes).  The
+    engine never auto-recalibrates; that's a separate operator-driven
+    tool (scripts/calibrate_timestampers.py).
+    """
+    do_uid = _resolve_do_uid(args)
+    if not do_uid:
+        return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(here)
+    path = os.path.join(repo_root, "state", "dos", f"{do_uid}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        ts = data.get("timestampers", {}).get(key)
+        if ts is None:
+            return None
+        bias = ts.get("bias_ns")
+        if bias is None:
+            return None
+        log.info("Timestamper bias loaded: %s = %+.3f ns "
+                 "(calibrated_at=%s)",
+                 key, float(bias), ts.get("calibrated_at", "unknown"))
+        return float(bias)
+    except (OSError, ValueError, TypeError) as e:
+        log.warning("Failed to read timestamper bias for %s from %s: %s",
+                    key, path, e)
+        return None
+
+
+def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     """Set up servo (PHC-based or TICC-only).
 
     Returns context dict on success, or an int exit code on failure:
@@ -4847,7 +5226,6 @@ def _setup_servo(args, known_ecef, qerr_store, ptp=None):
     gate_stats = None
     try:
         from peppar_fix import DisciplineScheduler
-        from peppar_fix import compute_error_sources
         from peppar_fix.timestamper_state import TimestamperParams
     except ImportError:
         log.error("peppar_fix library not available for servo")
@@ -5097,8 +5475,8 @@ def _setup_servo(args, known_ecef, qerr_store, ptp=None):
         sigma_ticc_ns=sigma_ticc,
         sigma_do_phase_ns=0.92,
         sigma_do_freq_ppb=args.kalman_sigma_freq,
-        sigma_tcxo_phase_ns=2.0,    # rx TCXO (F9T) PPS TDEV(1s)
-        sigma_tcxo_freq_ppb=0.1,    # rx TCXO drift rate
+        sigma_tcxo_phase_ns=2.0,                          # rx TCXO PPS TDEV(1s)
+        sigma_tcxo_freq_ppb=args.kalman_sigma_tcxo_freq,  # rx TCXO drift rate
         max_ppb=caps['max_adj'],
         initial_freq=current_adj,
         initial_dt_rx_ns=bootstrap_dt_rx_ns,
@@ -5106,9 +5484,10 @@ def _setup_servo(args, known_ecef, qerr_store, ptp=None):
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
              "sigma_do=[0.92 ns, %.4f ppb], "
-             "sigma_tcxo=[2.0 ns, 0.1 ppb], "
+             "sigma_tcxo=[2.0 ns, %.3f ppb], "
              "initial_freq=%.1f ppb, base_freq=%s, tcxo_init=%s",
-             sigma_ticc, args.kalman_sigma_freq, current_adj,
+             sigma_ticc, args.kalman_sigma_freq,
+             args.kalman_sigma_tcxo_freq, current_adj,
              f"{bootstrap_base_freq:.1f}" if bootstrap_base_freq else "None",
              bootstrap_dt_rx_ns is not None)
     scheduler = DisciplineScheduler(
@@ -5126,8 +5505,6 @@ def _setup_servo(args, known_ecef, qerr_store, ptp=None):
         "pps_var": RunningVarianceWindow(),
         "pps_qerr_plus_var": RunningVarianceWindow(),
         "pps_qerr_minus_var": RunningVarianceWindow(),
-        # TICC qVIR is computed in the ticc_reader thread
-        # (not here) using per-timestamp variance, not diff variance.
     }
 
     # PPS event queue
@@ -5226,12 +5603,6 @@ def _setup_servo(args, known_ecef, qerr_store, ptp=None):
             ticc_log_f.flush()
 
         qerr_ticc_tracker = QErrTimescaleTracker()
-        # TICC qVIR: pure correlation check, no DO in the picture.
-        # Tracks chB interval deviations (PPS sawtooth) and checks
-        # whether matched qerr removes that variance.
-        _chb_raw_var = RunningVarianceWindow(maxlen=64)
-        _chb_corr_var = RunningVarianceWindow(maxlen=64)
-        _chb_qvir_count = [0]
 
         def ticc_reader():
             # When TICC-driven, the reference channel (chB) also generates
@@ -5287,25 +5658,6 @@ def _setup_servo(args, known_ecef, qerr_store, ptp=None):
                                             qerr_store.clear_pending()
                                 ticc_tracker.set_pending_ref_qerr(
                                     event.ref_sec, _qerr)
-                                # TICC qVIR: apply qerr to each chB
-                                # TIMESTAMP (not intervals).  Corrected
-                                # = chB_phase + qerr.  Detrended variance
-                                # of corrected should be much smaller than
-                                # raw (sawtooth removed, leaving TICC noise).
-                                # Pure F9T PPS + TICC, no DO.
-                                phase_ns = event.ref_ps / 1000.0
-                                _chb_raw_var.add(phase_ns)
-                                if _qerr is not None:
-                                    _chb_corr_var.add(phase_ns + _qerr)
-                                    _chb_qvir_count[0] += 1
-                                    if _chb_qvir_count[0] % 100 == 0:
-                                        rv = _chb_raw_var.detrended_variance()
-                                        cv = _chb_corr_var.detrended_variance()
-                                        if rv and cv and cv > 0:
-                                            qvir = rv / cv
-                                            log.info("TICC qVIR: %.1f "
-                                                     "(raw=%.2f corr=%.2f ns²)",
-                                                     qvir, rv, cv)
 
                             # TICC chB is the primary PPS source for the
                             # correlation gate.  EXTTS is only used when
@@ -5370,7 +5722,6 @@ def _setup_servo(args, known_ecef, qerr_store, ptp=None):
             'pps_qerr_plus_var_ns2', 'pps_qerr_plus_ratio',
             'pps_qerr_minus_var_ns2', 'pps_qerr_minus_ratio',
             'carrier_error_ns',
-            'source', 'source_error_ns', 'source_confidence_ns',
             'adjfine_ppb', 'phase', 'n_meas', 'gain_scale',
             'discipline_interval', 'n_accumulated', 'watchdog_alarm',
             'tracking_mode', 'time_to_zero_s',
@@ -5391,6 +5742,9 @@ def _setup_servo(args, known_ecef, qerr_store, ptp=None):
         'servo': servo,
         'scheduler': scheduler,
         'qerr_store': qerr_store,
+        'extint_store': extint_store,
+        'bias_extint_ns': _load_timestamper_bias(args, "extint:default"),
+        'bias_ticc_ns':   _load_timestamper_bias(args, "ticc_diff:default"),
         'qerr_alignment': qerr_alignment,
         'pps_queue': pps_queue,
         'pps_history': pps_history,
@@ -5408,10 +5762,8 @@ def _setup_servo(args, known_ecef, qerr_store, ptp=None):
         'phase': 'freerun' if args.freerun else 'tracking',
         'adjfine_ppb': current_adj,
         'gain_scale': 1.0,
-        'prev_source': None,
         'tmode_set': False,
         'position_saved': False,
-        'compute_error_sources': compute_error_sources,
         'ppp_cal': PPPCalibration(tick_ns=8.0, min_samples=10),
         'rx_tcxo': RxTcxoTracker(freq_window=30),
         'dt_rx_buffer': deque(maxlen=30),
@@ -5611,8 +5963,7 @@ def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
     # The TDC PFD measures PPS vs DPLL output.
     # Positive = output behind PPS = need to speed up.
     # Use TDC as the sole error source with 50 ps confidence.
-    from peppar_fix.error_sources import ErrorSource
-    source = ErrorSource('CM_TDC', phase_ns, 0.050)
+    cm_tdc_confidence_ns = 0.050
 
     TRACK_OUTLIER_NS = args.track_outlier_ns
     if TRACK_OUTLIER_NS is not None and abs(phase_ns) > TRACK_OUTLIER_NS:
@@ -5626,7 +5977,7 @@ def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
     else:
         ctx['consecutive_outliers'] = 0
 
-    scheduler.accumulate(source.error_ns, source.confidence_ns, source.name)
+    scheduler.accumulate(phase_ns, cm_tdc_confidence_ns, 'CM_TDC')
 
     if scheduler.should_correct():
         avg_error, avg_confidence, n_samples = scheduler.flush()
@@ -5697,7 +6048,6 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     pps_queue = ctx['pps_queue']
     ticc_tracker = ctx.get('ticc_tracker')
     log_w = ctx['log_w']
-    compute_error_sources = ctx['compute_error_sources']
     skip_stats = ctx.get('skip_stats')
 
     BASE_KP = args.track_kp
@@ -5792,9 +6142,17 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             # Auto-capture: on the first valid TICC measurement, set the
             # target to the current differential.  This zeros the initial
             # offset (cable delay, ARM alignment) so the servo starts at
-            # ~0 error and tracks drift from there.  For PHC+PEROUT the
-            # initial diff is ~0 anyway; for external DOs it can be µs.
-            if (ctx.get('ticc_target_auto') is None
+            # ~0 error and tracks drift from there.  Only used when
+            # --ticc-target-auto is explicitly set; default behaviour
+            # is to actively pull chA-chB to zero (= PEROUT edge at
+            # local TICC chA aligned with F9T PPS at TICC chB, which
+            # is GPS top-of-second modulo F9T qErr).  See
+            # docs/peroutVS-phc-time.md for what "GPS-aligned" means
+            # in this system: it's the rising edge of PEROUT as seen
+            # by the local TICC chA, not the PHC's internal counter
+            # (those differ by a per-host PHC→PEROUT→cable delay).
+            if (getattr(args, 'ticc_target_auto', False)
+                    and ctx.get('ticc_target_auto') is None
                     and args.ticc_target_ns == 0.0):
                 args.ticc_target_ns = ticc_measurement.diff_ns
                 ctx['ticc_target_auto'] = ticc_measurement.diff_ns
@@ -5834,7 +6192,21 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     # Prefer TICC-matched qErr (more precise epoch), fall back to EXTTS
     _qerr_for_rx_tcxo = qerr_for_ticc_pps_ns if qerr_for_ticc_pps_ns is not None else qerr_for_extts_pps_ns
     if _qerr_for_rx_tcxo is not None:
-        unwrapped_ns = rx_tcxo.update(_qerr_for_rx_tcxo)
+        # Frequency-aided unwrap: predict next qErr from dt_rx rate
+        # (PPP carrier-phase has no 8-ns sawtooth ambiguity).  Without
+        # this, F9T rx TCXOs at 100s of ppb defeat the half-tick
+        # threshold and the unwrap goes wrong.
+        # See docs/dofreq-est-measurement-ladder.md §"Arm 2".
+        predicted_drift = None
+        if dt_rx_ns is not None and dt_rx_sigma is not None and dt_rx_sigma < 2.0:
+            prev_dt_rx = ctx.get('prev_dt_rx_for_unwrap')
+            if prev_dt_rx is not None:
+                # Single-sample dt_rx rate: sigma ~0.14 ns/s, well within
+                # the 4-ns/s ambiguity bound.  No smoothing needed.
+                predicted_drift = dt_rx_ns - prev_dt_rx
+            ctx['prev_dt_rx_for_unwrap'] = dt_rx_ns
+        unwrapped_ns = rx_tcxo.update(_qerr_for_rx_tcxo,
+                                      predicted_drift_ns_per_s=predicted_drift)
         _rx_tcxo_freq, freq_n = rx_tcxo.freq_ns_per_s()
         # Synthesize phase: dt_rx resolves tick, qErr gives sub-tick
         if dt_rx_ns is not None and dt_rx_sigma is not None and dt_rx_sigma < 2.0:
@@ -5867,8 +6239,6 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     if qerr_for_extts_pps_ns is not None:
         qerr_alignment["pps_qerr_plus_var"].add(rate_compensated + qerr_for_extts_pps_ns)
         qerr_alignment["pps_qerr_minus_var"].add(rate_compensated - qerr_for_extts_pps_ns)
-    # TICC qVIR (the definitive correlation check) runs in the
-    # ticc_reader thread, not here.  See TICC qVIR log messages.
     # Carrier phase tracker: auto-init and accumulate adjfine
     carrier_tracker = ctx.get('carrier_tracker')
     if carrier_tracker is not None and not getattr(args, 'no_carrier', False):
@@ -5930,11 +6300,6 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             lvl("  [%s] EXTTS qVIR: Δvar(pps)/Δvar(pps+qErr) = %.2f (%s)",
                 n_epochs, qerr_plus_ratio, label)
 
-    # ── Unified error source selection ──
-    # All available sources (PPS, PPS+qErr, Carrier, TICC) compete on
-    # equal terms via compute_error_sources().  TICC data is passed when
-    # available — no separate ticc_drive path.
-
     # Feed PPP calibration: compare PPP-derived qerr against TIM-TP
     # qErr for the first ~10 epochs to determine the constant offset.
     ppp_cal = ctx['ppp_cal']
@@ -5944,64 +6309,6 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         if done:
             log.info(f"  PPP calibration done: offset={ppp_cal.offset_ns:+.3f}ns "
                      f"({ppp_cal._n} samples)")
-    # Correction age drives sigma inflation on Carrier and PPS+PPP.
-    # When NTRIP goes stale, those sources lose competition gracefully
-    # to PPS+qErr / PPS instead of dying.
-    corr_age_for_inflation = None
-    if corr_snapshot is not None:
-        ages = [a for a in (corr_snapshot.get("broadcast_age_s"),
-                            corr_snapshot.get("ssr_age_s"))
-                if a is not None]
-        if ages:
-            corr_age_for_inflation = max(ages)
-
-    # Build TICC+qErr corrected error for the TICC source competition.
-    # pps_err_ticc_ns is the raw TICC diff; apply qErr to get the
-    # qErr-corrected value that compute_error_sources() will use.
-    _ts = ctx.get('ts_params')
-    _ticc_for_sources = pps_err_ticc_ns
-    _ticc_conf_for_sources = ticc_confidence
-    if pps_err_ticc_ns is not None:
-        _ticc_conf_for_sources = (_ts.qerr_confidence_ns
-                                  if _ts else args.ticc_confidence_ns)
-        # Apply qErr correction to TICC measurement
-        if qerr_for_ticc_pps_ns is not None:
-            _ticc_for_sources = pps_err_ticc_ns + qerr_for_ticc_pps_ns
-        elif qerr_for_extts_pps_ns is not None:
-            _ticc_for_sources = pps_err_ticc_ns + qerr_for_extts_pps_ns
-
-    sources = compute_error_sources(
-        pps_err_extts_ns,
-        None if args.no_qerr else qerr_for_extts_pps_ns,
-        dt_rx_ns,
-        dt_rx_sigma,
-        pps_confidence=_ts.pps_confidence_ns if _ts else 20.0,
-        qerr_confidence=_ts.qerr_confidence_ns if _ts else 3.0,
-        carrier_max_sigma=args.carrier_max_sigma_ns,
-        ppp_cal=None if args.no_ppp else ppp_cal,
-        carrier_tracker=(None if getattr(args, 'no_carrier', False)
-                         else ctx.get('carrier_tracker')),
-        corr_age_s=corr_age_for_inflation,
-        corr_staleness_ns_per_s=getattr(
-            args, 'corr_staleness_ns_per_s', 0.1),
-        ticc_error_ns=_ticc_for_sources,
-        ticc_confidence=_ticc_conf_for_sources,
-    )
-    best = sources[0]
-
-    # Source-change logging: when the winner of the source competition
-    # changes, emit a one-liner so postmortem can spot graceful degradation
-    # cascades (Carrier → PPS+qErr → PPS → holdover).
-    last_source_name = ctx.get('last_source_name')
-    if last_source_name != best.name:
-        log.info(
-            "Source change: %s → %s (err=%+.1fns σ=%.1fns, corr_age=%s)",
-            last_source_name or "(none)", best.name,
-            best.error_ns, best.confidence_ns,
-            f"{corr_age_for_inflation:.1f}s"
-            if corr_age_for_inflation is not None else "n/a",
-        )
-        ctx['last_source_name'] = best.name
 
     # No warmup or step phases — PHC bootstrap handles phase and frequency.
     # PI tracking from epoch 1.
@@ -6014,9 +6321,22 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     mode_time_to_zero_s = None
     mode_gain_floor = None
 
+    # Outlier check on the raw observed phase error.  Prefer the TICC
+    # chA-chB diff when present — it's the direct "DO PPS vs GNSS PPS"
+    # measurement, valid in both PHC mode (chA driven by PEROUT) and
+    # TICC-only mode (chA driven by DAC-steered OCXO).  Fall back to
+    # EXTTS PHC fractional offset on hosts without a TICC.  Don't use
+    # the EKF state x[2] — it lags by the filter's response and can
+    # hide a sustained step.  Don't use pps_err_extts_ns alone — on
+    # TICC-only hosts phc_nsec is synthesized as 0 so the EXTTS signal
+    # is identically 0 and the outlier detector silently disables.
+    outlier_observable_ns = (
+        pps_err_ticc_ns if pps_err_ticc_ns is not None
+        else pps_err_extts_ns
+    )
     if (
         TRACK_OUTLIER_NS is not None and
-        abs(best.error_ns) > TRACK_OUTLIER_NS and
+        abs(outlier_observable_ns) > TRACK_OUTLIER_NS and
         not scheduler._converging
     ):
         ctx['consecutive_outliers'] += 1
@@ -6030,19 +6350,27 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                                 "30 consecutive outliers")
             ctx['phc_diverged'] = True
             return "outlier"
-        log.warning(f"  Outlier: {best}, skipping ({ctx['consecutive_outliers']}/30)")
+        log.warning(f"  Outlier: pps_err={outlier_observable_ns:+.0f}ns, "
+                    f"skipping ({ctx['consecutive_outliers']}/30)")
         return "outlier"
     else:
         ctx['consecutive_outliers'] = 0
 
-    scheduler.accumulate(best.error_ns, best.confidence_ns, best.name)
+    # Scheduler input: |x[2]| is the EKF's DO-phase-vs-GPS-time estimate,
+    # the direct one-to-one replacement for the old source-mux output.
+    # σ comes from sqrt(P[2,2]) — the filter's own uncertainty in x[2].
+    scheduler.accumulate(
+        abs(servo.estimated_phase_ns),
+        max(servo.phase_uncertainty_ns, 0.001),
+        'EKF',
+    )
 
     # Feed in-band noise estimator (before correction decision)
     noise_est = ctx.get('noise_estimator')
     if noise_est is not None:
         # will_correct is a lookahead — True if scheduler will flush this epoch
         will_correct = scheduler.should_correct()
-        noise_est.feed(best.error_ns, ctx['adjfine_ppb'], will_correct)
+        noise_est.feed(pps_err_extts_ns, ctx['adjfine_ppb'], will_correct)
 
     # Three-stage clockClass promotion: 248 (boot) → 52 (PHC bootstrapped,
     # set by wrapper after bootstrap) → 6 (servo settled).  Demote back
@@ -6056,8 +6384,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
 
     if TRACK_RESTEP_NS is not None and not args.freerun:
         # Use pps_err_extts_ns (raw PHC fractional offset) for the restep
-        # check, not best.error_ns which includes the filter's dt_rx.
-        # After a step, dt_rx is stale and large while the filter
+        # check.  After a step, dt_rx is stale and large while the filter
         # reconverges — checking it would cause spurious resteps.
         if abs(pps_err_extts_ns) >= TRACK_RESTEP_NS:
             ctx['tracking_large_error_count'] += 1
@@ -6087,12 +6414,6 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     # frequency well from any starting phase; absolute phase alignment
     # requires a reliable step source.
 
-    if ctx['prev_source'] != best.name:
-        if ctx['prev_source'] is not None:
-            log.info(f"  Source: {ctx['prev_source']} → {best.name} "
-                     f"(confidence {best.confidence_ns:.1f}ns)")
-        ctx['prev_source'] = best.name
-
     # Post-step cooldown: skip frequency corrections while the filter
     # reconverges.  Without this, stale dt_rx drives the servo to
     # over-correct, undoing the step.
@@ -6112,21 +6433,78 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         if mode_gain_floor is not None:
             gain_scale = max(gain_scale, mode_gain_floor)
 
-        # DOFreqEst EKF: pass raw TICC (no qErr) + PPP dt_rx.
-        # Use actual wall-clock elapsed time, not n_samples — the EKF's
-        # process model must match real elapsed time for correct prediction.
-        # This lets the scheduler interval float above 1 without breaking
-        # the EKF, reducing actuation noise at short tau.
+        # gnss-phase-experiment: four-arm Kalman fusion in DOFreqEst.
+        # See docs/dofreq-est-measurement-ladder.md.  Each arm gated on
+        # availability inside servo.update; predict step always runs.
+        #
+        # Wired today: Arm 1 (PPP), Arm 3 (TIM-TM2 → x[2]),
+        #              Arm 4 (TICC chA-chB → couple x[0], x[2]).
+        # Pending:    Arm 2 (qErr-as-frequency).
+        extint_phase_ns = None
+        extint_sigma_ns = None
+        _ext = ctx.get('extint_store')
+        if _ext is not None:
+            sample = _ext.consume_latest()
+            if sample is not None:
+                extint_phase_ns, _acc = sample
+                # accEst is reported as integer ns by the F9T;
+                # treat it as the 1-σ for the Kalman update.
+                extint_sigma_ns = float(max(_acc, 1))
+        # Arm 4: pps_err_ticc_ns is already negated upstream so the
+        # sign matches DOFreqEst's z_ticc = -x[2] - qerr(x[0]) model.
+        # ticc_confidence is per-measurement σ in ns from the TICC
+        # tracker.  --no-ticc gates the arm off for ablation.
+        ticc_diff_ns = None
+        ticc_sigma_ns = None
+        if (not getattr(args, 'no_ticc', False)
+                and pps_err_ticc_ns is not None
+                and ticc_confidence is not None):
+            ticc_diff_ns = pps_err_ticc_ns
+            ticc_sigma_ns = float(max(ticc_confidence, 0.001))
+        # Static-bias correction per timestamper: subtract the
+        # operator-calibrated offset before the EKF sees the
+        # measurement.  Calibrated values come from
+        # state/dos/<do_uid>.json (see scripts/calibrate_timestampers.py
+        # and docs/dofreq-est-measurement-ladder.md).  When no
+        # calibration has been recorded the bias entries are None and
+        # this is a no-op.  This keeps every arm pointed at the same
+        # physical x[2] = 0 so ablation runs converge to the same
+        # truth and P[2,2] is a real σ-vs-reference.
+        _bias_ext = ctx.get('bias_extint_ns')
+        if extint_phase_ns is not None and _bias_ext is not None:
+            extint_phase_ns -= _bias_ext
+        _bias_ticc = ctx.get('bias_ticc_ns')
+        if ticc_diff_ns is not None and _bias_ticc is not None:
+            ticc_diff_ns -= _bias_ticc
         now_mono = time.monotonic()
         dt_actual = now_mono - ctx['last_correction_mono']
         ctx['last_correction_mono'] = now_mono
-        if pps_err_ticc_ns is not None:
-            adjfine_ppb = -servo.update(
-                pps_err_ticc_ns, dt=dt_actual,
-                dt_rx_ns=dt_rx_ns, dt_rx_sigma_ns=dt_rx_sigma)
-        else:
-            # No TICC measurement this epoch — hold previous frequency.
-            adjfine_ppb = ctx['adjfine_ppb']
+        # ── Arm 2: rx TCXO frequency from unwrapped qErr slope ──
+        # Skipped if --no-qerr-arm or if buffer not yet full enough.
+        # slope is in ns/s = ppb of fractional frequency offset.
+        qerr_freq_ppb = None
+        qerr_freq_sigma_ppb = None
+        if not getattr(args, 'no_qerr_arm', False):
+            _slope, _sigma, _n = ctx['rx_tcxo'].freq_ppb_with_sigma()
+            if _slope is not None and _sigma is not None and _n >= 10:
+                qerr_freq_ppb = _slope
+                # Floor on Arm 2 sigma.  Default 1.0 ppb — accounts for
+                # rx_TCXO frequency wander within the slope window (real
+                # F9T TCXOs wander 5-8 ppb on minute-scale timescales, so
+                # OLS slope sigma assuming white-phase qErr noise — which
+                # would be ~50 fppb — undersells the actual uncertainty
+                # by 1000x).  Tunable via --qerr-freq-sigma-floor for
+                # experimentation.
+                qerr_freq_sigma_ppb = max(_sigma, args.qerr_freq_sigma_floor)
+        adjfine_ppb = -servo.update(
+            dt=dt_actual,
+            dt_rx_ns=dt_rx_ns, dt_rx_sigma_ns=dt_rx_sigma,
+            qerr_freq_ppb=qerr_freq_ppb, qerr_freq_sigma_ppb=qerr_freq_sigma_ppb,
+            extint_phase_ns=extint_phase_ns,
+            extint_sigma_ns=extint_sigma_ns,
+            ticc_diff_ns=ticc_diff_ns,
+            ticc_sigma_ns=ticc_sigma_ns,
+        )
         max_track_ppb = min(
             ctx['caps']['max_adj'],
             args.track_max_ppb if args.track_max_ppb is not None else ctx['caps']['max_adj'],
@@ -6147,20 +6525,15 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         scheduler.compute_adaptive_interval(avg_confidence)
 
         if n_epochs % 10 == 0:
-            mode_suffix = ''
-            ct = ctx.get('carrier_tracker')
-            if (ct is not None and ct.initialized
-                    and best.name == 'Carrier' and n_epochs % 60 == 0):
-                mode_suffix += (f" anchor_resid={ct.anchor_residual_ns:+.1f}ns")
-            log.info(f"  [{n_epochs}] {best.name}: "
+            log.info(f"  [{n_epochs}] EKF: "
                      f"err={avg_error:+.1f}ns (avg {n_samples}) "
                      f"adj={adjfine_ppb:+.1f}ppb "
                      f"gain={gain_scale:.2f}x "
-                     f"interval={scheduler.interval}{mode_suffix}")
+                     f"interval={scheduler.interval}")
     else:
         if n_epochs % 10 == 0:
-            log.info(f"  [{n_epochs}] {best.name}: "
-                     f"err={best.error_ns:+.1f}ns "
+            log.info(f"  [{n_epochs}] EKF: "
+                     f"err={servo.estimated_phase_ns:+.1f}ns "
                      f"coast ({scheduler.n_accumulated}/{scheduler.interval}) "
                      f"adj={ctx['adjfine_ppb']:+.1f}ppb")
 
@@ -6181,7 +6554,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                pps_err_ticc_ns, ticc_age_s, ticc_confidence,
                pps_var_ns2, pps_qerr_plus_var_ns2, qerr_plus_ratio,
                pps_qerr_minus_var_ns2, qerr_minus_ratio,
-               carrier_error_ns, best,
+               carrier_error_ns,
                ctx['adjfine_ppb'], ctx['phase'], n_used,
                ctx['gain_scale'], scheduler, isb_gal_ns, isb_bds_ns,
                ctx.get('tracking_mode'), mode_time_to_zero_s,
@@ -6201,7 +6574,7 @@ def _log_servo(log_w, log_f, ts_str, gps_unix_sec, phc_sec, phc_nsec,
                pps_err_ticc_ns, ticc_age_s, ticc_confidence,
                pps_var_ns2, pps_qerr_plus_var_ns2, qerr_plus_ratio,
                pps_qerr_minus_var_ns2, qerr_minus_ratio,
-               carrier_error_ns, best,
+               carrier_error_ns,
                adjfine_ppb, phase, n_used, gain_scale, scheduler,
                isb_gal_ns, isb_bds_ns, tracking_mode, time_to_zero_s,
                phc_gettime_ns=None,
@@ -6243,7 +6616,6 @@ def _log_servo(log_w, log_f, ts_str, gps_unix_sec, phc_sec, phc_nsec,
         f'{pps_qerr_minus_var_ns2:.3f}' if pps_qerr_minus_var_ns2 is not None else '',
         f'{qerr_minus_ratio:.3f}' if qerr_minus_ratio is not None else '',
         f'{carrier_error_ns:.3f}' if carrier_error_ns is not None else '',
-        best.name, f'{best.error_ns:.3f}', f'{best.confidence_ns:.3f}',
         f'{adjfine_ppb:.3f}', phase, n_used, f'{gain_scale:.3f}',
         scheduler.interval, scheduler.n_accumulated, 0,
         tracking_mode or '',
@@ -6616,12 +6988,38 @@ def run(args):
     # position fix for the position-consensus watchdog.
     nav2_store = Nav2PositionStore()
 
-    # Enable NAV2 secondary engine on the F9T if not already on.
+    # gnss-phase-experiment: TIM-TM2 store for DOFreqEst Arm 3.  When
+    # --no-extint is set we don't allocate the store and don't enable
+    # the F9T's TIM-TM2 message — the EKF arm stays gated off cleanly
+    # (consume_latest returns None forever).
+    extint_store = None
+    extint_log_f = None
+    if not args.no_extint:
+        _ext_log_writer = None
+        if getattr(args, 'extint_log', None):
+            try:
+                extint_log_f = open(args.extint_log, 'w', newline='')
+                _ext_log_writer = csv.writer(extint_log_f)
+                _ext_log_writer.writerow([
+                    'host_timestamp', 'host_monotonic',
+                    'wn', 'tow_ms', 'tow_sub_ms_ns',
+                    'acc_est_ns', 'phase_residual_ns', 'count', 'flags',
+                ])
+                extint_log_f.flush()
+                log.info("TIM-TM2 CSV log: %s", args.extint_log)
+            except OSError as e:
+                log.error("Failed to open extint_log %s: %s", args.extint_log, e)
+                _ext_log_writer = None
+                extint_log_f = None
+        extint_store = TimTm2Store(log_writer=_ext_log_writer,
+                                   log_file=extint_log_f)
+
+    # Enable NAV2 secondary engine and TIM-TM2 emission on the F9T.
     # This is done here (before serial_reader starts) because the
     # ensure_receiver step only runs the full config when dual-freq
     # observations are missing — if the F9T was already configured
-    # for L5 from a previous run, the NAV2 keys would never be sent.
-    # This quick config burst is harmless if NAV2 is already enabled.
+    # for L5 from a previous run, these keys would never be sent.
+    # The config burst is harmless if values are already correct.
     try:
         from peppar_fix.receiver import send_cfg, PORT_SUFFIX
         from peppar_fix.gnss_stream import open_gnss
@@ -6629,13 +7027,18 @@ def run(args):
         _nav2_ser, _ = open_gnss(args.serial, args.baud)
         _nav2_ubr = _UBR(_nav2_ser, protfilter=2)
         _pname = PORT_SUFFIX.get(args.port_type, "USB")
-        _nav2_ok = send_cfg(_nav2_ser, _nav2_ubr, {
+        _cfg_keys = {
             "CFG_NAV2_OUT_ENABLED": 1,
             f"CFG_MSGOUT_UBX_NAV2_PVT_{_pname}": 5,
-        }, "NAV2 secondary engine enable")
+        }
+        if extint_store is not None:
+            _cfg_keys[f"CFG_MSGOUT_UBX_TIM_TM2_{_pname}"] = 1
+        _nav2_ok = send_cfg(_nav2_ser, _nav2_ubr, _cfg_keys,
+                            "NAV2 + TIM-TM2 enable")
         _nav2_ser.close()
         if _nav2_ok:
-            log.info("NAV2 secondary engine enabled (position consensus)")
+            extras = ", TIM-TM2" if extint_store is not None else ""
+            log.info(f"NAV2 secondary engine enabled (position consensus){extras}")
         else:
             log.warning("NAV2 config failed (position consensus unavailable)")
     except Exception as e:
@@ -6673,7 +7076,8 @@ def run(args):
     t_serial = threading.Thread(
         target=serial_reader,
         args=(args.serial, args.baud, obs_queue, stop_event, beph, systems, ssr),
-        kwargs={**serial_kwargs, 'driver': driver, 'nav2_store': nav2_store},
+        kwargs={**serial_kwargs, 'driver': driver, 'nav2_store': nav2_store,
+                'extint_store': extint_store},
         daemon=True,
     )
     t_serial.start()
@@ -7002,6 +7406,7 @@ def run(args):
                 ape_thread=ape_thread,
                 ar_position=_ar_position,
                 ar_pos_lock=_ar_pos_lock,
+                extint_store=extint_store,
             )
             # run_steady_state returns an int exit code on error,
             # or a gate_stats dict on normal completion.
@@ -7157,6 +7562,33 @@ Two-phase operation:
     pos = ap.add_argument_group("Position")
     pos.add_argument("--known-pos",
                      help="Known position as lat,lon,alt (skips bootstrap)")
+    pos.add_argument("--pin-position", action="store_true",
+                     help="Disable the slow AntPosEst→known_ecef blend in "
+                          "run_steady_state.  Use when --known-pos is a "
+                          "surveyed truth (sub-cm σ) that should NOT be "
+                          "drifted toward AntPosEst's ~m-class estimate.  "
+                          "Default off — preserves the warm-start refine "
+                          "behavior for rough-seed --known-pos use.  "
+                          "Precursor to the full --surveyed-position mode "
+                          "(I-013342-main).")
+    pos.add_argument("--init-ztd-mm", type=float, default=None,
+                     help="Manually seed FixedPosFilter ZTD residual "
+                          "at this value (millimetres) at filter init "
+                          "instead of the default 0.0.  Companion to "
+                          "--init-ztd-sigma-mm.  Use 0.0 ± 50.0 to ask "
+                          "'is the architecture sound under tight ZTD "
+                          "prior?' independently of any atmospheric-data "
+                          "source.  Bravo's I-024942-main MetAR-seeded "
+                          "path will use the same FixedPosFilter API "
+                          "with the Saastamoinen-derived value.")
+    pos.add_argument("--init-ztd-sigma-mm", type=float, default=None,
+                     help="1-σ uncertainty on --init-ztd-mm seed in "
+                          "millimetres.  Default: legacy 500 mm wide "
+                          "prior.  Tighter (e.g. 50) requires confidence "
+                          "in the seed value (METAR/Saastamoinen) and "
+                          "constrains the filter from drifting ZTD past "
+                          "physical envelope while clock state catches "
+                          "up.")
     pos.add_argument("--seed-pos",
                      help="Seed position for bootstrap (speeds convergence)")
     pos.add_argument("--sigma", type=float, default=3.0,
@@ -7222,6 +7654,51 @@ Two-phase operation:
                           "reported hAcc exceeds this threshold (NAV2 too "
                           "noisy to trust as a continuous position witness).  "
                           "Default 3 m matches Bravo's SO_POS hAcc gate.")
+    pos.add_argument("--init-ztd-from-met",
+                     action="store_true", default=False,
+                     help="Seed FixedPosFilter ZTD state from latest METAR "
+                          "via Saastamoinen.  Queries aviationweather.gov "
+                          "on demand at filter init (no cron / local file "
+                          "needed; see --init-ztd-station to pick a "
+                          "station).  Avoids the multi-meter ZTD cold-"
+                          "start transient that pin-position mode exposes "
+                          "(see I-024942 + 2026-05-04 overnight findings).  "
+                          "Default off — preserves current init_ztd_m=0 "
+                          "behavior.  Mutually exclusive with --init-ztd-mm "
+                          "(manual seed).")
+    pos.add_argument("--init-ztd-station", default=DEFAULT_STATION,
+                     metavar="ICAO",
+                     help=f"ICAO id of the airport for METAR fetch when "
+                          f"--init-ztd-from-met is set (default "
+                          f"{DEFAULT_STATION}, ~7 km from UFO1).  Pick a "
+                          f"station within ~50 km of the antenna for "
+                          f"meaningful pressure/temperature similarity.")
+    pos.add_argument("--ztd-tie-interval-s", type=int, default=60,
+                     help="Apply a soft METAR-derived prior on the "
+                          "FixedPosFilter ZTD residual every N epochs "
+                          "(approx N seconds at 1 Hz; default 60).  "
+                          "Set to 0 to disable.  Bounds ZTD-state "
+                          "drift driven by per-SV systematic-bias "
+                          "absorption (SSR L5I→L5Q substitution, "
+                          "antenna PCV miscorrection, multipath); see "
+                          "I-172521.  More frequent than the 5-min "
+                          "METAR report cadence is fine — the cached "
+                          "report just gets re-applied, which still "
+                          "compounds the soft pull against the "
+                          "per-epoch bias-absorption walk.  Re-uses "
+                          "--init-ztd-station for the source airport.")
+    pos.add_argument("--ztd-tie-sigma-mm", type=float, default=30.0,
+                     help="1-σ uncertainty (mm) on the periodic ZTD "
+                          "tie target.  Default 30 mm — matches the "
+                          "METAR + Saastamoinen + spatial-coherence "
+                          "error budget (1 hPa → 2 mm ZHD; "
+                          "Saastamoinen model ~1-3 cm; nearby airport "
+                          "spatial coherence ~1 cm).  Smaller → "
+                          "tighter pull (more rapid convergence but "
+                          "may damp legitimate atmospheric tracking); "
+                          "larger → softer (filter dominates and the "
+                          "tie becomes nearly a noop, since the "
+                          "filter's σ is bias-polluted not honest).")
     pos.add_argument("--bootstrap-rms-k", type=float, default=2.0,
                      help="Phase-1 convergence requires PR-residual RMS < "
                           "k × SIGMA_P_IF.  Catches locally-consistent but "
@@ -7447,8 +7924,14 @@ Two-phase operation:
                           "project_mad_outlier_rejection_landed_20260426.md.")
     pos.add_argument("--timeout", type=int, default=3600,
                      help="Bootstrap timeout in seconds (default: 3600)")
-    pos.add_argument("--watchdog-threshold", type=float, default=0.5,
-                     help="Position watchdog threshold in meters (default: 0.5)")
+    pos.add_argument("--watchdog-threshold", type=float, default=10.0,
+                     help="Position watchdog threshold in meters (default: "
+                          "10.0).  Watchdog trips when PR residual RMS "
+                          "exceeds max(baseline*3, baseline+threshold) for "
+                          "10 consecutive epochs.  10 m corresponds to a "
+                          "30 ns time error — the bound below which we "
+                          "tolerate riding through transient sky/SSR "
+                          "noise without re-seeding a converged filter.")
 
     # Serial
     serial = ap.add_argument_group("Serial")
@@ -7585,6 +8068,16 @@ Two-phase operation:
                        help="DO frequency random walk (ppb/epoch). Lower = "
                             "more stable frequency estimate, less wander. "
                             "Default 0.01 from ADEV characterization.")
+    servo.add_argument("--kalman-sigma-tcxo-freq", type=float, default=0.1,
+                       help="rx TCXO frequency random walk (ppb/epoch).  "
+                            "Default 0.1 — empirically better than the 0.5 "
+                            "value bravo's variance-matching math suggested.  "
+                            "Tighter Q[1,1] means the filter SMOOTHS rx_TCXO "
+                            "wander rather than chasing it; chasing it via "
+                            "larger Q[1,1] degrades long-τ TDEV (PiFace "
+                            "2026-05-08: τ=100s 1.117→1.758 ns at Q=0.5).  "
+                            "Tunable; per-host value belongs in TOML "
+                            "host-config eventually.")
     servo.add_argument("--track-kp", type=float, default=0.3,
                        help="PI servo Kp gain (default: 0.3)")
     servo.add_argument("--track-ki", type=float, default=0.1,
@@ -7658,6 +8151,37 @@ Two-phase operation:
     servo.add_argument("--no-carrier", action="store_true",
                        help="Disable PPP Carrier Phase servo drive "
                             "(Carrier source disabled, PPS+PPP still available)")
+    servo.add_argument("--qerr-freq-sigma-floor", type=float, default=1.0,
+                       help="Lower bound on Arm 2's qerr_freq_sigma_ppb in "
+                            "ppb (default 1.0).  Captures real rx_TCXO "
+                            "frequency wander within the slope window that "
+                            "OLS-derived sigma misses.  Smaller = filter "
+                            "trusts Arm 2 more.  See "
+                            "docs/dofreq-est-measurement-ladder.md §Arm 2.")
+    servo.add_argument("--no-qerr-arm", action="store_true",
+                       help="Disable DOFreqEst Arm 2 (qErr slope → x[1] = "
+                            "rx TCXO frequency).  When set, the EKF runs "
+                            "without the qErr-as-frequency-slope arm.  "
+                            "Useful for ablation runs comparing PPP-only "
+                            "vs PPP+qErr-Arm2 servo behavior.  See "
+                            "docs/dofreq-est-measurement-ladder.md §Arm 2.")
+    servo.add_argument("--no-extint", action="store_true",
+                       help="Disable DOFreqEst Arm 3 (TIM-TM2 → x[2]).  "
+                            "When set, the engine does not allocate a "
+                            "TimTm2Store, does not enable TIM-TM2 emission "
+                            "on the F9T, and the EKF arm 3 stays None — "
+                            "useful for ablation runs comparing PPP-only "
+                            "to PPP+EXTINT performance.  See "
+                            "docs/dofreq-est-measurement-ladder.md.")
+    servo.add_argument("--no-ticc", action="store_true",
+                       help="Disable DOFreqEst Arm 4 (TICC chA-chB → "
+                            "couple x[0] and x[2]).  When set, the EKF "
+                            "arm 4 stays None even if --ticc-port is "
+                            "configured — TICC measurements are still "
+                            "logged and used for diagnostics, but not "
+                            "fed to the servo.  Used for ablation runs "
+                            "comparing TIM-TM2-only against TICC+TIM-TM2 "
+                            "performance.")
     servo.add_argument("--do-char-file", default="data/do_characterization.json",
                        help="Path to DO characterization JSON (read at startup)")
     servo.add_argument("--do-label", default=None,
@@ -7756,6 +8280,18 @@ Two-phase operation:
                            "of servo state; lets post-processing redo the "
                            "qErr ↔ TICC chB matching the engine does in "
                            "real time, without sawtooth dewrap heuristics.")
+    ticc.add_argument("--extint-log", default=None,
+                      help="Optional raw TIM-TM2 CSV log path for the "
+                           "gnss-phase-experiment.  Each row captures "
+                           "one TIM-TM2 message from the F9T with "
+                           "(host_timestamp, host_monotonic, wn, tow_ms, "
+                           "tow_sub_ms_ns, acc_est_ns, phase_residual_ns, "
+                           "count, flags).  Pair with --ticc-log to "
+                           "post-hoc compare TIM-TM2 (DOFreqEst Arm 3) "
+                           "against TICC chA-chB (Arm 4) and quantify "
+                           "their static offset + dynamic noise — the "
+                           "ablation matrix from "
+                           "docs/dofreq-est-measurement-ladder.md.")
     ticc.add_argument("--ticc-baud", type=int, default=115200,
                       help="TICC baud rate (default: 115200)")
     ticc.add_argument("--ticc-phc-channel", choices=["chA", "chB"], default="chA",
@@ -7765,7 +8301,24 @@ Two-phase operation:
     ticc.add_argument("--ticc-max-age-s", type=float, default=2.0,
                       help="Maximum age for a paired TICC measurement to be used")
     ticc.add_argument("--ticc-target-ns", type=float, default=0.0,
-                      help="Target chPHC-chREF offset in ns for TICC-driven servo mode")
+                      help="Target chPHC-chREF offset in ns for TICC-driven "
+                           "servo mode.  Default 0 means actively pull "
+                           "PEROUT-vs-F9T_PPS to zero (so the local TICC chA "
+                           "rising edge marks GPS top-of-second, modulo F9T "
+                           "qErr).  See docs/peroutVS-phc-time.md for the "
+                           "implications: the PHC's internal counter remains "
+                           "offset from this edge by PHC→PEROUT→cable "
+                           "propagation latency, which is per-host fixed.  "
+                           "To preserve the legacy auto-capture-of-initial-"
+                           "diff behaviour (servo only corrects drift "
+                           "around the bootstrap residual, not the residual "
+                           "itself), pass --ticc-target-auto.")
+    ticc.add_argument("--ticc-target-auto", action="store_true", default=False,
+                      help="At the first epoch, capture the TICC chA-chB "
+                           "diff and use that as the servo setpoint.  "
+                           "Legacy behaviour, retained for diagnostic runs "
+                           "where you want to track drift around an arbitrary "
+                           "starting point rather than pulling chA-chB to zero.")
     ticc.add_argument("--ticc-confidence-ns", type=float, default=3.0,
                       help="Assumed confidence of TICC differential error when driving servo")
     # --ticc-drive removed: TICC competes as a source whenever --ticc-port

@@ -26,7 +26,7 @@ _SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from solve_ppp import PPPFilter, IDX_ZTD
+from solve_ppp import FixedPosFilter, PPPFilter, IDX_ZTD
 
 
 class InitialPriorTest(unittest.TestCase):
@@ -60,6 +60,61 @@ class InitialPriorTest(unittest.TestCase):
         f.initialize([1e6, 0.0, 0.0], clock_m=0.0, ztd_sigma_m=0.1)
         self.assertAlmostEqual(f.P[IDX_ZTD, IDX_ZTD], 0.1**2)
         self.assertAlmostEqual(f._ztd_sigma_m, 0.1)
+
+
+class InitZtdSeedTest(unittest.TestCase):
+    """init_ztd_m parameter on PPPFilter.initialize + FixedPosFilter ctor.
+
+    Per I-024942 (METAR-seeded ZTD prior).  The seed lands the
+    filter close to atmospheric truth at epoch 1, avoiding the
+    multi-meter ZTD cold-start transient observed under
+    --pin-position on 2026-05-04.
+    """
+
+    def test_pppfilter_default_init_ztd_zero(self):
+        f = PPPFilter()
+        f.initialize([1e6, 0.0, 0.0], clock_m=0.0)
+        self.assertAlmostEqual(f.x[IDX_ZTD], 0.0)
+
+    def test_pppfilter_init_ztd_seed_lands(self):
+        f = PPPFilter()
+        f.initialize([1e6, 0.0, 0.0], clock_m=0.0, init_ztd_m=0.034)
+        self.assertAlmostEqual(f.x[IDX_ZTD], 0.034)
+
+    def test_pppfilter_init_ztd_signed(self):
+        # Negative residuals (low-pressure systems) must be accepted.
+        f = PPPFilter()
+        f.initialize([1e6, 0.0, 0.0], clock_m=0.0, init_ztd_m=-0.080)
+        self.assertAlmostEqual(f.x[IDX_ZTD], -0.080)
+
+    def test_pppfilter_init_ztd_orthogonal_to_sigma(self):
+        # init_ztd_m sets the mean; ztd_sigma_m sets the σ.
+        f = PPPFilter()
+        f.initialize([1e6, 0.0, 0.0], clock_m=0.0,
+                     init_ztd_m=0.10, ztd_sigma_m=0.05)
+        self.assertAlmostEqual(f.x[IDX_ZTD], 0.10)
+        self.assertAlmostEqual(f.P[IDX_ZTD, IDX_ZTD], 0.05**2)
+
+    def test_fixedposfilter_default_init_ztd_zero(self):
+        f = FixedPosFilter([1e6, 0.0, 0.0])
+        self.assertAlmostEqual(f.x[FixedPosFilter.IDX_ZTD], 0.0)
+        # Default σ preserved at 0.5 m.
+        self.assertAlmostEqual(
+            f.P[FixedPosFilter.IDX_ZTD, FixedPosFilter.IDX_ZTD],
+            0.5**2)
+
+    def test_fixedposfilter_init_ztd_seed_lands(self):
+        f = FixedPosFilter([1e6, 0.0, 0.0],
+                           init_ztd_m=0.034, init_ztd_sigma_m=0.05)
+        self.assertAlmostEqual(f.x[FixedPosFilter.IDX_ZTD], 0.034)
+        self.assertAlmostEqual(
+            f.P[FixedPosFilter.IDX_ZTD, FixedPosFilter.IDX_ZTD],
+            0.05**2)
+
+    def test_fixedposfilter_init_ztd_negative(self):
+        f = FixedPosFilter([1e6, 0.0, 0.0],
+                           init_ztd_m=-0.080, init_ztd_sigma_m=0.05)
+        self.assertAlmostEqual(f.x[FixedPosFilter.IDX_ZTD], -0.080)
 
 
 class ZtdProcessNoiseTest(unittest.TestCase):
@@ -210,6 +265,105 @@ class Nav2AnchorTest(unittest.TestCase):
         f2.apply_nav2_anchor(self._BASE_ECEF, h_acc_m=1.0, v_acc_m=None)
         np.testing.assert_allclose(f1.x, f2.x, atol=1e-12)
         np.testing.assert_allclose(f1.P, f2.P, atol=1e-12)
+
+
+class FixedPosFilterZtdSeedTest(unittest.TestCase):
+    """FixedPosFilter accepts init_ztd_m + init_ztd_sigma_m for the
+    I-024942-main METAR-seeded ZTD prior path and Main's manual
+    --init-ztd-mm validation flag.
+
+    Default behaviour preserved: 0 m residual ZTD, 0.5 m σ.
+    """
+
+    _BASE_ECEF = np.array([157470.222, -4756189.544, 4232767.952])
+
+    def test_default_ztd_zero_with_legacy_sigma(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF)
+        self.assertAlmostEqual(f.x[f.IDX_ZTD], 0.0)
+        self.assertAlmostEqual(f.P[f.IDX_ZTD, f.IDX_ZTD], 0.5 ** 2)
+
+    def test_seeded_ztd_value(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF, init_ztd_m=0.123)
+        self.assertAlmostEqual(f.x[f.IDX_ZTD], 0.123)
+
+    def test_tightened_sigma(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF, init_ztd_sigma_m=0.05)
+        self.assertAlmostEqual(f.P[f.IDX_ZTD, f.IDX_ZTD], 0.05 ** 2)
+
+    def test_seed_and_sigma_independent(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF,
+                           init_ztd_m=-0.3,
+                           init_ztd_sigma_m=0.05)
+        self.assertAlmostEqual(f.x[f.IDX_ZTD], -0.3)
+        self.assertAlmostEqual(f.P[f.IDX_ZTD, f.IDX_ZTD], 0.05 ** 2)
+        # Other states unchanged.
+        self.assertAlmostEqual(f.x[f.IDX_CLK], 0.0)
+        self.assertAlmostEqual(f.P[f.IDX_CLK, f.IDX_CLK], 1e18)
+
+
+class ApplyZtdTieTest(unittest.TestCase):
+    """apply_ztd_tie generalized to accept a non-zero target (I-172521)."""
+
+    _BASE_ECEF = np.array([157470.222, -4756189.544, 4232767.952])
+
+    def _init_pppfilter(self):
+        from solve_ppp import PPPFilter
+        f = PPPFilter()
+        f.initialize(self._BASE_ECEF, 0.0, 0.0, 0.0)
+        return f
+
+    def test_pppfilter_default_target_zero_unchanged(self):
+        # Backward compatibility: default target=0 still pulls toward 0.
+        f = self._init_pppfilter()
+        f.x[IDX_ZTD] = 0.5
+        f.P[IDX_ZTD, IDX_ZTD] = 0.1 ** 2
+        f.apply_ztd_tie(0.05)  # legacy call shape, σ=50mm
+        # State should pull toward 0, not stay at 0.5.
+        self.assertLess(abs(f.x[IDX_ZTD]), 0.5)
+
+    def test_pppfilter_target_pulls_toward_target(self):
+        f = self._init_pppfilter()
+        f.x[IDX_ZTD] = 0.5
+        f.P[IDX_ZTD, IDX_ZTD] = 0.1 ** 2
+        f.apply_ztd_tie(0.05, target_m=0.2)
+        # Should be pulled toward 0.2, not 0.
+        self.assertLess(abs(f.x[IDX_ZTD] - 0.2), abs(f.x[IDX_ZTD] - 0.0))
+        self.assertLess(abs(f.x[IDX_ZTD] - 0.2), 0.5 - 0.2)
+
+    def test_fixedposfilter_has_apply_ztd_tie(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF)
+        self.assertTrue(hasattr(f, 'apply_ztd_tie'))
+
+    def test_fixedposfilter_pulls_toward_target(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF, init_ztd_m=0.5,
+                           init_ztd_sigma_m=0.1)
+        f.apply_ztd_tie(0.05, target_m=0.2)
+        # Pulled toward 0.2, by ~K = 0.1²/(0.1² + 0.05²) ≈ 0.8.
+        # So x should land near 0.5 - 0.8*(0.5-0.2) = 0.26.
+        self.assertAlmostEqual(f.x[f.IDX_ZTD], 0.26, delta=0.02)
+
+    def test_fixedposfilter_zero_sigma_noop(self):
+        from solve_ppp import FixedPosFilter
+        f = FixedPosFilter(self._BASE_ECEF, init_ztd_m=0.5)
+        f.apply_ztd_tie(0.0, target_m=0.1)  # σ=0 is a noop guard
+        self.assertAlmostEqual(f.x[f.IDX_ZTD], 0.5)
+
+    def test_fixedposfilter_tighter_sigma_pulls_harder(self):
+        from solve_ppp import FixedPosFilter
+        f1 = FixedPosFilter(self._BASE_ECEF, init_ztd_m=0.5,
+                            init_ztd_sigma_m=0.1)
+        f2 = FixedPosFilter(self._BASE_ECEF, init_ztd_m=0.5,
+                            init_ztd_sigma_m=0.1)
+        f1.apply_ztd_tie(0.20, target_m=0.0)  # loose σ
+        f2.apply_ztd_tie(0.05, target_m=0.0)  # tight σ
+        # f2 should be pulled closer to 0 than f1.
+        self.assertLess(f2.x[f2.IDX_ZTD], f1.x[f1.IDX_ZTD])
 
 
 if __name__ == "__main__":

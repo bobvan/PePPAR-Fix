@@ -16,15 +16,38 @@ eph_mount = "BCEP00BKG0"
 # (BDS-off, CNES-only) per I-003751-main.  WHU dual-mount tried
 # this afternoon (commit 1124a0f) regressed badly — ZTD walked
 # to -7m, WL fixing collapsed (2/31 fixed), trip rate 60/hr.
-# Bias-routing across CNES + WHU mounts has interplay we have to
-# bring up stepwise per the new backlog item.  Tomorrow midday
-# when PiFace rejoins UFO1, MadHat + PiFace become an F9T-20B
-# twin pair (same hardware, same antenna) — the optimal test
-# bed for the WHU bringup work.
 #
-# Until then: known-good single-mount CNES.
+# 2026-05-02: BDS re-enabled here for I-122350-main P3 twin-WHU on
+# UFO1 (Bob picked Opt A — match TimeHat's gps,gal,bds for the
+# cleanest constellation-symmetric A/B).  The diagnostic framework
+# now in place (Main P1 src_mount logging 87e5da3 + Bravo bias_diff
+# 2603d71 + Charlie reference baseline) is what was missing
+# yesterday; that's the regression defense, not BDS-off.
 ssr_ntrip_conf = "ntrip-cnes.conf"
-systems = "gps,gal"
+# Dual-mount WHU phase-bias capability — disabled by default (I-122350
+# P2, 2026-05-02).  Uncomment the two ssr_bias_* lines below to bring
+# in WHU OSBC00WHU1 alongside CNES SSRA00CNE0.  Both mounts live on
+# products.igs-ip.net under the same login, so ntrip-cnes.conf covers
+# both.
+#
+# Asymmetric-hardware role: MadHat (TIM 2.25) tracks the full L5/B2a-I
+# fleet — the *gap-signal* leg.  Enabling WHU here exercises the
+# bias-application path on signals CNES doesn't publish (GPS L5Q phase
+# bias + BDS B2a-I phase bias).  Any regression here isolates a
+# gap-signal bug rather than a dual-mount merge bug (the TimeHat
+# (TIM 2.20) leg covers shared-only signals).  See I-122350-main
+# 'useful asymmetry' framing + I-003751-main stepwise plan.
+#
+# This is the host that suffered yesterday's WHU regression (1124a0f,
+# reverted in ef49574).  Re-enable here only after Main's P1 per-SV
+# per-signal bias logging (commit 87e5da3 onwards) is in place +
+# Charlie's TimeHat-CNES reference baseline is captured (done
+# 2026-05-02 ~10:09 CDT, snapshot at TimeHat:~/peppar-fix/data/
+# day0502-baseline-reference/).  bias_diff overlay (commit 2603d71)
+# consumes the new src= field for the twin-WHU diff.
+ssr_bias_mount      = "OSBC00WHU1"
+ssr_bias_ntrip_conf = "ntrip-cnes.conf"
+systems = "gps,gal,bds"
 
 # TICC #2: chA = PEROUT (i226 PPS OUT), chB = GNSS PPS.
 ticc_port = "/dev/ticc2"
