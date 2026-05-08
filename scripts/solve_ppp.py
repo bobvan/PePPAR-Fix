@@ -23,7 +23,7 @@ import csv
 import logging
 import math
 import sys
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import timedelta
 
 import numpy as np
@@ -1092,6 +1092,43 @@ class FixedPosFilter:
     IDX_ISB_BDS = 4
     N_STATES = 5
 
+    # Catastrophic residual gate (I-202649 v2 — residual consistency).
+    #
+    # The MadHat death 2026-05-08 14:49 UTC was a single-epoch F9T
+    # serial-corruption burst that injected coordinated +339 m PR
+    # residuals on three SVs.  MAD outlier rejection (within update())
+    # cannot catch coordinated catastrophes — the residuals all agree
+    # with each other so MAD-vs-median sees no outlier.
+    #
+    # An earlier fixed-threshold gate (median > 100 m or count > 50%
+    # over 50 m) reverted because it tripped during normal DO bootstrap:
+    # FixedPosFilter's clock-rate state starts wide; residuals legitimately
+    # grow at the bare-TCXO rate (~100-1000 ppb) per epoch until the
+    # rate state converges, producing a linear ramp of 100-1000 m per
+    # epoch that's not a burst — it's the filter learning.
+    #
+    # Residual-consistency design: detect transient spikes (single-
+    # epoch jump above the recent baseline) without firing on linear
+    # rate-divergence (consistent growth that's part of convergence).
+    #
+    # Approach: maintain a rolling history of accepted-epoch median
+    # |PR residual|; trip when the current epoch's median exceeds
+    # CATASTROPHIC_PR_RATIO_TRIP × max(history_median, FLOOR_M).
+    # History is updated only on ACCEPT — sustained bursts don't
+    # contaminate the baseline, and the consecutive-rejects counter
+    # exposes them for a future exit-for-rebootstrap follow-up.
+    #
+    # During the warmup window (first CATASTROPHIC_HISTORY_MIN epochs),
+    # the gate is inactive — the filter's bootstrap phase gets free
+    # run.  This is acceptable: a first-epoch-catastrophic burst
+    # would still be caught by the existing 30-outlier servo cascade
+    # downstream (~30 s of detection latency vs immediate, but no
+    # filter-state poisoning lockout).
+    CATASTROPHIC_PR_RATIO_TRIP = 20.0
+    CATASTROPHIC_PR_BASELINE_FLOOR_M = 5.0
+    CATASTROPHIC_HISTORY_MAX = 10
+    CATASTROPHIC_HISTORY_MIN = 5
+
     def __init__(self, pos_ecef, init_ztd_m=0.0, init_ztd_sigma_m=0.5):
         """Fixed-position PPP filter.
 
@@ -1128,6 +1165,11 @@ class FixedPosFilter:
         self.last_n_td = 0
         self.last_resid_pr = np.array([])
         self.last_resid_td = np.array([])
+        # Catastrophic residual gate state (I-202649).  History records
+        # accepted-epoch median |PR residual|; rejected epochs do NOT
+        # update history so the baseline stays clean across bursts.
+        self._pr_median_history = deque(maxlen=self.CATASTROPHIC_HISTORY_MAX)
+        self._consecutive_catastrophic_rejects = 0
 
     def predict(self, dt):
         if dt <= 0:
@@ -1367,6 +1409,43 @@ class FixedPosFilter:
         H = np.array(H_rows)
         z = np.array(z_rows)
         R = np.diag(R_diag)
+
+        # Catastrophic residual gate (I-202649 v2).  See class-level
+        # comment for the design.  Trips on transient spike from a
+        # stable baseline; warmup-quiet during bootstrap.
+        if pr_idx and len(self._pr_median_history) >= self.CATASTROPHIC_HISTORY_MIN:
+            pr_z_abs = np.abs(z[pr_idx])
+            median_pr = float(np.median(pr_z_abs))
+            baseline = max(
+                float(np.median(self._pr_median_history)),
+                self.CATASTROPHIC_PR_BASELINE_FLOOR_M,
+            )
+            if median_pr > baseline * self.CATASTROPHIC_PR_RATIO_TRIP:
+                self._consecutive_catastrophic_rejects += 1
+                log.error(
+                    "[CATASTROPHIC_REJECT] median |PR|=%.1fm > %.0f×baseline "
+                    "%.1fm (consecutive rejects: %d) — epoch rejected, "
+                    "state unchanged",
+                    median_pr, self.CATASTROPHIC_PR_RATIO_TRIP, baseline,
+                    self._consecutive_catastrophic_rejects,
+                )
+                # Preserve pre-fit residuals for downstream visibility.
+                self.last_n_pr = n_pr
+                self.last_n_td = n_td
+                self.last_resid_pr = z[pr_idx].copy()
+                self.last_resid_td = (z[td_idx].copy() if td_idx
+                                      else np.array([]))
+                # Don't update prev_geo / prev_clock — corrupted obs as
+                # a TD-CP baseline would poison the next epoch.  Don't
+                # update _pr_median_history either — sustained bursts
+                # mustn't contaminate baseline.
+                return 0, np.array([]), 0
+        # Accept path: record this epoch's median |PR| in history and
+        # reset the consecutive-rejects counter.
+        if pr_idx:
+            self._pr_median_history.append(
+                float(np.median(np.abs(z[pr_idx]))))
+        self._consecutive_catastrophic_rejects = 0
 
         S = H @ self.P @ H.T + R
         try:
