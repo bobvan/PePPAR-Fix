@@ -5791,7 +5791,6 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         'phase': 'freerun' if args.freerun else 'tracking',
         'adjfine_ppb': current_adj,
         'gain_scale': 1.0,
-        'prev_source': None,
         'tmode_set': False,
         'position_saved': False,
         'compute_error_sources': compute_error_sources,
@@ -6394,20 +6393,6 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     )
     best = sources[0]
 
-    # Source-change logging: when the winner of the source competition
-    # changes, emit a one-liner so postmortem can spot graceful degradation
-    # cascades (Carrier → PPS+qErr → PPS → holdover).
-    last_source_name = ctx.get('last_source_name')
-    if last_source_name != best.name:
-        log.info(
-            "Source change: %s → %s (err=%+.1fns σ=%.1fns, corr_age=%s)",
-            last_source_name or "(none)", best.name,
-            best.error_ns, best.confidence_ns,
-            f"{corr_age_for_inflation:.1f}s"
-            if corr_age_for_inflation is not None else "n/a",
-        )
-        ctx['last_source_name'] = best.name
-
     # No warmup or step phases — PHC bootstrap handles phase and frequency.
     # PI tracking from epoch 1.
 
@@ -6491,12 +6476,6 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     # source is GNSS-derived (not system clock).  The PI servo tracks
     # frequency well from any starting phase; absolute phase alignment
     # requires a reliable step source.
-
-    if ctx['prev_source'] != best.name:
-        if ctx['prev_source'] is not None:
-            log.info(f"  Source: {ctx['prev_source']} → {best.name} "
-                     f"(confidence {best.confidence_ns:.1f}ns)")
-        ctx['prev_source'] = best.name
 
     # Post-step cooldown: skip frequency corrections while the filter
     # reconverges.  Without this, stale dt_rx drives the servo to
