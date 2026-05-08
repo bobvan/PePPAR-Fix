@@ -5506,8 +5506,6 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         "pps_var": RunningVarianceWindow(),
         "pps_qerr_plus_var": RunningVarianceWindow(),
         "pps_qerr_minus_var": RunningVarianceWindow(),
-        # TICC qVIR is computed in the ticc_reader thread
-        # (not here) using per-timestamp variance, not diff variance.
     }
 
     # PPS event queue
@@ -5606,12 +5604,6 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             ticc_log_f.flush()
 
         qerr_ticc_tracker = QErrTimescaleTracker()
-        # TICC qVIR: pure correlation check, no DO in the picture.
-        # Tracks chB interval deviations (PPS sawtooth) and checks
-        # whether matched qerr removes that variance.
-        _chb_raw_var = RunningVarianceWindow(maxlen=64)
-        _chb_corr_var = RunningVarianceWindow(maxlen=64)
-        _chb_qvir_count = [0]
 
         def ticc_reader():
             # When TICC-driven, the reference channel (chB) also generates
@@ -5667,25 +5659,6 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                                             qerr_store.clear_pending()
                                 ticc_tracker.set_pending_ref_qerr(
                                     event.ref_sec, _qerr)
-                                # TICC qVIR: apply qerr to each chB
-                                # TIMESTAMP (not intervals).  Corrected
-                                # = chB_phase + qerr.  Detrended variance
-                                # of corrected should be much smaller than
-                                # raw (sawtooth removed, leaving TICC noise).
-                                # Pure F9T PPS + TICC, no DO.
-                                phase_ns = event.ref_ps / 1000.0
-                                _chb_raw_var.add(phase_ns)
-                                if _qerr is not None:
-                                    _chb_corr_var.add(phase_ns + _qerr)
-                                    _chb_qvir_count[0] += 1
-                                    if _chb_qvir_count[0] % 100 == 0:
-                                        rv = _chb_raw_var.detrended_variance()
-                                        cv = _chb_corr_var.detrended_variance()
-                                        if rv and cv and cv > 0:
-                                            qvir = rv / cv
-                                            log.info("TICC qVIR: %.1f "
-                                                     "(raw=%.2f corr=%.2f ns²)",
-                                                     qvir, rv, cv)
 
                             # TICC chB is the primary PPS source for the
                             # correlation gate.  EXTTS is only used when
@@ -6271,8 +6244,6 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     if qerr_for_extts_pps_ns is not None:
         qerr_alignment["pps_qerr_plus_var"].add(rate_compensated + qerr_for_extts_pps_ns)
         qerr_alignment["pps_qerr_minus_var"].add(rate_compensated - qerr_for_extts_pps_ns)
-    # TICC qVIR (the definitive correlation check) runs in the
-    # ticc_reader thread, not here.  See TICC qVIR log messages.
     # Carrier phase tracker: auto-init and accumulate adjfine
     carrier_tracker = ctx.get('carrier_tracker')
     if carrier_tracker is not None and not getattr(args, 'no_carrier', False):
