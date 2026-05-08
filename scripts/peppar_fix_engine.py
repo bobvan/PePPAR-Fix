@@ -491,20 +491,44 @@ class RxTcxoTracker:
         Returns (freq_ns_per_s, n_samples) or (None, 0) if insufficient data.
         At 1 Hz sampling, each index step = 1 second.
         """
+        slope, sigma, n = self._slope_with_sigma()
+        if slope is None:
+            return None, 0
+        return slope, n
+
+    def freq_ppb_with_sigma(self):
+        """Same slope as freq_ns_per_s, but also returns slope sigma.
+
+        slope sigma comes from residual variance about the linear fit
+        divided by sxx — standard textbook OLS sigma.  In ppb (= ns/s).
+
+        Returns (slope_ppb, sigma_ppb, n_samples) or (None, None, 0).
+        Used by Arm 2 of the four-arm Kalman fusion to pass rx TCXO
+        frequency observations into DOFreqEst.update(qerr_freq_ppb=...).
+        """
+        return self._slope_with_sigma()
+
+    def _slope_with_sigma(self):
         n = len(self._phase_buf)
         if n < 5:
-            return None, 0
-        # Simple linear regression: phase = a + b*t
+            return None, None, 0
         phases = list(self._phase_buf)
-        sx = n * (n - 1) / 2
-        sxx = n * (n - 1) * (2 * n - 1) / 6
-        sy = sum(phases)
-        sxy = sum(i * v for i, v in enumerate(phases))
-        denom = n * sxx - sx * sx
-        if abs(denom) < 1e-10:
-            return None, 0
-        slope = (n * sxy - sx * sy) / denom
-        return slope, n
+        # Centered indices for stable slope sigma calculation.
+        t_mean = (n - 1) / 2.0
+        y_mean = sum(phases) / n
+        sxx = sum((i - t_mean) ** 2 for i in range(n))
+        sxy = sum((i - t_mean) * (phases[i] - y_mean) for i in range(n))
+        if sxx <= 0:
+            return None, None, 0
+        slope = sxy / sxx
+        intercept = y_mean - slope * t_mean
+        # Residual variance about the linear fit; (n-2) DoF.
+        if n <= 2:
+            return slope, float("inf"), n
+        ss_resid = sum((phases[i] - intercept - slope * i) ** 2 for i in range(n))
+        var_resid = ss_resid / (n - 2)
+        sigma_slope = math.sqrt(max(var_resid, 0.0) / sxx)
+        return slope, sigma_slope, n
 
     def accumulated_phase_ns(self):
         """Return current unwrapped accumulated phase in ns."""
@@ -6492,10 +6516,20 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         now_mono = time.monotonic()
         dt_actual = now_mono - ctx['last_correction_mono']
         ctx['last_correction_mono'] = now_mono
+        # ── Arm 2: rx TCXO frequency from unwrapped qErr slope ──
+        # Skipped if --no-qerr-arm or if buffer not yet full enough.
+        # slope is in ns/s = ppb of fractional frequency offset.
+        qerr_freq_ppb = None
+        qerr_freq_sigma_ppb = None
+        if not getattr(args, 'no_qerr_arm', False):
+            _slope, _sigma, _n = ctx['rx_tcxo'].freq_ppb_with_sigma()
+            if _slope is not None and _sigma is not None and _n >= 10:
+                qerr_freq_ppb = _slope
+                qerr_freq_sigma_ppb = max(_sigma, 0.005)  # floor: 5 fppb
         adjfine_ppb = -servo.update(
             dt=dt_actual,
             dt_rx_ns=dt_rx_ns, dt_rx_sigma_ns=dt_rx_sigma,
-            qerr_freq_ppb=None, qerr_freq_sigma_ppb=None,
+            qerr_freq_ppb=qerr_freq_ppb, qerr_freq_sigma_ppb=qerr_freq_sigma_ppb,
             extint_phase_ns=extint_phase_ns,
             extint_sigma_ns=extint_sigma_ns,
             ticc_diff_ns=ticc_diff_ns,
@@ -8143,6 +8177,13 @@ Two-phase operation:
     servo.add_argument("--no-carrier", action="store_true",
                        help="Disable PPP Carrier Phase servo drive "
                             "(Carrier source disabled, PPS+PPP still available)")
+    servo.add_argument("--no-qerr-arm", action="store_true",
+                       help="Disable DOFreqEst Arm 2 (qErr slope → x[1] = "
+                            "rx TCXO frequency).  When set, the EKF runs "
+                            "without the qErr-as-frequency-slope arm.  "
+                            "Useful for ablation runs comparing PPP-only "
+                            "vs PPP+qErr-Arm2 servo behavior.  See "
+                            "docs/dofreq-est-measurement-ladder.md §Arm 2.")
     servo.add_argument("--no-extint", action="store_true",
                        help="Disable DOFreqEst Arm 3 (TIM-TM2 → x[2]).  "
                             "When set, the engine does not allocate a "
