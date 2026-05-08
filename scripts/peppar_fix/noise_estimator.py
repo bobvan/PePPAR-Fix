@@ -65,6 +65,18 @@ class InBandNoiseEstimator:
         self._phase_acc_ns = 0.0
         self._prev_mono = None
 
+        # Last-feed exposure for external CSV / instrumentation paths
+        # (I-162848 Step 1).  Populated on every feed() call so the
+        # engine can record (mono, residual_ns, channel) without
+        # duplicating detrending math.  Channel is "gap" when this
+        # epoch landed in BOTH gap_phases and corr_phases (no
+        # correction applied), "correction" when this epoch landed in
+        # corr_phases only (a correction was applied — the linear
+        # drift accumulator was reset).
+        self.last_mono = None
+        self.last_residual_ns = None
+        self.last_channel = None
+
     def feed(self, phase_error_ns, adjfine_ppb, corrected_this_epoch,
              mono=None):
         """Feed one epoch's measurement.
@@ -108,11 +120,18 @@ class InBandNoiseEstimator:
             if len(self._gap_phases) > self._max_history:
                 self._gap_phases.pop(0)
                 self._gap_times.pop(0)
+            channel = "gap"
         else:
             # Reset detrending accumulator on correction — the correction
             # changes the frequency, so phase accumulation restarts.
             self._phase_acc_ns = 0.0
             self._last_correction_mono = mono
+            channel = "correction"
+
+        # Expose last-feed values for external CSV instrumentation.
+        self.last_mono = mono
+        self.last_residual_ns = residual_ns
+        self.last_channel = channel
 
         # Periodically recompute ADEV (every 60 samples)
         if self._corr_count % 60 == 0:

@@ -5423,6 +5423,8 @@ def _setup_servo(args, known_ecef, qerr_store, ptp=None):
         'consecutive_outliers': 0,
         'last_correction_mono': time.monotonic(),
         'noise_estimator': _init_noise_estimator(args),
+        'noise_buffer_writer': None,    # set below if --noise-buffer-csv
+        'noise_buffer_f': None,         # file handle for clean shutdown
         'holdover': {
             'active': False,
             'reason': '',
@@ -5431,6 +5433,23 @@ def _setup_servo(args, known_ecef, qerr_store, ptp=None):
             'reasons': {},
         },
     }
+
+    # ── Optional noise-buffer CSV (I-162848 Step 1) ───────────────── #
+    # Per-epoch (mono, residual_ns, channel) export from
+    # InBandNoiseEstimator.feed for offline gap-PSD characterization.
+    # Side-by-side comparison with freerun captures in the overlap
+    # band (f > 1/gap_window) validates the detrending; PSD mismatch
+    # there means feed()'s "expected drift = adjfine·dt" model is
+    # missing something (DO frequency wander beyond the linear ramp).
+    nb_path = getattr(args, 'noise_buffer_csv', None)
+    if nb_path:
+        nb_f = open(nb_path, 'w', newline='')
+        nb_w = csv.writer(nb_f)
+        nb_w.writerow(['mono', 'residual_ns', 'channel'])
+        nb_f.flush()
+        ctx['noise_buffer_writer'] = nb_w
+        ctx['noise_buffer_f'] = nb_f
+        log.info("Noise-buffer CSV → %s", nb_path)
 
     # ── TICC sanity check ─────────────────────────────────────────── #
     # When TICC is present, wait for the first differential measurement
@@ -6043,6 +6062,17 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         # will_correct is a lookahead — True if scheduler will flush this epoch
         will_correct = scheduler.should_correct()
         noise_est.feed(best.error_ns, ctx['adjfine_ppb'], will_correct)
+        # Optional CSV export of per-epoch (mono, residual_ns, channel)
+        # samples for offline gap-PSD analysis (I-162848 Step 1).
+        # Detrending math lives inside feed(); here we just persist
+        # the freshly-computed residual + channel label.
+        nb_writer = ctx.get('noise_buffer_writer')
+        if nb_writer is not None and noise_est.last_channel is not None:
+            nb_writer.writerow([
+                f"{noise_est.last_mono:.9f}",
+                f"{noise_est.last_residual_ns:.6f}",
+                noise_est.last_channel,
+            ])
 
     # Three-stage clockClass promotion: 248 (boot) → 52 (PHC bootstrapped,
     # set by wrapper after bootstrap) → 6 (servo settled).  Demote back
@@ -6292,6 +6322,12 @@ def _cleanup_servo(ctx):
         ctx['log_f'].close()
     if ctx.get('ticc_log_f'):
         ctx['ticc_log_f'].close()
+    if ctx.get('noise_buffer_f'):
+        try:
+            ctx['noise_buffer_f'].flush()
+            ctx['noise_buffer_f'].close()
+        except Exception:
+            pass
     pmc = ctx.get('pmc')
     if pmc is not None:
         pmc.close()
@@ -7723,6 +7759,19 @@ Two-phase operation:
                            "ref_ps/channel.  Pair with --qerr-log to do "
                            "post-hoc qErr correction by index-matching on "
                            "CLOCK_MONOTONIC.")
+    ticc.add_argument("--noise-buffer-csv", default=None,
+                      help="Optional per-epoch noise-buffer CSV export "
+                           "(I-162848 Step 1).  Each row records "
+                           "(mono, residual_ns, channel) from the "
+                           "InBandNoiseEstimator's detrended phase "
+                           "samples — channel='gap' for no-correction "
+                           "epochs (free-running DO observation), "
+                           "'correction' for correction epochs.  Used "
+                           "for offline gap-PSD analysis vs freerun "
+                           "captures in the overlap band; PSD mismatch "
+                           "indicates the detrending model "
+                           "('expected drift = adjfine·dt') is missing "
+                           "DO frequency wander beyond the linear ramp.")
     ticc.add_argument("--slip-log", default=None,
                       help="Optional cycle-slip CSV log.  One row per "
                            "SlipEvent captures epoch, sv, reasons "
