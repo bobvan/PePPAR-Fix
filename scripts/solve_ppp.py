@@ -1092,21 +1092,6 @@ class FixedPosFilter:
     IDX_ISB_BDS = 4
     N_STATES = 5
 
-    # Catastrophic residual gate.  MAD outlier rejection above catches
-    # ISOLATED outliers (one bad SV vs the rest); this gate catches
-    # COORDINATED catastrophes where many SVs are simultaneously
-    # corrupted (F9T serial-burst, RTCM stream desync) and MAD-vs-
-    # median sees them as agreeing with each other.  Reject epoch
-    # entirely (state untouched) when:
-    #   - median |PR residual| exceeds CATASTROPHIC_PR_MEDIAN_M, OR
-    #   - >= CATASTROPHIC_PR_FRAC of admitted SVs have |PR| above
-    #     CATASTROPHIC_PR_PER_SV_M (need >=3 PR observations).
-    # See I-202649-main and project_madhat_death_serial_burst_20260508
-    # for the incident that motivated this.
-    CATASTROPHIC_PR_MEDIAN_M = 100.0
-    CATASTROPHIC_PR_PER_SV_M = 50.0
-    CATASTROPHIC_PR_FRAC = 0.5
-
     def __init__(self, pos_ecef, init_ztd_m=0.0, init_ztd_sigma_m=0.5):
         """Fixed-position PPP filter.
 
@@ -1382,32 +1367,6 @@ class FixedPosFilter:
         H = np.array(H_rows)
         z = np.array(z_rows)
         R = np.diag(R_diag)
-
-        # Catastrophic residual gate — see class-level comment.
-        if pr_idx:
-            pr_z_abs = np.abs(z[pr_idx])
-            median_pr = float(np.median(pr_z_abs))
-            n_huge = int(np.sum(pr_z_abs > self.CATASTROPHIC_PR_PER_SV_M))
-            n_pr_total = len(pr_idx)
-            median_trip = median_pr > self.CATASTROPHIC_PR_MEDIAN_M
-            count_trip = (n_pr_total >= 3 and
-                          n_huge >= n_pr_total * self.CATASTROPHIC_PR_FRAC and
-                          n_huge >= 2)
-            if median_trip or count_trip:
-                reason = ("median" if median_trip else "count")
-                log.error("[CATASTROPHIC_REJECT] %s trip — median |PR|=%.1fm "
-                          "(%d/%d > %.0fm) — epoch rejected, state unchanged",
-                          reason, median_pr, n_huge, n_pr_total,
-                          self.CATASTROPHIC_PR_PER_SV_M)
-                # Preserve pre-fit residuals for downstream visibility.
-                self.last_n_pr = n_pr
-                self.last_n_td = n_td
-                self.last_resid_pr = z[pr_idx].copy()
-                self.last_resid_td = (z[td_idx].copy() if td_idx
-                                      else np.array([]))
-                # Don't update prev_geo or prev_clock — corrupted obs
-                # would poison the next epoch's time-differenced phase.
-                return 0, np.array([]), 0
 
         S = H @ self.P @ H.T + R
         try:
