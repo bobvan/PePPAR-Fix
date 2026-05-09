@@ -3857,6 +3857,26 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                           init_ztd_m=init_ztd_m,
                           init_ztd_sigma_m=init_ztd_sigma_m)
     filt.prev_clock = 0.0
+
+    # σ_pin: time filter's uncertainty about its pinned ARP, used by
+    # the σ-weighted Bayesian position-blend (I-125649 Stage 2).
+    # Initial value reflects how the engine learned this position:
+    #   --pin-position with surveyed coords (sub-cm OPUS/PRIDE):
+    #     σ_pin tiny (1 mm); blend is effectively no-op, preserving pin
+    #   --known-pos without --pin-position (warm-start refinement):
+    #     σ_pin = 0.5 m (typical AntPosEst float convergence target)
+    #   No --known-pos (cold start, NAV2-seeded):
+    #     σ_pin = 5 m (NAV2 horizontal/vertical accuracy class)
+    # The blend converges σ_pin toward σ_pos as updates accumulate;
+    # see warm-start trajectory in dayplan I-125649-main.
+    if getattr(args, 'pin_position', False):
+        sigma_pin_m = 0.001  # 1 mm — surveyed pin, blend no-op
+    elif getattr(args, 'known_pos', None) is not None:
+        sigma_pin_m = 0.5    # warm-start refining
+    else:
+        sigma_pin_m = 5.0    # NAV2-class
+    log.info("Position-blend σ_pin initial: %.3f m (--ar-mode=%s)",
+             sigma_pin_m, args.ar_mode)
     watchdog = PositionWatchdog(threshold_m=args.watchdog_threshold)
     # Shadow gate: TD-CP-only watchdog runs in parallel for I-145915
     # bake-in.  Verdict logged per epoch but does NOT drive engine
@@ -4258,31 +4278,77 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 continue
 
             # Blend AntPosEst's refined position into DOFreqEst's reference.
-            # Exponential blend: 12 ps/epoch migration rate for 5m offset —
-            # invisible to the servo (200× below PPS noise floor).
-            # See docs/ppp-ar-design.md "Gradual position feed-in".
             #
-            # Skipped under --pin-position: when the supplied known_pos is
-            # surveyed truth (sub-cm σ from OPUS-Static / PRIDE-PPP),
-            # AntPosEst's ~m-class estimate is strictly worse and blending
-            # it in degrades the pin.  Precursor to the full
-            # --surveyed-position mode (I-013342-main).
+            # --ar-mode wl (production default, I-125649 Stage 2):
+            #   σ-weighted Bayesian update — each accepted AntPosEst
+            #   estimate is treated as an observation of the true ARP
+            #   with covariance σ_pos², blended with the current σ_pin
+            #   prior via Kalman-scalar update:
+            #     α_eff = σ_pin² / (σ_pin² + σ_pos²)
+            #     ARP_new = ARP + α_eff × (pos_new − ARP)
+            #     σ_pin'  = σ_pin × σ_pos / sqrt(σ_pin² + σ_pos²)
+            #   Mahalanobis 3σ outlier gate rejects implausible jumps.
+            #   Naturally converges fast at first (NAV2 → float, big
+            #   updates) and self-throttles as σ_pin ↘ σ_pos.
+            #
+            # --ar-mode full (legacy, research-only):
+            #   fixed α=0.001 trickle (τ≈1000 epochs) per the original
+            #   docs/ppp-ar-design.md "Gradual position feed-in".  Kept
+            #   for back-compat with research workflows; predates the
+            #   I-125649 Bayesian redesign.
+            #
+            # Skipped under --pin-position regardless of mode: surveyed
+            # known_pos is sub-cm truth and AntPosEst float is worse.
             if (not getattr(args, 'pin_position', False)
                     and ar_position is not None and ar_pos_lock is not None):
                 with ar_pos_lock:
                     ar_ecef = ar_position.get('ecef')
                     ar_sigma = ar_position.get('sigma')
                 if ar_ecef is not None and ar_sigma is not None and ar_sigma < 1.0:
-                    alpha = 0.001  # τ ≈ 1000 epochs (1000 s at 1 Hz)
                     delta = ar_ecef - known_ecef
-                    step = alpha * delta
-                    known_ecef += step
-                    filt.pos = np.array(known_ecef)
-                    step_mm = float(np.linalg.norm(step)) * 1000
-                    if n_epochs % 100 == 0 and float(np.linalg.norm(delta)) > 0.01:
-                        log.info("Position blend: Δ=%.2fm step=%.1fmm "
-                                 "(AR σ=%.3fm)",
-                                 float(np.linalg.norm(delta)), step_mm, ar_sigma)
+                    delta_3d = float(np.linalg.norm(delta))
+                    if args.ar_mode == "wl":
+                        # Mahalanobis-style 3σ outlier gate (combined
+                        # σ_pin + σ_pos as the test scale).  Defends
+                        # against single-epoch garbage from cycle slips
+                        # or transient SSR errors.
+                        gate_3sigma_m = 3.0 * (sigma_pin_m + ar_sigma)
+                        if delta_3d > gate_3sigma_m:
+                            if n_epochs % 100 == 0:
+                                log.warning(
+                                    "Position blend outlier rejected: "
+                                    "Δ=%.2fm > 3σ=%.2fm (σ_pin=%.3f σ_pos=%.3f)",
+                                    delta_3d, gate_3sigma_m,
+                                    sigma_pin_m, ar_sigma,
+                                )
+                        else:
+                            alpha_eff = (sigma_pin_m ** 2 /
+                                         (sigma_pin_m ** 2 + ar_sigma ** 2))
+                            step = alpha_eff * delta
+                            known_ecef += step
+                            filt.pos = np.array(known_ecef)
+                            sigma_pin_m = (sigma_pin_m * ar_sigma /
+                                           math.sqrt(sigma_pin_m ** 2
+                                                     + ar_sigma ** 2))
+                            step_mm = float(np.linalg.norm(step)) * 1000
+                            if n_epochs % 100 == 0 and delta_3d > 0.01:
+                                log.info(
+                                    "Position blend: Δ=%.2fm α=%.3f "
+                                    "step=%.1fmm σ_pin=%.3fm σ_pos=%.3fm",
+                                    delta_3d, alpha_eff, step_mm,
+                                    sigma_pin_m, ar_sigma,
+                                )
+                    else:
+                        # --ar-mode full: legacy fixed trickle
+                        alpha = 0.001  # τ ≈ 1000 epochs (1000 s at 1 Hz)
+                        step = alpha * delta
+                        known_ecef += step
+                        filt.pos = np.array(known_ecef)
+                        step_mm = float(np.linalg.norm(step)) * 1000
+                        if n_epochs % 100 == 0 and delta_3d > 0.01:
+                            log.info("Position blend: Δ=%.2fm step=%.1fmm "
+                                     "(AR σ=%.3fm)",
+                                     delta_3d, step_mm, ar_sigma)
 
             # Watchdog with NAV2 position consensus
             resid_rms = float(np.sqrt(np.mean(resid ** 2))) if len(resid) > 0 else 0.0
