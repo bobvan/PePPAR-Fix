@@ -14,7 +14,16 @@ ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
 # CNES SSR for PPP-AR (credentials in ntrip-cnes.conf)
 ssr_ntrip_conf = "ntrip-cnes.conf"
-systems = "gps,gal,bds"
+
+# BDS dropped 2026-05-09 per I-165118-charlie research (immediate
+# operational mitigation (a)).  CNES publishes only legacy BDS phase
+# biases (L2I/L6I/L7I = B1I/B3I/B2I-legacy) — no B2a-I.  F9T-20B and
+# F10T both track BDS B2a-I and report under C5I/L5I; without a
+# phase-bias source, every BDS L5/B2a obs feeds WL/float math
+# uncorrected.  Re-enable when I-165118 Fix #2 lands or an AC
+# publishes BDS B2a-I phase biases.  See
+# docs/bds-b2a-phase-bias-survey-2026-05-09.md.
+systems = "gps,gal"
 
 # CTI OSC5A2B02 OCXO via AD5693R DAC on I2C bus 1.
 # Characterized 2026-04-14: gain=1.062, linearity <5 ppb over ±200 ppb.

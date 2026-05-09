@@ -47,7 +47,32 @@ ssr_ntrip_conf = "ntrip-cnes.conf"
 # consumes the new src= field for the twin-WHU diff.
 ssr_bias_mount      = "OSBC00WHU1"
 ssr_bias_ntrip_conf = "ntrip-cnes.conf"
-systems = "gps,gal,bds"
+
+# BDS dropped 2026-05-09 per I-165118-charlie research (immediate
+# operational mitigation (a)): no AC on IGS-IP publishes BDS B2a-I
+# phase biases.  CNES publishes only B1I/B3I/B2I-legacy phase biases;
+# WHU publishes no BDS phase biases at all (60s/5min/15min probes
+# all return RTCM 1059/1065/1242/1260/1265 — multi-GNSS code biases
+# plus GPS phase only — never 1267 or 1270).  CHC publishes
+# B1I + B2I-legacy; CAS publishes B1I + B1C; SHAO/GFZ/BKG publish
+# none.  See docs/bds-b2a-phase-bias-survey-2026-05-09.md.
+#
+# F9T-20B tracks BDS B2a-I and reports under RINEX C5I/L5I.  Without
+# a phase-bias source, BDS L5/B2a-I observations flow into the
+# WL/MW/float math with bias=0, biasing each B2a-I-tracking SV by
+# the unknown true phase-bias value (m-scale per SV).  4-7 BDS SVs
+# per epoch on dual-freq fix → multi-meter position basin
+# contamination.  Empirical case: day0509-madhat-coldstart.log
+# (102 BDS [PB_APPLIED] emits with src=? on L5/B2a, +1146 mm ZTD
+# residual smoking gun).
+#
+# Re-enable when one of:
+#  - I-165118 Fix #2 (engine-side gate widening) lands and keeps
+#    BDS B2a-I observations OUT of WL/float math when phase bias
+#    is MISS, OR
+#  - An AC publishes BDS B2a-I phase biases (track via re-probing
+#    quarterly with scripts/probe_cas_ssr.py against IGS RTS mounts).
+systems = "gps,gal"
 
 # TICC #2: chA = PEROUT (i226 PPS OUT), chB = GNSS PPS.
 ticc_port = "/dev/ticc2"
