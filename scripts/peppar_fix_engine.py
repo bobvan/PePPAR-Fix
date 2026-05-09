@@ -3805,7 +3805,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                      stop_event, qerr_store=None, out_w=None, nav2_store=None,
                      ape_sm=None, dfe_sm=None, ape_thread=None,
                      ar_position=None, ar_pos_lock=None,
-                     extint_store=None):
+                     extint_store=None,
+                     pos_sigma_m=None, pos_source=None):
     """Run FixedPosFilter for clock estimation with optional servo.
 
     This is the steady-state phase: position is known, we estimate clock
@@ -3859,24 +3860,36 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     filt.prev_clock = 0.0
 
     # σ_pin: time filter's uncertainty about its pinned ARP, used by
-    # the σ-weighted Bayesian position-blend (I-125649 Stage 2).
-    # Initial value reflects how the engine learned this position:
+    # the σ-weighted Bayesian position-blend (I-125649 Stage 2/3).
+    # Initial value comes from how the engine learned this position
+    # (threaded from main()'s seed-source resolution):
     #   --pin-position with surveyed coords (sub-cm OPUS/PRIDE):
-    #     σ_pin tiny (1 mm); blend is effectively no-op, preserving pin
+    #     σ_pin = 1 mm; blend is no-op, preserving pin
     #   --known-pos without --pin-position (warm-start refinement):
     #     σ_pin = 0.5 m (typical AntPosEst float convergence target)
-    #   No --known-pos (cold start, NAV2-seeded):
-    #     σ_pin = 5 m (NAV2 horizontal/vertical accuracy class)
+    #   NAV2 seed (Stage 3):
+    #     σ_pin = nav2_h_acc (typically 1-3 m on clean sky, up to 5 m
+    #     near the wait_for_nav2_seed gate)
+    #   Phase-1 PPP bootstrap fallback:
+    #     σ_pin = bootstrap σ (sub-meter once converged)
     # The blend converges σ_pin toward σ_pos as updates accumulate;
     # see warm-start trajectory in dayplan I-125649-main.
     if getattr(args, 'pin_position', False):
         sigma_pin_m = 0.001  # 1 mm — surveyed pin, blend no-op
+    elif pos_sigma_m is not None and pos_sigma_m > 0:
+        # Use the actual seed σ from main() — NAV2 hAcc, Phase-1
+        # bootstrap σ, or operator-supplied --known-pos with non-zero σ.
+        sigma_pin_m = float(pos_sigma_m)
     elif getattr(args, 'known_pos', None) is not None:
-        sigma_pin_m = 0.5    # warm-start refining
+        # --known-pos supplied without explicit σ; treat as warm-start
+        # (operator's coords are not necessarily surveyed truth — that
+        # would have used --pin-position).
+        sigma_pin_m = 0.5
     else:
-        sigma_pin_m = 5.0    # NAV2-class
-    log.info("Position-blend σ_pin initial: %.3f m (--ar-mode=%s)",
-             sigma_pin_m, args.ar_mode)
+        sigma_pin_m = 5.0    # NAV2-class fallback
+    log.info("Position-blend σ_pin initial: %.3f m "
+             "(source=%s, --ar-mode=%s)",
+             sigma_pin_m, pos_source or "default", args.ar_mode)
     watchdog = PositionWatchdog(threshold_m=args.watchdog_threshold)
     # Shadow gate: TD-CP-only watchdog runs in parallel for I-145915
     # bake-in.  Verdict logged per epoch but does NOT drive engine
@@ -7448,6 +7461,8 @@ def run(args):
             bootstrap_result = result
             known_ecef = bootstrap_result.ecef
             sigma_m = bootstrap_result.sigma_m
+            pos_sigma_m = sigma_m  # threaded into run_steady_state for σ_pin init
+            pos_source = pos_source or "ppp_bootstrap"
             ape_sm.transition(AntPosEstState.CONVERGING,
                               f"bootstrap converged (σ={sigma_m:.1f}m), entering steady state")
 
@@ -7648,6 +7663,8 @@ def run(args):
                 ar_position=_ar_position,
                 ar_pos_lock=_ar_pos_lock,
                 extint_store=extint_store,
+                pos_sigma_m=pos_sigma_m,
+                pos_source=pos_source,
             )
             # run_steady_state returns an int exit code on error,
             # or a gate_stats dict on normal completion.
