@@ -122,8 +122,11 @@ def build_actuator(args):
             ppb_per_code=args.dac_ppb_per_code,
             max_ppb=args.dac_max_ppb,
             dac_type=args.dac_type,
+            dac_gain=getattr(args, 'dac_gain', 0),
         )
-        label = f"DAC bus={args.dac_bus} addr=0x{dac_addr:02x}"
+        gain_label = "2×" if getattr(args, 'dac_gain', 0) else "1×"
+        label = (f"DAC bus={args.dac_bus} addr=0x{dac_addr:02x} "
+                 f"({gain_label} mode)")
         return actuator, label
 
     if getattr(args, 'phc', None) is not None:
@@ -173,6 +176,10 @@ def main():
                     help="Initial estimate of ppb/code (refined by calibration)")
     ap.add_argument("--dac-max-ppb", type=float, default=None)
     ap.add_argument("--dac-type", default="ad5693r")
+    ap.add_argument("--dac-gain", type=int, default=0, choices=[0, 1],
+                    help="AD5693R GAIN bit: 0=1× output (0..Vref, default), "
+                         "1=2× output (0..2×Vref).  Recharacterize after "
+                         "changing — ppb_per_code roughly doubles in 2× mode.")
 
     # PHC actuator (alternative)
     ap.add_argument("--phc", default=None,
