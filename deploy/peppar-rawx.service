@@ -1,17 +1,29 @@
 # peppar-rawx.service — continuous F9P RAWX capture for offline PPP
 #
+# STATUS 2026-05-09: DORMANT.  Both F9Ps removed from clkPoC3 — Bob
+# may redeploy them on demand (e.g. to ptpmon for an OPUS-vs-RTK A/B).
+# The service is stopped + disabled on clkPoC3 and there is currently
+# no F9P on any other host that uses this unit.  Unit file retained
+# as the ready-made template for whenever an F9P comes back; just
+# update R1_PORT (and add R2_PORT if a second is wired) before
+# enable + start.
+#
 # Reads RXM-RAWX + RXM-SFRBX + NAV-PVT from one or two F9Ps over USB
 # and dumps the raw UBX byte stream to hourly-rotated files for
 # offline PRIDE-PPP / RTKLIB processing.
 #
-# Designed for clkPoC3 (post-DO-decommission) where the lab's two
-# F9Ps live, sharing the UFO1 antenna via splitter.  Same data feeds:
+# Original use case: clkPoC3 (post-DO-decommission) where the lab's
+# two F9Ps lived 2026-04-29 → 2026-05-09, sharing the UFO1 (then
+# CHOKE1 from 2026-05-05) antenna via splitter.  The captured data
+# fed:
 #   - PRIDE-PPP for an independent ARP cross-check vs OPUS
 #   - F9P RTK against CORS NTRIP (when not in this RAWX-only mode —
 #     the F9Ps can be reconfigured for RTK on demand without
 #     reflashing, but only one mode at a time per receiver)
+# Operational truth source post-removal is the GRX1200 daily
+# OPUS-Static series (see /home/bob/grx1200-logs/ + the surveys repo).
 #
-# Install:
+# Install (when redeploying):
 #   sudo cp deploy/peppar-rawx.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now peppar-rawx.service
