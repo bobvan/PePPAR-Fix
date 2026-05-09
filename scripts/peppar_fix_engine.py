@@ -4290,85 +4290,97 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 skip_stats["too_few_meas"] += 1
                 continue
 
-            # Blend AntPosEst's refined position into DOFreqEst's reference.
+            # Blend a refined position estimate into FixedPosFilter's ARP.
             #
-            # --ar-mode wl (production default, I-125649 Stage 2):
-            #   σ-weighted Bayesian update — each accepted AntPosEst
-            #   estimate is treated as an observation of the true ARP
-            #   with covariance σ_pos², blended with the current σ_pin
-            #   prior via Kalman-scalar update:
-            #     α_eff = σ_pin² / (σ_pin² + σ_pos²)
-            #     ARP_new = ARP + α_eff × (pos_new − ARP)
-            #     σ_pin'  = σ_pin × σ_pos / sqrt(σ_pin² + σ_pos²)
-            #   Mahalanobis 3σ outlier gate rejects implausible jumps.
-            #   Naturally converges fast at first (NAV2 → float, big
-            #   updates) and self-throttles as σ_pin ↘ σ_pos.
+            # --ar-mode wl (production default, I-125649 Stage 4):
+            #   Source = NAV2 running-mean.  Cold-start finding 2026-05-09:
+            #   WL-only AntPosEst converges to a 6-8 m basin off NAV2 on
+            #   our lab antenna (worse than NAV2 itself), so the original
+            #   AntPosEst-feed (Stage 2) was based on a false premise.
+            #   NAV2 hAcc=0.8m on clean sky is the actual best refinement
+            #   available pre-PRIDE-survey.
+            #
+            #   Each accepted NAV2 fix is blended via σ-weighted Bayesian
+            #   update:
+            #     α_eff = σ_pin² / (σ_pin² + σ_nav2²)
+            #     ARP_new = ARP + α_eff × (nav2_ecef − ARP)
+            #     σ_pin'  = max(σ_pin_kalman, σ_nav2)
+            #   The σ_pin floor at σ_nav2 acknowledges that successive
+            #   NAV2 fixes share atmospheric/multipath state — they're
+            #   not statistically independent, so naive √N aggregation
+            #   would overstate convergence.  Effective N over minutes
+            #   is small; over hours geometry rotation helps.
+            #
+            #   NAV2 fixes are sampled every 10 epochs (~10 s).  This
+            #   throttle reduces correlated-update overcount and gives
+            #   the geometry time to rotate between samples.
+            #
+            #   AntPosEst published positions remain available for ARP-
+            #   motion detection (per I-125649 design) but are NOT used
+            #   to update the time filter's ARP under --ar-mode wl.
             #
             # --ar-mode full (legacy, research-only):
-            #   fixed α=0.001 trickle (τ≈1000 epochs) per the original
-            #   docs/ppp-ar-design.md "Gradual position feed-in".  Kept
-            #   for back-compat with research workflows; predates the
-            #   I-125649 Bayesian redesign.
+            #   Original AntPosEst α=0.001 trickle preserved unchanged.
             #
             # Skipped under --pin-position regardless of mode: surveyed
-            # known_pos is sub-cm truth and AntPosEst float is worse.
-            if (not getattr(args, 'pin_position', False)
-                    and ar_position is not None and ar_pos_lock is not None):
-                with ar_pos_lock:
-                    ar_ecef = ar_position.get('ecef')
-                    ar_sigma = ar_position.get('sigma')
-                if ar_ecef is not None and ar_sigma is not None and ar_sigma < 1.0:
-                    delta = ar_ecef - known_ecef
-                    delta_3d = float(np.linalg.norm(delta))
-                    if args.ar_mode == "wl":
-                        # Mahalanobis-style 3σ outlier gate (combined
-                        # σ_pin + σ_pos as the test scale).  Defends
-                        # against single-epoch garbage from cycle slips
-                        # or transient SSR errors.
-                        gate_3sigma_m = 3.0 * (sigma_pin_m + ar_sigma)
-                        if delta_3d > gate_3sigma_m:
-                            if n_epochs % 100 == 0:
-                                log.warning(
-                                    "Position blend outlier rejected: "
-                                    "Δ=%.2fm > 3σ=%.2fm (σ_pin=%.3f σ_pos=%.3f)",
-                                    delta_3d, gate_3sigma_m,
-                                    sigma_pin_m, ar_sigma,
-                                )
-                        else:
-                            alpha_eff = (sigma_pin_m ** 2 /
-                                         (sigma_pin_m ** 2 + ar_sigma ** 2))
-                            step = alpha_eff * delta
-                            known_ecef += step
-                            filt.pos = np.array(known_ecef)
-                            # Update σ_pin via Kalman scalar update, then
-                            # floor at σ_pos.  Floor prevents the
-                            # over-confidence trap: successive AntPosEst
-                            # publications aren't independent observations
-                            # — they're correlated samples from the same
-                            # evolving filter, so naive Kalman aggregation
-                            # overcounts information (σ_pin → σ_pos/√N).
-                            # Floor at the most recent σ_pos says "the time
-                            # filter can never be more confident in the
-                            # ARP than the source it's learning from."
-                            # Discovered 2026-05-09 cold-start smoke on
-                            # MadHat: σ_pin reached 0.08 m and the
-                            # Mahalanobis gate rejected all subsequent
-                            # updates while AntPosEst genuinely was 2 m
-                            # off the time filter's anchored ARP.
-                            sigma_pin_kalman = (sigma_pin_m * ar_sigma /
-                                                math.sqrt(sigma_pin_m ** 2
-                                                          + ar_sigma ** 2))
-                            sigma_pin_m = max(sigma_pin_kalman, ar_sigma)
-                            step_mm = float(np.linalg.norm(step)) * 1000
-                            if n_epochs % 100 == 0 and delta_3d > 0.01:
-                                log.info(
-                                    "Position blend: Δ=%.2fm α=%.3f "
-                                    "step=%.1fmm σ_pin=%.3fm σ_pos=%.3fm",
-                                    delta_3d, alpha_eff, step_mm,
-                                    sigma_pin_m, ar_sigma,
-                                )
-                    else:
-                        # --ar-mode full: legacy fixed trickle
+            # known_pos is sub-cm truth and any blend source is worse.
+            if not getattr(args, 'pin_position', False):
+                if args.ar_mode == "wl":
+                    # NAV2 running-mean blend.  Sample every 10 epochs.
+                    if (nav2_store is not None and n_epochs % 10 == 0):
+                        nav2_op = nav2_store.get_opinion(max_age_s=10.0)
+                        if (nav2_op is not None
+                                and nav2_op.get('fix_type') == 3
+                                and nav2_op.get('h_acc_m') is not None
+                                and nav2_op['h_acc_m'] < 5.0):
+                            nav2_ecef_now = np.asarray(nav2_op['ecef'],
+                                                       dtype=float)
+                            sigma_nav2 = float(nav2_op['h_acc_m'])
+                            delta = nav2_ecef_now - known_ecef
+                            delta_3d = float(np.linalg.norm(delta))
+                            gate_3sigma_m = 3.0 * (sigma_pin_m + sigma_nav2)
+                            if delta_3d > gate_3sigma_m:
+                                if n_epochs % 100 == 0:
+                                    log.warning(
+                                        "NAV2 blend outlier rejected: "
+                                        "Δ=%.2fm > 3σ=%.2fm "
+                                        "(σ_pin=%.3f σ_nav2=%.3f)",
+                                        delta_3d, gate_3sigma_m,
+                                        sigma_pin_m, sigma_nav2,
+                                    )
+                            else:
+                                alpha_eff = (sigma_pin_m ** 2 /
+                                             (sigma_pin_m ** 2
+                                              + sigma_nav2 ** 2))
+                                step = alpha_eff * delta
+                                known_ecef += step
+                                filt.pos = np.array(known_ecef)
+                                sigma_pin_kalman = (
+                                    sigma_pin_m * sigma_nav2 /
+                                    math.sqrt(sigma_pin_m ** 2
+                                              + sigma_nav2 ** 2))
+                                sigma_pin_m = max(sigma_pin_kalman,
+                                                  sigma_nav2)
+                                step_mm = (float(np.linalg.norm(step))
+                                           * 1000)
+                                if (n_epochs % 100 == 0
+                                        and delta_3d > 0.01):
+                                    log.info(
+                                        "NAV2 blend: Δ=%.2fm α=%.3f "
+                                        "step=%.1fmm σ_pin=%.3fm "
+                                        "σ_nav2=%.3fm",
+                                        delta_3d, alpha_eff, step_mm,
+                                        sigma_pin_m, sigma_nav2,
+                                    )
+                elif (ar_position is not None and ar_pos_lock is not None):
+                    # --ar-mode full: legacy AntPosEst α=0.001 trickle
+                    with ar_pos_lock:
+                        ar_ecef = ar_position.get('ecef')
+                        ar_sigma = ar_position.get('sigma')
+                    if (ar_ecef is not None and ar_sigma is not None
+                            and ar_sigma < 1.0):
+                        delta = ar_ecef - known_ecef
+                        delta_3d = float(np.linalg.norm(delta))
                         alpha = 0.001  # τ ≈ 1000 epochs (1000 s at 1 Hz)
                         step = alpha * delta
                         known_ecef += step
