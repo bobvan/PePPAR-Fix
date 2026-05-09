@@ -891,6 +891,25 @@ class SSRState:
             # Secondary-mount writes are restricted to GAP_FILL_SIGNALS
             # to prevent cross-AC datum mixing on shared signals.  Per
             # I-122350-main P3 fix and docs/ac-datum-mixing.md.
+            #
+            # Diagnostic (I-165118-charlie 2026-05-09): one-shot log of
+            # what (sys_prefix, rinex_code, src_mount) tuples we DROP
+            # at this gate.  Surfaces WHU-publishes-but-allow-list-
+            # rejects mismatches so we can decide whether to extend
+            # the allow-list or update the signal map.
+            if not hasattr(self, '_pb_gap_drop_logged'):
+                self._pb_gap_drop_logged = set()
+            drop_key = (sys_prefix, rinex_code, src_mount)
+            if drop_key not in self._pb_gap_drop_logged:
+                log.info(
+                    "[PB_GAP_DROP] sys=%s rinex=%s src=%s sig_id=%d "
+                    "bias=%+.4f m — secondary-mount write rejected "
+                    "by GAP_FILL_SIGNALS allow-list (first sighting)",
+                    sys_prefix, rinex_code,
+                    (src_mount or '?'),
+                    sig_id_int, bias_m,
+                )
+                self._pb_gap_drop_logged.add(drop_key)
             return 0
         if not hasattr(self, '_pb_codes_logged'):
             self._pb_codes_logged = set()
