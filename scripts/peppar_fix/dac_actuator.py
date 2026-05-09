@@ -130,18 +130,21 @@ class DacActuator(FrequencyActuator):
         """Write AD5693R control register with the configured GAIN bit.
 
         Control-register layout (AD5693R/AD5692R/AD5691R/AD5693
-        datasheet, "Write Control Register" command 0x40):
-          D13     = REF   (external reference select, AD5693 only;
-                           must be 0 on the -R variants which have a
-                           fixed internal reference — selecting external
-                           on an -R part leaves DAC output uncontrolled)
-          D12     = (reserved, always 0)
-          D11     = GAIN  (0 = 1× mode, 1 = 2× mode)
-          D10     = RESET (0 = normal, 1 = soft reset)
-          D9:D8   = PD1:PD0 (00 = normal operation)
-          others reserved (write 0).
+        datasheet page 22, "Write Control Register" command 0x40):
+          D15     = RESET  (1 = soft reset to power-on defaults)
+          D14     = PD1    (power-down mode bit 1)
+          D13     = PD0    (power-down mode bit 0)
+          D12     = REF    (external reference select; AD5693 only —
+                            must be 0 on -R variants, which have a
+                            fixed internal reference; selecting
+                            external on an -R part leaves DAC output
+                            uncontrolled because there is no external
+                            reference pin to drive)
+          D11     = GAIN   (0 = 1× output 0..Vref, 1 = 2× output 0..2×Vref)
+          D10..D0 = reserved (write 0)
 
         D11 → bit 3 of the MSB byte → mask 0x08.
+        D15..D8 = MSB byte (sent first), D7..D0 = LSB byte.
 
         Sent as 3 bytes after the I2C address: command 0x40, then
         16 bits of control data MSB-first.
