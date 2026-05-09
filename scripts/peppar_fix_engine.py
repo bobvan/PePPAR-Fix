@@ -4340,9 +4340,25 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                             step = alpha_eff * delta
                             known_ecef += step
                             filt.pos = np.array(known_ecef)
-                            sigma_pin_m = (sigma_pin_m * ar_sigma /
-                                           math.sqrt(sigma_pin_m ** 2
-                                                     + ar_sigma ** 2))
+                            # Update σ_pin via Kalman scalar update, then
+                            # floor at σ_pos.  Floor prevents the
+                            # over-confidence trap: successive AntPosEst
+                            # publications aren't independent observations
+                            # — they're correlated samples from the same
+                            # evolving filter, so naive Kalman aggregation
+                            # overcounts information (σ_pin → σ_pos/√N).
+                            # Floor at the most recent σ_pos says "the time
+                            # filter can never be more confident in the
+                            # ARP than the source it's learning from."
+                            # Discovered 2026-05-09 cold-start smoke on
+                            # MadHat: σ_pin reached 0.08 m and the
+                            # Mahalanobis gate rejected all subsequent
+                            # updates while AntPosEst genuinely was 2 m
+                            # off the time filter's anchored ARP.
+                            sigma_pin_kalman = (sigma_pin_m * ar_sigma /
+                                                math.sqrt(sigma_pin_m ** 2
+                                                          + ar_sigma ** 2))
+                            sigma_pin_m = max(sigma_pin_kalman, ar_sigma)
                             step_mm = float(np.linalg.norm(step)) * 1000
                             if n_epochs % 100 == 0 and delta_3d > 0.01:
                                 log.info(
