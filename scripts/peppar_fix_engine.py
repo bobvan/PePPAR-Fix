@@ -3890,6 +3890,18 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     log.info("Position-blend σ_pin initial: %.3f m "
              "(source=%s, --ar-mode=%s)",
              sigma_pin_m, pos_source or "default", args.ar_mode)
+
+    # Stage 6 self-healing gate (I-125649): when the blend keeps
+    # rejecting updates with the same sustained outlier delta, the
+    # source has likely moved (e.g., AntPosEst was reset by the
+    # SECOND_OPINION_POS watchdog) and σ_pin is now too tight to
+    # let the gate re-engage with the new source position.  Track
+    # consecutive rejections and, after a threshold, widen σ_pin
+    # so the next blend can be applied.  Counter resets on any
+    # accepted blend.
+    consecutive_blend_rejects = 0
+    SUSTAINED_REJECT_THRESHOLD = 5  # ≈ 50 s for NAV2 source (10-epoch)
+    SIGMA_PIN_WIDEN_M = 5.0          # NAV2-class fallback ceiling
     watchdog = PositionWatchdog(threshold_m=args.watchdog_threshold)
     # Shadow gate: TD-CP-only watchdog runs in parallel for I-145915
     # bake-in.  Verdict logged per epoch but does NOT drive engine
@@ -4365,6 +4377,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                             known_ecef = blend.arp_new
                             filt.pos = np.array(known_ecef)
                             sigma_pin_m = blend.sigma_pin_new_m
+                            consecutive_blend_rejects = 0
                             if (n_epochs % 100 == 0
                                     and blend.delta_3d_m > 0.01):
                                 log.info(
@@ -4377,14 +4390,40 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                                     sigma_pin_m, src_sigma,
                                 )
                         else:
-                            if n_epochs % 100 == 0:
+                            consecutive_blend_rejects += 1
+                            if (consecutive_blend_rejects
+                                    >= SUSTAINED_REJECT_THRESHOLD):
+                                # Source has settled at a position
+                                # outside the gate.  Widen σ_pin so
+                                # the next blend can re-engage.
+                                # This catches AntPosEst-source
+                                # SECOND_OPINION_POS resets and
+                                # similar discontinuities.  Counter
+                                # resets after the widen so we don't
+                                # log every epoch.
+                                old_sigma = sigma_pin_m
+                                sigma_pin_m = max(sigma_pin_m,
+                                                  SIGMA_PIN_WIDEN_M)
+                                log.warning(
+                                    "%s blend: %d consecutive rejects "
+                                    "— widening σ_pin %.3f → %.3f m "
+                                    "(self-healing gate, I-125649 "
+                                    "Stage 6)",
+                                    src_label,
+                                    consecutive_blend_rejects,
+                                    old_sigma, sigma_pin_m,
+                                )
+                                consecutive_blend_rejects = 0
+                            elif n_epochs % 100 == 0:
                                 log.warning(
                                     "%s blend outlier rejected: "
                                     "Δ=%.2fm > %.1fσ=%.2fm "
-                                    "(σ_pin=%.3f σ_src=%.3f)",
+                                    "(σ_pin=%.3f σ_src=%.3f) "
+                                    "[%d consecutive]",
                                     src_label, blend.delta_3d_m,
                                     3.0, blend.gate_3sigma_m,
                                     sigma_pin_m, src_sigma,
+                                    consecutive_blend_rejects,
                                 )
                 elif (ar_position is not None and ar_pos_lock is not None):
                     # --ar-mode full: legacy AntPosEst α=0.001 trickle
