@@ -4,6 +4,24 @@ You are working on PePPAR Fix, a GNSS-disciplined precision clock system.
 This file contains hard-won operational knowledge. Read it before writing
 code or touching lab hardware.
 
+## Cooperating with other agents — read the dayplan, write via the tool
+
+PePPAR-Fix is co-developed by multiple agents (`main`, `bravo`,
+`charlie`, …) plus Bob.  Coordination happens via a shared day plan
+backed by an append-only ops log.  **Before doing anything else in a
+fresh session, render the dayplan to get context:**
+
+```sh
+/home/bob/.claude/projects/-home-bob-git-PePPAR-Fix/dayplan/dayplan.py render | less
+```
+
+To file a new item, comment on an existing one, or ack a review,
+**use the same CLI** (`propose` / `discuss` / `ack` / `amend` /
+`status`).  **Do not edit `/tmp/dp-*.txt`** — that's render output,
+not storage; edits there are invisible to other agents.
+
+Full workflow + conventions: [`docs/dayplan-cooperation.md`](docs/dayplan-cooperation.md).
+
 ## Project goal
 
 PePPAR Fix aims to faithfully transfer the **long-term stability of GPS
@@ -489,6 +507,7 @@ here before changing anything in the areas they cover.
 
 | File | Summary |
 |---|---|
+| [dayplan-cooperation.md](docs/dayplan-cooperation.md) | **Read this first if you're new to a multi-agent session.** How to use the shared dayplan tool (`propose` / `discuss` / `ack` / `amend` / `status` / `render`).  Storage model, I-number convention, threading conventions, and the load-bearing rule "don't edit /tmp/dp-*.txt — that's render output, not storage." |
 | [stream-timescale-correlation.md](docs/stream-timescale-correlation.md) | **Read this first.** How to correctly correlate events from independent timescales (GNSS, PPS, TICC, NTRIP). Covers why queue-order matching fails, the strict correlation gate design, confidence scoring, and fault injection testing. |
 | [clock-state-modeling.md](docs/clock-state-modeling.md) | Where time-domain knowledge enters the position filter.  Maps the three oscillators (rx TCXO, DO, RO) to filter states, lays out four levers (stochastic rx TCXO model, TICC+qErr pseudo-measurement, full co-estimation, RO characterization), and the recommended ordering.  Attacks the null-mode clock axis identified in the 2026-04-23 PRIDE arc. |
 | [full-data-flow.md](docs/full-data-flow.md) | Complete inventory of live data sources, their timescales, sink policies (freshest-only vs loss-free vs correlated-window), freshness requirements, and decimation effects. |
