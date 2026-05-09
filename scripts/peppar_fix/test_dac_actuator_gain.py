@@ -74,7 +74,7 @@ class DacActuatorGainBitTest(unittest.TestCase):
 
     def test_explicit_gain_zero_writes_ctrl_reg_with_gain_bit_clear(self):
         """dac_gain=0 still writes the control register (idempotent w.r.t. POR)
-        but with GAIN bit (DB12) clear → MSB byte 0x00."""
+        but with GAIN bit (D11) clear → MSB byte 0x00."""
         _, mock_bus = self._setup_with_gain(0)
         # First write should be control register (cmd 0x40), then DAC code (cmd 0x30).
         ctrl_writes = [w for w in mock_bus.writes if w[1] == 0x40]
@@ -84,21 +84,32 @@ class DacActuatorGainBitTest(unittest.TestCase):
         addr, cmd, data = ctrl_writes[0]
         self.assertEqual(addr, 0x4c)
         self.assertEqual(cmd, 0x40)
-        # DB12 (GAIN) must be 0 → MSB byte 0x00
+        # D11 (GAIN) clear → MSB byte 0x00
         self.assertEqual(data[0], 0x00,
                          f"expected GAIN bit clear (MSB=0x00), got 0x{data[0]:02x}")
         self.assertEqual(data[1], 0x00,
                          "all other ctrl-reg bits should be 0 in default mode")
 
     def test_explicit_gain_one_writes_ctrl_reg_with_gain_bit_set(self):
-        """dac_gain=1 writes the control register with GAIN bit (DB12) set."""
+        """dac_gain=1 writes the control register with GAIN bit (D11) set.
+
+        D11 = bit 3 of the MSB byte = mask 0x08.  Earlier 0x10 was
+        wrong — that's D12 (which is 'REF select' on AD5693, leaving
+        the DAC output uncontrolled when no external reference is
+        connected).  Verified against AD5693R datasheet 2026-05-08
+        after a 2×-mode calibration on clkPoC3 showed flat (zero
+        gain) DAC response across the full sweep — the smoking gun
+        was the offset at code 32767 (= 2.5V) jumping from +798 ppb
+        (1× mode, internal-ref operation) to +1109 ppb (Vctrl
+        floating because external-ref was selected with no ref
+        connected)."""
         _, mock_bus = self._setup_with_gain(1)
         ctrl_writes = [w for w in mock_bus.writes if w[1] == 0x40]
         self.assertEqual(len(ctrl_writes), 1)
         addr, cmd, data = ctrl_writes[0]
-        # DB12 in MSB byte → bit 4 → 0x10
-        self.assertEqual(data[0], 0x10,
-                         f"expected GAIN bit set (MSB=0x10), got 0x{data[0]:02x}")
+        # D11 in MSB byte → bit 3 → 0x08
+        self.assertEqual(data[0], 0x08,
+                         f"expected GAIN bit set at D11 (MSB=0x08), got 0x{data[0]:02x}")
         self.assertEqual(data[1], 0x00,
                          "no RESET, no PD: LSB byte 0")
 

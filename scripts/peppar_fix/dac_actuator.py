@@ -129,18 +129,26 @@ class DacActuator(FrequencyActuator):
     def _write_ad5693r_control_register(self):
         """Write AD5693R control register with the configured GAIN bit.
 
-        Control-register layout (AD5693R datasheet, "Write Control
-        Register" command 0x40):
-          DB12 = GAIN  (0 = 1× mode, 1 = 2× mode)
-          DB11 = RESET (0 = normal)
-          DB10:DB9 = PD1:PD0  (00 = normal operation)
+        Control-register layout (AD5693R/AD5692R/AD5691R/AD5693
+        datasheet, "Write Control Register" command 0x40):
+          D13     = REF   (external reference select, AD5693 only;
+                           must be 0 on the -R variants which have a
+                           fixed internal reference — selecting external
+                           on an -R part leaves DAC output uncontrolled)
+          D12     = (reserved, always 0)
+          D11     = GAIN  (0 = 1× mode, 1 = 2× mode)
+          D10     = RESET (0 = normal, 1 = soft reset)
+          D9:D8   = PD1:PD0 (00 = normal operation)
           others reserved (write 0).
 
-        Sent as 3 bytes: command 0x40, then 16 bits of control data.
+        D11 → bit 3 of the MSB byte → mask 0x08.
+
+        Sent as 3 bytes after the I2C address: command 0x40, then
+        16 bits of control data MSB-first.
         """
         if self._bus is None:
             raise RuntimeError("DAC bus not open — call setup() first")
-        gain_bit = 0x10 if self._dac_gain else 0x00  # DB12 in MSB byte
+        gain_bit = 0x08 if self._dac_gain else 0x00  # D11 in MSB byte
         self._bus.write_i2c_block_data(self._addr, 0x40,
                                        [gain_bit, 0x00])
 
