@@ -159,13 +159,20 @@ class MelbourneWubbenaTracker:
             return None
         return C / wl1, C / wl2
 
-    def update(self, sv, phi1_cyc, phi2_cyc, pr1_m, pr2_m, f1, f2):
+    def update(self, sv, phi1_cyc, phi2_cyc, pr1_m, pr2_m, f1, f2,
+                weight=None):
         """Update MW average for one satellite.
 
         Args:
             phi1_cyc, phi2_cyc: carrier phase in cycles (bias-corrected)
             pr1_m, pr2_m: pseudorange in meters
             f1, f2: frequencies in Hz
+            weight: optional per-observation quality weight in [0, 1]
+                from peppar_fix.obs_quality.obs_quality_weight().
+                None → unweighted EMA (legacy / replay paths;
+                equivalent to pre-fix-L behavior).  Low-weight samples
+                advance the running mean and the fix-readiness counter
+                (``n_eff``) slowly.  See I-155354 fix-L.
         """
         # Admit: receiver-tracked SV passing the elev/health/constellation
         # gate enters processing.  MW.update is the first hook that sees
@@ -182,14 +189,22 @@ class MelbourneWubbenaTracker:
 
         lambda_wl = C / (f1 - f2)
 
+        # Quality weight (fix-L): None → unweighted (legacy path).
+        # Clamp to [0, 1] so callers can't accidentally pass a >1 weight
+        # and inflate the EMA past the cap.
+        w = 1.0 if weight is None else max(0.0, min(1.0, float(weight)))
+
         if sv not in self._state:
             # First sample of arc — initialize SV state, then prime the
             # Hatch smoother (which on first sample returns raw PR =
             # smooth PR).  MW computed with raw == smooth on this epoch.
+            # n_eff seeds at the first sample's weight so a low-quality
+            # arc-start doesn't claim full evidence yet.
             self._state[sv] = {
                 'mw_avg': self._mw_meters(phi1_cyc, phi2_cyc,
                                            pr1_m, pr2_m, f1, f2),
                 'n_epochs': 1,
+                'n_eff': w,
                 'n_wl': None,
                 'fixed': False,
                 'f1': f1,
@@ -233,15 +248,31 @@ class MelbourneWubbenaTracker:
             var = sum((x - mean) ** 2 for x in rd) / len(rd)
             s['resid_std_cyc'] = math.sqrt(var)
 
-        # Exponential moving average
-        alpha = 1.0 / max(1.0, min(s['n_epochs'] + 1, self.tau_s))
-        s['mw_avg'] = (1.0 - alpha) * s['mw_avg'] + alpha * mw
+        # Weighted exponential moving average (fix-L).  Equivalent to the
+        # unweighted form when weight=None: w=1.0 → n_eff = n_epochs,
+        # alpha = 1 / min(n_eff, tau_s), matching pre-fix-L behavior.
+        # Cap n_eff at tau_s for the running window; floor at 1.0 in
+        # the alpha denominator avoids divide-by-zero on degenerate
+        # weight sequences.
+        n_eff_prev = s.get('n_eff', float(s['n_epochs']))
+        n_eff = min(n_eff_prev + w, self.tau_s)
+        if w > 0.0:
+            alpha = w / max(1.0, n_eff)
+            s['mw_avg'] = (1.0 - alpha) * s['mw_avg'] + alpha * mw
+        # else: 0-weight sample contributes nothing to running mean,
+        # but we still tick n_epochs for arc-tracking and the resid deque.
+        s['n_eff'] = n_eff
         s['n_epochs'] += 1
 
         if s['fixed']:
             return
 
-        if s['n_epochs'] >= self.min_epochs:
+        # Fix-readiness gates on n_eff (effective sample count) — a
+        # low-elev / low-CN0 SV with 60 raw epochs but n_eff=3 is not
+        # ready for integer fixing yet; wait for higher-quality samples
+        # to accumulate.  Falls through to n_epochs-equivalent in the
+        # legacy unweighted path (every weight=1.0 → n_eff = n_epochs).
+        if n_eff >= self.min_epochs:
             n_wl_float = s['mw_avg'] / lambda_wl
             frac = abs(n_wl_float - round(n_wl_float))
             if frac < self.fix_threshold:

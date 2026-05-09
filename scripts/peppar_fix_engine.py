@@ -57,6 +57,7 @@ from ppp_ar import MelbourneWubbenaTracker, NarrowLaneResolver
 from peppar_fix.cycle_slip import (
     CycleSlipMonitor, SlipEvent, flush_sv_phase, is_pr_only_slip,
 )
+from peppar_fix.obs_quality import obs_quality_weight
 from peppar_fix.sv_state import SvAmbState, SvStateTracker
 from peppar_fix.false_fix_monitor import FalseFixMonitor
 from peppar_fix.if_step_monitor import IfStepMonitor
@@ -1668,7 +1669,14 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
             if all(v is not None for v in (phi1, phi2, pr1, pr2, wl1, wl2)):
                 f1_hz = C / wl1
                 f2_hz = C / wl2
-                mw_tracker.update(sv, phi1, phi2, pr1, pr2, f1_hz, f2_hz)
+                # Per-obs quality weight (fix-L): low elev / low CN0
+                # samples advance the MW running mean and fix-readiness
+                # counter slowly.  See peppar_fix.obs_quality docstring.
+                weight = obs_quality_weight(
+                    elev_deg=elevations.get(sv),
+                    cno_db=obs.get('cno'))
+                mw_tracker.update(sv, phi1, phi2, pr1, pr2, f1_hz, f2_hz,
+                                   weight=weight)
 
         # PPP-AR: narrow-lane resolution attempt (every epoch after warmup).
         # `elevations` was computed above for the cycle-slip monitor;
@@ -2955,7 +2963,13 @@ class AntPosEstThread(threading.Thread):
                         continue
                     f1_hz = C / wl1
                     f2_hz = C / wl2
-                    mw.update(sv, phi1, phi2, pr1, pr2, f1_hz, f2_hz)
+                    # Per-obs quality weight (fix-L); see bootstrap call
+                    # site + peppar_fix.obs_quality docstring.
+                    weight = obs_quality_weight(
+                        elev_deg=elevations.get(sv),
+                        cno_db=obs.get('cno'))
+                    mw.update(sv, phi1, phi2, pr1, pr2, f1_hz, f2_hz,
+                               weight=weight)
                     gf_now[sv] = gf_phase_m(phi1, phi2, wl1, wl2)
 
             # WL drift monitor: detect wrong WL integer commits via
