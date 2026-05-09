@@ -115,67 +115,167 @@ displaced, the LSQ position solution lands in a basin
 multiple meters from the surveyed truth — exactly the I-155354
 motivation.
 
-## Mechanism (hypothesis)
+## Cycle-slip audit (2026-05-09 follow-up)
 
-The MW (Melbourne-Wübbena) tracker computes wide-lane integer
-fixes from the linear combination
+A second audit (`scripts/replay/slip_vs_wl_audit.py`) on the same
+day0506 MadHat log reveals two layered failures, both pointing at
+PR-noise contamination of the MW formula.
+
+### Audit (1): the slip detector fires conf=LOW on mw_jump alone
+
+```
+reason                                count  conf=HIGH  conf=LOW  carrier?
+mw_jump                                1275          0      1275  no
+gf_jump,ubx_locktime_drop               595        595         0  YES
+arc_gap                                 276          0       276  YES
+arc_gap,mw_jump                         163        163         0  YES
+gf_jump                                 143          0       143  YES
+gf_jump,mw_jump                          87         87         0  YES
+gf_jump,mw_jump,ubx_locktime_drop        66         66         0  YES
+ubx_locktime_drop                        64          0        64  YES
+```
+
+**47.8 % of slip events (1275/2669) are mw_jump-only**, no
+carrier-phase corroboration.  These are flagged conf=LOW by the
+detector — but the engine still calls `flush_sv_phase()` for
+every slip regardless of confidence
+(`peppar_fix_engine.py:2696`), which calls
+`mw_tracker.reset(sv)` and wipes the WL fix.
+
+The mw_jump signal includes pseudorange (Melbourne-Wübbena
+combines code and phase).  PR noise spikes shift the MW
+running mean; a few-meter PR noise event maps to several
+cycles of MW jump even when the underlying carrier phase
+hasn't moved.  These are PR-noise false positives, not real
+slips.  Charlie's I-194752 work already established that
+MW-residual rolling-mean is uncorrelated with real slips
+(Z = -0.17, p = 0.86) — exactly this concern, scaled up.
+
+### Audit (2): even CARRIER-confirmed slips produce wrong-integer re-fixes
+
+```
+=== Post-slip WL re-fix outcomes (window 300s) ===
+category     no_refix   same_int   DIFF_int  notes
+CARRIER           524          3        712  |Δcyc| median=38  max=276
+mw-only           285         12        934  |Δcyc| median=30  max=298
+```
+
+Of slips with a post-slip re-fix on the same SV:
+- CARRIER-confirmed: **712/715 = 99.6 %** re-fix to a DIFFERENT
+  integer; median |Δcyc| = 38 cycles ≈ 28 m
+- mw-only:           **934/946 = 98.7 %** re-fix to a DIFFERENT
+  integer; median |Δcyc| = 30 cycles ≈ 22 m
+
+This is the deeper finding: **the MW tracker's re-fix process is
+structurally unable to anchor to consistent integers** — even
+across legitimate carrier-phase slips that reset only the slip-
+of-cycles count, the new integer differs by tens of cycles.  A
+real cycle slip changes the carrier-phase ambiguity by O(1) cycle,
+not O(30).
+
+### Per-SV drift extent (top 10 by mw-only slip count)
+
+```
+sv     carrier_slips  mw_only_slips  fixes   min_n_wl  max_n_wl   range
+C33               28             55     46      -233       +33     266
+C38               24             47     45      -100      +270     370
+E36               26             46     37      -106      +120     226
+G20              128             37     16       -88      +191     279
+C36               16             35     26      -143       +71     214
+C31               15             35     25      -183       +74     257
+E11               14             34     32       -61      +102     163
+C34               20             34     37       -98       +82     180
+E29               25             32     20       -94      +100     194
+C23                8             32     25      -135       +82     217
+```
+
+Several SVs show 200+ cycle ranges in their fix history — orders
+of magnitude beyond what real cycle slips could explain.  The MW
+re-fix lands in a different basin almost every time.
+
+## Diagnosis (corrected from initial mechanism hypothesis)
+
+My initial hypothesis was "the cycle-slip detector silently misses
+slips, the tracker absorbs them by re-fixing."  Audit shows the
+opposite: the detector fires aggressively (often falsely on
+mw_jump alone), AND even the legitimate-slip re-fixes land on
+wrong integers.
+
+The MW (Melbourne-Wübbena) tracker computes
 `MW = (φ1·λ1 - φ2·λ2)·(f1+f2)/(f1-f2) − (P1·f1 + P2·f2)/(f1+f2)`
-which is geometry-free and ionosphere-free, so its expected value
-is just `λ_WL × N_WL + sub-cycle bias`. The integer N_WL is
-obtained by rounding (or LAMBDA-decorrelated rounding) once the
-running mean has settled.
+which is geometry-free and ionosphere-free, but **NOT
+pseudorange-free**.  Expected value: `λ_WL × N_WL + sub-cycle
+bias`.  The PR contribution `(P1·f1 + P2·f2)/(f1+f2)` is the
+narrow-lane (NL) of pseudorange, which inherits PR-side noise:
+~30 cm code noise floor, multipath spikes of meters, signal-
+code mismatch biases.
 
-The engine's `int_history=[37, 44, 35, 28, 15]` for E10 means the
-running-mean has been jumping by tens of cycles between successive
-fix attempts. Plausible mechanisms:
+Two-layer failure mode:
 
-1. **Pseudorange-side noise spikes** are inflating the running
-   mean variance, and the tracker is re-fixing on partially-
-   corrupted data. F9T pseudorange noise floor is ~30 cm; if a
-   multipath spike adds a few meters of PR noise to one channel,
-   the MW value shifts by `~PR_error / λ_WL` cycles. A 5 m PR
-   spike would shift WL by ~7 cycles — consistent with what
-   we're seeing.
+1. **PR-noise contamination of MW signal**: meter-scale PR
+   noise events shift MW by several λ_WL.  The slip detector
+   sees these as `mw_jump` and flushes the tracker —
+   conf=LOW, carrier-not-confirmed, mostly false positives.
+   47.8 % of slip events fall in this category.
 
-2. **Wrong signal-code mapping.** F9T-20B tracks GAL on E1+E5a
-   by default (the `SYS / FREQUENCY BAND` line in the RINEX
-   header confirms `GAL E1 E5a`). If the engine's MW formula
-   is using the wrong code per signal (e.g., L5I-vs-L5Q phase
-   bias mismatch from the L5 phase-bias-empirical work
-   already documented for GPS but possibly affecting GAL E5a
-   too), the integer lock is corrupted.
+2. **Post-slip re-fix uses fresh MW samples that still carry
+   the same PR-noise bias** that triggered the false positive.
+   The new running mean settles to a DIFFERENT integer with
+   ~99 % probability (median 30-38 cycles different).  Multiple
+   consecutive false-positive flushes drift the integer
+   monotonically — the per-SV `range` column above shows
+   200+ cycles of drift on several SVs.
 
-3. **Cycle-slip detector miss.** A real cycle slip on the
-   carrier phase changes the WL integer by a non-trivial amount.
-   If the cycle-slip detector misses a slip, the MW tracker
-   sees a step in the running mean and re-fixes to a new
-   integer. The slip detector relies on phase coherence
-   between L1/L5 (GF and MW jumps), and any failure mode
-   there leaks into WL integers.
-
-(2) and (3) are testable. (3) is most suggestive given the
-"multi-cycle drift then re-fix" pattern visible in E10's
-int_history. A cycle-slip failure mode would produce exactly
-this signature.
+Charlie's I-194752 GF_STEP detector replaced MW-residual-based
+slip detection because Z=-0.17 showed MW-residual is uncorrelated
+with real slips.  This audit confirms the corollary: **the same
+PR-noise contamination that makes MW-residual a bad slip detector
+also makes MW a bad WL ambiguity estimator**.  The WL integer
+isn't actually being constrained by carrier-phase observations
+in the streaming path — it's being driven by PR noise plus a
+rounding step.
 
 ## Next steps
 
-1. **Cycle-slip detector audit on this dataset.** Replay the
-   day0506 RINEX through the engine's slip detector with the
-   most recent thresholds; correlate slip-detection events
-   against E10's int_history transitions. If slips were
-   detected at the integer-jump points, the WL re-fix is
-   correct (slips break ambiguity continuity); if no slips
-   detected, the slip detector missed real slips and the
-   tracker is silently absorbing them.
-2. **Run PRIDE 24-h with AR enabled** on MadHat-2026126.obs.
-   More SVs, more arcs, all integer-confident. Strengthens the
-   bias-magnitude estimate across the full SV cohort.
-3. **Bracket against Charlie's hypothesis #2** (L5 phase-bias
-   mismatch). Compare per-SV WL error rates between L5-band
-   GAL SVs and other-band SVs; if L5 is uniquely affected, the
-   phase-bias mechanism is implicated. If all bands are affected,
-   it's a more general MW-tracker issue.
+In order of expected leverage:
+
+1. **Gate `flush_sv_phase()` on slip confidence.**  Treat
+   conf=LOW (mw_jump-only) slip events as warnings, not
+   ambiguity-resetting events.  ~5 LOC change at
+   `peppar_fix_engine.py:2696` to skip `mw_tracker.reset()`
+   when `ev.confidence == 'LOW'`.  Eliminates the 1275
+   false-positive flushes per day.  Doesn't fix layer 2 (the
+   re-fix on real slips is still wrong) but stops the bleeding
+   from layer 1.
+
+2. **Rebuild WL re-fix to anchor against PRIDE-grade ambiguity
+   resolution**, not the streaming MW running-mean.  Options:
+   - LAMBDA over a multi-SV ambiguity vector (orders of
+     magnitude tighter than per-SV rounding)
+   - Wait-and-PRIDE: defer streaming WL fix until PRIDE batch
+     produces an integer for the arc, then anchor the streaming
+     tracker to PRIDE's value.  Loses streaming-low-latency
+     property; gains correctness.
+   - Drop streaming WL entirely (the I-125649 `--ar-mode none`
+     path).  Position filter goes float-only; ARP-motion
+     detection runs on float-σ basis.  Float σ ≈ 1-3 m which
+     is still inside the 1-m budget Bob wants for ARP detection.
+
+3. **Run PRIDE 24-h with AR enabled** on MadHat-2026126.obs
+   for comprehensive per-SV validation across the full SV
+   cohort.  Quantitative bound on per-SV bias magnitudes
+   across diurnal cycle.  ~few-hour wall time.
+
+4. **Bracket against Charlie's hypothesis #2** (L5 phase-bias
+   mismatch).  If L5-band SVs have higher mw-only slip rates
+   or larger drift ranges than other bands, phase-bias is
+   contributing.  If similar across bands, the PR-noise-
+   contamination story is the primary mechanism.
+
+(1) is the cheapest immediate fix; (3) goes from "WL is broken"
+to "drop WL streaming entirely" depending on the leverage from
+(1).  Recommend landing (1) in parallel with the ar-mode wl
+deployment (I-125649).
 
 ## References
 
