@@ -48,20 +48,33 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 log = logging.getLogger("calibrate_do")
 
 
-def measure_frequency_offset(ticc, channel, dwell_s):
-    """Measure mean interval and frequency offset over a dwell period.
+def measure_frequency_offset(ticc, channel, dwell_s, ref_channel=None):
+    """Measure DO frequency offset over a dwell period.
 
-    The DO under test should produce edges at a nominal rate (e.g. 1 Hz
-    from a divide-by-10M counter).  We measure successive intervals and
-    compute the fractional frequency offset.
+    Two modes:
 
-    Returns:
-        dict with:
-            mean_interval_ps: mean interval in picoseconds
-            freq_offset_ppb: fractional frequency offset in ppb
-            interval_std_ps: standard deviation of intervals
-            n_intervals: number of intervals measured
+    1. Single-channel period method (ref_channel=None): measures
+       successive intervals between `channel` edges.  Output drifts
+       with the TICC reference oscillator's offset because intervals
+       are timed against TICC's own clock.
+
+    2. Differential vs reference (ref_channel set, e.g. 'chB'):
+       computes (channel_ts - ref_ts) per ref-second and fits a
+       slope.  Both channels are timestamped against the same TICC
+       clock, so the TICC reference offset CANCELS in the
+       difference.  ref_channel is treated as exactly 1 PPS (e.g.
+       GPS PPS); slope = -ε × 1000 ps per ref-second, where ε is
+       chA's fractional frequency offset relative to ref.
+
+    Returns: dict with `freq_offset_ppb` (positive = `channel` faster).
     """
+    if ref_channel is not None:
+        return _measure_via_ref(ticc, channel, ref_channel, dwell_s)
+    return _measure_via_period(ticc, channel, dwell_s)
+
+
+def _measure_via_period(ticc, channel, dwell_s):
+    """Single-channel period method (drifts with TICC ref offset)."""
     edges = []
     deadline = time.monotonic() + dwell_s
 
@@ -75,7 +88,6 @@ def measure_frequency_offset(ticc, channel, dwell_s):
     if len(edges) < 3:
         return None
 
-    # Compute intervals in picoseconds
     intervals_ps = []
     for i in range(1, len(edges)):
         sec_diff = edges[i][0] - edges[i-1][0]
@@ -88,12 +100,14 @@ def measure_frequency_offset(ticc, channel, dwell_s):
         return None
 
     mean_ps = sum(intervals_ps) / len(intervals_ps)
-    # Nominal interval: round to nearest second (PPS from divider)
     nominal_ps = round(mean_ps / 1_000_000_000_000) * 1_000_000_000_000
     if nominal_ps == 0:
-        nominal_ps = 1_000_000_000_000  # assume 1 Hz
+        nominal_ps = 1_000_000_000_000
 
-    freq_offset_ppb = (mean_ps - nominal_ps) / nominal_ps * 1e9
+    # δν/ν = -δT/T: longer mean interval = slower oscillator.  See
+    # docs/misnomers.md `freq_offset_ppb` (2026-05-09) for the
+    # sign-flip incident.
+    freq_offset_ppb = -(mean_ps - nominal_ps) / nominal_ps * 1e9
 
     variance = sum((x - mean_ps) ** 2 for x in intervals_ps) / len(intervals_ps)
     std_ps = variance ** 0.5
@@ -103,6 +117,75 @@ def measure_frequency_offset(ticc, channel, dwell_s):
         "freq_offset_ppb": freq_offset_ppb,
         "interval_std_ps": std_ps,
         "n_intervals": len(intervals_ps),
+        "method": "period",
+    }
+
+
+def _measure_via_ref(ticc, channel, ref_channel, dwell_s):
+    """Differential method: chA freq offset relative to ref_channel.
+
+    TICC ref oscillator offset cancels because both channels share
+    it.  Treats ref_channel as exactly 1 PPS (GPS PPS).  Slope of
+    (chA_ps - ref_ps) over ref-seconds = -ε × 1000 ps/sec.
+    """
+    pairs = {}  # ref_sec -> {ch: ref_ps}
+    deadline = time.monotonic() + dwell_s
+    for ch, ref_sec, ref_ps in ticc:
+        if time.monotonic() > deadline:
+            break
+        if ch not in (channel, ref_channel):
+            continue
+        if ref_sec not in pairs:
+            pairs[ref_sec] = {}
+        pairs[ref_sec][ch] = ref_ps
+
+    paired = []
+    for sec in sorted(pairs):
+        p = pairs[sec]
+        if channel in p and ref_channel in p:
+            diff = p[channel] - p[ref_channel]
+            # Unwrap: chA and chB within the same ref_sec should be
+            # close in ref_ps (sub-second).  If they straddle the
+            # 0/10^12 boundary, the diff appears ±10^12 off.
+            if diff > 5e11:
+                diff -= int(1e12)
+            elif diff < -5e11:
+                diff += int(1e12)
+            paired.append((sec, diff))
+
+    if len(paired) < 3:
+        return None
+
+    n = len(paired)
+    xs = [p[0] for p in paired]
+    ys = [p[1] for p in paired]
+    xm = sum(xs) / n
+    ym = sum(ys) / n
+    den = sum((x - xm) ** 2 for x in xs)
+    if den < 1e-12:
+        return None
+    num = sum((xs[i] - xm) * (ys[i] - ym) for i in range(n))
+    slope_ps_per_sec = num / den
+    intercept = ym - slope_ps_per_sec * xm
+
+    # chA faster than ref → chA timestamp arrives EARLIER each sec
+    # → (chA - ref) becomes MORE NEGATIVE → slope is negative.
+    # Standard convention has positive freq_offset = faster, so negate.
+    # 1 ppb = 1 ns/s = 1000 ps/s.
+    freq_offset_ppb = -slope_ps_per_sec / 1000.0
+
+    residuals = [ys[i] - (slope_ps_per_sec * xs[i] + intercept) for i in range(n)]
+    var = sum(r ** 2 for r in residuals) / n
+    std_ps = var ** 0.5
+
+    return {
+        "freq_offset_ppb": freq_offset_ppb,
+        "interval_std_ps": std_ps,  # legacy key — actually offset-residual std
+        "n_intervals": n - 1,
+        "n_pairs": n,
+        "method": "vs_ref",
+        "ref_channel": ref_channel,
+        "mean_offset_ps": ym,
     }
 
 
@@ -152,6 +235,15 @@ def main():
     ap.add_argument("--ticc-baud", type=int, default=115200)
     ap.add_argument("--channel", default="chA",
                     help="TICC channel carrying the DO under test (default: chA)")
+    ap.add_argument("--ref-channel", default=None,
+                    help="Reference TICC channel (e.g. 'chB' for GPS PPS).  "
+                         "When set, computes DO frequency offset relative "
+                         "to this channel — TICC reference oscillator "
+                         "offset cancels because both channels are "
+                         "timestamped by the same TICC clock.  Reference "
+                         "is treated as exactly 1 PPS.  When absent, "
+                         "falls back to single-channel period method "
+                         "(drifts with TICC ref offset).")
 
     # Measurement
     ap.add_argument("--dwell", type=int, default=30,
@@ -205,7 +297,8 @@ def main():
     if actuator is None and args.sweep_ppb is None and args.sweep_codes is None:
         log.info("Measure-only mode — reading %s for %ds", args.channel, args.dwell)
         with Ticc(args.ticc_port, args.ticc_baud) as ticc:
-            result = measure_frequency_offset(ticc, args.channel, args.dwell)
+            result = measure_frequency_offset(ticc, args.channel, args.dwell,
+                                              ref_channel=args.ref_channel)
         if result is None:
             log.error("No measurements on %s", args.channel)
             return 1
@@ -262,7 +355,8 @@ def main():
                         break
 
                 log.info("  Measuring for %ds...", args.dwell)
-                meas = measure_frequency_offset(ticc, args.channel, args.dwell)
+                meas = measure_frequency_offset(ticc, args.channel, args.dwell,
+                                                ref_channel=args.ref_channel)
                 if meas is None:
                     log.warning("  No measurements — skipping")
                     continue

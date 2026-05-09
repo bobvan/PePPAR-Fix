@@ -355,6 +355,39 @@ useful belt-and-suspenders.  Defer until after the
 `SettingSvDropMonitor` and `FixSetIntegrityMonitor.window_rms`
 fixes ship and we measure the residual log noise.
 
+## 2026-05-09
+
+### `freq_offset_ppb` — Dangerous (fixed)
+
+**Where**: `tools/calibrate_do.py:96` (function
+`measure_frequency_offset`).
+**Claim**: a frequency offset in ppb.
+**Actual**: returned the fractional **period** offset, i.e.
+`(T_actual - T_nominal) / T_nominal`.  These differ by a sign
+(δν/ν = −δT/T), so the value carried the opposite sign of the
+name's implied convention.
+**Why it matters**: every `dac_ppb_per_code` derived from a
+calibration sweep using this script came out sign-flipped.
+On clkPoC3's IsoTemp OCXO131-100 bring-up 2026-05-08 this
+saved `−0.022869` for an OCXO with a datasheet positive Vctrl
+slope; the engine then commanded the loop into the wrong
+direction and rail-saturated at +749 ppb adj while chA-chB
+diverged at +1100 ppb/s.  Reference test against PiFace's
+already-converged loop with hand-set `+0.0361` (which never
+went through this script) made the sign error decisive.
+**Proposed**: minimal fix landed today — negate the expression
+and add a citation comment pointing at this entry.  The
+variable name stays as `freq_offset_ppb` because that's now
+what the function actually returns.
+**Notes**: filed alongside dayplan item queueing the deeper
+follow-up — audit other callers of `measure_frequency_offset`'s
+return value, decide whether the function itself should be
+renamed for clarity vs the period-domain `mean_interval_ps`
+it also returns, and consider whether `dac_ppb_per_code`
+should be renamed in `DacActuator` to flag that it's the
+SYSTEM response (can be ±) not the OCXO intrinsic slope
+(see open dayplan item I-010246-main).
+
 ## Code-quality issues found alongside (not misnomers)
 
 ### `gmf._coeff_sum` — dead code
