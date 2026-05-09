@@ -30,8 +30,27 @@ State retained across slip (frequency-like or per-receiver):
 Four independent detectors run per epoch.  Any detector firing triggers
 flush_sv_phase() once per epoch per SV; a slip with ≥2 detectors firing
 is tagged HIGH confidence (for antenna-quality reporting), else LOW.
-Flushing runs regardless of confidence — the cost of a spurious flush
-is one ambiguity re-convergence, far cheaper than contaminating NL.
+
+Original design: "Flushing runs regardless of confidence — the cost of
+a spurious flush is one ambiguity re-convergence, far cheaper than
+contaminating NL."  THIS WAS EMPIRICALLY WRONG.  Audit on day0506 MadHat
+(scripts/replay/slip_vs_wl_audit.py + docs/wl-integer-vs-pride-comparison.md)
+showed:
+  - 47.8 % (1275/2669) of slip events are mw_jump alone — driven by
+    PR-side noise spikes, not real cycle slips.  MW formula isn't
+    PR-free, so PR multipath shifts the running mean by λ_WL cycles.
+  - On post-flush re-fix, even CARRIER-confirmed slips produced a
+    DIFFERENT integer 99.6 % of the time (median 38 cycles ≈ 28 m of
+    WL displacement).  The "cheap re-convergence" assumption was wrong:
+    re-fix uses fresh MW samples that are still PR-noise-contaminated,
+    landing on a wrong integer most of the time.
+
+Corrected design (I-155354 fix-I, 2026-05-09): use is_pr_only_slip()
+to identify mw_jump-only events and skip the WL-tracker reset for
+those.  Carrier-confirmed slips (gf_jump, ubx_locktime_drop, arc_gap)
+still flush as before.  Per-SV ambiguity preservation across PR-noise
+spikes keeps the MW running mean's history available; the integer
+isn't lost to a re-fix on noisy data.
 
   1. UBX locktime drop
      u-blox resets locktime_ms on tracking-loop cycle slip.  A drop
@@ -380,6 +399,40 @@ class CycleSlipMonitor:
             rs = ",".join(f"{r}={c}" for r, c in sorted(reasons.items()))
             parts.append(f"{sv}:{total}[{rs}]")
         return "slips: " + " ".join(parts)
+
+
+# ── Slip-classification helpers ──────────────────────────────────── #
+
+
+# Slip-event reason strings the detectors emit.  See SlipEvent.reasons.
+_PR_ONLY_REASON_SET = frozenset({"mw_jump"})
+
+
+def is_pr_only_slip(reasons) -> bool:
+    """True iff a slip event's reason set is exactly {'mw_jump'} —
+    i.e., NO carrier-phase corroboration (gf_jump, ubx_locktime_drop,
+    arc_gap).
+
+    The MW formula
+      MW = phase_WL - pseudorange_NL
+    isn't PR-free.  PR multipath spikes shift the MW running mean by
+    O(λ_WL) cycles even when carrier-phase is healthy.  The slip
+    detector flags these as `mw_jump`-only events with conf=LOW.
+
+    Engine consumers should use this to GATE WL-tracker reset:
+    PR-only slips don't represent real ambiguity discontinuity, so
+    flushing the MW state and re-fixing on fresh (still-noisy) MW
+    samples lands on a wrong integer most of the time.
+
+    See scripts/replay/slip_vs_wl_audit.py +
+    docs/wl-integer-vs-pride-comparison.md for the empirical
+    grounding (47.8 % of slip events on day0506 MadHat are
+    PR-only; 99.6 % of post-flush re-fixes land on different
+    integers).
+
+    Accepts any iterable of reason strings.
+    """
+    return frozenset(reasons) == _PR_ONLY_REASON_SET
 
 
 # ── Flush entry point ────────────────────────────────────────────── #
