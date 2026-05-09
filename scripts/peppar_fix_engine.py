@@ -4944,6 +4944,7 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
         ppb_per_code=ppb_per_code,
         max_ppb=getattr(args, 'dac_max_ppb', None),
         dac_type=getattr(args, 'dac_type', 'mcp4725'),
+        dac_gain=getattr(args, 'dac_gain', 0) or 0,
     )
     dac.setup()
 
@@ -5227,8 +5228,9 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
                 bits=getattr(args, 'dac_bits', 12),
                 ppb_per_code=getattr(args, 'dac_ppb_per_code', 1.0),
                 dac_type=getattr(args, 'dac_type', 'mcp4725'),
+                dac_gain=getattr(args, 'dac_gain', 0) or 0,
             )
-            _dac_reset.setup()  # writes center code
+            _dac_reset.setup()  # writes ctrl reg + center code
             _dac_reset.teardown()
             log.info("DAC reset to center before TICC measurement")
         _do_tadd_arm(args)
@@ -5400,6 +5402,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                     ppb_per_code=ppb_per_code,
                     max_ppb=getattr(args, 'dac_max_ppb', None),
                     dac_type=getattr(args, 'dac_type', 'mcp4725'),
+                    dac_gain=getattr(args, 'dac_gain', 0) or 0,
                 )
                 actuator_type = "dac"
                 log.info("Using DAC actuator: bus=%d addr=0x%02x bits=%d ppb/code=%.4f",
@@ -8380,6 +8383,12 @@ Two-phase operation:
     servo.add_argument("--dac-type", default=None,
                        choices=["mcp4725", "ad5693r", "generic"],
                        help="DAC chip type (default: mcp4725)")
+    servo.add_argument("--dac-gain", type=int, default=None,
+                       choices=[0, 1],
+                       help="AD5693R GAIN bit: 0=1× output (0..Vref, default), "
+                            "1=2× output (0..2×Vref).  Required for OCXOs that "
+                            "need >Vref Vctrl to compensate freerun offset; "
+                            "ignored for other DAC types.  See I-000711.")
 
     # DO bootstrap (absorbed from phc_bootstrap.py)
     boot = ap.add_argument_group("DO bootstrap (automatic when --servo)")
