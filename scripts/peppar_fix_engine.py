@@ -7906,14 +7906,24 @@ Two-phase operation:
                           "isolates the join test's effect from other "
                           "branch-carried changes.  See "
                           "project_to_main_defensive_mechanisms_20260421.md.")
-    pos.add_argument("--wl-only", action="store_true",
-                     help="WL-only mode: skip NL integer resolution "
-                          "entirely.  MW tracker still fixes WL "
-                          "ambiguities; the float IF solution uses "
-                          "WL-fixed + float NL.  SvAmbState and "
-                          "AntPosEstState lifecycles are clamped at "
-                          "CONVERGING.  Foundation experiment — see "
-                          "docs/wl-only-foundation.md.")
+    pos.add_argument("--ar-mode", choices=["wl", "full"], default="wl",
+                     help="Ambiguity resolution mode for the position "
+                          "filter.  'wl' (default, production): fix WL "
+                          "integers via MW tracker, skip NL entirely.  "
+                          "SvAmbState and AntPosEstState lifecycles "
+                          "clamp at CONVERGING.  'full' (research only): "
+                          "WL + NL, including LAMBDA + bootstrap-prob + "
+                          "ANCHORING/ANCHORED transitions.  See "
+                          "docs/wl-only-foundation.md and dayplan "
+                          "I-125649-main for why 'wl' is the production "
+                          "default — six weeks of NL-AR pathology "
+                          "(slip storms, ZTD-trip cascades, false-fix "
+                          "lock-in) and FixedPosFilter's TD-CP design "
+                          "make NL not load-bearing for clock transfer.")
+    # Deprecated alias: --wl-only sets --ar-mode wl (suppressed help).
+    pos.add_argument("--wl-only", dest="wl_only_legacy",
+                     action="store_true",
+                     help=argparse.SUPPRESS)
     pos.add_argument("--no-solid-tide", dest="solid_tide",
                      action="store_false", default=True,
                      help="Disable the IERS 2010 Step 1 solid Earth "
@@ -8591,6 +8601,20 @@ Two-phase operation:
     )
 
     args = ap.parse_args()
+
+    # Translate --ar-mode to internal `wl_only` flag.  --ar-mode is the
+    # user-facing knob (I-125649-main); `wl_only` is the legacy internal
+    # name that flows through the rest of the engine + sv_state +
+    # NarrowLaneResolver + AntPosEst state machine.  Once --ar-mode lands
+    # the same default everywhere, the internal `wl_only` rename is a
+    # mechanical follow-up (out of scope for this commit).
+    if getattr(args, "wl_only_legacy", False):
+        # Deprecated --wl-only alias still used.  Treat as --ar-mode wl
+        # (the only behavior --wl-only ever expressed).  No warning yet
+        # — wait until the next commit cycle to surface deprecation.
+        args.ar_mode = "wl"
+    args.wl_only = (args.ar_mode == "wl")
+
     _apply_host_config(args)
     # Apply defaults for args that are None after CLI + host config.
     # These were made nullable so host config can override them.
@@ -8707,6 +8731,13 @@ Two-phase operation:
 
     if getattr(args, '_host_config_path', None):
         log.info("Host config: %s", args._host_config_path)
+
+    # AR mode (I-125649-main).  'wl' is the production default; 'full'
+    # is research-only.  Visible in startup log so post-hoc analysis can
+    # tell which AR pipeline was active without grepping CLI args.
+    log.info("AR mode: %s (%s)", args.ar_mode,
+             "WL only — NL/LAMBDA disabled" if args.wl_only
+             else "WL + NL — full LAMBDA pipeline")
 
     # σ_phi / σ_pr override visibility (the override itself fires
     # earlier in main(), before basicConfig).
