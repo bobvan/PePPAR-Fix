@@ -7684,6 +7684,7 @@ def _apply_host_config(args):
         "dac_ppb_per_code": ("dac_ppb_per_code", float),
         "dac_max_ppb":      ("dac_max_ppb",      float),
         "dac_type":         ("dac_type",         str),
+        "dac_gain":         ("dac_gain",         int),
         "tadd_gpio":        ("tadd_gpio",        int),
         "tadd_hold_s":      ("tadd_hold_s",      float),
         "ticc_port":        ("ticc_port",        str),
