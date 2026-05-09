@@ -45,6 +45,7 @@ import numpy as np
 
 from solve_pseudorange import C, ecef_to_lla, lla_to_ecef
 from solve_ppp import PPPFilter, FixedPosFilter, ls_init, N_BASE, SIGMA_P_IF, IDX_ZTD as PPP_IDX_ZTD
+from peppar_fix.obs_routing import obs_for_position
 from solid_tide import solid_tide_displacement, sun_pos_ecef
 import peer_publisher
 from antex import ANTEXParser, compute_pcv_correction
@@ -1613,9 +1614,14 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
             if sv not in current_svs:
                 filt.remove_ambiguity(sv)
 
-        # EKF update
+        # EKF update — position-side consumes only SVs whose phase biases
+        # are fully available; the per-filter gate (I-175645-charlie)
+        # drops MISS-bias SVs to keep the half-bias-corrected MW
+        # combination from poisoning WL integer search.  See
+        # obs_for_position() docstring at module top.
+        pos_observations = obs_for_position(observations)
         n_used, resid, sys_counts = filt.update(
-            observations, corrections, gps_time, clk_file=corrections)
+            pos_observations, corrections, gps_time, clk_file=corrections)
 
         if n_used < 4:
             continue
@@ -1644,8 +1650,11 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
                 '', '', '', len(filt.sv_to_idx),
             ])
 
-        # PPP-AR: Melbourne-Wubbena wide-lane update (every epoch)
-        for obs in observations:
+        # PPP-AR: Melbourne-Wubbena wide-lane update (every epoch).
+        # Same per-filter gate (I-175645-charlie): MW combination places
+        # WL integer search on a wrong cycle when band-2 phase bias is
+        # MISS, so iterate only the position-filtered observation list.
+        for obs in pos_observations:
             sv = obs['sv']
             phi1 = obs.get('phi1_cyc')
             phi2 = obs.get('phi2_cyc')
@@ -2850,9 +2859,11 @@ class AntPosEstThread(threading.Thread):
                     else:
                         self._last_pcv_skipped += 1
 
-            # EKF update
+            # EKF update — position-side per-filter gate
+            # (I-175645-charlie); see obs_for_position() at module top.
+            pos_observations = obs_for_position(observations)
             n_used, resid, sys_counts = filt.update(
-                observations, corrections, gps_time, clk_file=corrections,
+                pos_observations, corrections, gps_time, clk_file=corrections,
                 receiver_offset_ecef=tide_offset)
             if n_used < 4:
                 continue
@@ -2911,9 +2922,11 @@ class AntPosEstThread(threading.Thread):
             readmit_blocked: list[str] = []
             # Per-SV GF observation for this epoch.  Populated alongside
             # the MW update; consumed by the GF step demoter below.
-            # Pure phase, geometry-free.
+            # Pure phase, geometry-free.  Per-filter gate
+            # (I-175645-charlie): MW combination needs phase biases on
+            # both bands, so iterate only the position-filtered list.
             gf_now: dict[str, float] = {}
-            for obs in observations:
+            for obs in pos_observations:
                 sv = obs['sv']
                 phi1 = obs.get('phi1_cyc')
                 phi2 = obs.get('phi2_cyc')
