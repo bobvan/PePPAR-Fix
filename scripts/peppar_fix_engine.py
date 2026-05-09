@@ -4292,32 +4292,29 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
 
             # Blend a refined position estimate into FixedPosFilter's ARP.
             #
-            # --ar-mode wl (production default, I-125649 Stage 4):
-            #   Source = NAV2 running-mean.  Cold-start finding 2026-05-09:
-            #   WL-only AntPosEst converges to a 6-8 m basin off NAV2 on
-            #   our lab antenna (worse than NAV2 itself), so the original
-            #   AntPosEst-feed (Stage 2) was based on a false premise.
-            #   NAV2 hAcc=0.8m on clean sky is the actual best refinement
-            #   available pre-PRIDE-survey.
+            # --ar-mode wl (production default):
+            #   σ-weighted Bayesian blend with selectable source via
+            #   --position-blend-source {nav2, antposest, none}.  Math
+            #   lives in scripts/peppar_fix/arp_blend.py and is unit-
+            #   tested independently (test_arp_blend.py).
             #
-            #   Each accepted NAV2 fix is blended via σ-weighted Bayesian
-            #   update:
-            #     α_eff = σ_pin² / (σ_pin² + σ_nav2²)
-            #     ARP_new = ARP + α_eff × (nav2_ecef − ARP)
-            #     σ_pin'  = max(σ_pin_kalman, σ_nav2)
-            #   The σ_pin floor at σ_nav2 acknowledges that successive
-            #   NAV2 fixes share atmospheric/multipath state — they're
-            #   not statistically independent, so naive √N aggregation
-            #   would overstate convergence.  Effective N over minutes
-            #   is small; over hours geometry rotation helps.
+            #   nav2 (default):  source = NAV2 running-mean.  Cold-start
+            #     finding 2026-05-09 — WL-only AntPosEst converges to a
+            #     6-8 m basin off NAV2 on our lab, with ZTD residual
+            #     +1146 mm (PR-domain bias dumped into ZTD).  NAV2 is
+            #     more accurate than WL-only AntPosEst until the
+            #     systematic biases (I-155354, I-165118) are closed.
+            #     Sampled every 10 epochs (~10 s) to throttle
+            #     correlated-update overcount.
             #
-            #   NAV2 fixes are sampled every 10 epochs (~10 s).  This
-            #   throttle reduces correlated-update overcount and gives
-            #   the geometry time to rotate between samples.
+            #   antposest:  source = AntPosEst published position.
+            #     Available for the future restoration once systematic
+            #     biases close — at that point switch the default.
+            #     Today useful for research / regression A/B.
             #
-            #   AntPosEst published positions remain available for ARP-
-            #   motion detection (per I-125649 design) but are NOT used
-            #   to update the time filter's ARP under --ar-mode wl.
+            #   none:  no blend.  σ_pin frozen at init.  Useful when
+            #     --known-pos is operator-supplied warm-start coords
+            #     and the operator wants no live refinement.
             #
             # --ar-mode full (legacy, research-only):
             #   Original AntPosEst α=0.001 trickle preserved unchanged.
@@ -4326,52 +4323,69 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             # known_pos is sub-cm truth and any blend source is worse.
             if not getattr(args, 'pin_position', False):
                 if args.ar_mode == "wl":
-                    # NAV2 running-mean blend.  Sample every 10 epochs.
-                    if (nav2_store is not None and n_epochs % 10 == 0):
+                    blend_source = getattr(
+                        args, 'position_blend_source', 'nav2')
+                    src_ecef = None
+                    src_sigma = None
+                    src_label = None
+
+                    if (blend_source == "nav2"
+                            and nav2_store is not None
+                            and n_epochs % 10 == 0):
                         nav2_op = nav2_store.get_opinion(max_age_s=10.0)
                         if (nav2_op is not None
                                 and nav2_op.get('fix_type') == 3
                                 and nav2_op.get('h_acc_m') is not None
                                 and nav2_op['h_acc_m'] < 5.0):
-                            nav2_ecef_now = np.asarray(nav2_op['ecef'],
-                                                       dtype=float)
-                            sigma_nav2 = float(nav2_op['h_acc_m'])
-                            delta = nav2_ecef_now - known_ecef
-                            delta_3d = float(np.linalg.norm(delta))
-                            gate_3sigma_m = 3.0 * (sigma_pin_m + sigma_nav2)
-                            if delta_3d > gate_3sigma_m:
-                                if n_epochs % 100 == 0:
-                                    log.warning(
-                                        "NAV2 blend outlier rejected: "
-                                        "Δ=%.2fm > 3σ=%.2fm "
-                                        "(σ_pin=%.3f σ_nav2=%.3f)",
-                                        delta_3d, gate_3sigma_m,
-                                        sigma_pin_m, sigma_nav2,
-                                    )
-                            else:
-                                alpha_eff = (sigma_pin_m ** 2 /
-                                             (sigma_pin_m ** 2
-                                              + sigma_nav2 ** 2))
-                                step = alpha_eff * delta
-                                known_ecef += step
-                                filt.pos = np.array(known_ecef)
-                                sigma_pin_kalman = (
-                                    sigma_pin_m * sigma_nav2 /
-                                    math.sqrt(sigma_pin_m ** 2
-                                              + sigma_nav2 ** 2))
-                                sigma_pin_m = max(sigma_pin_kalman,
-                                                  sigma_nav2)
-                                step_mm = (float(np.linalg.norm(step))
-                                           * 1000)
-                                if (n_epochs % 100 == 0
-                                        and delta_3d > 0.01):
-                                    log.info(
-                                        "NAV2 blend: Δ=%.2fm α=%.3f "
-                                        "step=%.1fmm σ_pin=%.3fm "
-                                        "σ_nav2=%.3fm",
-                                        delta_3d, alpha_eff, step_mm,
-                                        sigma_pin_m, sigma_nav2,
-                                    )
+                            src_ecef = np.asarray(nav2_op['ecef'],
+                                                  dtype=float)
+                            src_sigma = float(nav2_op['h_acc_m'])
+                            src_label = "NAV2"
+                    elif (blend_source == "antposest"
+                            and ar_position is not None
+                            and ar_pos_lock is not None):
+                        with ar_pos_lock:
+                            ae_ecef = ar_position.get('ecef')
+                            ae_sigma = ar_position.get('sigma')
+                        if (ae_ecef is not None and ae_sigma is not None
+                                and ae_sigma < 1.0):
+                            src_ecef = np.asarray(ae_ecef, dtype=float)
+                            src_sigma = float(ae_sigma)
+                            src_label = "AntPosEst"
+                    # blend_source == "none": no source, no blend
+
+                    if src_ecef is not None and src_sigma is not None:
+                        from peppar_fix.arp_blend import (
+                            bayesian_arp_blend)
+                        blend = bayesian_arp_blend(
+                            known_ecef, sigma_pin_m,
+                            src_ecef, src_sigma,
+                        )
+                        if blend.action == "applied":
+                            known_ecef = blend.arp_new
+                            filt.pos = np.array(known_ecef)
+                            sigma_pin_m = blend.sigma_pin_new_m
+                            if (n_epochs % 100 == 0
+                                    and blend.delta_3d_m > 0.01):
+                                log.info(
+                                    "%s blend: Δ=%.2fm α=%.3f "
+                                    "step=%.1fmm σ_pin=%.3fm "
+                                    "σ_src=%.3fm",
+                                    src_label, blend.delta_3d_m,
+                                    blend.alpha_eff,
+                                    blend.step_3d_m * 1000,
+                                    sigma_pin_m, src_sigma,
+                                )
+                        else:
+                            if n_epochs % 100 == 0:
+                                log.warning(
+                                    "%s blend outlier rejected: "
+                                    "Δ=%.2fm > %.1fσ=%.2fm "
+                                    "(σ_pin=%.3f σ_src=%.3f)",
+                                    src_label, blend.delta_3d_m,
+                                    3.0, blend.gate_3sigma_m,
+                                    sigma_pin_m, src_sigma,
+                                )
                 elif (ar_position is not None and ar_pos_lock is not None):
                     # --ar-mode full: legacy AntPosEst α=0.001 trickle
                     with ar_pos_lock:
@@ -8035,6 +8049,24 @@ Two-phase operation:
     pos.add_argument("--wl-only", dest="wl_only_legacy",
                      action="store_true",
                      help=argparse.SUPPRESS)
+    pos.add_argument("--position-blend-source",
+                     choices=["nav2", "antposest", "none"],
+                     default="nav2",
+                     help="Source for the FixedPosFilter ARP blend "
+                          "under --ar-mode wl.  'nav2' (default): "
+                          "NAV2 running mean — best precision available "
+                          "today given WL-only AntPosEst basin trap "
+                          "(see I-125649 cold-start finding 2026-05-09 "
+                          "and umbrella I-155354).  'antposest': feed "
+                          "from AntPosEst published position — for "
+                          "research today, will become the default once "
+                          "the systematic float/WL biases close "
+                          "(I-155354 / I-165118).  'none': no blend, "
+                          "σ_pin frozen at init.  Ignored under "
+                          "--ar-mode full (legacy α=0.001 trickle "
+                          "always uses AntPosEst there) and under "
+                          "--pin-position (blend is always skipped, "
+                          "surveyed truth pinned).")
     pos.add_argument("--no-solid-tide", dest="solid_tide",
                      action="store_false", default=True,
                      help="Disable the IERS 2010 Step 1 solid Earth "
