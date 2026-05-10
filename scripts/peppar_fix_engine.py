@@ -48,6 +48,7 @@ from solve_ppp import PPPFilter, FixedPosFilter, ls_init, N_BASE, SIGMA_P_IF, ID
 from solid_tide import solid_tide_displacement, sun_pos_ecef
 import peer_publisher
 from antex import ANTEXParser, compute_pcv_correction
+from peppar_fix.arp_blend import bayesian_arp_blend
 from peppar_fix.bootstrap_gate import (
     residuals_consistent, nav2_agrees, scrub_for_retry,
 )
@@ -4367,8 +4368,6 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     # blend_source == "none": no source, no blend
 
                     if src_ecef is not None and src_sigma is not None:
-                        from peppar_fix.arp_blend import (
-                            bayesian_arp_blend)
                         blend = bayesian_arp_blend(
                             known_ecef, sigma_pin_m,
                             src_ecef, src_sigma,
