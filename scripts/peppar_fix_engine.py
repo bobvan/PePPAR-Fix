@@ -48,6 +48,7 @@ from solve_ppp import PPPFilter, FixedPosFilter, ls_init, N_BASE, SIGMA_P_IF, ID
 from solid_tide import solid_tide_displacement, sun_pos_ecef
 import peer_publisher
 from antex import ANTEXParser, compute_pcv_correction
+from peppar_fix.arp_blend import bayesian_arp_blend
 from peppar_fix.bootstrap_gate import (
     residuals_consistent, nav2_agrees, scrub_for_retry,
 )
@@ -3805,7 +3806,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                      stop_event, qerr_store=None, out_w=None, nav2_store=None,
                      ape_sm=None, dfe_sm=None, ape_thread=None,
                      ar_position=None, ar_pos_lock=None,
-                     extint_store=None):
+                     extint_store=None,
+                     pos_sigma_m=None, pos_source=None):
     """Run FixedPosFilter for clock estimation with optional servo.
 
     This is the steady-state phase: position is known, we estimate clock
@@ -3857,6 +3859,50 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                           init_ztd_m=init_ztd_m,
                           init_ztd_sigma_m=init_ztd_sigma_m)
     filt.prev_clock = 0.0
+
+    # σ_pin: time filter's uncertainty about its pinned ARP, used by
+    # the σ-weighted Bayesian position-blend (I-125649 Stage 2/3).
+    # Initial value comes from how the engine learned this position
+    # (threaded from main()'s seed-source resolution):
+    #   --pin-position with surveyed coords (sub-cm OPUS/PRIDE):
+    #     σ_pin = 1 mm; blend is no-op, preserving pin
+    #   --known-pos without --pin-position (warm-start refinement):
+    #     σ_pin = 0.5 m (typical AntPosEst float convergence target)
+    #   NAV2 seed (Stage 3):
+    #     σ_pin = nav2_h_acc (typically 1-3 m on clean sky, up to 5 m
+    #     near the wait_for_nav2_seed gate)
+    #   Phase-1 PPP bootstrap fallback:
+    #     σ_pin = bootstrap σ (sub-meter once converged)
+    # The blend converges σ_pin toward σ_pos as updates accumulate;
+    # see warm-start trajectory in dayplan I-125649-main.
+    if getattr(args, 'pin_position', False):
+        sigma_pin_m = 0.001  # 1 mm — surveyed pin, blend no-op
+    elif pos_sigma_m is not None and pos_sigma_m > 0:
+        # Use the actual seed σ from main() — NAV2 hAcc, Phase-1
+        # bootstrap σ, or operator-supplied --known-pos with non-zero σ.
+        sigma_pin_m = float(pos_sigma_m)
+    elif getattr(args, 'known_pos', None) is not None:
+        # --known-pos supplied without explicit σ; treat as warm-start
+        # (operator's coords are not necessarily surveyed truth — that
+        # would have used --pin-position).
+        sigma_pin_m = 0.5
+    else:
+        sigma_pin_m = 5.0    # NAV2-class fallback
+    log.info("Position-blend σ_pin initial: %.3f m "
+             "(source=%s, --ar-mode=%s)",
+             sigma_pin_m, pos_source or "default", args.ar_mode)
+
+    # Stage 6 self-healing gate (I-125649): when the blend keeps
+    # rejecting updates with the same sustained outlier delta, the
+    # source has likely moved (e.g., AntPosEst was reset by the
+    # SECOND_OPINION_POS watchdog) and σ_pin is now too tight to
+    # let the gate re-engage with the new source position.  Track
+    # consecutive rejections and, after a threshold, widen σ_pin
+    # so the next blend can be applied.  Counter resets on any
+    # accepted blend.
+    consecutive_blend_rejects = 0
+    SUSTAINED_REJECT_THRESHOLD = 5  # ≈ 50 s for NAV2 source (10-epoch)
+    SIGMA_PIN_WIDEN_M = 5.0          # NAV2-class fallback ceiling
     watchdog = PositionWatchdog(threshold_m=args.watchdog_threshold)
     # Shadow gate: TD-CP-only watchdog runs in parallel for I-145915
     # bake-in.  Verdict logged per epoch but does NOT drive engine
@@ -4257,32 +4303,145 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 skip_stats["too_few_meas"] += 1
                 continue
 
-            # Blend AntPosEst's refined position into DOFreqEst's reference.
-            # Exponential blend: 12 ps/epoch migration rate for 5m offset —
-            # invisible to the servo (200× below PPS noise floor).
-            # See docs/ppp-ar-design.md "Gradual position feed-in".
+            # Blend a refined position estimate into FixedPosFilter's ARP.
             #
-            # Skipped under --pin-position: when the supplied known_pos is
-            # surveyed truth (sub-cm σ from OPUS-Static / PRIDE-PPP),
-            # AntPosEst's ~m-class estimate is strictly worse and blending
-            # it in degrades the pin.  Precursor to the full
-            # --surveyed-position mode (I-013342-main).
-            if (not getattr(args, 'pin_position', False)
-                    and ar_position is not None and ar_pos_lock is not None):
-                with ar_pos_lock:
-                    ar_ecef = ar_position.get('ecef')
-                    ar_sigma = ar_position.get('sigma')
-                if ar_ecef is not None and ar_sigma is not None and ar_sigma < 1.0:
-                    alpha = 0.001  # τ ≈ 1000 epochs (1000 s at 1 Hz)
-                    delta = ar_ecef - known_ecef
-                    step = alpha * delta
-                    known_ecef += step
-                    filt.pos = np.array(known_ecef)
-                    step_mm = float(np.linalg.norm(step)) * 1000
-                    if n_epochs % 100 == 0 and float(np.linalg.norm(delta)) > 0.01:
-                        log.info("Position blend: Δ=%.2fm step=%.1fmm "
-                                 "(AR σ=%.3fm)",
-                                 float(np.linalg.norm(delta)), step_mm, ar_sigma)
+            # --ar-mode wl (production default):
+            #   σ-weighted Bayesian blend with selectable source via
+            #   --position-blend-source {nav2, antposest, none}.  Math
+            #   lives in scripts/peppar_fix/arp_blend.py and is unit-
+            #   tested independently (test_arp_blend.py).
+            #
+            #   nav2 (default):  source = NAV2 running-mean.  Cold-start
+            #     finding 2026-05-09 — WL-only AntPosEst converges to a
+            #     6-8 m basin off NAV2 on our lab, with ZTD residual
+            #     +1146 mm (PR-domain bias dumped into ZTD).  NAV2 is
+            #     more accurate than WL-only AntPosEst until the
+            #     systematic biases (I-155354, I-165118) are closed.
+            #     Sampled every 10 epochs (~10 s) to throttle
+            #     correlated-update overcount.
+            #
+            #   antposest:  source = AntPosEst published position.
+            #     Available for the future restoration once systematic
+            #     biases close — at that point switch the default.
+            #     Today useful for research / regression A/B.
+            #
+            #   none:  no blend.  σ_pin frozen at init.  Useful when
+            #     --known-pos is operator-supplied warm-start coords
+            #     and the operator wants no live refinement.
+            #
+            # --ar-mode full (legacy, research-only):
+            #   Original AntPosEst α=0.001 trickle preserved unchanged.
+            #
+            # Skipped under --pin-position regardless of mode: surveyed
+            # known_pos is sub-cm truth and any blend source is worse.
+            if not getattr(args, 'pin_position', False):
+                if args.ar_mode == "wl":
+                    blend_source = getattr(
+                        args, 'position_blend_source', 'nav2')
+                    src_ecef = None
+                    src_sigma = None
+                    src_label = None
+
+                    if (blend_source == "nav2"
+                            and nav2_store is not None
+                            and n_epochs % 10 == 0):
+                        nav2_op = nav2_store.get_opinion(max_age_s=10.0)
+                        if (nav2_op is not None
+                                and nav2_op.get('fix_type') == 3
+                                and nav2_op.get('h_acc_m') is not None
+                                and nav2_op['h_acc_m'] < 5.0):
+                            src_ecef = np.asarray(nav2_op['ecef'],
+                                                  dtype=float)
+                            src_sigma = float(nav2_op['h_acc_m'])
+                            src_label = "NAV2"
+                    elif (blend_source == "antposest"
+                            and ar_position is not None
+                            and ar_pos_lock is not None):
+                        with ar_pos_lock:
+                            ae_ecef = ar_position.get('ecef')
+                            ae_sigma = ar_position.get('sigma')
+                        if (ae_ecef is not None and ae_sigma is not None
+                                and ae_sigma < 1.0):
+                            src_ecef = np.asarray(ae_ecef, dtype=float)
+                            src_sigma = float(ae_sigma)
+                            src_label = "AntPosEst"
+                    # blend_source == "none": no source, no blend
+
+                    if src_ecef is not None and src_sigma is not None:
+                        blend = bayesian_arp_blend(
+                            known_ecef, sigma_pin_m,
+                            src_ecef, src_sigma,
+                        )
+                        if blend.action == "applied":
+                            known_ecef = blend.arp_new
+                            filt.pos = np.array(known_ecef)
+                            sigma_pin_m = blend.sigma_pin_new_m
+                            consecutive_blend_rejects = 0
+                            if (n_epochs % 100 == 0
+                                    and blend.delta_3d_m > 0.01):
+                                log.info(
+                                    "%s blend: Δ=%.2fm α=%.3f "
+                                    "step=%.1fmm σ_pin=%.3fm "
+                                    "σ_src=%.3fm",
+                                    src_label, blend.delta_3d_m,
+                                    blend.alpha_eff,
+                                    blend.step_3d_m * 1000,
+                                    sigma_pin_m, src_sigma,
+                                )
+                        else:
+                            consecutive_blend_rejects += 1
+                            if (consecutive_blend_rejects
+                                    >= SUSTAINED_REJECT_THRESHOLD):
+                                # Source has settled at a position
+                                # outside the gate.  Widen σ_pin so
+                                # the next blend can re-engage.
+                                # This catches AntPosEst-source
+                                # SECOND_OPINION_POS resets and
+                                # similar discontinuities.  Counter
+                                # resets after the widen so we don't
+                                # log every epoch.
+                                old_sigma = sigma_pin_m
+                                sigma_pin_m = max(sigma_pin_m,
+                                                  SIGMA_PIN_WIDEN_M)
+                                log.warning(
+                                    "%s blend: %d consecutive rejects "
+                                    "— widening σ_pin %.3f → %.3f m "
+                                    "(self-healing gate, I-125649 "
+                                    "Stage 6)",
+                                    src_label,
+                                    consecutive_blend_rejects,
+                                    old_sigma, sigma_pin_m,
+                                )
+                                consecutive_blend_rejects = 0
+                            elif n_epochs % 100 == 0:
+                                log.warning(
+                                    "%s blend outlier rejected: "
+                                    "Δ=%.2fm > %.1fσ=%.2fm "
+                                    "(σ_pin=%.3f σ_src=%.3f) "
+                                    "[%d consecutive]",
+                                    src_label, blend.delta_3d_m,
+                                    3.0, blend.gate_3sigma_m,
+                                    sigma_pin_m, src_sigma,
+                                    consecutive_blend_rejects,
+                                )
+                elif (ar_position is not None and ar_pos_lock is not None):
+                    # --ar-mode full: legacy AntPosEst α=0.001 trickle
+                    with ar_pos_lock:
+                        ar_ecef = ar_position.get('ecef')
+                        ar_sigma = ar_position.get('sigma')
+                    if (ar_ecef is not None and ar_sigma is not None
+                            and ar_sigma < 1.0):
+                        delta = ar_ecef - known_ecef
+                        delta_3d = float(np.linalg.norm(delta))
+                        alpha = 0.001  # τ ≈ 1000 epochs (1000 s at 1 Hz)
+                        step = alpha * delta
+                        known_ecef += step
+                        filt.pos = np.array(known_ecef)
+                        step_mm = float(np.linalg.norm(step)) * 1000
+                        if n_epochs % 100 == 0 and delta_3d > 0.01:
+                            log.info("Position blend: Δ=%.2fm step=%.1fmm "
+                                     "(AR σ=%.3fm)",
+                                     delta_3d, step_mm, ar_sigma)
 
             # Watchdog with NAV2 position consensus
             resid_rms = float(np.sqrt(np.mean(resid ** 2))) if len(resid) > 0 else 0.0
@@ -7382,6 +7541,8 @@ def run(args):
             bootstrap_result = result
             known_ecef = bootstrap_result.ecef
             sigma_m = bootstrap_result.sigma_m
+            pos_sigma_m = sigma_m  # threaded into run_steady_state for σ_pin init
+            pos_source = pos_source or "ppp_bootstrap"
             ape_sm.transition(AntPosEstState.CONVERGING,
                               f"bootstrap converged (σ={sigma_m:.1f}m), entering steady state")
 
@@ -7582,6 +7743,8 @@ def run(args):
                 ar_position=_ar_position,
                 ar_pos_lock=_ar_pos_lock,
                 extint_store=extint_store,
+                pos_sigma_m=pos_sigma_m,
+                pos_source=pos_source,
             )
             # run_steady_state returns an int exit code on error,
             # or a gate_stats dict on normal completion.
@@ -7906,14 +8069,42 @@ Two-phase operation:
                           "isolates the join test's effect from other "
                           "branch-carried changes.  See "
                           "project_to_main_defensive_mechanisms_20260421.md.")
-    pos.add_argument("--wl-only", action="store_true",
-                     help="WL-only mode: skip NL integer resolution "
-                          "entirely.  MW tracker still fixes WL "
-                          "ambiguities; the float IF solution uses "
-                          "WL-fixed + float NL.  SvAmbState and "
-                          "AntPosEstState lifecycles are clamped at "
-                          "CONVERGING.  Foundation experiment — see "
-                          "docs/wl-only-foundation.md.")
+    pos.add_argument("--ar-mode", choices=["wl", "full"], default="wl",
+                     help="Ambiguity resolution mode for the position "
+                          "filter.  'wl' (default, production): fix WL "
+                          "integers via MW tracker, skip NL entirely.  "
+                          "SvAmbState and AntPosEstState lifecycles "
+                          "clamp at CONVERGING.  'full' (research only): "
+                          "WL + NL, including LAMBDA + bootstrap-prob + "
+                          "ANCHORING/ANCHORED transitions.  See "
+                          "docs/wl-only-foundation.md and dayplan "
+                          "I-125649-main for why 'wl' is the production "
+                          "default — six weeks of NL-AR pathology "
+                          "(slip storms, ZTD-trip cascades, false-fix "
+                          "lock-in) and FixedPosFilter's TD-CP design "
+                          "make NL not load-bearing for clock transfer.")
+    # Deprecated alias: --wl-only sets --ar-mode wl (suppressed help).
+    pos.add_argument("--wl-only", dest="wl_only_legacy",
+                     action="store_true",
+                     help=argparse.SUPPRESS)
+    pos.add_argument("--position-blend-source",
+                     choices=["nav2", "antposest", "none"],
+                     default="nav2",
+                     help="Source for the FixedPosFilter ARP blend "
+                          "under --ar-mode wl.  'nav2' (default): "
+                          "NAV2 running mean — best precision available "
+                          "today given WL-only AntPosEst basin trap "
+                          "(see I-125649 cold-start finding 2026-05-09 "
+                          "and umbrella I-155354).  'antposest': feed "
+                          "from AntPosEst published position — for "
+                          "research today, will become the default once "
+                          "the systematic float/WL biases close "
+                          "(I-155354 / I-165118).  'none': no blend, "
+                          "σ_pin frozen at init.  Ignored under "
+                          "--ar-mode full (legacy α=0.001 trickle "
+                          "always uses AntPosEst there) and under "
+                          "--pin-position (blend is always skipped, "
+                          "surveyed truth pinned).")
     pos.add_argument("--no-solid-tide", dest="solid_tide",
                      action="store_false", default=True,
                      help="Disable the IERS 2010 Step 1 solid Earth "
@@ -8591,6 +8782,20 @@ Two-phase operation:
     )
 
     args = ap.parse_args()
+
+    # Translate --ar-mode to internal `wl_only` flag.  --ar-mode is the
+    # user-facing knob (I-125649-main); `wl_only` is the legacy internal
+    # name that flows through the rest of the engine + sv_state +
+    # NarrowLaneResolver + AntPosEst state machine.  Once --ar-mode lands
+    # the same default everywhere, the internal `wl_only` rename is a
+    # mechanical follow-up (out of scope for this commit).
+    if getattr(args, "wl_only_legacy", False):
+        # Deprecated --wl-only alias still used.  Treat as --ar-mode wl
+        # (the only behavior --wl-only ever expressed).  No warning yet
+        # — wait until the next commit cycle to surface deprecation.
+        args.ar_mode = "wl"
+    args.wl_only = (args.ar_mode == "wl")
+
     _apply_host_config(args)
     # Apply defaults for args that are None after CLI + host config.
     # These were made nullable so host config can override them.
@@ -8707,6 +8912,13 @@ Two-phase operation:
 
     if getattr(args, '_host_config_path', None):
         log.info("Host config: %s", args._host_config_path)
+
+    # AR mode (I-125649-main).  'wl' is the production default; 'full'
+    # is research-only.  Visible in startup log so post-hoc analysis can
+    # tell which AR pipeline was active without grepping CLI args.
+    log.info("AR mode: %s (%s)", args.ar_mode,
+             "WL only — NL/LAMBDA disabled" if args.wl_only
+             else "WL + NL — full LAMBDA pipeline")
 
     # σ_phi / σ_pr override visibility (the override itself fires
     # earlier in main(), before basicConfig).
