@@ -70,6 +70,21 @@ class MelbourneWubbenaTracker:
     # that moves WL also moves GF by >1 cm.
     _SIGMA_FLOOR_CYC = 0.50
 
+    # Hatch-style carrier-smoothed pseudorange (I-155354 fix-H).  The
+    # MW formula combines code (PR) with carrier phase; PR noise
+    # floor (~30 cm raw on F9T) shifts the running mean by O(λ_WL)
+    # cycles when multipath spikes occur.  Hatch smoothing uses
+    # carrier-phase deltas to project previous smoothed PR forward;
+    # new raw PR mixes in at weight α=1/N.  Reduces PR noise floor
+    # 30 cm → ~5 cm in ~36 epochs of arc (sqrt(36) = 6× reduction).
+    # PR noise < λ_WL/8 → MW running mean rounds correctly.
+    #
+    # Cap N at HATCH_N_MAX so multi-hour arcs don't over-smooth past
+    # ionospheric drift the carrier-phase delta projection might lag.
+    # 600 epochs ≈ 10 min at 1 Hz; ample bandwidth for typical iono
+    # while still reaching effective ~24× σ reduction.
+    _HATCH_N_MAX = 600
+
     def __init__(self, tau_s=60.0, fix_threshold=0.15, min_epochs=60,
                  sv_state: SvStateTracker | None = None):
         self.tau_s = tau_s              # exponential averaging time constant
@@ -91,6 +106,50 @@ class MelbourneWubbenaTracker:
             (f1 * phi1_cyc * (C / f1) - f2 * phi2_cyc * (C / f2)) / (f1 - f2)
             - (f1 * pr1_m + f2 * pr2_m) / (f1 + f2)
         )
+
+    def _hatch_smooth_pr(self, sv, phi1_cyc, phi2_cyc,
+                          pr1_m, pr2_m, f1, f2):
+        """Hatch-style carrier-smoothed pseudorange per band.
+
+        Returns (pr1_smooth_m, pr2_smooth_m).  Mutates the SV's
+        hatch state.  Caller must have already ensured the SV's
+        outer state dict exists and is valid for this arc — first
+        sample of arc sets up the hatch substate with smooth = raw.
+
+        P_smooth(t) = α·P_raw(t) + (1-α)·(P_smooth(t-1) + λ·Δφ(t))
+
+        α = 1/min(N, HATCH_N_MAX) where N is the arc-sample count.
+        Smoother is reset by MelbourneWubbenaTracker.reset(sv) on
+        slip — fresh arc rebuilds smoother from raw at α=1.
+        """
+        s = self._state[sv]
+        h = s.get('hatch')
+        if h is None:
+            # First sample of arc — smooth = raw, prime the predictor.
+            s['hatch'] = {
+                'p1_smooth': float(pr1_m),
+                'p2_smooth': float(pr2_m),
+                'prev_phi1_cyc': float(phi1_cyc),
+                'prev_phi2_cyc': float(phi2_cyc),
+                'n': 1,
+            }
+            return float(pr1_m), float(pr2_m)
+        n = min(h['n'] + 1, self._HATCH_N_MAX)
+        alpha = 1.0 / n
+        lambda1 = C / f1
+        lambda2 = C / f2
+        d_phi1_m = (phi1_cyc - h['prev_phi1_cyc']) * lambda1
+        d_phi2_m = (phi2_cyc - h['prev_phi2_cyc']) * lambda2
+        p1_pred = h['p1_smooth'] + d_phi1_m
+        p2_pred = h['p2_smooth'] + d_phi2_m
+        p1_smooth = alpha * pr1_m + (1.0 - alpha) * p1_pred
+        p2_smooth = alpha * pr2_m + (1.0 - alpha) * p2_pred
+        h['p1_smooth'] = p1_smooth
+        h['p2_smooth'] = p2_smooth
+        h['prev_phi1_cyc'] = float(phi1_cyc)
+        h['prev_phi2_cyc'] = float(phi2_cyc)
+        h['n'] = n
+        return p1_smooth, p2_smooth
 
     @staticmethod
     def _freqs_from_obs(obs):
@@ -122,11 +181,14 @@ class MelbourneWubbenaTracker:
                 )
 
         lambda_wl = C / (f1 - f2)
-        mw = self._mw_meters(phi1_cyc, phi2_cyc, pr1_m, pr2_m, f1, f2)
 
         if sv not in self._state:
+            # First sample of arc — initialize SV state, then prime the
+            # Hatch smoother (which on first sample returns raw PR =
+            # smooth PR).  MW computed with raw == smooth on this epoch.
             self._state[sv] = {
-                'mw_avg': mw,
+                'mw_avg': self._mw_meters(phi1_cyc, phi2_cyc,
+                                           pr1_m, pr2_m, f1, f2),
                 'n_epochs': 1,
                 'n_wl': None,
                 'fixed': False,
@@ -135,12 +197,35 @@ class MelbourneWubbenaTracker:
                 'resid_deque': deque(maxlen=self._RESID_WIN),
                 'resid_std_cyc': None,
             }
+            self._hatch_smooth_pr(sv, phi1_cyc, phi2_cyc,
+                                   pr1_m, pr2_m, f1, f2)
             return
 
         s = self._state[sv]
-        # Track residual from the *pre-update* average so jump detection
-        # can read a sigma that hasn't absorbed the current sample yet.
-        residual_cyc = (mw - s['mw_avg']) / lambda_wl
+        # Carrier-smoothed PR feeds the MW formula's running mean
+        # (reduces PR noise floor 6× over ~36 epochs of arc, bringing
+        # the MW running mean within λ_WL/8 ≈ 9 cm — well inside
+        # rounding tolerance).  See _hatch_smooth_pr docstring +
+        # I-155354 fix-H.
+        #
+        # BUT the slip-detector sigma comes from the raw-vs-smooth-mean
+        # residual deque: detect_jump compares raw mw against mw_avg,
+        # so the deque's sigma must reflect raw-PR noise (~0.4 cyc)
+        # not smoothed-PR noise (~0.07 cyc) — otherwise the jump
+        # threshold would tighten and PR-noise spikes would become
+        # mw_jump events even more often than they did before fix-H.
+        # Compute both: raw for detector, smooth for WL fix.
+        mw_raw = self._mw_meters(phi1_cyc, phi2_cyc,
+                                  pr1_m, pr2_m, f1, f2)
+        pr1_smooth, pr2_smooth = self._hatch_smooth_pr(
+            sv, phi1_cyc, phi2_cyc, pr1_m, pr2_m, f1, f2)
+        mw_smooth = self._mw_meters(phi1_cyc, phi2_cyc,
+                                     pr1_smooth, pr2_smooth, f1, f2)
+        # Slip detector input: raw mw against smoothed mw_avg.  Sigma
+        # reflects raw-PR noise (correct for jump-threshold scaling).
+        residual_cyc = (mw_raw - s['mw_avg']) / lambda_wl
+        # WL fixing input: smoothed mw feeds the running mean below.
+        mw = mw_smooth
         rd = s.setdefault('resid_deque', deque(maxlen=self._RESID_WIN))
         rd.append(residual_cyc)
         if len(rd) >= 8:

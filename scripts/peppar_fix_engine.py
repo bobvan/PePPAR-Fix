@@ -55,7 +55,9 @@ from peppar_fix.bootstrap_gate import (
 from broadcast_eph import BroadcastEphemeris
 from ssr_corrections import SSRState, RealtimeCorrections
 from ppp_ar import MelbourneWubbenaTracker, NarrowLaneResolver
-from peppar_fix.cycle_slip import CycleSlipMonitor, SlipEvent, flush_sv_phase
+from peppar_fix.cycle_slip import (
+    CycleSlipMonitor, SlipEvent, flush_sv_phase, is_pr_only_slip,
+)
 from peppar_fix.sv_state import SvAmbState, SvStateTracker
 from peppar_fix.false_fix_monitor import FalseFixMonitor
 from peppar_fix.if_step_monitor import IfStepMonitor
@@ -1577,10 +1579,20 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
             elevations=elevations,
             azimuths=azimuths, ipp_szas=ipp_szas)
         for ev in slip_events:
-            flush_sv_phase(
-                ev.sv, filt=filt, mw_tracker=mw_tracker,
-                nl_resolver=nl_resolver, slip_monitor=slip_monitor,
-                reason="|".join(ev.reasons), epoch=n_epochs)
+            # PR-only slips (mw_jump alone) are PR-noise false positives;
+            # don't flush WL state.  See is_pr_only_slip() docstring +
+            # I-155354 fix-I + docs/wl-integer-vs-pride-comparison.md.
+            if is_pr_only_slip(ev.reasons):
+                log.info("[SLIP_FILTERED] sv=%s mw_jump-only conf=%s "
+                         "mw=%s — PR-only, ambiguity preserved",
+                         ev.sv, ev.confidence,
+                         f"{ev.mw_jump_cyc:.2f}c"
+                         if ev.mw_jump_cyc is not None else "-")
+            else:
+                flush_sv_phase(
+                    ev.sv, filt=filt, mw_tracker=mw_tracker,
+                    nl_resolver=nl_resolver, slip_monitor=slip_monitor,
+                    reason="|".join(ev.reasons), epoch=n_epochs)
             log.info("slip: sv=%s reasons=%s conf=%s lock=%.0fms cno=%.1f"
                      " elev=%s az=%s ipp_sza=%s gap=%s gf=%s mw=%s",
                      ev.sv, ",".join(ev.reasons), ev.confidence,
@@ -2694,18 +2706,30 @@ class AntPosEstThread(threading.Thread):
                 elevations=elevations,
                 azimuths=azimuths, ipp_szas=ipp_szas)
             for ev in slip_events:
-                flush_sv_phase(
-                    ev.sv, filt=filt, mw_tracker=mw,
-                    nl_resolver=nl,
-                    slip_monitor=self._slip_monitor,
-                    sv_state=self._sv_state,
-                    confidence=ev.confidence,
-                    reason="|".join(ev.reasons), epoch=self._n_epochs)
-                # Wind-up tracker state is per-SV cumulative; drop it
-                # on slip so the next update seeds fresh (absolute
-                # zero absorbed into the re-floating ambiguity).
-                if self._windup_tracker is not None:
-                    self._windup_tracker.reset(ev.sv)
+                # PR-only slips (mw_jump alone) are PR-noise false
+                # positives; don't flush WL state or wind-up tracker.
+                # See is_pr_only_slip() docstring + I-155354 fix-I +
+                # docs/wl-integer-vs-pride-comparison.md.
+                if is_pr_only_slip(ev.reasons):
+                    log.info("[SLIP_FILTERED] sv=%s mw_jump-only "
+                             "conf=%s mw=%s — PR-only, ambiguity "
+                             "preserved",
+                             ev.sv, ev.confidence,
+                             f"{ev.mw_jump_cyc:.2f}c"
+                             if ev.mw_jump_cyc is not None else "-")
+                else:
+                    flush_sv_phase(
+                        ev.sv, filt=filt, mw_tracker=mw,
+                        nl_resolver=nl,
+                        slip_monitor=self._slip_monitor,
+                        sv_state=self._sv_state,
+                        confidence=ev.confidence,
+                        reason="|".join(ev.reasons), epoch=self._n_epochs)
+                    # Wind-up tracker state is per-SV cumulative; drop it
+                    # on slip so the next update seeds fresh (absolute
+                    # zero absorbed into the re-floating ambiguity).
+                    if self._windup_tracker is not None:
+                        self._windup_tracker.reset(ev.sv)
                 log.info("slip: sv=%s reasons=%s conf=%s lock=%.0fms"
                          " cno=%.1f elev=%s az=%s ipp_sza=%s gap=%s gf=%s mw=%s",
                          ev.sv, ",".join(ev.reasons), ev.confidence,
