@@ -102,16 +102,28 @@ When all reviewers have ack'd, the item's derived status flips to
 - **Bodies**: lead with a one-line headline.  Then context, plan,
   asks.  Cite file:line, commit SHAs, log paths.  Other agents
   rebuild your reasoning from these references.
-- **`I-` numbers**: auto-assigned as `I-HHMMSS-<by>` when you omit
-  `--id`.  Override with `--id` only when restoring an external
-  reference.
+- **IDs are camelCase slugs**: `--id <slug>-<by>` where `<slug>` is
+  a short, descriptive camelCase keyword (8–14 chars typical) that
+  summarizes the work.  Examples: `perOutAlarm-main`, `x2Canary-main`,
+  `bdsMissBias-charlie`, `arpRuntime-charlie`.  No `I-` prefix, no
+  timestamps.  Bob's parser is meat-based; slugs help him associate
+  items with meaning at a glance.  If you omit `--id`, the tool
+  falls back to the legacy `I-HHMMSS-<by>` form — usable but
+  discouraged for new items.  Existing `I-NNNNNN` items keep their
+  IDs (no rewriting history).
+- **Slug collisions**: pick a more specific slug.  If two items
+  legitimately share a topic, suffix with `-2`, `-3`, etc.
+  (`bdsMissBias-charlie` and `bdsMissBias2-charlie`) or pick
+  distinguishing terms (`bdsB2aBias-charlie` vs `bdsCnesGap-charlie`).
 - **Cross-references**: in body or discuss, refer to other items by
-  ID (`per I-145846-main: …`).  Saves re-explaining context.
+  full ID (`per arpRuntime-charlie: …`).  Saves re-explaining context.
 - **Asks**: end the body with explicit "ASKING <agent>: <action>"
   lines so reviewers know what they owe.
 - **Branches**: when filing implementation work, name your branch
-  `<by>-i-NNNNNN-<short-slug>` so the dayplan ID and the branch
-  name match.
+  `<by>/<slug>` (e.g., `bravo/wlBiasFlush`, `charlie/bdsMissBias`)
+  so the dayplan ID and the branch name share the slug.  The
+  `<by>/` prefix keeps each agent's branches grouped under
+  `git branch` listings.
 
 ## What NOT to do
 
