@@ -14,6 +14,18 @@ ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
 # CNES SSR for PPP-AR (credentials in ntrip-cnes.conf)
 ssr_ntrip_conf = "ntrip-cnes.conf"
+
+# BDS B2a-I phase biases are not published by any IGS-IP AC as of
+# 2026-05-09 (CNES has only B1I/B3I/B2I-legacy; WHU has GPS phase
+# only; CAS has B1I+B1C; rest none).  See
+# docs/bds-b2a-phase-bias-survey-2026-05-09.md.  But: I-175645 Fix #2
+# (per-filter MISS-bias gate; this PR) routes BDS B2a-I observations
+# correctly even without phase biases — dropped from PPPFilter / MW
+# / WL math (where MISS bias would basin position), kept for
+# FixedPosFilter via TD-CP (where the phase-bias constant cancels
+# epoch-to-epoch).  So BDS contributes ~6-8 SVs/epoch to time-side
+# dt_rx σ tightening without poisoning position.  systems= safely
+# enables BDS post-Fix-#2; would have been the wrong call pre-Fix-#2.
 systems = "gps,gal,bds"
 
 # CTI OSC5A2B02 OCXO via AD5693R DAC on I2C bus 1.

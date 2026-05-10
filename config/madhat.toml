@@ -47,6 +47,35 @@ ssr_ntrip_conf = "ntrip-cnes.conf"
 # consumes the new src= field for the twin-WHU diff.
 ssr_bias_mount      = "OSBC00WHU1"
 ssr_bias_ntrip_conf = "ntrip-cnes.conf"
+
+# BDS B2a-I phase biases are not published by any IGS-IP AC as of
+# 2026-05-09 (CNES has only B1I/B3I/B2I-legacy; WHU has GPS phase
+# only; CAS has B1I+B1C; CHC has B1I+B2I-legacy; SHAO/GFZ/BKG
+# publish none).  Survey at docs/bds-b2a-phase-bias-survey-
+# 2026-05-09.md.  Pre-I-175645, this gap silently bias-injected
+# BDS L5/B2a-I observations into the WL/MW/float math (bias=0
+# fallback at realtime_ppp.py:1030-1035) and MadHat day0509-
+# coldstart basined to 6-8 m off NAV2 with ZTD residual stuck at
+# +1146 mm (102 BDS [PB_APPLIED] src=? emits, smoking gun).
+#
+# I-175645 Fix #2 (per-filter MISS-bias gate; this PR) routes the
+# BDS B2a-I observations correctly:
+#  - Dropped from PPPFilter / MW tracker / WL bootstrap (via
+#    obs_for_position helper at scripts/peppar_fix/obs_routing.py)
+#    so the half-corrected MW combination doesn't basin position.
+#  - Kept for FixedPosFilter via TD-CP — the phase-bias constant
+#    cancels epoch-to-epoch (delta_phi = phi_if_m[t] - phi_if_m[t-1]
+#    at solve_ppp.py:1389-1393), so BDS contributes ~6-8 SVs/epoch
+#    to time-side dt_rx σ tightening without poisoning position.
+#
+# 4-fix validation @ test-merge-bravo-charlie c5b90ee at 29 min
+# uptime: AntPosEst ZTD basin -1770..+6205 mm → +1 mm; σ_dt_rx
+# 0.16 → 0.10 ns; 349 BDS B2a-I MISS events properly routed.
+#
+# Re-disable systems= bds only if a future incident shows the gate
+# misses a partial-MISS regime (e.g. one band fully covered, the
+# other has a bias delivered then lost mid-arc).  Will track via
+# the [SLIP_FILTERED] / [PB_APPLIED] log volume.
 systems = "gps,gal,bds"
 
 # TICC #2: chA = PEROUT (i226 PPS OUT), chB = GNSS PPS.
