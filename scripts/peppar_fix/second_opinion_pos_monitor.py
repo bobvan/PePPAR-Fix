@@ -47,7 +47,33 @@ from __future__ import annotations
 import logging
 from collections import deque
 
+import numpy as np
+
 log = logging.getLogger(__name__)
+
+
+def select_reset_target(
+    pin_position: bool,
+    pin_ecef,
+    nav2_ecef,
+):
+    """Pick the ECEF to reset the filter to when SECOND_OPINION_POS trips.
+
+    Under ``--pin-position`` with a surveyed ``--known-pos`` the pin IS
+    truth.  NAV2 has documented biases (~4 m east on shared-antenna F9Ts
+    per ``project_nav2_systematic_bias.md``; ~3-4 m vertical low on
+    CHOKE1 per ``wrongIntBasin-charlie`` 2026-05-11 forensics) and is the
+    wrong target to snap back to.  The monitor's trip still catches the
+    "filter has drifted from NAV2" signal — we just snap to the right
+    reference.  Symmetric with the engine's existing position-blend skip
+    under ``--pin-position`` (engine.py around the blend site).
+
+    Returns ``(reset_ecef, label)`` where label is ``"known_pos"`` when
+    the pin was used, else ``"NAV2"``.
+    """
+    if pin_position and pin_ecef is not None:
+        return np.asarray(pin_ecef, dtype=float), "known_pos"
+    return np.asarray(nav2_ecef, dtype=float), "NAV2"
 
 
 class SecondOpinionPosMonitor:

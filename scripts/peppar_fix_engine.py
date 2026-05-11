@@ -66,7 +66,10 @@ from peppar_fix.setting_sv_drop_monitor import SettingSvDropMonitor
 from peppar_fix.fix_set_integrity_monitor import FixSetIntegrityMonitor
 from peppar_fix.wl_drift_monitor import WlDriftMonitor
 from peppar_fix.gf_step_monitor import GfStepMonitor, gf_phase_m
-from peppar_fix.second_opinion_pos_monitor import SecondOpinionPosMonitor
+from peppar_fix.second_opinion_pos_monitor import (
+    SecondOpinionPosMonitor,
+    select_reset_target,
+)
 from peppar_fix.wl_phase_admission_gate import WlPhaseAdmissionGate
 from peppar_fix.wl_readmission_gate import WlReAdmissionGate
 from peppar_fix.anchoring_sv_promoter import AnchoringSvPromoter
@@ -1912,7 +1915,8 @@ class AntPosEstThread(threading.Thread):
                  ztd_tie_sigma=None,
                  pos_sigma_m=10.0,
                  nav2_anchor_enabled=True,
-                 nav2_anchor_max_hacc_m=3.0):
+                 nav2_anchor_max_hacc_m=3.0,
+                 pin_position=False):
         super().__init__(daemon=True, name="AntPosEst")
         # Phase 3 wind-up (Wu 1993): per-SV cumulative wind-up tracker
         # + carrier-phase correction applied before filter.update().
@@ -1982,6 +1986,14 @@ class AntPosEstThread(threading.Thread):
         # I-051234 sub-B.
         self._nav2_anchor_enabled = bool(nav2_anchor_enabled)
         self._nav2_anchor_max_hacc_m = float(nav2_anchor_max_hacc_m)
+        # --pin-position with surveyed --known-pos: snapshot the original
+        # ECEF here so SECOND_OPINION_POS resets target the pin, not NAV2.
+        # See wrongIntBasin-charlie (2026-05-11): NAV2 reset on shared-antenna
+        # F9Ts is ~3-4 m biased from CHOKE1 truth, which becomes a basin pull.
+        self._pin_position = bool(pin_position)
+        self._pin_ecef = (np.asarray(known_ecef, dtype=float).copy()
+                          if self._pin_position and known_ecef is not None
+                          else None)
         self._systems = systems  # {'gps','gal','bds'} subset — for ISB pinning
 
         # Initialize from bootstrap result or create fresh filter
@@ -3485,22 +3497,33 @@ class AntPosEstThread(threading.Thread):
                     _rh_tag = (
                         f" rolling_hAcc={_rh:.2f}m" if _rh is not None
                         else "")
+                    _nav2_ecef = lla_to_ecef(_so_opinion['lat'],
+                                             _so_opinion['lon'],
+                                             _so_opinion['alt_m'])
+                    _reset_ecef, _reset_label = select_reset_target(
+                        self._pin_position, self._pin_ecef, _nav2_ecef,
+                    )
+                    if _reset_label == "known_pos":
+                        _lat, _lon, _alt = ecef_to_lla(
+                            _reset_ecef[0], _reset_ecef[1], _reset_ecef[2])
+                        _reset_tag = (
+                            f"known_pos LLA ({_lat:.6f},{_lon:.6f},"
+                            f"{_alt:.1f}m) [pin]")
+                    else:
+                        _reset_tag = (
+                            f"NAV2 LLA ({_so_opinion['lat']:.6f},"
+                            f"{_so_opinion['lon']:.6f},"
+                            f"{_so_opinion['alt_m']:.1f}m)")
                     log.warning(
                         "[SECOND_OPINION_POS] tripped: nav2Δ=%.2fm > "
                         "%.2fm sustained %d ep%s — full re-init at "
-                        "NAV2 LLA (%.6f,%.6f,%.1fm); unfixing %d NL.",
+                        "%s; unfixing %d NL.",
                         _so_ev['nav2_delta_3d_m'],
                         _so_ev['threshold_m'],
                         _so_ev['sustained_epochs'],
                         _rh_tag,
-                        _so_opinion['lat'], _so_opinion['lon'],
-                        _so_opinion['alt_m'], len(nl._fixed),
-                    )
-                    _reset_ecef = np.array(
-                        lla_to_ecef(_so_opinion['lat'],
-                                    _so_opinion['lon'],
-                                    _so_opinion['alt_m']),
-                        dtype=float,
+                        _reset_tag,
+                        len(nl._fixed),
                     )
                     for _sv in list(nl._fixed.keys()):
                         nl.unfix(_sv)
@@ -7774,6 +7797,7 @@ def run(args):
                 getattr(args, "nav2_soft_anchor", True)),
             nav2_anchor_max_hacc_m=float(
                 getattr(args, "nav2_anchor_max_hacc_m", 3.0)),
+            pin_position=bool(getattr(args, "pin_position", False)),
         )
         ape_thread.start()
 
