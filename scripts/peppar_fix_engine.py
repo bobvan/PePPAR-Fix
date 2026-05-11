@@ -8953,6 +8953,34 @@ Two-phase operation:
         stream=sys.stderr,
     )
 
+    # Log the git hash (and branch + dirty flag) at startup so post-hoc
+    # analysis of any engine log can be matched against an exact commit
+    # without grepping the host's working tree.  Especially valuable
+    # after a wrapper-driven re-launch (recoveryRetry-main) since the
+    # working tree could have been pulled between runs.  Best-effort:
+    # silent fallback if git isn't available or the install isn't a
+    # git checkout.
+    try:
+        import subprocess
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+        _repo_root = os.path.dirname(_script_dir)
+        _git_kw = dict(cwd=_repo_root, capture_output=True, text=True, timeout=2)
+        _sha = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"], **_git_kw)
+        _branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], **_git_kw)
+        _dirty = subprocess.run(
+            ["git", "status", "--porcelain"], **_git_kw)
+        if _sha.returncode == 0:
+            sha = _sha.stdout.strip() or "unknown"
+            branch = _branch.stdout.strip() if _branch.returncode == 0 else "?"
+            dirty = "dirty" if (_dirty.returncode == 0
+                                and _dirty.stdout.strip()) else "clean"
+            log.info("peppar-fix-engine git=%s branch=%s tree=%s",
+                     sha, branch, dirty)
+    except Exception:
+        pass  # Best-effort; absence of this line is not fatal.
+
     if getattr(args, '_host_config_path', None):
         log.info("Host config: %s", args._host_config_path)
 
