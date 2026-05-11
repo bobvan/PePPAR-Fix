@@ -5900,12 +5900,20 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     if args.ticc_port:
         ticc_tracker = TiccPairTracker(args.ticc_phc_channel, args.ticc_ref_channel)
         if args.ticc_log:
-            ticc_log_f = open(args.ticc_log, 'w', newline='')
+            # Append mode so wrapper-driven re-launches (exit code 5
+            # recovery) preserve prior session's data.  Write header
+            # only on first open / empty file.  See recoveryRetry-main.
+            _ticc_log_needs_header = (
+                not os.path.exists(args.ticc_log)
+                or os.path.getsize(args.ticc_log) == 0
+            )
+            ticc_log_f = open(args.ticc_log, 'a', newline='')
             ticc_log_w = csv.writer(ticc_log_f)
-            ticc_log_w.writerow([
-                'host_timestamp', 'host_monotonic', 'ref_sec', 'ref_ps', 'channel'
-            ])
-            ticc_log_f.flush()
+            if _ticc_log_needs_header:
+                ticc_log_w.writerow([
+                    'host_timestamp', 'host_monotonic', 'ref_sec', 'ref_ps', 'channel'
+                ])
+                ticc_log_f.flush()
 
         qerr_ticc_tracker = QErrTimescaleTracker()
 
@@ -7296,13 +7304,20 @@ def run(args):
         qerr_log_writer = None
         if getattr(args, 'qerr_log', None):
             try:
-                qerr_log_f = open(args.qerr_log, 'w', newline='')
+                # Append mode for wrapper-restart preservation; see
+                # recoveryRetry-main.
+                _qerr_log_needs_header = (
+                    not os.path.exists(args.qerr_log)
+                    or os.path.getsize(args.qerr_log) == 0
+                )
+                qerr_log_f = open(args.qerr_log, 'a', newline='')
                 qerr_log_writer = csv.writer(qerr_log_f)
-                qerr_log_writer.writerow([
-                    'host_timestamp', 'host_monotonic', 'qerr_ns',
-                    'tow_ms', 'qerr_invalid',
-                ])
-                qerr_log_f.flush()
+                if _qerr_log_needs_header:
+                    qerr_log_writer.writerow([
+                        'host_timestamp', 'host_monotonic', 'qerr_ns',
+                        'tow_ms', 'qerr_invalid',
+                    ])
+                    qerr_log_f.flush()
                 log.info("qErr CSV log: %s", args.qerr_log)
             except OSError as e:
                 log.error("Failed to open qerr_log %s: %s", args.qerr_log, e)
@@ -7356,14 +7371,21 @@ def run(args):
         _ext_log_writer = None
         if getattr(args, 'extint_log', None):
             try:
-                extint_log_f = open(args.extint_log, 'w', newline='')
+                # Append mode for wrapper-restart preservation; see
+                # recoveryRetry-main.
+                _extint_log_needs_header = (
+                    not os.path.exists(args.extint_log)
+                    or os.path.getsize(args.extint_log) == 0
+                )
+                extint_log_f = open(args.extint_log, 'a', newline='')
                 _ext_log_writer = csv.writer(extint_log_f)
-                _ext_log_writer.writerow([
-                    'host_timestamp', 'host_monotonic',
-                    'wn', 'tow_ms', 'tow_sub_ms_ns',
-                    'acc_est_ns', 'phase_residual_ns', 'count', 'flags',
-                ])
-                extint_log_f.flush()
+                if _extint_log_needs_header:
+                    _ext_log_writer.writerow([
+                        'host_timestamp', 'host_monotonic',
+                        'wn', 'tow_ms', 'tow_sub_ms_ns',
+                        'acc_est_ns', 'phase_residual_ns', 'count', 'flags',
+                    ])
+                    extint_log_f.flush()
                 log.info("TIM-TM2 CSV log: %s", args.extint_log)
             except OSError as e:
                 log.error("Failed to open extint_log %s: %s", args.extint_log, e)
@@ -7742,46 +7764,43 @@ def run(args):
         )
         ape_thread.start()
 
-        # Phase 2: Steady state (with internal re-bootstrap on PHC divergence).
-        # The transition into CONVERGING happened at the Phase-1 terminator
-        # above (collapsed from the old VERIFYING → VERIFIED → CONVERGING
-        # three-edge chain into a single VERIFYING → CONVERGING edge with
-        # Phase-1 info pinned in the reason string).  We're already in
-        # CONVERGING by the time we start the steady-state loop.
-        max_rebootstrap = 3
-        for _attempt in range(1, max_rebootstrap + 1):
-            steady_result = run_steady_state(
-                args,
-                known_ecef,
-                obs_queue,
-                corrections,
-                beph,
-                ssr,
-                stop_event,
-                qerr_store=qerr_store,
-                out_w=out_w,
-                nav2_store=nav2_store,
-                ape_sm=ape_sm,
-                dfe_sm=dfe_sm,
-                ape_thread=ape_thread,
-                ar_position=_ar_position,
-                ar_pos_lock=_ar_pos_lock,
-                extint_store=extint_store,
-                pos_sigma_m=pos_sigma_m,
-                pos_source=pos_source,
-            )
-            # run_steady_state returns an int exit code on error,
-            # or a gate_stats dict on normal completion.
-            if isinstance(steady_result, int):
-                if steady_result == 5 and _attempt < max_rebootstrap:
-                    log.warning(
-                        "PHC diverged — internal re-bootstrap "
-                        "(attempt %d/%d)", _attempt, max_rebootstrap)
-                    continue  # run_steady_state will re-bootstrap internally
-                exit_code = steady_result
-            else:
-                gate_stats = steady_result
-            break
+        # Phase 2: Steady state.  On exit code 5 (catastrophic-reject
+        # cascade or PHC divergence) the engine returns to the wrapper,
+        # which relaunches a fresh process — that path correctly
+        # re-initializes EPH / SSR / Serial / AntPosEst reader threads.
+        # The previous in-process retry loop did NOT restart those
+        # subsystems on attempt 2; it called run_steady_state again
+        # with torn-down input threads, hit "DO bootstrap failed",
+        # returned a 0-epoch gate_stats dict (not int 5), and the
+        # outer logic exited with default code 0 — silently blinding
+        # the wrapper to the failure.  See recoveryRetry-main.
+        steady_result = run_steady_state(
+            args,
+            known_ecef,
+            obs_queue,
+            corrections,
+            beph,
+            ssr,
+            stop_event,
+            qerr_store=qerr_store,
+            out_w=out_w,
+            nav2_store=nav2_store,
+            ape_sm=ape_sm,
+            dfe_sm=dfe_sm,
+            ape_thread=ape_thread,
+            ar_position=_ar_position,
+            ar_pos_lock=_ar_pos_lock,
+            extint_store=extint_store,
+            pos_sigma_m=pos_sigma_m,
+            pos_source=pos_source,
+        )
+        # run_steady_state returns an int exit code on error
+        # (e.g. 5 for catastrophic-reject cascade) or a gate_stats
+        # dict on normal completion.
+        if isinstance(steady_result, int):
+            exit_code = steady_result
+        else:
+            gate_stats = steady_result
 
     except KeyboardInterrupt:
         log.info("Interrupted")
