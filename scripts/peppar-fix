@@ -97,5 +97,34 @@ if [[ ! -f "$DO_CHAR_FILE" ]]; then
     fi
 fi
 
-# ── Run engine ─────────────────────────────────────────────────────────── #
-exec "$PYTHON_BIN" "$SCRIPT_DIR/peppar_fix_engine.py" "$@"
+# ── Run engine (with relaunch on catastrophic-reject cascade) ─────────── #
+#
+# Exit code 5 = engine signalled "re-bootstrap from scratch": catastrophic-
+# reject cascade (FixedPosFilter ≥30 consecutive |PR| > 20× baseline) or
+# PHC divergence.  Engine's in-process retry path was structurally broken
+# (subsystems torn down on attempt 1 cleanup, attempt 2 starves and
+# silently exits 0).  See recoveryRetry-main.  Wrapper relaunch is the
+# clean recovery path — fresh process, fresh subsystems, fresh state.
+#
+# All other exit codes (0=clean shutdown, 1=fatal config, 3=PPS/TICC
+# bring-up failure, etc.) propagate to the wrapper's caller unchanged.
+#
+# Log files (--ticc-log / --extint-log / --qerr-log) open in append mode
+# in the engine, so prior session's data is preserved across re-launches.
+
+while true; do
+    # `set -e` (from `set -euo pipefail` at top of script) propagates
+    # any non-zero exit from a body command in a while loop, so a bare
+    # `cmd; _rc=$?` would terminate the wrapper at the engine's exit-5
+    # without ever reaching the relaunch logic.  The `|| _rc=$?` idiom
+    # is set-e-safe: the right side of `||` runs only on failure, but
+    # `||` itself returns 0 to errexit, so the loop continues.  Found
+    # by bravo's audit (recoveryRetry-main, 2026-05-11T02:31:45Z).
+    _rc=0
+    "$PYTHON_BIN" "$SCRIPT_DIR/peppar_fix_engine.py" "$@" || _rc=$?
+    if [ "$_rc" -ne 5 ]; then
+        exit "$_rc"
+    fi
+    echo "=== peppar-fix: engine exited 5 (catastrophic re-bootstrap); relaunching in 2s ===" >&2
+    sleep 2
+done
