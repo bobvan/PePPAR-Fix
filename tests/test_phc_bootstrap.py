@@ -30,14 +30,33 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
-from peppar_fix.ptp_device import PtpDevice
+import pytest
 
-
-# TODO: this test was built around data/drift.json.  Drift storage
+# This is a CLI hardware-integration script, not a pytest unit test.
+# Its test_* helpers take argparse `args` (which pytest tries to treat
+# as a fixture), and it spawns a `phc_bootstrap.py` subprocess that
+# drives a real PHC + GNSS + TICC chain.  Module-level skip stops
+# `./bin/test` from picking up the four test_* functions as fixture-
+# missing errors during routine runs.
+#
+# To run manually with hardware attached:
+#     venv/bin/python tests/test_phc_bootstrap.py --serial /dev/gnss-top \
+#         --baud 115200 --port-type USB --ntrip-conf ntrip.conf \
+#         --eph-mount BCEP00BKG0 --ptp-dev /dev/ptp_i226 \
+#         --extts-channel 0 --pps-pin 1 --program-pin
+#
+# Also: this test was built around data/drift.json.  Drift storage
 # has moved to state/dos/<uid>.json; the fault-injection helpers
 # below need to be ported before this integration test is useful
-# again.  Kept here for now as a reference for the test intent.
+# again.  Kept here as a reference for the test intent.
+pytest.skip(
+    "Hardware-integration script — run manually under venv with --serial etc. "
+    "Pending port from data/drift.json to state/dos/<uid>.json.",
+    allow_module_level=True,
+)
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
+from peppar_fix.ptp_device import PtpDevice
 
 
 def read_drift(path):
