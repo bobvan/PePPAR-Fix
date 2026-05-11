@@ -113,8 +113,15 @@ fi
 # in the engine, so prior session's data is preserved across re-launches.
 
 while true; do
-    "$PYTHON_BIN" "$SCRIPT_DIR/peppar_fix_engine.py" "$@"
-    _rc=$?
+    # `set -e` (from `set -euo pipefail` at top of script) propagates
+    # any non-zero exit from a body command in a while loop, so a bare
+    # `cmd; _rc=$?` would terminate the wrapper at the engine's exit-5
+    # without ever reaching the relaunch logic.  The `|| _rc=$?` idiom
+    # is set-e-safe: the right side of `||` runs only on failure, but
+    # `||` itself returns 0 to errexit, so the loop continues.  Found
+    # by bravo's audit (recoveryRetry-main, 2026-05-11T02:31:45Z).
+    _rc=0
+    "$PYTHON_BIN" "$SCRIPT_DIR/peppar_fix_engine.py" "$@" || _rc=$?
     if [ "$_rc" -ne 5 ]; then
         exit "$_rc"
     fi
