@@ -5789,10 +5789,46 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                  "(current_adj=%.1f, glide=%.1f)",
                  bootstrap_base_freq, current_adj,
                  current_adj - bootstrap_base_freq)
+
+    # doProcessNoiseFromChar-main: override sigma_do_{phase,freq} from
+    # measured DO characterization when available.  Defaults (0.92 ns,
+    # args.kalman_sigma_freq) describe a generic PHC + TCXO; real OCXO
+    # noise floors are 10-100× tighter, and the gap drives over-
+    # aggressive servo response.  Falls back to defaults if no char or
+    # extraction fails.
+    sigma_do_phase_ns_eff = 0.92
+    sigma_do_freq_ppb_eff = args.kalman_sigma_freq
+    if do_uid_local is not None:
+        try:
+            from peppar_fix.do_state import derive_do_process_noise
+            _ds = load_do_state(do_uid_local)
+            if _ds and _ds.get('characterization'):
+                derived = derive_do_process_noise(_ds['characterization'])
+                if derived:
+                    p = derived.get('sigma_do_phase_ns')
+                    f = derived.get('sigma_do_freq_ppb')
+                    if p is not None:
+                        log.info("DOFreqEst: sigma_do_phase override from "
+                                 "characterization: %.4f ns/√s (source=%s, "
+                                 "was %.4f)",
+                                 p, derived.get('sigma_do_phase_source'),
+                                 sigma_do_phase_ns_eff)
+                        sigma_do_phase_ns_eff = p
+                    if f is not None:
+                        log.info("DOFreqEst: sigma_do_freq override from "
+                                 "characterization: %.4f ppb/√s (source=%s, "
+                                 "was %.4f)",
+                                 f, derived.get('sigma_do_freq_source'),
+                                 sigma_do_freq_ppb_eff)
+                        sigma_do_freq_ppb_eff = f
+        except Exception as e:
+            log.warning("Could not derive DO process noise from "
+                        "characterization: %s", e)
+
     servo = DOFreqEst(
         sigma_ticc_ns=sigma_ticc,
-        sigma_do_phase_ns=0.92,
-        sigma_do_freq_ppb=args.kalman_sigma_freq,
+        sigma_do_phase_ns=sigma_do_phase_ns_eff,
+        sigma_do_freq_ppb=sigma_do_freq_ppb_eff,
         sigma_tcxo_phase_ns=2.0,                          # rx TCXO PPS TDEV(1s)
         sigma_tcxo_freq_ppb=args.kalman_sigma_tcxo_freq,  # rx TCXO drift rate
         max_ppb=caps['max_adj'],
@@ -5801,10 +5837,10 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         base_freq=bootstrap_base_freq,
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
-             "sigma_do=[0.92 ns, %.4f ppb], "
+             "sigma_do=[%.4f ns, %.4f ppb], "
              "sigma_tcxo=[2.0 ns, %.3f ppb], "
              "initial_freq=%.1f ppb, base_freq=%s, tcxo_init=%s",
-             sigma_ticc, args.kalman_sigma_freq,
+             sigma_ticc, sigma_do_phase_ns_eff, sigma_do_freq_ppb_eff,
              args.kalman_sigma_tcxo_freq, current_adj,
              f"{bootstrap_base_freq:.1f}" if bootstrap_base_freq else "None",
              bootstrap_dt_rx_ns is not None)

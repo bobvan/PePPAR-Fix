@@ -163,6 +163,69 @@ def save_do_characterization(unique_id, characterization, state_dir=None):
     save_do_state(state, state_dir)
 
 
+def derive_do_process_noise(characterization):
+    """Extract DOFreqEst process-noise parameters from a DO characterization.
+
+    The DOFreqEst EKF uses (sigma_do_phase_ns, sigma_do_freq_ppb) as
+    random-walk amplitudes per √s for the DO state.  Defaults
+    (0.92 ns, ≈0.05 ppb) are 10–100× looser than well-disciplined
+    OCXO + DAC chains actually wander, which drives the EKF to
+    over-react to GNSS-side measurement noise and inject it into the
+    actuator.  Driving these from measured characterization closes
+    that gap.  See doProcessNoiseFromChar-main.
+
+    Heuristic (v1):
+      sigma_do_phase_ns  = ASD@0.1Hz of the DO's PPS or Carrier
+                           output (units ns/√Hz, used directly as
+                           ns/√s for the random-walk).  Prefer
+                           Carrier > PPS > PPS+qErr.
+      sigma_do_freq_ppb  = ASD@0.1Hz of the `adjfine` source
+                           (units ppb/√Hz).  This is the freq-noise
+                           floor the DO sees on its actuator input.
+
+    Both numbers are conservative — they're the noise floor at the
+    PSD measurement band-center, not the absolute white-FM floor.
+    Refinement: factor in slope and pick a better point on the PSD
+    curve.  Doing the simple thing first.
+
+    Returns:
+        dict with keys 'sigma_do_phase_ns' and/or 'sigma_do_freq_ppb'
+        for whichever were extractable; an empty dict if nothing
+        usable was found; None if characterization is malformed.
+    """
+    if not isinstance(characterization, dict):
+        return None
+    sources = characterization.get("sources")
+    if not isinstance(sources, dict):
+        return {}
+
+    out = {}
+
+    # Phase noise — prefer Carrier (cleanest DO output) > PPS > PPS+qErr.
+    for key in ("Carrier", "PPS", "PPS+qErr"):
+        src = sources.get(key)
+        if not isinstance(src, dict):
+            continue
+        if src.get("units") != "ns":
+            continue
+        v = src.get("asd_at_0.1Hz")
+        if isinstance(v, (int, float)) and v > 0:
+            out["sigma_do_phase_ns"] = float(v)
+            out["sigma_do_phase_source"] = key
+            break
+
+    # Frequency noise — adjfine ASD measures the DO's freq-domain
+    # noise floor at the actuator input.
+    src = sources.get("adjfine")
+    if isinstance(src, dict) and src.get("units") == "ppb":
+        v = src.get("asd_at_0.1Hz")
+        if isinstance(v, (int, float)) and v > 0:
+            out["sigma_do_freq_ppb"] = float(v)
+            out["sigma_do_freq_source"] = "adjfine"
+
+    return out
+
+
 # ── PHC state ────────────────────────────────────────────────────────────── #
 
 def _phc_path(unique_id, state_dir=None):
