@@ -577,7 +577,13 @@ class RxTcxoTracker:
             this call, and the unwrapped phase after the final sample
             (or self._accumulated_ns if zero drained).
         """
-        floor = self._prev_t_s if self._prev_t_s is not None else 0.0
+        # drain_since uses strict t > floor.  On a fresh tracker we
+        # want every retained sample; floor=0.0 worked accidentally in
+        # production (real monotonic timestamps are positive) but
+        # dropped legitimate t=0.0 samples in unit tests.  Use -inf as
+        # the "before all samples" sentinel — any finite t is strictly
+        # greater.
+        floor = self._prev_t_s if self._prev_t_s is not None else float("-inf")
         samples = qerr_store.drain_since(floor)
         for host_time, qerr_ns in samples:
             self.update(qerr_ns, t_s=host_time,
