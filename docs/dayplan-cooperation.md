@@ -125,6 +125,57 @@ When all reviewers have ack'd, the item's derived status flips to
   `<by>/` prefix keeps each agent's branches grouped under
   `git branch` listings.
 
+## Approvals — dayplan, not GitHub PR reviews
+
+**Approval lives in the dayplan.  GitHub PR reviews don't work as a
+canonical record in this setup.**
+
+Why: every agent (`main`, `bravo`, `charlie`) shares one
+authenticated identity to the GitHub CLI — Bob's user `bobvan`.
+That has two consequences GitHub's review machinery wasn't designed
+for:
+
+1. **Self-approval is blocked.**  When an agent opens a PR via `gh
+   pr create`, the PR author on GitHub is `bobvan`.  When another
+   agent then tries `gh pr review --approve`, GitHub refuses
+   because it sees the same user trying to approve their own PR.
+2. **Comments are not reviews.**  Posting via `gh pr review
+   --comment` (or `gh api repos/.../pulls/N/comments`) records a
+   regular issue comment with `state=COMMENTED`, not a Review-type
+   event with `state=APPROVED`.  Even if the comment body says
+   "APPROVE" in plain text, GitHub's `reviewDecision` stays empty
+   and the PR shows zero approvals on its summary screen.
+
+So **the canonical approval record is `dayplan.py ack`**.  When
+all reviewers on an item have ack'd, the item's derived status
+flips to `AGREED` (per the ops table above).  That's the binding
+agreement; GitHub PR review state is decorative for our workflow.
+
+What to do instead:
+
+- **As a reviewer**: post your substantive review as a `dayplan.py
+  discuss --by <you> --id <slug>-<owner> --msg "..."` thread.
+  When ready to approve, also run `dayplan.py ack --by <you> --id
+  <slug>-<owner>` (optional `--note` for a one-line summary).  The
+  `ack` op is what flips the item to `AGREED`.
+- **Optionally cross-post on GitHub**: a comment summarising the
+  review on the PR helps anyone reading the GitHub UI without
+  dayplan access, but **don't expect or rely on its review
+  state** — it'll show as a comment, not an approval.
+- **As a PR author**: don't wait for GitHub's "Approved" indicator
+  to merge.  Check the dayplan render for the item's status:
+  `AGREED` (all reviewers ack'd) is the green light.  Bob will
+  click merge based on the dayplan record, not GitHub's review
+  count.
+- **Don't run `gh pr review --approve`** as one agent for another
+  agent's PR.  It'll fail (self-approval block) and the failed
+  attempt clutters the PR's review history.
+
+If we ever migrate to per-agent GitHub identities or a CI bot that
+mirrors `dayplan ack` → `gh pr review --approve` from a separate
+account, this section can shrink to a sentence and a pointer at
+the migration commit.  Until then, dayplan is authoritative.
+
 ## What NOT to do
 
 - **Don't edit `/tmp/dp-*.txt`.**  That's render output.  Edits
@@ -137,6 +188,9 @@ When all reviewers have ack'd, the item's derived status flips to
 - **Don't close items unilaterally.**  `close` archives the
   whole day; it's a Bob-or-coordinator action, not a per-agent
   action.
+- **Don't `gh pr review --approve` someone else's PR.**  See the
+  Approvals section above — GitHub's review machinery doesn't
+  work for our shared-user setup.  Use `dayplan.py ack` instead.
 
 ## Roles
 
