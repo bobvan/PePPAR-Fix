@@ -346,6 +346,7 @@ work it'll be on a different host.
 
 | Host | Venv | Activation |
 |---|---|---|
+| dev box (gt) | `/home/bob/git/PePPAR-Fix/venv` | `source /home/bob/git/PePPAR-Fix/venv/bin/activate` |
 | TimeHat | `/home/bob/peppar-fix/venv` | `source ../venv/bin/activate` |
 | PiPuss | `/home/bob/pygpsclient` | `source ~/pygpsclient/bin/activate` |
 | ~~Onocoy~~ | mothballed 2026-04-08 | – |
@@ -354,6 +355,43 @@ work it'll be on a different host.
 Scripts live in `/home/bob/peppar-fix/scripts/` on TimeHat. Other hosts
 may not have the full peppar-fix repo — deploy scripts via `scp` as
 needed.
+
+### Running unit tests — always from the dev-box venv
+
+`pyserial` is a core dep declared in `pyproject.toml` and required by
+the engine.  Running `pytest` against system python3 (which lacks
+pyserial) produces ~12 spurious failures that are NOT real test
+failures — just `ModuleNotFoundError` from `import serial` in
+`scripts/ticc.py` propagating up through anything that imports
+`peppar_fix_engine`.
+
+**Always run tests via the dev-box venv** at
+`/home/bob/git/PePPAR-Fix/venv`, OR through the `bin/test` wrapper
+at the repo root which exec's the venv's pytest:
+
+```bash
+# From any worktree on the dev box:
+./bin/test                                    # full suite
+./bin/test scripts/peppar_fix/test_foo.py     # specific file
+./bin/test -k some_pattern                    # pattern match
+```
+
+If `bin/test` errors on `venv not found`, the venv is missing on
+this dev box — bootstrap it once with:
+
+```bash
+python3 -m venv /home/bob/git/PePPAR-Fix/venv
+/home/bob/git/PePPAR-Fix/venv/bin/pip install -e '.[dev]'
+```
+
+`[dev]` resolves through `pyproject.toml`'s `optional-dependencies`
+to pull in pytest + numpy + pyubx2 + pyserial + pyrtcm + matplotlib +
+allantools + smbus2 + textual.  One install covers all test paths.
+
+When reporting test results in PR reviews and dayplan posts, "all
+tests pass" should be **literally** all tests pass under the venv —
+no "12 pre-existing failures we ignore."  Real failures uncovered
+by the venv get filed as their own dayplan items, not papered over.
 
 ## Lab Storage Warning
 

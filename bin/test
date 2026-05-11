@@ -1,0 +1,45 @@
+#!/bin/bash
+# Run pytest from the dev-box venv that has pyserial + pyubx2 + numpy
+# + pyrtcm + matplotlib + allantools + smbus2 + textual installed.
+#
+# Why: pyserial is a core dep declared in pyproject.toml.  Running
+# pytest with system python (which lacks pyserial) produces ~12
+# spurious "failures" that are just ModuleNotFoundError propagating
+# from `import serial` in scripts/ticc.py up through anything that
+# imports peppar_fix_engine.  Those aren't real test failures —
+# they're env noise.
+#
+# Forwards all arguments to pytest, so:
+#   ./bin/test                              # full suite
+#   ./bin/test scripts/peppar_fix/test_foo  # specific file/path
+#   ./bin/test -k some_pattern              # pattern match
+#   ./bin/test -v --tb=short                # any pytest flags
+#
+# See CLAUDE.md "Running unit tests" for full setup if the venv is
+# missing.
+set -euo pipefail
+
+VENV_PYTEST=/home/bob/git/PePPAR-Fix/venv/bin/pytest
+
+if [[ ! -x "$VENV_PYTEST" ]]; then
+    echo "ERROR: dev-box venv not found at /home/bob/git/PePPAR-Fix/venv" >&2
+    echo "" >&2
+    echo "Bootstrap with:" >&2
+    echo "  python3 -m venv /home/bob/git/PePPAR-Fix/venv" >&2
+    echo "  /home/bob/git/PePPAR-Fix/venv/bin/pip install -e '.[dev]'" >&2
+    echo "" >&2
+    echo "See CLAUDE.md 'Running unit tests' for context." >&2
+    exit 2
+fi
+
+# Default to running both top-level test dirs when invoked with no
+# args.  When the user passes args, pass through unchanged — they
+# may be scoping (`./bin/test path/to/test.py`), filtering
+# (`./bin/test -k pattern`), or both.  For flag-only invocation that
+# wants the full suite, pass the dirs explicitly:
+#   ./bin/test scripts/peppar_fix/ tests/ -v --tb=short
+if [[ $# -eq 0 ]]; then
+    exec "$VENV_PYTEST" scripts/peppar_fix/ tests/
+else
+    exec "$VENV_PYTEST" "$@"
+fi
