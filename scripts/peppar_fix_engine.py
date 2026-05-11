@@ -3993,7 +3993,49 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
         # servo starts.  Skipped if --skip-bootstrap or --freerun.
         # For PHC DOs: phase step + adjfine.
         # For VCOCXO DOs: TADD ARM + DAC frequency seed.
-        if not getattr(args, 'skip_bootstrap', False) and not args.freerun:
+        #
+        # dacWarmStart-main: when --warm-start-if-fresh is set, gate the
+        # bootstrap on the freshness of state/dos/<uid>.json.  Recent
+        # last_known_freq_offset_ppb seeds _bootstrap_freq_ppb directly,
+        # which _setup_servo's "Restored bootstrap frequency" path
+        # re-applies after actuator.setup().  Saves 15-30s on watchdog
+        # re-bootstrap where the saved freq is seconds old.
+        skip_for_warm_start = False
+        if (getattr(args, 'warm_start_if_fresh', False)
+                and not args.freerun
+                and not getattr(args, 'skip_bootstrap', False)):
+            try:
+                from peppar_fix.do_state import is_do_warm_startable
+                _do_uid_ws = (getattr(args, 'do_unique_id', None)
+                              or _resolve_do_uid(args))
+                if _do_uid_ws is not None:
+                    ok, info = is_do_warm_startable(
+                        _do_uid_ws,
+                        max_age_s=args.warm_start_max_age_s,
+                        max_ppb=args.warm_start_max_ppb)
+                    if ok:
+                        args._bootstrap_freq_ppb = info["freq_ppb"]
+                        skip_for_warm_start = True
+                        log.info("Warm-start: skipping DO bootstrap "
+                                 "(freq=%.1f ppb, age=%.0fs from state)",
+                                 info["freq_ppb"], info["age_s"])
+                        if dfe_sm is not None:
+                            dfe_sm.transition(DOFreqEstState.TRACKING,
+                                              "warm-start from saved freq")
+                    else:
+                        log.info("Warm-start gate failed (%s) — "
+                                 "falling back to cold-start bootstrap",
+                                 info.get("reason", "unknown"))
+                else:
+                    log.info("Warm-start: no do_unique_id resolvable — "
+                             "falling back to cold-start bootstrap")
+            except Exception as e:
+                log.warning("Warm-start gate raised %s — "
+                            "falling back to cold-start bootstrap", e)
+
+        if (not skip_for_warm_start
+                and not getattr(args, 'skip_bootstrap', False)
+                and not args.freerun):
             if not _do_bootstrap_init(args, ptp, known_ecef, obs_queue,
                                         beph, ssr, stop_event,
                                         dfe_sm=dfe_sm):
@@ -8696,6 +8738,19 @@ Two-phase operation:
                       help="Frequency sanity threshold in ppb (default: 10.0)")
     boot.add_argument("--skip-bootstrap", action="store_true",
                       help="Skip DO bootstrap even when --servo is set")
+    boot.add_argument("--warm-start-if-fresh", action="store_true",
+                      help="Skip DO bootstrap when state/dos/<uid>.json has a "
+                           "recent last_known_freq_offset_ppb (saves 15-30s "
+                           "on watchdog re-bootstrap).  Gate: mtime age <= "
+                           "--warm-start-max-age-s AND |freq| <= "
+                           "--warm-start-max-ppb.  Falls back to cold-start "
+                           "if the gate fails.  See dacWarmStart-main.")
+    boot.add_argument("--warm-start-max-age-s", type=float, default=86400.0,
+                      help="Max DO-state age (s) for warm-start gate "
+                           "(default: 86400 = 24h)")
+    boot.add_argument("--warm-start-max-ppb", type=float, default=500.0,
+                      help="Physical sanity envelope for saved freq "
+                           "(default: 500 ppb)")
     boot.add_argument("--tadd-gpio", type=int, default=None,
                       help="BCM GPIO pin for TADD-2 Mini ARM sync (enables TADD ARM "
                            "during bootstrap for external DOs with a divider)")

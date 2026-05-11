@@ -163,6 +163,61 @@ def save_do_characterization(unique_id, characterization, state_dir=None):
     save_do_state(state, state_dir)
 
 
+def is_do_warm_startable(unique_id, max_age_s=86400, max_ppb=500.0,
+                         state_dir=None):
+    """Decide whether the DO can skip cold-start bootstrap.
+
+    Cold-start bootstrap costs ~15-30 s: DAC center reset + post-ARM
+    settle + freerun PPS measurement.  When the prior run's
+    last_known_freq_offset_ppb is recent and physically plausible,
+    the DAC can be seeded from it directly and the freerun
+    measurement skipped.  This matters across watchdog re-bootstraps
+    where the saved freq is ~seconds old.  See dacWarmStart-main.
+
+    Pass criteria (all must hold):
+      - State file exists and parses
+      - 'last_known_freq_offset_ppb' is present and finite
+      - |freq| <= max_ppb (sanity envelope; a 5000 ppb value is
+        almost certainly a parsing error or stale corruption)
+      - File mtime within max_age_s of now
+
+    Returns:
+        (True, dict) where dict has keys 'freq_ppb', 'age_s',
+            'reason' when warm-startable.
+        (False, dict) where dict has 'reason' describing why not.
+    """
+    import math
+    import time as _time
+    path = _do_path(unique_id, state_dir)
+    if not os.path.exists(path):
+        return (False, {"reason": "no_state_file"})
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError as e:
+        return (False, {"reason": f"stat_failed: {e}"})
+    age_s = _time.time() - mtime
+    if age_s > max_age_s:
+        return (False, {"reason": f"too_old: age={age_s:.0f}s "
+                                 f"max={max_age_s:.0f}s"})
+    state = load_do_state(unique_id, state_dir)
+    if state is None:
+        return (False, {"reason": "load_failed"})
+    freq = state.get("last_known_freq_offset_ppb")
+    if freq is None:
+        return (False, {"reason": "no_last_known_freq"})
+    try:
+        freq_f = float(freq)
+    except (TypeError, ValueError):
+        return (False, {"reason": f"freq_not_numeric: {freq!r}"})
+    if not math.isfinite(freq_f):
+        return (False, {"reason": f"freq_not_finite: {freq_f}"})
+    if abs(freq_f) > max_ppb:
+        return (False, {"reason": f"freq_out_of_envelope: "
+                                 f"|{freq_f:.1f}| > {max_ppb:.1f} ppb"})
+    return (True, {"freq_ppb": freq_f, "age_s": age_s,
+                   "reason": "fresh"})
+
+
 def derive_do_process_noise(characterization):
     """Extract DOFreqEst process-noise parameters from a DO characterization.
 
