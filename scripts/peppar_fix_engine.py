@@ -7444,12 +7444,28 @@ def run(args):
     # by configure_messages(), but that only runs on first-time
     # config; this burst guarantees enablement on every restart.
     try:
-        from peppar_fix.receiver import send_cfg, PORT_SUFFIX
+        from peppar_fix.receiver import send_cfg
         from peppar_fix.gnss_stream import open_gnss
         from pyubx2 import UBXReader as _UBR
         _nav2_ser, _ = open_gnss(args.serial, args.baud)
         _nav2_ubr = _UBR(_nav2_ser, protfilter=2)
-        _pname = PORT_SUFFIX.get(args.port_type, "USB")
+        # args.port_type is the user-facing port string ("UART",
+        # "UART2", "USB", "SPI", "I2C" per the --ubx-port choices).
+        # Translate to the u-blox CFG-VALSET key suffix.  Note "UART"
+        # maps to "UART1" — UBX keys use the indexed form even though
+        # the user-facing CLI / TOML uses bare "UART".
+        # Bug history: the previous code used PORT_SUFFIX.get
+        # (int-keyed) against this string, silently falling back to
+        # "USB" on every host.  Caught 2026-05-12 on MadHat F10T,
+        # where USB-suffixed keys NAK because the F10T has no USB
+        # port (the host-side /dev/f10t is the ArduSimple board's
+        # USB-UART bridge, not the F10T's own interface).
+        _PORT_SUFFIX_FOR_VALSET = {
+            "UART": "UART1", "UART2": "UART2",
+            "USB": "USB", "SPI": "SPI", "I2C": "I2C",
+        }
+        _pname = _PORT_SUFFIX_FOR_VALSET.get(
+            args.port_type, args.port_type or "USB")
         _cfg_keys = {
             "CFG_NAV2_OUT_ENABLED": 1,
             f"CFG_MSGOUT_UBX_NAV2_PVT_{_pname}": 5,
