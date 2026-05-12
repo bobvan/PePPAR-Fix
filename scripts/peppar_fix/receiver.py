@@ -655,55 +655,76 @@ def _wait_ack_parsed(ubr, cls_name, msg_name, timeout):
     return False
 
 
-def send_cfg(ser, ubr, key_values, description="", layers=7):
-    """Send a VALSET configuration and wait for ACK.
+# ─── POLICY: never bundle CFG-VALSET keys at the wire level ────────── #
+#
+# UBX CFG-VALSET messages can carry multiple key=value pairs.  The
+# receiver replies with a SINGLE ACK or NAK per VALSET message — not
+# per key.  A multi-key VALSET that NAKs tells us "at least one key
+# failed" but NOT which one.  That's spray-and-pray: when something
+# goes wrong (firmware version mismatch, key renamed across chipsets,
+# unsupported feature on this hardware), we lose the identity of the
+# failing key.  Undiagnosable.
+#
+# RULE: any code path that sends CFG to a receiver and expects
+# ACK/NAK MUST send one key per VALSET and synchronously wait for
+# the ACK/NAK before sending the next.  Higher-level code is welcome
+# to compose multi-key dicts for organizational purposes and pass
+# them through ``send_cfg()`` — the helper serializes the dict to
+# one-key-at-a-time at the wire level.
+#
+# DO NOT add a new bundled-VALSET helper.  If a future caller needs
+# raw multi-key VALSET (e.g., for a feature where the receiver
+# explicitly documents atomic key-group semantics), document the
+# departure inline and justify why the diagnostic loss is acceptable
+# for that specific case.
+#
+# History: bundling burned us on 2026-04-17 ptpmon L5 signal enable
+# (15-key bundle NAK'd — couldn't tell which key) and on 2026-05-12
+# MadHat F10T post-config burst (5-key bundle NAK'd — couldn't
+# tell which key without a diagnostic rebuild).  See
+# docs/receiver-signals.md "UBX command/response sequencing".
 
-    UBX ACK/NAK responses are sequenced against commands but asynchronous.
-    We MUST wait for the ACK/NAK from each command before sending the next,
-    or a NAK could be misattributed to the wrong command. A timeout (3s)
-    is treated as equivalent to NAK. See docs/receiver-signals.md.
+def _send_cfg_one(ser, ubr, key, value, layers=7):
+    """Send a single key=value VALSET, wait synchronously for ACK/NAK.
+
+    Wire-level helper — one key per VALSET, one ACK or NAK per call.
+    Returns True on ACK, False on NAK or 3-second timeout (timeout
+    treated as NAK).  This is the only place in the codebase that
+    actually writes a VALSET to the serial port.
+    """
+    _ensure_imports()
+    msg = _UBXMessage.config_set(layers, 0, [(key, value)])
+    ser.write(msg.serialize())
+    return wait_ack(ubr, "CFG", "VALSET", timeout=3.0)
+
+
+def send_cfg(ser, ubr, key_values, description="", layers=7):
+    """Send each key as a single-key VALSET, return (ok_keys, nak_keys).
+
+    Bundling prohibited at the wire level — see the POLICY block above
+    this function.  Multi-key dicts are accepted as a convenience for
+    callers that organize related keys together; this function
+    serializes them to one-key-per-VALSET and logs each ACK/NAK
+    individually.
 
     Args:
         layers: 1=RAM, 2=BBR, 4=Flash, 7=all (default).
-    """
-    _ensure_imports()
-    cfg_data = list(key_values.items())
-    msg = _UBXMessage.config_set(layers, 0, cfg_data)
-    log.info(f"  {description}...")
-    ser.write(msg.serialize())
-    ack = wait_ack(ubr, "CFG", "VALSET", timeout=3.0)
-    if ack:
-        log.info(f"  {description}... OK")
-    else:
-        log.warning(f"  {description}... TIMEOUT (no ACK)")
-    return ack
-
-
-def send_cfg_per_key(ser, ubr, key_values, description="", layers=7):
-    """Send each key individually, wait for ACK between.
-
-    Prefer this over send_cfg(dict) when we care about which specific
-    key(s) NAK — a bundled VALSET ACKs/NAKs atomically, so a NAK loses
-    the identity of the failing key.  Per-key sends are slower
-    (~3s/key worst-case) but tell us exactly what the receiver rejects.
-
-    Used on signal configuration where any single unsupported key can
-    blanket-NAK a 15-key bundle and block startup.  2026-04-17 ptpmon:
-    L5 signal enable NAK'd as a bundle — we couldn't tell which key
-    (the F9T rejected) without this diagnostic.
 
     Returns:
-        (ok_keys, nak_keys): sets of key names that ACK'd vs NAK'd.
+        (ok_keys, nak_keys): sets partitioning the input keys by
+        outcome.  Test ``not nak_keys`` for the "all succeeded"
+        aggregate (the common case for callers that just want a
+        pass/fail gate).  Use the sets directly when you need to
+        act on the specific failing keys (retry with a different
+        value, log a structured diagnostic, fall back to a
+        feature-disable path).
     """
-    _ensure_imports()
     ok_keys = set()
     nak_keys = set()
     if description:
-        log.info(f"{description} (per-key, {len(key_values)} keys):")
+        log.info(f"  {description}...")
     for key, value in key_values.items():
-        msg = _UBXMessage.config_set(layers, 0, [(key, value)])
-        ser.write(msg.serialize())
-        if wait_ack(ubr, "CFG", "VALSET", timeout=3.0):
+        if _send_cfg_one(ser, ubr, key, value, layers=layers):
             log.info(f"  {key}={value}  OK")
             ok_keys.add(key)
         else:
@@ -785,7 +806,7 @@ def configure_signals(ser, ubr, driver=None):
     """
     driver = driver or get_driver("f9t")
     log.info(f"  Signals: {_driver_band_summary(driver)}")
-    ok_keys, nak_keys = send_cfg_per_key(
+    ok_keys, nak_keys = send_cfg(
         ser, ubr, driver.signal_config,
         description=f"Signal config ({driver.name})",
     )
@@ -830,11 +851,12 @@ def configure_rate(ser, ubr, rate_hz):
 def configure_rate_ms(ser, ubr, meas_ms):
     """Set measurement rate in milliseconds."""
     rate_hz = 1000 / meas_ms
-    return send_cfg(ser, ubr, {
+    _ok, nak = send_cfg(ser, ubr, {
         "CFG_RATE_MEAS": meas_ms,
         "CFG_RATE_NAV": 1,
         "CFG_RATE_TIMEREF": 0,
     }, f"Measurement rate = {rate_hz:.1f} Hz ({meas_ms} ms)")
+    return not nak
 
 
 def configure_messages(ser, ubr, port_id, sfrbx_rate=1):
@@ -896,7 +918,8 @@ def configure_messages(ser, ubr, port_id, sfrbx_rate=1):
     names = ("RAWX, TIM-TP" if sfrbx_rate == 0
              else "RAWX, SFRBX, PVT, SAT, TIM-TP, NAV2-PVT, "
                   "NAV-SIG, NAV-CLOCK, NAV-TIMEGPS")
-    return send_cfg(ser, ubr, messages, f"UBX messages on {pname}: {names}")
+    _ok, nak = send_cfg(ser, ubr, messages, f"UBX messages on {pname}: {names}")
+    return not nak
 
 
 def configure_nmea_off(ser, ubr, port_id):
@@ -905,8 +928,8 @@ def configure_nmea_off(ser, ubr, port_id):
     nmea_off = {}
     for nmea_msg in ["GGA", "GLL", "GSA", "GSV", "RMC", "VTG"]:
         nmea_off[f"CFG_MSGOUT_NMEA_ID_{nmea_msg}_{pname}"] = 0
-    result = send_cfg(ser, ubr, nmea_off, f"Disable NMEA output on {pname}")
-    if not result:
+    _ok, nak = send_cfg(ser, ubr, nmea_off, f"Disable NMEA output on {pname}")
+    if nak:
         log.info("    (NMEA disable failed -- non-critical)")
     return True
 
@@ -914,11 +937,12 @@ def configure_nmea_off(ser, ubr, port_id):
 def configure_tmode(ser, ubr, survey_dur_s, survey_acc_m):
     """Configure survey-in for Time Mode."""
     acc_tenths_mm = int(survey_acc_m * 1000) * 10
-    return send_cfg(ser, ubr, {
+    _ok, nak = send_cfg(ser, ubr, {
         "CFG_TMODE_MODE": 1,
         "CFG_TMODE_SVIN_MIN_DUR": survey_dur_s,
         "CFG_TMODE_SVIN_ACC_LIMIT": acc_tenths_mm,
     }, f"Survey-in: {survey_dur_s}s, {survey_acc_m}m accuracy")
+    return not nak
 
 
 def configure_uart_baud(ser, ubr, baud):
