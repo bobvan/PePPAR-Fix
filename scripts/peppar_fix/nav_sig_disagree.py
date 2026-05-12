@@ -149,6 +149,12 @@ class NavSigDisagreeMonitor:
     def __init__(self) -> None:
         # (sv, sig_id_engine) → (receiver_admits: bool, our_admits: bool)
         self._last_state: dict[tuple[str, str], tuple[bool, bool]] = {}
+        # Mapping-gap counters.  Surfaces engine-sig→UBX-sigid pairs
+        # the engine admits that we couldn't find in the receiver's
+        # snapshot (either keying mismatch or signal absent from
+        # NAV-SIG entirely).  Bumped per (sv, sig_name); read via
+        # ``unknown_signal_counts()`` for diagnostics.
+        self._unknown_signals: dict[tuple[str, str], int] = {}
 
     def check_epoch(
         self,
@@ -182,7 +188,16 @@ class NavSigDisagreeMonitor:
                 receiver_sig = self._fallback_receiver_lookup(
                     sv, sig_name, recv_snap)
                 if receiver_sig is None:
-                    # Truly unknown to receiver — defer classification.
+                    # Truly unknown to receiver — count + defer
+                    # classification.  Bump only for engine-admitted
+                    # signals since receiver-only keys (every snapshot
+                    # entry) are not "engine sees, receiver doesn't"
+                    # — they're the symmetric "receiver sees, engine
+                    # doesn't" case, which is just an SV the engine
+                    # hasn't tracked.
+                    if (sv, sig_name) in our_admit_set:
+                        self._unknown_signals[(sv, sig_name)] = (
+                            self._unknown_signals.get((sv, sig_name), 0) + 1)
                     continue
             receiver_admits = bool(getattr(receiver_sig, 'pr_used', False))
             our_admits = (sv, sig_name) in our_admit_set
@@ -276,5 +291,18 @@ class NavSigDisagreeMonitor:
     def state_size(self) -> int:
         return len(self._last_state)
 
+    def unknown_signal_counts(self) -> dict[tuple[str, str], int]:
+        """Return mapping-gap counter snapshot.
+
+        Keys are ``(sv, sig_name)`` for engine-admitted signals that
+        could not be matched to any entry in the receiver's snapshot.
+        Surfaces stale or incomplete UBX-sigid mappings in
+        ``_ENGINE_SIG_TO_UBX`` (or, less commonly, signals the receiver
+        isn't actually emitting NAV-SIG records for).  Read
+        periodically from outside for log emission / dashboards.
+        """
+        return dict(self._unknown_signals)
+
     def reset(self) -> None:
         self._last_state.clear()
+        self._unknown_signals.clear()

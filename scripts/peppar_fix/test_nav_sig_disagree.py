@@ -165,6 +165,63 @@ class NavSigDisagreeMonitorTest(unittest.TestCase):
         self.monitor.reset()
         self.assertEqual(self.monitor.state_size(), 0)
 
+    # ─── unknown-signal mapping-gap counter ──────────────────────── #
+
+    def test_unknown_signal_counts_admitted_but_missing(self):
+        # Engine admits an SV+signal the receiver has no record for.
+        # Should bump the unknown counter and skip classification.
+        admit = {("G99", "GPS-L1CA"): {"lock_time_ms": 1000}}
+        self.monitor.check_epoch(100, admit, self.store)
+        counts = self.monitor.unknown_signal_counts()
+        self.assertEqual(counts.get(("G99", "GPS-L1CA")), 1)
+        self.assertEqual(self._log_messages(), [])  # not a disagreement
+
+    def test_unknown_signal_does_not_count_receiver_only(self):
+        # Receiver has a record for an SV+signal the engine doesn't
+        # admit.  That's the symmetric case and is NOT a mapping
+        # gap — it's just engine not tracking that SV.  No bump.
+        self.store.set("E50", "GAL-E5aQ", pr_used=True)
+        self.monitor.check_epoch(100, {}, self.store)
+        counts = self.monitor.unknown_signal_counts()
+        self.assertNotIn(("E50", "GAL-E5aQ"), counts)
+
+    def test_unknown_signal_count_increments_each_epoch(self):
+        admit = {("G99", "GPS-L1CA"): {}}
+        self.monitor.check_epoch(100, admit, self.store)
+        self.monitor.check_epoch(101, admit, self.store)
+        self.monitor.check_epoch(102, admit, self.store)
+        counts = self.monitor.unknown_signal_counts()
+        self.assertEqual(counts.get(("G99", "GPS-L1CA")), 3)
+
+    def test_unknown_signal_separated_per_sv_sig(self):
+        admit = {
+            ("G99", "GPS-L1CA"): {},
+            ("E99", "GAL-E5aQ"): {},
+        }
+        self.monitor.check_epoch(100, admit, self.store)
+        counts = self.monitor.unknown_signal_counts()
+        self.assertEqual(counts.get(("G99", "GPS-L1CA")), 1)
+        self.assertEqual(counts.get(("E99", "GAL-E5aQ")), 1)
+
+    def test_reset_clears_unknown_counter(self):
+        admit = {("G99", "GPS-L1CA"): {}}
+        self.monitor.check_epoch(100, admit, self.store)
+        self.assertEqual(
+            self.monitor.unknown_signal_counts().get(("G99", "GPS-L1CA")), 1)
+        self.monitor.reset()
+        self.assertEqual(self.monitor.unknown_signal_counts(), {})
+
+    def test_unknown_counter_unaffected_by_normal_disagreement(self):
+        # A normal disagreement (receiver-record present) doesn't
+        # bump the unknown counter.
+        self.store.set("E19", "GAL-E5aQ", pr_used=False)
+        admit = {("E19", "GAL-E5aQ"): {}}
+        self.monitor.check_epoch(100, admit, self.store)
+        # Disagreement logged
+        self.assertEqual(len(self._log_messages()), 1)
+        # But unknown counter empty
+        self.assertEqual(self.monitor.unknown_signal_counts(), {})
+
 
 if __name__ == "__main__":
     unittest.main()
