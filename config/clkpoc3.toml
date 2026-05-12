@@ -1,10 +1,15 @@
 [peppar]
-# F10T (NEO-F10T-00B-01 on ArduSimple) on /dev/f10t — stable udev
-# symlink matched by FTDI FT230X serial D30GD1PE.
-serial = "/dev/f10t"
-baud = 38400
-receiver = "f10t"
-# No ptp_dev — the engine does not use the CM4 PHC.  TICC-only mode.
+# F9T EVKs share one USB descriptor (no unique serial), so udev can't
+# make a stable name and /dev/ttyACMx is fragile (enumeration shifts
+# when any USB device is added/removed).  Bind to the physical USB
+# port via /dev/serial/by-path — only breaks if the F9T's USB cable
+# is moved to a different port.  See docs/lab-operations.md §12.
+serial = "/dev/serial/by-path/platform-fe9c0000.xhci-usb-0:1.2:1.0"
+baud = 115200
+ubx_port = "USB"
+receiver = "f9t-l5"
+# No ptp_dev — the engine does not use the CM4's PHC.
+# ts2phc disciplines bcm_phy_ptp from DO PPS on SYNC_IN independently.
 ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
 # CNES SSR for PPP-AR (credentials in ntrip-cnes.conf)
@@ -23,40 +28,23 @@ ssr_ntrip_conf = "ntrip-cnes.conf"
 # enables BDS post-Fix-#2; would have been the wrong call pre-Fix-#2.
 systems = "gps,gal,bds"
 
-# ⚠ SIGN-CONVENTION NOTE: dac_ppb_per_code below is the SYSTEM
-# response (ppb of OCXO frequency change per LSB DAC code change),
-# accounting for the ENTIRE signal chain — DAC output, any
-# inverting / buffer stages on the hat, and OCXO Vctrl response.
-# It is NOT the OCXO's intrinsic Vctrl-to-frequency slope.
-# OCXO131-100 datasheet says POSITIVE slope (higher V → higher
-# freq), yet the system coefficient here is NEGATIVE because the
-# clkPoC3 hat has an inverting analog stage between DAC and
-# Vctrl.  See I-010246-main for cleanup discussion (rename or
-# clearer docs).
-#
-# DO: IsoTemp OCXO131-100 (NOT the CTI OSC5A2B02 currently on PiFace).
-# Datasheet: https://www.analysir.com/downloads/isotemp%20ocxo%20131%2010MHz.pdf
-#   - Vctrl range: 0–5 V (positive slope per datasheet)
-#   - clkPoC3 hat inversion → measured system gain is NEGATIVE
-#
-# Calibration 2026-05-08, AD5693R 2× mode (D11 GAIN bit = 1,
-# 0–5V output range), --sweep-codes 22767,42767, 5 pts:
-#   gain          = -0.022869 ppb/code  (system response, 2× mode)
-#   freerun       = +445 ppb (DO fast vs GPS, DAC at center 32767 = 2.5V)
-#   tuning range  = 457 ppb across ±10000 codes (~1500 ppb full-scale)
-#   linearity     = 4.2 ppb max residual
-#   GPS-lock target DAC code: ~52200 (= ~4.0V Vctrl)
-do_label = "ocxo-clkpoc3-v2"
+# CTI OSC5A2B02 OCXO via AD5693R DAC on I2C bus 1.
+# Characterized 2026-04-14: gain=1.062, linearity <5 ppb over ±200 ppb.
+# OCXO runs +149 ppb high at DAC midscale.
+do_label = "ocxo-clkpoc3"
 do_type = "vcocxo"
 dac_bus = 1
 dac_addr = "0x4C"
 dac_bits = 16
+# Sign verified 2026-04-14: freerun at center shows -149 ppb (slow),
+# not +149 as previously characterized.  Positive ppb_per_code means
+# higher code → higher frequency → corrects the slow crystal.
+dac_ppb_per_code = "0.0361"
 dac_type = "ad5693r"
-dac_gain = 1                       # AD5693R 2× mode (D11 set)
-dac_ppb_per_code = "+0.023089"     # SYSTEM response, MEASURED 2026-05-08
 
 # TADD-2 Mini divider: ARM on GPIO 16, syncs 10 MHz → 1 PPS.
 tadd_gpio = 16
 
-# TICC #5: chA = DO PPS, chB = F10T PPS.
-ticc_port = "/dev/ticc5"
+# TICC #3: chA = DO PPS, chB = GNSS PPS.
+# TICC competes as a servo source whenever ticc_port is configured.
+ticc_port = "/dev/ticc3"
