@@ -1925,7 +1925,8 @@ class AntPosEstThread(threading.Thread):
                  pos_sigma_m=10.0,
                  nav2_anchor_enabled=True,
                  nav2_anchor_max_hacc_m=3.0,
-                 pin_position=False):
+                 pin_position=False,
+                 nav_sig_store=None):
         super().__init__(daemon=True, name="AntPosEst")
         # Phase 3 wind-up (Wu 1993): per-SV cumulative wind-up tracker
         # + carrier-phase correction applied before filter.update().
@@ -2003,6 +2004,12 @@ class AntPosEstThread(threading.Thread):
         self._pin_ecef = (np.asarray(known_ecef, dtype=float).copy()
                           if self._pin_position and known_ecef is not None
                           else None)
+        # Phase A.5 of slipDetectUnified-main: log receiver vs engine
+        # admit disagreement (see docs/wrong-int-basin-2026-05-11.md +
+        # nav_sig_disagree module).  No-op when store is None.
+        self._nav_sig_store = nav_sig_store
+        from peppar_fix.nav_sig_disagree import NavSigDisagreeMonitor
+        self._nav_sig_disagree = NavSigDisagreeMonitor()
         self._systems = systems  # {'gps','gal','bds'} subset — for ISB pinning
 
         # Initialize from bootstrap result or create fresh filter
@@ -2908,6 +2915,42 @@ class AntPosEstThread(threading.Thread):
             # EKF update — position-side per-filter gate
             # (I-175645-charlie); see obs_for_position() at module top.
             pos_observations = obs_for_position(observations)
+
+            # Phase A.5 of slipDetectUnified-main: log disagreement
+            # between receiver's NAV-SIG.prUsed verdict and engine's
+            # admit decision.  Per (sv, sig_name) granularity from
+            # f1_sig_name / f2_sig_name carried on each obs.  No
+            # behavior change — pure logger.  No-op when store is None.
+            if self._nav_sig_store is not None:
+                admit_set: dict[tuple[str, str], dict] = {}
+                for o in pos_observations:
+                    sv = o.get('sv')
+                    if sv is None:
+                        continue
+                    cno = o.get('cno')
+                    pr_ok = o.get('ar_phase_bias_ok')
+                    reason = ("ar_phase_bias_ok" if pr_ok
+                              else "admit")
+                    for f_key, sig_key, lock_key in (
+                            ('f1', 'f1_sig_name', 'f1_lock_ms'),
+                            ('f2', 'f2_sig_name', 'f2_lock_ms')):
+                        sig_name = o.get(sig_key)
+                        if not sig_name:
+                            continue
+                        admit_set[(sv, sig_name)] = {
+                            'cno': cno,
+                            'lock_time_ms': o.get(lock_key),
+                            'our_admission_reason': reason,
+                        }
+                try:
+                    self._nav_sig_disagree.check_epoch(
+                        self._n_epochs, admit_set, self._nav_sig_store)
+                except Exception:
+                    # Pure logger — never let a bug here break the EKF.
+                    log.exception(
+                        "NavSigDisagreeMonitor.check_epoch failed; "
+                        "continuing without it.")
+
             n_used, resid, sys_counts = filt.update(
                 pos_observations, corrections, gps_time, clk_file=corrections,
                 receiver_offset_ecef=tide_offset)
@@ -8049,6 +8092,7 @@ def run(args):
             nav2_anchor_max_hacc_m=float(
                 getattr(args, "nav2_anchor_max_hacc_m", 3.0)),
             pin_position=bool(getattr(args, "pin_position", False)),
+            nav_sig_store=nav_sig_store,
         )
         ape_thread.start()
 
