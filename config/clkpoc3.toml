@@ -47,4 +47,4 @@ tadd_gpio = 16
 
 # TICC #3: chA = DO PPS, chB = GNSS PPS.
 # TICC competes as a servo source whenever ticc_port is configured.
-ticc_port = "/dev/ticc3"
+ticc_port = "/dev/ticc5"
