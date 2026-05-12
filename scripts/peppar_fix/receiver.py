@@ -669,9 +669,8 @@ def _wait_ack_parsed(ubr, cls_name, msg_name, timeout):
 # ACK/NAK MUST send one key per VALSET and synchronously wait for
 # the ACK/NAK before sending the next.  Higher-level code is welcome
 # to compose multi-key dicts for organizational purposes and pass
-# them through these helpers — both ``send_cfg()`` and
-# ``send_cfg_per_key()`` accept a dict — but the helpers serialize
-# the dict to one-key-at-a-time at the wire level.
+# them through ``send_cfg()`` — the helper serializes the dict to
+# one-key-at-a-time at the wire level.
 #
 # DO NOT add a new bundled-VALSET helper.  If a future caller needs
 # raw multi-key VALSET (e.g., for a feature where the receiver
@@ -700,7 +699,7 @@ def _send_cfg_one(ser, ubr, key, value, layers=7):
 
 
 def send_cfg(ser, ubr, key_values, description="", layers=7):
-    """Send each key as a single-key VALSET, return True iff all ACK'd.
+    """Send each key as a single-key VALSET, return (ok_keys, nak_keys).
 
     Bundling prohibited at the wire level — see the POLICY block above
     this function.  Multi-key dicts are accepted as a convenience for
@@ -712,49 +711,18 @@ def send_cfg(ser, ubr, key_values, description="", layers=7):
         layers: 1=RAM, 2=BBR, 4=Flash, 7=all (default).
 
     Returns:
-        bool: True iff every key ACK'd.  False if any single key
-              NAK'd or timed out.  Per-key outcomes are logged at
-              INFO (ACK) or WARNING (NAK) so a downstream reader
-              can always identify which specific key failed.
-    """
-    if description:
-        log.info(f"  {description}...")
-    n_ok, n_nak = 0, 0
-    for key, value in key_values.items():
-        if _send_cfg_one(ser, ubr, key, value, layers=layers):
-            log.info(f"    {key}={value}  OK")
-            n_ok += 1
-        else:
-            log.warning(f"    {key}={value}  NAK")
-            n_nak += 1
-    if description:
-        if n_nak == 0:
-            log.info(f"  {description}... OK ({n_ok} keys)")
-        else:
-            log.warning(
-                f"  {description}... {n_nak}/{n_ok + n_nak} NAK")
-    return n_nak == 0
-
-
-def send_cfg_per_key(ser, ubr, key_values, description="", layers=7):
-    """Send each key individually, return (ok_keys, nak_keys) sets.
-
-    Wire behavior identical to ``send_cfg()`` (both call
-    ``_send_cfg_one`` for each key — bundling is prohibited at the
-    wire level; see POLICY above).  Difference is the return shape:
-    this returns the set partition so callers can act on the
-    specific failing keys (e.g. retry with a different value,
-    log a structured diagnostic, fall back to a feature-disable
-    path).  ``send_cfg()`` returns a bool aggregate; pick whichever
-    matches the caller's needs.
-
-    Returns:
-        (ok_keys, nak_keys): sets of key names that ACK'd vs NAK'd.
+        (ok_keys, nak_keys): sets partitioning the input keys by
+        outcome.  Test ``not nak_keys`` for the "all succeeded"
+        aggregate (the common case for callers that just want a
+        pass/fail gate).  Use the sets directly when you need to
+        act on the specific failing keys (retry with a different
+        value, log a structured diagnostic, fall back to a
+        feature-disable path).
     """
     ok_keys = set()
     nak_keys = set()
     if description:
-        log.info(f"{description} (per-key, {len(key_values)} keys):")
+        log.info(f"  {description}...")
     for key, value in key_values.items():
         if _send_cfg_one(ser, ubr, key, value, layers=layers):
             log.info(f"  {key}={value}  OK")
@@ -838,7 +806,7 @@ def configure_signals(ser, ubr, driver=None):
     """
     driver = driver or get_driver("f9t")
     log.info(f"  Signals: {_driver_band_summary(driver)}")
-    ok_keys, nak_keys = send_cfg_per_key(
+    ok_keys, nak_keys = send_cfg(
         ser, ubr, driver.signal_config,
         description=f"Signal config ({driver.name})",
     )
@@ -883,11 +851,12 @@ def configure_rate(ser, ubr, rate_hz):
 def configure_rate_ms(ser, ubr, meas_ms):
     """Set measurement rate in milliseconds."""
     rate_hz = 1000 / meas_ms
-    return send_cfg(ser, ubr, {
+    _ok, nak = send_cfg(ser, ubr, {
         "CFG_RATE_MEAS": meas_ms,
         "CFG_RATE_NAV": 1,
         "CFG_RATE_TIMEREF": 0,
     }, f"Measurement rate = {rate_hz:.1f} Hz ({meas_ms} ms)")
+    return not nak
 
 
 def configure_messages(ser, ubr, port_id, sfrbx_rate=1):
@@ -949,7 +918,8 @@ def configure_messages(ser, ubr, port_id, sfrbx_rate=1):
     names = ("RAWX, TIM-TP" if sfrbx_rate == 0
              else "RAWX, SFRBX, PVT, SAT, TIM-TP, NAV2-PVT, "
                   "NAV-SIG, NAV-CLOCK, NAV-TIMEGPS")
-    return send_cfg(ser, ubr, messages, f"UBX messages on {pname}: {names}")
+    _ok, nak = send_cfg(ser, ubr, messages, f"UBX messages on {pname}: {names}")
+    return not nak
 
 
 def configure_nmea_off(ser, ubr, port_id):
@@ -958,8 +928,8 @@ def configure_nmea_off(ser, ubr, port_id):
     nmea_off = {}
     for nmea_msg in ["GGA", "GLL", "GSA", "GSV", "RMC", "VTG"]:
         nmea_off[f"CFG_MSGOUT_NMEA_ID_{nmea_msg}_{pname}"] = 0
-    result = send_cfg(ser, ubr, nmea_off, f"Disable NMEA output on {pname}")
-    if not result:
+    _ok, nak = send_cfg(ser, ubr, nmea_off, f"Disable NMEA output on {pname}")
+    if nak:
         log.info("    (NMEA disable failed -- non-critical)")
     return True
 
@@ -967,11 +937,12 @@ def configure_nmea_off(ser, ubr, port_id):
 def configure_tmode(ser, ubr, survey_dur_s, survey_acc_m):
     """Configure survey-in for Time Mode."""
     acc_tenths_mm = int(survey_acc_m * 1000) * 10
-    return send_cfg(ser, ubr, {
+    _ok, nak = send_cfg(ser, ubr, {
         "CFG_TMODE_MODE": 1,
         "CFG_TMODE_SVIN_MIN_DUR": survey_dur_s,
         "CFG_TMODE_SVIN_ACC_LIMIT": acc_tenths_mm,
     }, f"Survey-in: {survey_dur_s}s, {survey_acc_m}m accuracy")
+    return not nak
 
 
 def configure_uart_baud(ser, ubr, baud):

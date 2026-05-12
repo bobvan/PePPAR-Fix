@@ -7779,17 +7779,24 @@ def run(args):
         }
         if extint_store is not None:
             _cfg_keys[f"CFG_MSGOUT_UBX_TIM_TM2_{_pname}"] = 1
-        _nav2_ok = send_cfg(_nav2_ser, _nav2_ubr, _cfg_keys,
-                            "NAV2 + NAV-SIG/CLOCK/TIMEGPS + TIM-TM2 enable")
+        _ok_keys, _nak_keys = send_cfg(
+            _nav2_ser, _nav2_ubr, _cfg_keys,
+            "NAV2 + NAV-SIG/CLOCK/TIMEGPS + TIM-TM2 enable")
         _nav2_ser.close()
-        if _nav2_ok:
+        if not _nak_keys:
             extras = ", TIM-TM2" if extint_store is not None else ""
             log.info("NAV2 + NAV-SIG + NAV-CLOCK + NAV-TIMEGPS%s"
                      " enabled (position consensus + cascade diagnostics)",
                      extras)
         else:
-            log.warning("Post-config burst failed "
-                        "(position consensus + diagnostics may be unavailable)")
+            # Per-key NAK identities already logged at WARNING by
+            # send_cfg().  Summary here gives the operator a single
+            # line to grep for + the specific NAKing key set.
+            log.warning(
+                "Post-config burst: %d/%d keys NAK (%s) — "
+                "position consensus + diagnostics may be unavailable",
+                len(_nak_keys), len(_cfg_keys),
+                ", ".join(sorted(_nak_keys)))
     except Exception as e:
         log.warning("Post-config burst attempt failed: %s (continuing)", e)
 

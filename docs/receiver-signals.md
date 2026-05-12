@@ -93,22 +93,22 @@ identity of the failing key is lost — undiagnosable spray-and-pray.
 Higher-level code is welcome to compose multi-key dicts for
 organizational purposes — `configure_messages()` groups MSGOUT keys,
 `configure_signals()` groups signal-enable keys, etc.  These are passed
-through `send_cfg()` or `send_cfg_per_key()`, both of which **serialize
-the dict to one-key-at-a-time at the wire level** and log each ACK/NAK
-individually.
+through `send_cfg()`, which **serializes the dict to one-key-at-a-time
+at the wire level** and logs each ACK/NAK individually.
 
 Wire-level helper: `_send_cfg_one(ser, ubr, key, value)` — sends one
 key, waits one ACK/NAK, returns bool.  The only place that writes a
 VALSET to the serial port.
 
-Caller-facing helpers:
-- `send_cfg(ser, ubr, dict)` → bool (True iff every key ACK'd)
-- `send_cfg_per_key(ser, ubr, dict)` → `(ok_set, nak_set)` partition
+Caller-facing helper:
+- `send_cfg(ser, ubr, dict)` → `(ok_keys, nak_keys)` partition
 
-Both call `_send_cfg_one` per key; choose between them by return shape.
-Use `send_cfg_per_key()` when the caller needs to act on the specific
-failing key (e.g., retry, fall back, log a structured diagnostic).
-Use `send_cfg()` when an aggregate pass/fail is enough.
+Test `not nak_keys` for the "all succeeded" aggregate (the common
+case for callers that just want a pass/fail gate); use the sets
+directly when you need to act on the specific failing keys (retry
+with a different value, log a structured diagnostic, fall back to a
+feature-disable path).  There is exactly one caller-facing helper —
+do not add a second.
 
 ### Why this matters
 
@@ -127,12 +127,15 @@ Use `send_cfg()` when an aggregate pass/fail is enough.
 
 - 2026-04-17 ptpmon: L5 signal enable bundled as 15 keys → NAK on
   the whole bundle → no way to identify the rejected key without a
-  per-key rebuild.  Led to `send_cfg_per_key()` being added as a
-  diagnostic helper.
+  per-key rebuild.  Diagnostic helper `send_cfg_per_key()` added
+  as a workaround.
 - 2026-05-12 MadHat F10T: post-config burst bundled 5 keys
   (NAV2_OUT_ENABLED + NAV_SIG + NAV_CLOCK + NAV_TIMEGPS + TIM_TM2)
-  → suspected NAK → same undiagnosable failure.  Led to making
-  per-key behavior the default for all callers.
+  → bundled NAK → same undiagnosable failure.  Led to: (a) making
+  per-key the default wire behavior for all callers, (b) collapsing
+  the two helpers into the single `send_cfg()` documented above
+  (the diagnostic-helper distinction stopped pulling weight once
+  every code path was per-key by construction).
 
 ### DO NOT add a new bundled-VALSET helper
 

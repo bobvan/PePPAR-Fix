@@ -135,19 +135,22 @@ def factory_reset(ser, ubr):
 def configure_rate(ser, ubr, rate_hz):
     """Set measurement and navigation rate."""
     meas_ms = int(1000 / rate_hz)
-    return send_cfg(ser, ubr, {
+    _ok, nak = send_cfg(ser, ubr, {
         "CFG_RATE_MEAS": meas_ms,
         "CFG_RATE_NAV": 1,           # one nav solution per measurement
         "CFG_RATE_TIMEREF": 0,       # UTC
     }, f"Measurement rate = {rate_hz} Hz ({meas_ms} ms)")
+    return not nak
 
 
 def configure_signals(ser, ubr, driver=None):
     """Enable dual-frequency signals for PPP-AR."""
     if driver is None:
         driver = F9TDriver()
-    return send_cfg(ser, ubr, driver.signal_config,
-                    f"Signals: driver-specific dual-frequency set ({driver.name})")
+    _ok, nak = send_cfg(
+        ser, ubr, driver.signal_config,
+        f"Signals: driver-specific dual-frequency set ({driver.name})")
+    return not nak
 
 
 def configure_messages(ser, ubr, port_id):
@@ -164,8 +167,10 @@ def configure_messages(ser, ubr, port_id):
         f"CFG_MSGOUT_UBX_TIM_TP_{pname}": 1,
     }
 
-    return send_cfg(ser, ubr, messages,
-                    f"UBX messages on {pname}: RAWX, SFRBX, PVT, SAT, TIM-TP")
+    _ok, nak = send_cfg(
+        ser, ubr, messages,
+        f"UBX messages on {pname}: RAWX, SFRBX, PVT, SAT, TIM-TP")
+    return not nak
 
 
 def configure_nmea_off(ser, ubr, port_id):
@@ -179,8 +184,9 @@ def configure_nmea_off(ser, ubr, port_id):
         key = f"CFG_MSGOUT_NMEA_ID_{nmea_msg}_{pname}"
         nmea_off[key] = 0
 
-    result = send_cfg(ser, ubr, nmea_off, f"Disable NMEA output on {pname}")
-    if not result:
+    _ok, nak = send_cfg(ser, ubr, nmea_off,
+                        f"Disable NMEA output on {pname}")
+    if nak:
         print("    (NMEA disable failed — non-critical, continuing)")
     return True  # non-critical
 
@@ -190,11 +196,12 @@ def configure_tmode(ser, ubr, survey_dur_s, survey_acc_m):
     acc_mm = int(survey_acc_m * 1000)  # convert to mm
     acc_tenths_mm = acc_mm * 10        # CFG-TMODE uses 0.1 mm units
 
-    return send_cfg(ser, ubr, {
+    _ok, nak = send_cfg(ser, ubr, {
         "CFG_TMODE_MODE": 1,                 # 1 = Survey-In
         "CFG_TMODE_SVIN_MIN_DUR": survey_dur_s,
         "CFG_TMODE_SVIN_ACC_LIMIT": acc_tenths_mm,
     }, f"Survey-in: {survey_dur_s}s, {survey_acc_m}m accuracy")
+    return not nak
 
 
 def configure_uart_baud(ser, ubr, baud):
