@@ -617,16 +617,448 @@ class Nav2PositionStore:
                     f"n={self._update_count}")
 
 
+# ── UBX-NAV-SIG: receiver's per-signal usage verdict ────────────────────── #
+#
+# F9T / F10T publish per-(SV, signal) usage flags via UBX-NAV-SIG.  prUsed
+# is the receiver's own decision about whether to include that signal's
+# pseudorange in its NAV2 solution.  Cascade-#6 evidence (day0511,
+# clkPoC3): F10T NAV2 hAcc=0.74m stayed unchanged through a 21-ms chip-
+# slip — the receiver excluded the bad SV via NAV-SIG.prUsed=0 while we
+# kept admitting it.  See slipDetectUnified-main.
+#
+# This store mirrors Nav2PositionStore's pattern: thread-safe latest
+# snapshot, polling getters, optional on_transition callbacks for the
+# disagreement-instrumentation logger.
+#
+# sigFlags bit layout (per UBX-NAV-SIG spec):
+#   bits 0-1: health (0=unknown, 1=healthy, 2=unhealthy)
+#   bit 2:    prSmoothed
+#   bit 3:    prUsed     ← KEY: used in NAV2 solution
+#   bit 4:    crUsed
+#   bit 5:    doUsed
+#   bit 6:    prCorrUsed (DGNSS / RTCM)
+#   bit 7:    crCorrUsed
+#   bit 8:    doCorrUsed
+_SIG_FLAG_HEALTH_MASK = 0x0003
+_SIG_FLAG_PR_SMOOTHED = 0x0004
+_SIG_FLAG_PR_USED     = 0x0008
+_SIG_FLAG_CR_USED     = 0x0010
+_SIG_FLAG_DO_USED     = 0x0020
+
+
+class SigStatus:
+    """Per-(SV, sigId) snapshot from a single NAV-SIG message.
+
+    Lightweight value type — read-only after construction.  All fields
+    optional because pyubx2 occasionally omits fields the receiver
+    didn't populate.
+    """
+    __slots__ = ('gnss_id', 'sv_id', 'sig_id', 'sig_name',
+                 'pr_used', 'cr_used', 'do_used',
+                 'pr_smoothed', 'health', 'cno',
+                 'quality_ind', 'pr_res_m', 'host_mono')
+
+    def __init__(self, gnss_id, sv_id, sig_id, sig_name,
+                  pr_used, cr_used, do_used,
+                  pr_smoothed, health, cno,
+                  quality_ind, pr_res_m, host_mono):
+        self.gnss_id = gnss_id
+        self.sv_id = sv_id
+        self.sig_id = sig_id
+        self.sig_name = sig_name
+        self.pr_used = pr_used
+        self.cr_used = cr_used
+        self.do_used = do_used
+        self.pr_smoothed = pr_smoothed
+        self.health = health
+        self.cno = cno
+        self.quality_ind = quality_ind
+        self.pr_res_m = pr_res_m
+        self.host_mono = host_mono
+
+
+class Nav2SignalStore:
+    """Thread-safe latest per-(SV, sigId) usage verdict from the receiver.
+
+    Updated on each UBX-NAV-SIG message.  Consumers:
+      - polling: ``get(sv, sig_name)`` → SigStatus or None.
+      - bulk:    ``snapshot()`` → dict {(sv, sig_name): SigStatus}.
+      - on_transition: register a callback that fires when prUsed flips
+        for a (SV, sigId).  Charlie's Phase A.5 disagreement logger
+        consumes this — emits structured [NAV-SIG_DISAGREE] lines.
+
+    SVs not in the latest NAV-SIG message are NOT removed automatically
+    — callers can prune via ``mtime`` on the SigStatus host_mono field.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._by_key = {}  # (sv_label, sig_name) → SigStatus
+        self._transition_cbs = []  # list of (callback, prev_state) pairs
+        self._epoch = 0  # incremented per NAV-SIG message
+        self._update_count = 0
+        self._signal_names = None  # lazy-set by serial_reader from driver
+
+    def set_signal_names(self, signal_names):
+        """Driver-supplied (gnssId, sigId) → human-readable name map."""
+        self._signal_names = signal_names
+
+    def update(self, parsed_msg):
+        """Store a freshly-decoded UBX-NAV-SIG message.
+
+        Iterates per-signal entries and updates internal map.  Returns
+        a list of (sv_label, sig_name, prev_pr_used, new_pr_used)
+        tuples for prUsed transitions in this epoch — consumers (e.g.,
+        Charlie's disagreement logger) can use this directly, or
+        register on_transition callbacks that fire on each transition.
+        """
+        signal_names = self._signal_names or {}
+        num_sigs = getattr(parsed_msg, 'numSigs', 0) or 0
+        host_mono = time.monotonic()
+        transitions = []  # (sv_label, sig_name, prev_pr_used, new_pr_used)
+        epoch_snapshot = {}  # (sv_label, sig_name) → SigStatus
+
+        for i in range(1, num_sigs + 1):
+            i2 = f"{i:02d}"
+            gnss_id = getattr(parsed_msg, f'gnssId_{i2}', None)
+            sv_id   = getattr(parsed_msg, f'svId_{i2}',   None)
+            sig_id  = getattr(parsed_msg, f'sigId_{i2}',  None)
+            if gnss_id is None or sv_id is None or sig_id is None:
+                continue
+            sig_flags = getattr(parsed_msg, f'sigFlags_{i2}', 0) or 0
+            cno       = getattr(parsed_msg, f'cno_{i2}',       None)
+            qual      = getattr(parsed_msg, f'qualityInd_{i2}', None)
+            pr_res    = getattr(parsed_msg, f'prRes_{i2}',     None)
+            # prRes is signed 16-bit in units of 0.1 m per the UBX spec.
+            # pyubx2 may already decode the scaling; we apply the 0.1
+            # conversion defensively if the value looks like raw ticks.
+            pr_res_m = None
+            if pr_res is not None:
+                # Heuristic: if |pr_res| > 100 we assume raw 0.1m units.
+                pr_res_m = (pr_res * 0.1
+                             if abs(pr_res) > 100
+                             else float(pr_res))
+
+            sig_name = signal_names.get((gnss_id, sig_id))
+            if sig_name is None:
+                sig_name = f"sys{gnss_id}/sig{sig_id}"
+
+            sv_label = _sv_label(gnss_id, sv_id)
+            status = SigStatus(
+                gnss_id=gnss_id, sv_id=sv_id, sig_id=sig_id,
+                sig_name=sig_name,
+                pr_used=bool(sig_flags & _SIG_FLAG_PR_USED),
+                cr_used=bool(sig_flags & _SIG_FLAG_CR_USED),
+                do_used=bool(sig_flags & _SIG_FLAG_DO_USED),
+                pr_smoothed=bool(sig_flags & _SIG_FLAG_PR_SMOOTHED),
+                health=int(sig_flags & _SIG_FLAG_HEALTH_MASK),
+                cno=cno, quality_ind=qual,
+                pr_res_m=pr_res_m, host_mono=host_mono,
+            )
+            epoch_snapshot[(sv_label, sig_name)] = status
+
+        with self._lock:
+            # Compare against prior state to detect prUsed transitions.
+            for key, new_st in epoch_snapshot.items():
+                prev = self._by_key.get(key)
+                if prev is not None and prev.pr_used != new_st.pr_used:
+                    transitions.append(
+                        (key[0], key[1], prev.pr_used, new_st.pr_used)
+                    )
+            self._by_key.update(epoch_snapshot)
+            self._epoch += 1
+            self._update_count += 1
+            cbs = list(self._transition_cbs)
+            epoch = self._epoch
+
+        # Fire callbacks OUTSIDE the lock so a slow consumer can't
+        # block other readers.  Errors per-callback don't fail others.
+        for cb in cbs:
+            for sv_label, sig_name, prev_pu, new_pu in transitions:
+                try:
+                    cb(sv_label, sig_name, prev_pu, new_pu,
+                       epoch_snapshot[(sv_label, sig_name)])
+                except Exception as e:
+                    log.debug("NAV-SIG transition callback failed: %s", e)
+
+        return transitions
+
+    def get(self, sv_label, sig_name):
+        """Return latest SigStatus for (sv_label, sig_name) or None.
+
+        Polling getter — returns the raw dataclass without staleness
+        gating.  Use ``get_signal()`` for the dict-shaped, stale-aware
+        interface that consumer monitors (e.g. NavSigDisagreeMonitor)
+        prefer.
+        """
+        with self._lock:
+            return self._by_key.get((sv_label, sig_name))
+
+    def snapshot(self):
+        """Return shallow copy of the full map."""
+        with self._lock:
+            return dict(self._by_key)
+
+    def get_signal(self, sv, sig_id, max_age_s=5.0):
+        """Return dict signal status, or None if missing or stale.
+
+        Per the slipDetectUnified-main Phase A.5 monitor contract
+        (charlie/secondOpinionPinPos @ b42569f).  Wraps the internal
+        SigStatus dataclass in a dict with UBX-aligned camelCase
+        keys to match consumer expectations.
+
+        Args:
+            sv: SV label like 'G07', 'E19', 'C42'.
+            sig_id: signal name like 'GPS-L1CA', 'GAL-E5aQ', 'BDS-B2aI'.
+                Engine-internal naming; matches sig_name from the
+                receiver driver's signal_names map.
+            max_age_s: staleness gate.  Returns None if the SigStatus
+                hasn't been refreshed within this window.
+
+        Returns:
+            dict with required keys:
+                prUsed (bool), prRes (float | None, m),
+                cno (float | None, dB-Hz), health (int).
+            Plus optional keys: crUsed, doUsed, prSmoothed,
+            qualityInd, hostMono, ageS.
+            None if the (sv, sig_id) pair was never seen or its
+            status is older than max_age_s.
+        """
+        with self._lock:
+            st = self._by_key.get((sv, sig_id))
+        if st is None:
+            return None
+        age_s = time.monotonic() - st.host_mono
+        if age_s > max_age_s:
+            return None
+        return {
+            'prUsed':      st.pr_used,
+            'prRes':       st.pr_res_m,
+            'cno':         st.cno,
+            'health':      st.health,
+            'crUsed':      st.cr_used,
+            'doUsed':      st.do_used,
+            'prSmoothed':  st.pr_smoothed,
+            'qualityInd':  st.quality_ind,
+            'hostMono':    st.host_mono,
+            'ageS':        age_s,
+        }
+
+    def iter_signals(self, max_age_s=5.0):
+        """Yield (sv, sig_id) tuples for currently-fresh signals.
+
+        Per the Phase A.5 monitor contract — gives the consumer a
+        deterministic iteration order over signals the receiver is
+        actively reporting on.  Stale entries are filtered out by
+        the same max_age_s window as get_signal().
+        """
+        now = time.monotonic()
+        with self._lock:
+            items = [(key, st.host_mono) for key, st in self._by_key.items()]
+        for (sv, sig_id), host_mono in sorted(items):
+            if now - host_mono <= max_age_s:
+                yield sv, sig_id
+
+    def on_transition(self, callback):
+        """Register callback fired on each prUsed transition.
+
+        Signature: cb(sv_label, sig_name, prev_pr_used, new_pr_used, status).
+        """
+        with self._lock:
+            self._transition_cbs.append(callback)
+
+    def epoch(self):
+        with self._lock:
+            return self._epoch
+
+
+# ── UBX-NAV-CLOCK + NAV-TIMEGPS: receiver clock-state telemetry ──────── #
+#
+# Added for f9tClockTelemetry-bravo (recoveryRetry-main work item 2):
+# diagnostic visibility into the receiver's own clock state during
+# cascade events.  See I-115943-main / recoveryRetry-main thread for
+# the chip-slip vs command-envelope hypotheses these telemetry streams
+# help discriminate.
+
+class NavClockStore:
+    """Thread-safe latest UBX-NAV-CLOCK snapshot.
+
+    Fields: clkB (clock bias, ns), clkD (clock drift, ns/s),
+    tAcc (time accuracy, ns), fAcc (frequency accuracy, ps/s),
+    iTOW (GPS time of week, ms).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._clk_b_ns = None
+        self._clk_d_ns_per_s = None
+        self._t_acc_ns = None
+        self._f_acc_ps_per_s = None
+        self._itow_ms = None
+        self._host_mono = None
+        self._update_count = 0
+
+    def update(self, parsed_msg):
+        with self._lock:
+            self._clk_b_ns = getattr(parsed_msg, 'clkB', None)
+            self._clk_d_ns_per_s = getattr(parsed_msg, 'clkD', None)
+            self._t_acc_ns = getattr(parsed_msg, 'tAcc', None)
+            self._f_acc_ps_per_s = getattr(parsed_msg, 'fAcc', None)
+            self._itow_ms = getattr(parsed_msg, 'iTOW', None)
+            self._host_mono = time.monotonic()
+            self._update_count += 1
+
+    def get(self):
+        with self._lock:
+            if self._host_mono is None:
+                return None
+            return {
+                'clk_b_ns': self._clk_b_ns,
+                'clk_d_ns_per_s': self._clk_d_ns_per_s,
+                't_acc_ns': self._t_acc_ns,
+                'f_acc_ps_per_s': self._f_acc_ps_per_s,
+                'itow_ms': self._itow_ms,
+                'host_mono': self._host_mono,
+                'age_s': time.monotonic() - self._host_mono,
+                'n_updates': self._update_count,
+            }
+
+
+class NavTimeGpsStore:
+    """Thread-safe latest UBX-NAV-TIMEGPS snapshot.
+
+    Fields: iTOW (ms), fTOW (ns sub-ms), week, leapS, tAcc, valid flags.
+    Useful for: detecting receiver-side time-discontinuity events that
+    might correlate with the clkPoC3 / MadHat catastrophic cascades.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._itow_ms = None
+        self._ftow_ns = None
+        self._week = None
+        self._leap_s = None
+        self._t_acc_ns = None
+        self._valid_tow = False
+        self._valid_week = False
+        self._valid_leap_s = False
+        self._host_mono = None
+        self._update_count = 0
+
+    def update(self, parsed_msg):
+        with self._lock:
+            self._itow_ms = getattr(parsed_msg, 'iTOW', None)
+            self._ftow_ns = getattr(parsed_msg, 'fTOW', None)
+            self._week = getattr(parsed_msg, 'week', None)
+            self._leap_s = getattr(parsed_msg, 'leapS', None)
+            self._t_acc_ns = getattr(parsed_msg, 'tAcc', None)
+            valid = getattr(parsed_msg, 'valid', 0) or 0
+            self._valid_tow = bool(valid & 0x01)
+            self._valid_week = bool(valid & 0x02)
+            self._valid_leap_s = bool(valid & 0x04)
+            self._host_mono = time.monotonic()
+            self._update_count += 1
+
+    def get(self):
+        with self._lock:
+            if self._host_mono is None:
+                return None
+            return {
+                'itow_ms': self._itow_ms,
+                'ftow_ns': self._ftow_ns,
+                'week': self._week,
+                'leap_s': self._leap_s,
+                't_acc_ns': self._t_acc_ns,
+                'valid_tow': self._valid_tow,
+                'valid_week': self._valid_week,
+                'valid_leap_s': self._valid_leap_s,
+                'host_mono': self._host_mono,
+                'age_s': time.monotonic() - self._host_mono,
+                'n_updates': self._update_count,
+            }
+
+
+def _sv_label(gnss_id, sv_id):
+    """GNSS id + SV id → 'G07', 'E19', 'C42', etc."""
+    prefix = {0: 'G', 1: 'S', 2: 'E', 3: 'C', 5: 'J', 6: 'R'}.get(gnss_id)
+    if prefix is None:
+        return f"sys{gnss_id}_sv{sv_id}"
+    return f"{prefix}{int(sv_id):02d}"
+
+
+def _emit_nav_sig_log(store, parsed_msg):
+    """Emit a structured per-epoch [NAV-SIG] log line.
+
+    Format (one signal per line, multi-line on epochs >1 signal):
+      [NAV-SIG ep=N] G07/L1CA: prUsed=1 prRes=+0.3m cno=44 health=1
+                     E19/E5aQ: prUsed=0 prRes=+412.7m cno=39 health=1
+    """
+    epoch = store.epoch()
+    snapshot = store.snapshot()
+    if not snapshot:
+        return
+    # Sort for stable output order: by sv_label then sig_name.
+    keys = sorted(snapshot.keys())
+    header = f"[NAV-SIG ep={epoch}]"
+    pad = ' ' * (len(header) + 1)
+    for i, key in enumerate(keys):
+        st = snapshot[key]
+        sv_label, sig_name = key
+        pr_res_str = (f"{st.pr_res_m:+.1f}m"
+                      if st.pr_res_m is not None else "n/a")
+        cno_str = f"{st.cno}" if st.cno is not None else "n/a"
+        prefix = header if i == 0 else pad
+        log.info("%s %s/%s: prUsed=%d crUsed=%d doUsed=%d "
+                 "prRes=%s cno=%s health=%d",
+                 prefix, sv_label, sig_name,
+                 int(st.pr_used), int(st.cr_used), int(st.do_used),
+                 pr_res_str, cno_str, st.health)
+
+
+def _emit_nav_clock_log(parsed_msg):
+    """Emit a per-epoch [NAV-CLOCK] log line."""
+    clk_b  = getattr(parsed_msg, 'clkB', None)
+    clk_d  = getattr(parsed_msg, 'clkD', None)
+    t_acc  = getattr(parsed_msg, 'tAcc', None)
+    f_acc  = getattr(parsed_msg, 'fAcc', None)
+    itow   = getattr(parsed_msg, 'iTOW', None)
+    log.info("[NAV-CLOCK] iTOW=%s clkB=%sns clkD=%sns/s tAcc=%sns fAcc=%sps/s",
+             itow, clk_b, clk_d, t_acc, f_acc)
+
+
+def _emit_nav_time_gps_log(parsed_msg):
+    """Emit a per-epoch [NAV-TIMEGPS] log line."""
+    itow  = getattr(parsed_msg, 'iTOW', None)
+    ftow  = getattr(parsed_msg, 'fTOW', None)
+    week  = getattr(parsed_msg, 'week', None)
+    leap  = getattr(parsed_msg, 'leapS', None)
+    t_acc = getattr(parsed_msg, 'tAcc', None)
+    valid = getattr(parsed_msg, 'valid', 0) or 0
+    log.info("[NAV-TIMEGPS] iTOW=%s fTOW=%s week=%s leapS=%s "
+             "tAcc=%s validTow=%d validWeek=%d validLeap=%d",
+             itow, ftow, week, leap, t_acc,
+             bool(valid & 0x01), bool(valid & 0x02), bool(valid & 0x04))
+
+
 def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                    ssr=None, qerr_store=None, config_queue=None, driver=None,
                    raw_callback=None, nav2_store=None, rinex_writer=None,
-                   extint_store=None):
+                   extint_store=None, nav_sig_store=None,
+                   nav_clock_store=None, nav_time_gps_store=None):
     """Read UBX messages from a GNSS device.
 
     Puts (timestamp, observations_list) tuples onto obs_queue for each
     RXM-RAWX epoch. Also feeds RXM-SFRBX to broadcast ephemeris.
     If qerr_store is provided, extracts TIM-TP qErr and stores it.
     If nav2_store is provided, captures NAV2-PVT for position consensus.
+    If nav_sig_store is provided, captures UBX-NAV-SIG (per-(SV, sigId)
+    receiver usage verdict — prUsed, crUsed, etc.) and emits structured
+    [NAV-SIG] log lines per epoch.  Consumed by slipDetectUnified-main
+    Phase A + Charlie's Phase A.5 disagreement instrumentation.
+    If nav_clock_store / nav_time_gps_store are provided, captures
+    UBX-NAV-CLOCK and UBX-NAV-TIMEGPS for receiver-side clock-state
+    telemetry (f9tClockTelemetry-bravo / recoveryRetry-main work
+    item 2).
     If extint_store is provided, captures TIM-TM2 (DO PPS edge times
     from the F9T's GPS-time solution) for the gnss-phase-experiment
     EKF Arm 3.  Requires the F9T to be configured with
@@ -673,6 +1105,10 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
     SIG_NAMES = driver.signal_names
     SYS_MAP = driver.sys_map
     bds_l1_ref_cycles = driver.bds_l1_ref_cycles
+    # Seed the NAV-SIG store with the driver's per-receiver signal map
+    # so it can emit human-readable [NAV-SIG] log lines.
+    if nav_sig_store is not None:
+        nav_sig_store.set_signal_names(SIG_NAMES)
 
     pair_config = getattr(driver, 'if_pairs', None) or IF_PAIRS
     sig_lookup = {}
@@ -753,6 +1189,30 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
             # NAV2-PVT: secondary navigation engine position fix
             if msg_id == 'NAV2-PVT' and nav2_store is not None:
                 nav2_store.update(parsed)
+
+            # NAV-SIG: per-(SV, signal) usage verdict from the receiver.
+            # Updates Nav2SignalStore + emits structured per-epoch log line
+            # for the slipDetectUnified-main Phase A logger and Charlie's
+            # Phase A.5 disagreement detector.  Sampled every NAV-SIG
+            # epoch (default 1 Hz when CFG-MSGOUT-UBX_NAV_SIG_*=1).
+            if msg_id == 'NAV-SIG' and nav_sig_store is not None:
+                nav_sig_store.update(parsed)
+                _emit_nav_sig_log(nav_sig_store, parsed)
+
+            # NAV-CLOCK: receiver's own clock bias / drift / accuracy.
+            # Diagnostic visibility into receiver-side time state for
+            # the chip-slip / command-envelope cascade hypotheses
+            # (recoveryRetry-main work item 2).
+            if msg_id == 'NAV-CLOCK' and nav_clock_store is not None:
+                nav_clock_store.update(parsed)
+                _emit_nav_clock_log(parsed)
+
+            # NAV-TIMEGPS: receiver's GPS time solution (week, leapS,
+            # tAcc, valid flags).  Detects receiver-side time-
+            # discontinuity events.
+            if msg_id == 'NAV-TIMEGPS' and nav_time_gps_store is not None:
+                nav_time_gps_store.update(parsed)
+                _emit_nav_time_gps_log(parsed)
 
             # gnss-phase-experiment Arm 3: DO PPS edge time from
             # F9T's GPS-time solution.  See peppar_fix/extint_reader.py
