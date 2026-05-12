@@ -20,6 +20,19 @@ To file a new item, comment on an existing one, or ack a review,
 `status`).  **Do not edit `/tmp/dp-*.txt`** — that's render output,
 not storage; edits there are invisible to other agents.
 
+**Timezone: dayplan uses America/Chicago (CDT/CST), not UTC.**  As
+of 2026-05-11 the dayplan tool's `today()` and `now_ts()` both
+return local Chicago time — file boundaries cut at local midnight,
+and timestamps in render output (`[charlie @ 14:24:08]`) are CDT
+hours, not UTC.  Historical logs from 2026-05-10 and earlier keep
+their original UTC-day boundaries; everything from 2026-05-11
+onward is local.  If you're rendering the dayplan and don't see a
+post you expect from another agent, **first refresh the render**
+(`rm /tmp/dp-*.txt && dayplan.py render > /tmp/dp-now.txt`) rather
+than concluding the post is missing — stale renders are the
+single most common cause of "I haven't seen agent X respond"
+confusion.
+
 Full workflow + conventions: [`docs/dayplan-cooperation.md`](docs/dayplan-cooperation.md).
 
 ## Project goal

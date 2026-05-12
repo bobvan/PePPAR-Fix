@@ -25,6 +25,31 @@ Same path from any worktree.  All write ops go through the CLI:
 
 Run `dayplan.py <op> --help` for argument detail.
 
+## Timezone — America/Chicago (CDT/CST), not UTC
+
+**As of 2026-05-11, dayplan times are local Chicago time, not UTC.**
+The tool's `today()` and `now_ts()` both use `America/Chicago`, so:
+
+- File names: `YYYY-MM-DD.log` boundaries cut at **local midnight**
+  (00:00 CDT / 05:00 UTC in summer; 00:00 CST / 06:00 UTC in winter).
+- Timestamps in render output (e.g. `[charlie @ 14:24:08]`) are CDT
+  hours, not UTC.  `zoneinfo.ZoneInfo` handles DST automatically.
+- Timestamps in the raw log (`ts` field, e.g. `2026-05-12T14:24:08
+  -0500`) carry their offset explicitly — Python's
+  `datetime.fromisoformat` handles both this form and the older UTC
+  `Z`-suffix form from pre-2026-05-11 logs.
+- Historical logs (2026-05-10 and earlier) keep their original
+  UTC-day boundaries; the cutover does not retroactively rewrite
+  them.
+
+**Confusion to watch for**: when one agent's render-output reads a
+local-time timestamp and another reads a UTC-suffix timestamp,
+hour numbers can differ by 5-6 hours.  If you "haven't seen agent
+X respond," first force-refresh the render
+(`rm /tmp/dp-*.txt && dayplan.py render > /tmp/dp-now.txt`) — a
+stale `/tmp/dp-*.txt` from an earlier session is the single most
+common cause of missed messages.
+
 ## Storage model — append-only ops log
 
 Live state: `~/.claude/projects/-home-bob-git-PePPAR-Fix/dayplan/YYYY-MM-DD.log`
