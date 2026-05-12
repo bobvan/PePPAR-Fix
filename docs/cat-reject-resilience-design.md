@@ -1,265 +1,247 @@
-# Slip Detection & Surgical Handling — unified design for cycle and code slips
+# Slip Detection & Surgical Handling — design rev 2
 
-**Status**: design, 2026-05-12.
-**Motivation**: clkPoC3 day0511night hit 11 catastrophic-reject cascades
-in 14 hours. PiFace (same antenna, same SSR stream, F9T receiver) hit
-zero. Investigation showed:
+**Status**: design rev 2, 2026-05-12. (Rev 1 paralleled the receiver's
+own logic with our own per-SV continuity check; rev 2 just reads the
+receiver's verdict.)
 
-1. The existing slip detector **already catches** the per-SV bad-PR
-   events — typically as repeating `mw_jump conf=LOW` log lines on
-   low-elevation SVs, sometimes for an hour before the cascade fires.
-2. The engine **doesn't act** on LOW-confidence slips, so the bad PRs
-   accumulate in the EKF until cat-reject escalates to exit-5.
-3. The two slip classes are dual problems — cycle slip (carrier phase)
-   and code slip (pseudorange) — and deserve unified surgical handling.
+**Motivation**: clkPoC3 day0511night had 11 catastrophic-reject cascades
+in 14 hours; PiFace (same antenna, same SSR stream, F9T receiver) had 0.
+Investigation revealed:
 
-PiFace's clean record doesn't mean PiFace will *always* be clean.  Any
-receiver can occasionally emit massively-wrong observations (ionospheric
-scintillation, multipath, firmware tracking-loop slip, thermal
-transient).  The engine should fail-soft for all of them.
+1. The F10T's own NAV2 solution stays rock-steady through every cascade.
+2. So the F10T already has internal SV-exclusion machinery that rejects
+   the bad observations from its nav solution.
+3. We can *read* its verdict directly via UBX-NAV-SIG instead of
+   building our own parallel per-SV continuity check.
 
-## Background: why code slip detection should be easier than cycle slip
+The cycle/code slip dichotomy collapses: the receiver doesn't care
+about either label — it tracks each signal's `prUsed` / `crUsed` /
+`doUsed` per epoch based on its internal RAIM and signal-quality logic.
+We follow.
 
-|                    | **Cycle slip** (carrier phase ϕ)   | **Code slip** (pseudorange ρ)  |
-|--------------------|------------------------------------|-------------------------------|
-| Observable type    | Ambiguous — unknown integer N in cycles | Absolute — direct distance in meters |
-| Detection method   | Need combinations (GF, MW) to spot integer jumps because ϕ alone has no reference | Predict ρ from prior + range-rate; compare |
-| Why this matters   | The whole machinery of LAMBDA / WL / NL resolution exists *because* ϕ is ambiguous | PRs don't need any of that |
+## Empirical evidence — F10T NAV2 unaffected by 21 ms chip slip
 
-Cycle slips are unmarked and indistinguishable — hence the search for N
-and the elaborate slip-detection machinery.  PR codes are supposed to be
-absolute, so a 3500-meter jump in 1 second should be trivial to spot:
-no SV can physically move 3500 m in 1 second.  The current engine catches
-these (via the MW combination, which folds in code as well as carrier)
-but doesn't act on the LOW-confidence signal.
-
-## Empirical answer from day0511night
-
-For each of the 11 cascades on clkPoC3, slip-log lines from the
-suspected SV(s) appeared **before** the cat-reject cascade fired —
-often for many minutes:
-
-- **Cascade #11 (06:01)**: E19 emitted mw_jump LOW every second from
-  05:00 CDT onward.  61 minutes of persistent LOW-conf slip flags
-  before cat-reject escalated.
-- **Cascade #6 (22:36)**: E26 mw_jump every second from 22:34; then
-  E08 mw_jump every second from 22:35:57.  Within minutes of slip
-  onset, cascade fired.
-- **Cascade #2 (19:53)**: E15, C38, C26, E13 all chattering at low
-  elevation; eventually E15 went HIGH-conf with gf=1275 cm (12.75 m
-  geometry-free residual) but the engine had been ingesting bad data
-  from those SVs for ~10 minutes.
-
-The SVs are not snapping back to clean within seconds.  They stay
-wrong for the duration of their slip event (often minutes), then either
-recover when geometry changes (rising/setting) or remain wrong until
-muted by an unrelated mechanism (lock loss, arc gap, etc.).
-
-So the F10T isn't telling us SVs are teleporting briefly — it's telling
-us a tracking loop has slipped and is reporting a constant N-chip
-offset for the duration of the slipped state.  We already detect this;
-we just don't act.
-
-## Design: unified surgical slip handling
-
-Replace the binary `30 consecutive rejects → exit 5` with a **graduated
-response ladder** that uses the existing slip detector as the first
-line of defense.
+Cascade #6 on clkPoC3 day0511night (22:36 CDT, median |PR| = 6,295,637 m
+= exactly 21,488 L1 chips = 21 ms):
 
 ```
-Level 0: per-SV continuity check       NEW    catches single-SV slips at the epoch boundary
-Level 1: per-SV persistence escalator  NEW    promotes repeating LOW-conf slips to HIGH after N occurrences
-Level 2: per-SV mute on escalation     NEW    flush ambiguity + suspend from EKF for cooldown period
-Level 3: mode-classified cat-reject    NEW    distinguishes stationary chip-slip from drifting outlier
-Level 4: state-flush                   NEW    reset GNSS state, preserve clock state
-Level 5: re-bootstrap (exit-5)         keep   genuinely catastrophic faults
+22:36:17  [NAV2 1600] lat=<ARP> alt=<ARP_h+0.6m> hAcc=0.740m sv=20 pDOP=1.07
+22:36:18  [CATASTROPHIC_REJECT] median |PR|=6,295,636.8m  (consecutive: 1)
+22:36:27  [NAV2 1610] lat=<ARP> alt=<ARP_h+0.5m> hAcc=0.744m sv=20 pDOP=1.07
+            ← unchanged through the cascade
 ```
 
-### Level 0: per-SV PR continuity check
+Δlat between the two NAV2 reports ≈ 1 µdeg (~11 cm).  pDOP stable at
+1.07, hAcc stable at 0.74 m, sv count stable at 20.  The F10T's
+internal solver is unaware of any problem because it's already
+excluded the offending signal(s).
 
-For each SV at each epoch, predict the expected pseudorange from the
-previous valid epoch plus the line-of-sight range rate (from broadcast
-ephemeris):
+Equivalent stability holds across all 11 cascades.  We do not have a
+single case where F10T's NAV2 was destabilized by the chip slip.
+
+## Plan
+
+Replace the binary "30 rejects → exit 5" with a graduated response
+that *starts from the receiver's verdict*:
+
+```
+L0  NAV-SIG-based exclusion          NEW    skip obs where receiver says prUsed=0
+L2  per-SV mute (defensive)          NEW    catch cases where receiver re-admits too early
+L3  mode-classified cat-reject       NEW    if a cascade still happens, classify and contain
+L4  state-flush                      NEW    reset GNSS state, preserve clock + actuator
+L5  re-bootstrap (exit-5)            keep   last resort
+```
+
+L1 (persistence escalator from rev 1) is dropped — the receiver's
+internal logic handles persistence implicitly.
+
+### L0: NAV-SIG consumer
+
+UBX-NAV-SIG (msg class 0x01, ID 0x43) emits per-signal status every
+nav epoch:
+
+| Field        | Meaning                                                            |
+|--------------|--------------------------------------------------------------------|
+| `prUsed`     | Pseudorange used in nav solution (bit 0 of `flags`)                |
+| `crUsed`     | Carrier-range (phase) used (bit 1)                                 |
+| `doUsed`     | Doppler used (bit 2)                                               |
+| `prSmoothed` | Code smoothing applied (bit 3)                                     |
+| `prCorrUsed` | Corrections applied to PR (bit 4)                                  |
+| `crCorrUsed` | Corrections applied to carrier (bit 5)                             |
+| `doCorrUsed` | Corrections applied to doppler (bit 6)                             |
+| `health`     | 0=unknown, 1=healthy, 2=unhealthy (bits 8-9 of `flags`)            |
+| `cno`        | dBHz                                                               |
+| `prRes`      | PR residual in nav solution (m, 0.1m resolution, signed)           |
+| `ionoModel`  | Iono correction model used                                         |
+| `qualityInd` | Signal tracking quality (0-7)                                      |
+
+Available on both ZED-F9T-20B (TIM 2.25) and NEO-F10T-00B-01 per
+u-blox interface descriptions.
+
+**Engine integration**:
 
 ```python
-def check_pr_continuity(sv, pr_obs_m, prev_pr_obs_m, dt_s, ephemeris):
-    # Range rate from SV velocity dotted into line-of-sight unit vector.
-    r_dot = compute_range_rate_m_per_s(sv, ephemeris, our_known_pos)
-    expected = prev_pr_obs_m + r_dot * dt_s
-    residual = pr_obs_m - expected
-    # σ_pr_continuity ≈ 5-10 m for clean tracking; tighten with
-    # observed-rate-noise calibration.
-    if abs(residual) > 50.0:  # 50m = ~0.17 chips: catches anything chip-slip-sized
-        return SlipFlag(sv, kind="pr_continuity", residual_m=residual,
-                        conf=infer_conf_from_residual(residual))
-    return None
+# In the obs admission path (PPP filter + AntPosEst):
+sig_status = nav_sig_store.get(sv, signal_band, max_age_s=2.0)
+if sig_status is None:
+    # Receiver hasn't reported this signal recently; safer to skip
+    skip(reason="nav_sig_stale")
+elif not sig_status.pr_used:
+    skip(reason="nav_sig_pr_excluded")
+elif sig_status.health == "unhealthy":
+    skip(reason="nav_sig_unhealthy")
+else:
+    use(obs)
 ```
 
-10-20 LOC, no MW or GF combinations needed.  Drops a `pr_continuity`
-flag on any SV whose PR exceeds Keplerian-plausibility.  Note: a clock
-bias common to all SVs cancels in `prev_pr + r_dot*dt` ↔ `pr_obs`
-because it's the SAME bias both times.  So this check is robust to
-clock-state slips: a receiver clock chip-slip would create N consistent
-flags across all SVs, which is itself diagnostic.
+A new `Nav2SignalStore` mirrors `Nav2PositionStore` — receives parsed
+NAV-SIG payloads from the serial reader, stores a `(sv, sig_id) →
+SigStatus` map indexed by latest receive monotonic timestamp.
 
-### Level 1: per-SV persistence escalator
+**Composition with our existing exclusions**:
 
-The existing slip log emits LOW-confidence flags for transient slips.
-Currently those are noisy and ignored.  Make them load-bearing:
+`prUsed=0` is necessary-but-not-sufficient.  We still apply our own
+masks for things the receiver doesn't know about:
+
+- Missing phase bias (`PB_GAP_DROP` — our SSR-mount-coverage gap)
+- Elevation mask (below 10°)
+- ZTD-suspect SVs (when ZTD state is volatile)
+- AR-side ambiguity health (per the AntPosEst state machine)
+
+Composition: `use_sv = receiver_allows AND we_allow`.
+
+### L2: per-SV mute (defensive)
+
+If the receiver re-admits an SV (`prUsed: 0 → 1`) sooner than our own
+ambiguity-recovery wants, hold off using it until our state catches up.
+
+Lean on the existing `SvAmbState.WAITING → FLOATING` machinery: when a
+SV transitions `prUsed 0 → 1`, treat it as `arc_gap` re-acquisition
+(force the full WAITING → FLOATING → CONVERGING ladder, don't shortcut).
+
+### L3: mode-classified cat-reject
+
+If L0+L2 doesn't catch a failure (e.g. the receiver itself has a state
+bug, or its `prUsed` flag lags reality), cat-reject still fires.
+At consecutive ≥ 5, classify the last 5-10 rejected magnitudes:
 
 ```python
-class SvSlipTracker:
-    def __init__(self, escalate_after_n=5, decay_window_s=60):
-        self.low_conf_count = {}  # sv → count of consecutive LOW flags
-        self.last_flag_t    = {}
-
-    def feed(self, slip_flag):
-        sv = slip_flag.sv
-        # Reset count if more than decay_window since last flag
-        if t_now - self.last_flag_t.get(sv, 0) > self.decay_window_s:
-            self.low_conf_count[sv] = 0
-        if slip_flag.conf == "LOW":
-            self.low_conf_count[sv] = self.low_conf_count.get(sv, 0) + 1
-            if self.low_conf_count[sv] >= self.escalate_after_n:
-                # Promote to HIGH on persistence
-                slip_flag.conf = "HIGH"
-                slip_flag.reasons.append("persistence")
-        self.last_flag_t[sv] = t_now
-        return slip_flag
+def classify(recent_magnitudes_m):
+    mean = statistics.mean(recent_magnitudes_m)
+    sd   = statistics.stdev(recent_magnitudes_m)
+    cv   = sd / mean if mean > 0 else float('inf')
+    chips = mean / 293.05
+    if cv < 0.05 and mean > 100 and abs(chips - round(chips)) < 0.5:
+        return "STATIONARY_CHIPSLIP"
+    if cv > 0.20:
+        return "DRIFTING_OUTLIER"
+    return "UNKNOWN"
 ```
 
-A SV that emits 5 LOW-conf slip flags within 60 seconds is no longer
-noise — it's a sustained tracking failure.  Promote to HIGH so the
-existing flush-ambiguity-and-mute machinery kicks in.
+For STATIONARY_CHIPSLIP: HOLD state, don't increment consecutive
+counter, re-engage when median drops below threshold for ≥5 clean
+epochs.  Timeout 120 s to L4.
 
-### Level 2: per-SV mute with cooldown
+For DRIFTING_OUTLIER: exclude worst-PR-contributor SV (largest
+|residual / σ|), re-check median.
 
-When a HIGH-conf slip fires (either inherently HIGH or promoted from
-LOW), the existing code flushes the ambiguity.  Add: **suspend the SV
-from EKF participation for a cooldown period** (e.g. 60 sec).
+For UNKNOWN: behave like current code (consecutive=30 → L4).
 
-The SV's re-admission must satisfy the existing tracking re-acquire
-criteria PLUS pass the Level 0 continuity check on its first epoch
-back.  This prevents the same SV from getting re-admitted immediately
-and re-contaminating the EKF.
+### L4: state-flush (without restart)
 
-### Level 3: mode-classified cat-reject
+Flush all per-SV ambiguity state; preserve clock state, actuator,
+subsystems.  ~30 LOC.  Avoids the 6-second exit-5 overhead.
 
-If Levels 0-2 don't catch the failure (e.g. the bad data is the
-RECEIVER clock state slipping, not a single SV), cat-reject still
-fires.  At that point, classify the mode based on the last 5-10
-rejected epochs:
+### L5: re-bootstrap (current exit-5)
 
-```python
-class FailureMode(Enum):
-    STATIONARY_CHIPSLIP = ...  # CV<5%, mean is integer chip multiple
-    DRIFTING_OUTLIER    = ...  # CV>20%, drift over many epochs
-    UNKNOWN             = ...
-```
+Unchanged.  Fires only after L4 timeout.
 
-For STATIONARY_CHIPSLIP (5 of 11 cascades in day0511night):
-- HOLD the EKF state.
-- Do not increment `consecutive rejects`.
-- Re-engage when median |PR| drops back below the threshold for ≥5
-  clean epochs.
-- Timeout: escalate to Level 4 after 120 sec.
-
-For DRIFTING_OUTLIER (6 of 11):
-- Should NOT normally reach this level — Levels 0-2 should have
-  identified the offending SV(s) and muted them.
-- If we DO reach here, the worst-PR-contributor SV (largest
-  |residual / σ|) gets muted and the median re-checked.
-- Escalate to Level 4 only if outlier exclusion doesn't recover.
-
-### Level 4: state-flush (without restart)
-
-Same as in earlier draft: flush all per-SV ambiguity state, preserve
-clock state, preserve actuator, preserve subsystems.  ~20 LOC.  Skips
-the 6-second restart overhead.
-
-### Level 5: re-bootstrap (current exit-5 behavior)
-
-Unchanged.  Fires only after Level 4 times out.
-
-## Why this unification matters
-
-The cycle/code dichotomy disappears at the engine level: both are "the
-GNSS observable for this SV is anomalous against the model".  The slip
-log already records both kinds (mw_jump combines them).  The fix is to
-ACT on those records, not to add new detection machinery.
-
-The per-SV continuity check (Level 0) is the only genuinely new
-detector.  It exists to catch the case where the existing combinations
-fail to flag — e.g., a PR-only slip where the carrier is clean.  In
-day0511 data we didn't have a case of "PR slip with clean carrier",
-but the check is cheap and defends against unknown unknowns.
-
-## Implementation footprint
+## Implementation footprint (rev 2)
 
 | Component | Location | LOC | Notes |
 |-----------|----------|-----|-------|
-| Level 0 continuity check | `scripts/peppar_fix/ppp_ar.py` or solve_ppp | 30 | Per-SV per-epoch, ephemeris-based |
-| Level 1 persistence escalator | `scripts/peppar_fix/slip_detector.py` (or wherever slip flags are emitted) | 40 | Stateful SV tracker |
-| Level 2 mute + cooldown | existing SV state machine | 20 | Lean on existing FLOATING/WAITING enum + a new cooldown timer |
-| Level 3 mode classifier | `scripts/solve_ppp.py` cat-reject path | 50 | Replay-tested against day0511 data |
-| Level 4 state-flush | `scripts/peppar_fix_engine.py` | 30 | Carefully avoid touching actuator/EXTTS |
-| Tests (per-level synthetic injectors + replay harness) | scripts/peppar_fix/test_*.py | 200 | Critical for confidence |
+| NAV-SIG message subscribe + parser | `scripts/peppar_fix/receiver.py` + pyubx2 | 20 | Add to REQUIRED_MESSAGES; ack via CFG-MSG |
+| `Nav2SignalStore` | new `scripts/peppar_fix/nav_sig_store.py` | 60 | Mirror Nav2PositionStore; thread-safe map |
+| Engine consumer (obs admission) | `scripts/peppar_fix_engine.py` admission path | 30 | Skip when prUsed=0 / stale / unhealthy |
+| L2 mute integration | existing SV state machine | 20 | Trigger WAITING→FLOATING on prUsed 0→1 |
+| L3 mode classifier | `scripts/solve_ppp.py` cat-reject path | 50 | + recent-magnitudes ring buffer |
+| L4 state-flush | `scripts/peppar_fix_engine.py` | 30 |   |
+| Bonus 10-LOC win | cat-reject log line | 10 | Print chips + ms equivalents |
+| Tests (synthetic injectors + replay) | scripts/peppar_fix/test_*.py | 150 |   |
 
-Total: ~370 LOC + tests.  Estimate 6-8h of focused work to implement
-all five levels.  Could ship in phases: Level 0+1+2 first (the
-preventive layer that catches things early), then Level 3+4 as the
-graceful-degradation layer.
+Total: ~220 LOC + ~150 LOC tests = 4-5h focused work.
 
-## Open question for review
+## Validation phases
 
-For Level 0, what's the right σ threshold for PR-continuity?  Options:
-- Fixed threshold (50 m: catches anything > 0.17 chips, well above
-  receiver noise floor for clean tracking).
-- Adaptive: track per-SV PR-rate residual σ over a rolling window;
-  threshold = 5σ.  Catches anomalies relative to that SV's recent
-  noise.
-- Elevation-weighted: tighter at high elevation, looser at low.
+**Phase A — logger only, no behavior change.**
 
-I lean toward fixed initially (simplicity, no tuning needed); promote
-to adaptive if false-positive rate is problematic.
-
-## Validation plan
-
-**Lab data needed**: Once the F10T moves to MadHat (per Bob's plan to
-swap F10T ↔ F9T-BOT, putting F9T-BOT on clkPoC3 and F10T on MadHat),
-MadHat becomes the resilience test rig.
-
-Targets per overnight:
-- Existing slip detector firing rate (LOW-conf flags / hour).
-- Level 1 promotions (LOW → HIGH via persistence): expect O(10) / night
-  if the F10T tracking-loop pattern holds.
-- Level 2 mutes: should be close to one mute per cascade in the
-  current data.
-- Level 3 mode-classified cat-rejects: expect 5/11 → STATIONARY
-  cascades that hold-and-recover.
-- Level 4 state-flushes: expect 1-2 cascades that need to flush.
-- Level 5 re-bootstraps (exit-5): goal is 0 per night.
-
-**Pre-deploy validation**: replay harness fed with day0511 clkPoC3 log
-data should drive the engine through the 11 cascades and verify the
-new ladder behaves as predicted.  Build that harness first; ship code
-only when the replay matches the predicted classification.
-
-**Fall-back**: if F9T-BOT+clkPoC3 produces 0 events overnight (matching
-PiFace), we'll have to lean on the replay harness for validation.
-That's fine — the failure modes are well-documented in the day0511
-data.
-
-## Bonus 10-line win (do this regardless)
-
-In every cat-reject log line, also print the median magnitude in
-chips and milliseconds:
-
-```python
-chips = median_pr_m / 293.05
-ms    = median_pr_m / 299792.458
-log.error("[CATASTROPHIC_REJECT] median |PR|=%.1fm (%.3f L1 chips, %.3f ms) ...",
-          median_pr_m, chips, ms, ...)
+Subscribe to NAV-SIG, parse it, log a summary every epoch:
+```
+[NAV-SIG 12345] G07: prUsed=1 health=1 cno=44.0 prRes=+0.3m
+                E19: prUsed=0 health=1 cno=39.0 prRes=+412.7m  ← receiver excluded
+                ...
 ```
 
-Future debugging spots the chip-domain magnitude pattern at a glance.
+Run on the CURRENT engines (PiFace + clkPoC3 still running day0511 data
+into day0512).  No exclusion behavior change yet.  Capture:
+- Distribution of `prUsed=0` events per SV.
+- Correlation between `prUsed=0` and our cat-reject events.
+- Whether the F10T's chip-slip cascades have `prUsed=0` set on the
+  cascading SVs.
+
+If the correlation is strong (≥80% of our cat-rejected epochs have the
+cascading SV at `prUsed=0`), we have empirical proof.
+
+**Phase B — NAV-SIG-based exclusion, after F10T swap to MadHat.**
+
+Switch the engine to skip obs where the receiver says `prUsed=0`.
+Validation overnight on MadHat (F10T host).  Targets:
+- Exit-5 events: 0 expected
+- L3 mode-classified cat-rejects: ≤ 1 / night (only for receiver-side
+  state bugs or NAV-SIG lag)
+- TICC chA TDEV(1s) on MadHat: should approach F9T-class values
+  (PiFace ~0.4 ns) since the bad data is now filtered out at the
+  obs-admission boundary.
+
+If Phase A shows weak correlation (< 50% of cat-rejects have prUsed=0),
+that's surprising and reveals something about F10T NAV-SIG behavior
+we don't yet understand — fall back to the rev-1 per-SV continuity
+check approach, treat the receiver verdict as advisory not authoritative.
+
+## Open questions for review
+
+1. **NAV-SIG cadence on F10T**: u-blox default is 1 Hz.  Is that fast
+   enough?  RAWX is 1 Hz too, so the timescales match.  But if NAV-SIG
+   lags by 1 epoch, we'd be excluding based on slightly-stale info.
+   Need to measure empirically.
+
+2. **belt-and-suspenders question**: do we also want the rev-1 PR-rate
+   continuity check (predict ρ_k from ρ_{k-1} + range-rate, flag |residual| > 50 m)?
+   Pros: defends against any case where NAV-SIG lags or has a state bug.
+   Cons: complexity, potential false positives during real maneuvers.
+   Lean: defer to Phase B results; if NAV-SIG-only catches everything,
+   skip the continuity check.
+
+3. **L4 state-flush scope**: just ambiguities, or also dt_rx / ZTD?
+   Default proposal: just ambiguities (preserves the most-trustworthy
+   state).  Flipping ZTD or dt_rx loses information we don't want to lose.
+
+4. **What if NAV-SIG isn't being emitted?**  Fail-safe behavior:
+   - If NAV-SIG has been stale for >5s across all signals: assume
+     receiver is degraded, fall back to *not* requiring `prUsed=1`
+     (i.e., behave like current code without NAV-SIG dependency).
+     Log a warning.
+
+## Why this matters
+
+You wrote: "we are trying to parallel what it's doing internally".
+Exactly.  The receiver vendor has spent years on per-signal trust
+logic and exposes the result via a standard message.  Reading their
+answer is cheaper, more robust, and free of our own bias toward what
+"normal" looks like.  Our remaining responsibility is everything they
+don't know about: phase-bias mount coverage, AR readiness, our own
+ZTD stability monitor, the elevation mask we tune for our environment.
+
+Rev-1 framed this as building our own slip detector.  Rev-2 inverts:
+*use the receiver's verdict as primary input, layer our own
+domain-specific exclusions on top.*
