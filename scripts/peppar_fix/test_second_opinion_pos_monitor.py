@@ -3,7 +3,88 @@ from __future__ import annotations
 
 import unittest
 
-from peppar_fix.second_opinion_pos_monitor import SecondOpinionPosMonitor
+import numpy as np
+
+from peppar_fix.second_opinion_pos_monitor import (
+    SecondOpinionPosMonitor,
+    select_reset_target,
+)
+
+
+# CHOKE1 surveyed truth (NAD83(2011), 2026-05-11 5-day OPUS mean).
+_CHOKE1_ECEF = np.array(
+    [157469.3712, -4756188.9612, 4232768.4586], dtype=float)
+# NAV2's typical reported ECEF on MadHat — ~4 m horizontal east + ~3.8 m
+# vertical low from CHOKE1 truth (wrongIntBasin-charlie 2026-05-11).
+_NAV2_BIASED_ECEF = _CHOKE1_ECEF + np.array([2.5, 3.1, -3.5], dtype=float)
+
+
+class SelectResetTargetTest(unittest.TestCase):
+    """select_reset_target chooses pin vs NAV2 correctly."""
+
+    def test_pin_position_with_known_pos_returns_pin(self):
+        ecef, label = select_reset_target(
+            pin_position=True,
+            pin_ecef=_CHOKE1_ECEF,
+            nav2_ecef=_NAV2_BIASED_ECEF,
+        )
+        self.assertEqual(label, "known_pos")
+        np.testing.assert_array_equal(ecef, _CHOKE1_ECEF)
+
+    def test_no_pin_returns_nav2(self):
+        ecef, label = select_reset_target(
+            pin_position=False,
+            pin_ecef=None,
+            nav2_ecef=_NAV2_BIASED_ECEF,
+        )
+        self.assertEqual(label, "NAV2")
+        np.testing.assert_array_equal(ecef, _NAV2_BIASED_ECEF)
+
+    def test_pin_position_without_pin_ecef_falls_back_to_nav2(self):
+        # --pin-position set but no --known-pos: helper falls back to
+        # NAV2 as a safe default rather than guessing the pin.
+        ecef, label = select_reset_target(
+            pin_position=True,
+            pin_ecef=None,
+            nav2_ecef=_NAV2_BIASED_ECEF,
+        )
+        self.assertEqual(label, "NAV2")
+        np.testing.assert_array_equal(ecef, _NAV2_BIASED_ECEF)
+
+    def test_no_pin_with_stale_pin_ecef_still_returns_nav2(self):
+        # Defence-in-depth: caller forgot to clear pin_ecef but didn't
+        # set pin_position — we still pick NAV2 (the pin_position flag
+        # is the authoritative gate).
+        ecef, label = select_reset_target(
+            pin_position=False,
+            pin_ecef=_CHOKE1_ECEF,
+            nav2_ecef=_NAV2_BIASED_ECEF,
+        )
+        self.assertEqual(label, "NAV2")
+        np.testing.assert_array_equal(ecef, _NAV2_BIASED_ECEF)
+
+    def test_returns_ndarray_float(self):
+        # Helper coerces to float64 ndarray so downstream code (filter
+        # initialize) doesn't have to.
+        ecef, _ = select_reset_target(
+            pin_position=True,
+            pin_ecef=tuple(_CHOKE1_ECEF.tolist()),
+            nav2_ecef=tuple(_NAV2_BIASED_ECEF.tolist()),
+        )
+        self.assertIsInstance(ecef, np.ndarray)
+        self.assertEqual(ecef.dtype, np.float64)
+
+    def test_nav2_3d_displacement_irrelevant_to_choice(self):
+        # The helper's job is purely about WHICH target to use; the
+        # SECOND_OPINION_POS monitor is what decides WHEN to trip.
+        # Verify the helper doesn't try to be clever about distance.
+        ecef, label = select_reset_target(
+            pin_position=True,
+            pin_ecef=_CHOKE1_ECEF,
+            nav2_ecef=_CHOKE1_ECEF + np.array([100.0, 0.0, 0.0]),
+        )
+        self.assertEqual(label, "known_pos")
+        np.testing.assert_array_equal(ecef, _CHOKE1_ECEF)
 
 
 class SecondOpinionPosMonitorTest(unittest.TestCase):
