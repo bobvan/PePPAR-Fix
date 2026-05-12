@@ -282,7 +282,10 @@ class PPPFilter:
     """Multi-GNSS static-position PPP EKF with ISBs and float ambiguities."""
 
     def __init__(self, clock_model='random_walk',
-                 rx_tcxo_adev_1s=F9T_TCXO_ADEV_1S_DEFAULT):
+                 rx_tcxo_adev_1s=F9T_TCXO_ADEV_1S_DEFAULT,
+                 nav_sig_store=None,
+                 nav_sig_gate_enabled=False,
+                 nav_sig_max_age_s=2.0):
         """Multi-GNSS static-position PPP EKF.
 
         clock_model: 'random_walk' (default, legacy) or 'calibrated_white'.
@@ -299,6 +302,17 @@ class PPPFilter:
             for the receiver's rx TCXO.  Only consumed when
             clock_model='calibrated_white'.  Default is pessimistic; see
             F9T_TCXO_ADEV_1S_DEFAULT.
+        nav_sig_store: optional Nav2SignalStore for the NAV-SIG L0
+            admission gate.  When None or nav_sig_gate_enabled=False,
+            the gate is a no-op (admit reason='admit_gate_off') and
+            does not change filter behavior.  See
+            docs/nav-sig-gate-spec.md.
+        nav_sig_gate_enabled: when True AND nav_sig_store is set, the
+            per-obs admission loop drops observations where the receiver
+            reports prUsed=0 on either band (or unhealthy).
+        nav_sig_max_age_s: SigStatus older than this (relative to
+            time.monotonic() at update time) is treated as missing —
+            the gate falls through to our own quality checks alone.
         """
         if clock_model not in CLOCK_MODELS:
             raise ValueError(
@@ -311,6 +325,14 @@ class PPPFilter:
         self.sv_to_idx = {}
         self.prev_obs = {}
         self.initialized = False
+        # NAV-SIG L0 admission gate (Phase B engine-side per
+        # slipDetectUnified-main).  Default-off so the constructor
+        # change is bit-exact for callers that don't opt in.
+        from peppar_fix.nav_sig_gate import NavSigGateCounters
+        self.nav_sig_store = nav_sig_store
+        self.nav_sig_gate_enabled = bool(nav_sig_gate_enabled)
+        self.nav_sig_max_age_s = float(nav_sig_max_age_s)
+        self.nav_sig_counters = NavSigGateCounters()
 
     def initialize(self, pos_ecef, clock_m, isb_gal=0.0, isb_bds=0.0,
                    systems=None, pos_sigma_m=10.0, ztd_sigma_m=0.2,
@@ -756,7 +778,13 @@ class PPPFilter:
             'no_eph': 0,        # sat_pos missing (no ephemeris)
             'clock_bad': 0,     # |sat_clk| > 2 ms or missing
             'below_mask': 0,    # elev < ELEV_MASK
+            'nav_sig_excluded': 0,  # receiver said prUsed=0 (Phase B gate)
         }
+        # Phase B L0 admission gate — reset per-epoch counters.  The
+        # gate consults nav_sig_store after the other checks pass; this
+        # bookkeeping lets the engine emit a one-line summary per epoch.
+        self.nav_sig_counters.reset_epoch()
+        _nav_sig_now_mono = time.monotonic() if self.nav_sig_gate_enabled else 0.0
         if receiver_offset_ecef is not None:
             receiver_pos = x_eval[:3] + np.asarray(receiver_offset_ecef)
         else:
@@ -805,6 +833,26 @@ class PPPFilter:
             if elev < ELEV_MASK:
                 reject_counts['below_mask'] += 1
                 continue
+
+            # NAV-SIG L0 admission gate — when enabled, drop obs where
+            # the receiver reports prUsed=0 on either band of this SV.
+            # When disabled (default) or store absent, this is a no-op.
+            # See docs/nav-sig-gate-spec.md.
+            if self.nav_sig_gate_enabled and self.nav_sig_store is not None:
+                from peppar_fix.nav_sig_gate import decide
+                _gate = decide(
+                    self.nav_sig_store,
+                    sv=sv,
+                    f1_sig_name=obs.get('f1_sig_name'),
+                    f2_sig_name=obs.get('f2_sig_name'),
+                    gate_enabled=True,
+                    max_age_s=self.nav_sig_max_age_s,
+                    now_mono=_nav_sig_now_mono,
+                )
+                self.nav_sig_counters.record(_gate)
+                if not _gate.admit:
+                    reject_counts['nav_sig_excluded'] += 1
+                    continue
 
             tropo = self.tropo_delay(elev)
             m_wet = self.wet_mapping(elev)

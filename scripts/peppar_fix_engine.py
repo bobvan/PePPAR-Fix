@@ -1346,11 +1346,16 @@ def wait_for_nav2_seed(nav2_store, stop_event, timeout_s=60.0,
 
 
 def _build_ppp_filter(args):
-    """PPPFilter factory honouring --clock-model + --rx-tcxo-adev-1s.
+    """PPPFilter factory honouring --clock-model + --rx-tcxo-adev-1s
+    + --nav-sig-gate.
 
     Keeps the two instantiation sites (bootstrap + AntPosEstThread
     warm-start) in lockstep.  Default args shape preserves legacy
-    bit-exact behaviour (clock_model='random_walk').
+    bit-exact behaviour (clock_model='random_walk', nav-sig gate off).
+
+    args may carry a `nav_sig_store` attribute set by main() after
+    Nav2SignalStore is instantiated; the factory forwards it when
+    --nav-sig-gate is on.
     """
     kwargs = {}
     cm = getattr(args, "clock_model", "random_walk")
@@ -1359,6 +1364,16 @@ def _build_ppp_filter(args):
         adev = getattr(args, "rx_tcxo_adev_1s", None)
         if adev is not None:
             kwargs["rx_tcxo_adev_1s"] = float(adev)
+    # Phase B NAV-SIG L0 admission gate.  When --nav-sig-gate is set
+    # AND main() stashed a nav_sig_store on args, forward both into
+    # the filter so its per-obs loop can consult the receiver verdict.
+    if getattr(args, "nav_sig_gate", False):
+        store = getattr(args, "nav_sig_store", None)
+        if store is not None:
+            kwargs["nav_sig_store"] = store
+            kwargs["nav_sig_gate_enabled"] = True
+            max_age = getattr(args, "nav_sig_max_age_s", 2.0)
+            kwargs["nav_sig_max_age_s"] = float(max_age)
     return PPPFilter(**kwargs)
 
 
@@ -2037,12 +2052,20 @@ class AntPosEstThread(threading.Thread):
             log.info("AntPosEstThread: continuing from bootstrap PPPFilter "
                      "(amb=%d, %s)", len(self._filt.sv_to_idx), self._mw.summary())
         else:
-            ppp_kwargs = {}
-            if clock_model and clock_model != "random_walk":
-                ppp_kwargs["clock_model"] = clock_model
-                if rx_tcxo_adev_1s is not None:
-                    ppp_kwargs["rx_tcxo_adev_1s"] = float(rx_tcxo_adev_1s)
-            self._filt = PPPFilter(**ppp_kwargs)
+            # Use the shared factory so --nav-sig-gate + --clock-model
+            # are applied identically here and at the bootstrap site.
+            # AntPosEstThread receives `args` indirectly via the
+            # constructor's individual kwargs; we reconstruct a thin
+            # shim with the bits the factory reads.
+            class _FilterArgsShim:
+                pass
+            _shim = _FilterArgsShim()
+            _shim.clock_model    = clock_model
+            _shim.rx_tcxo_adev_1s = rx_tcxo_adev_1s
+            _shim.nav_sig_gate   = getattr(self, '_nav_sig_gate_enabled', False)
+            _shim.nav_sig_store  = getattr(self, '_nav_sig_store', None)
+            _shim.nav_sig_max_age_s = getattr(self, '_nav_sig_max_age_s', 2.0)
+            self._filt = _build_ppp_filter(_shim)
             log.info(
                 "AntPosEstThread: fresh PPPFilter at known position "
                 "(warm start) clock_model=%s%s",
@@ -7620,6 +7643,9 @@ def run(args):
     # data plane; engine-side disagreement logging consumes via
     # on_transition() registration.
     nav_sig_store = Nav2SignalStore()
+    # Stash on args so _build_ppp_filter can forward into PPPFilter
+    # when --nav-sig-gate is set.  Off by default; flip per overnight.
+    args.nav_sig_store = nav_sig_store
 
     # NAV-CLOCK + NAV-TIMEGPS stores — receiver clock-state telemetry
     # for f9tClockTelemetry-bravo (recoveryRetry-main work item 2).
@@ -8050,6 +8076,16 @@ def run(args):
                 getattr(args, "nav2_anchor_max_hacc_m", 3.0)),
             pin_position=bool(getattr(args, "pin_position", False)),
         )
+        # Phase B NAV-SIG L0 admission gate — attach store + flags to
+        # the thread so its fresh-PPPFilter path (warm-start, not
+        # bootstrap-inherited) picks them up via _build_ppp_filter.
+        # When --nav-sig-gate is off these are inert (filter constructor
+        # ignores them).
+        ape_thread._nav_sig_store = nav_sig_store
+        ape_thread._nav_sig_gate_enabled = bool(
+            getattr(args, 'nav_sig_gate', False))
+        ape_thread._nav_sig_max_age_s = float(
+            getattr(args, 'nav_sig_max_age_s', 2.0))
         ape_thread.start()
 
         # Phase 2: Steady state.  On exit code 5 (catastrophic-reject
@@ -8492,6 +8528,29 @@ Two-phase operation:
                           "values: 5e-11 to 1e-10.  Our lab-measured "
                           "DO TCXO maps to σ_y(1s)≈2e-9 (see "
                           "docs/ticc-baseline-2026-04-01.md).")
+    pos.add_argument("--nav-sig-gate", action="store_true",
+                     help="Enable the NAV-SIG L0 admission gate in "
+                          "the position filter (PPPFilter).  When set, "
+                          "observations whose corresponding UBX-NAV-SIG "
+                          "entries report prUsed=0 on either band (or "
+                          "health=2 unhealthy) are dropped from the "
+                          "filter update.  When NAV-SIG data is stale "
+                          "(> --nav-sig-max-age-s) or missing entirely, "
+                          "the gate falls through and our own quality "
+                          "checks are the only gate.  Default off — "
+                          "Phase B1 ships the code dormant.  Flip on "
+                          "after Phase A empirical data confirms the "
+                          "receiver's per-signal verdicts correlate "
+                          "with our own cat-reject events.  See "
+                          "docs/nav-sig-gate-spec.md.")
+    pos.add_argument("--nav-sig-max-age-s", type=float, default=2.0,
+                     help="SigStatus older than this (seconds, relative "
+                          "to time.monotonic() at filter update) is "
+                          "treated as missing — the gate falls through. "
+                          "Default 2.0 covers a one-epoch lag at 1 Hz "
+                          "NAV-SIG cadence.  Increase if NAV-SIG arrives "
+                          "less frequently than RAWX on a given "
+                          "transport.")
     pos.add_argument("--sigma-phi-if", type=float, default=None,
                      help="Override the IF carrier-phase measurement "
                           "noise sigma (meters).  Default uses "
