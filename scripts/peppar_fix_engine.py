@@ -6102,11 +6102,26 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             # realtime-to-PHC offset known from bootstrap.
             ticc_pps_estimator = TimebaseRelationEstimator()
 
+            # Stale-TICC detector (2026-05-12).  Track consecutive
+            # reopens that produced ZERO events.  Spamming "TICC reader
+            # started" every 2 s without measurements means the TICC
+            # opened but isn't producing data — typically because one
+            # of its PPS BNC inputs (chA = DO, chB = ref) was bumped
+            # or unplugged, or the TICC firmware hung.  Emit a clear
+            # [TICC_STALE] warning at threshold + on each subsequent
+            # cycle rather than burying the operator in repeated INFOs.
+            empty_reopens = 0
+            STALE_THRESHOLD_REOPENS = 5      # ≈ 10 s with 2 s reopen cadence
+            last_stale_log_mono = 0.0
+            STALE_LOG_INTERVAL_S = 30.0      # how often to repeat the warning
+
             while not stop_ticc.is_set():
+                events_this_open = 0
                 try:
                     with Ticc(args.ticc_port, args.ticc_baud, wait_for_boot=True) as ticc:
                         log.info("TICC reader started on %s", args.ticc_port)
                         for event in ticc.iter_events():
+                            events_this_open += 1
                             if stop_ticc.is_set():
                                 return
                             if ticc_log_w is not None:
@@ -6188,6 +6203,38 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                         return
                     log.warning("TICC reader reconnect after error: %s", exc)
                     time.sleep(1.0)
+
+                # ── Stale-TICC detector ────────────────────────────── #
+                # We exit the `with` block either via an exception
+                # (above) or via iter_events() returning.  Either way,
+                # if zero events were processed during this open, the
+                # TICC opened cleanly but produced nothing.  Count
+                # consecutive such opens; emit a clear warning at the
+                # threshold and at STALE_LOG_INTERVAL_S afterward.
+                if events_this_open == 0:
+                    empty_reopens += 1
+                else:
+                    if empty_reopens >= STALE_THRESHOLD_REOPENS:
+                        log.info("[TICC_STALE] /dev/ticc%s: recovered "
+                                 "after %d empty reopens — events flowing again",
+                                 args.ticc_port, empty_reopens)
+                    empty_reopens = 0
+
+                now_mono = time.monotonic()
+                if (empty_reopens >= STALE_THRESHOLD_REOPENS
+                        and (now_mono - last_stale_log_mono)
+                            >= STALE_LOG_INTERVAL_S):
+                    log.warning(
+                        "[TICC_STALE] %s: opened cleanly but received 0 "
+                        "events on the last %d reopens.  Likely cause: PPS "
+                        "BNC input(s) disconnected, TICC firmware hung, or "
+                        "no PPS pulses arriving on chA/chB.  Engine will "
+                        "keep retrying.  Try wiggling/reseating the BNCs, "
+                        "or DTR-reset via "
+                        "`python -c \"import serial; serial.Serial('%s', "
+                        "115200, dsrdtr=True).close()\"` then wait 15 s.",
+                        args.ticc_port, empty_reopens, args.ticc_port)
+                    last_stale_log_mono = now_mono
 
         t_ticc = threading.Thread(target=ticc_reader, daemon=True)
         t_ticc.start()
