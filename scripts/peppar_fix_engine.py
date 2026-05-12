@@ -295,7 +295,10 @@ def _compute_sv_ipp_szas(filt, azimuths, elevations, gps_time):
             continue
     return out
 from ntrip_client import NtripStream
-from realtime_ppp import serial_reader, ntrip_reader, QErrStore, Nav2PositionStore
+from realtime_ppp import (
+    serial_reader, ntrip_reader, QErrStore, Nav2PositionStore,
+    Nav2SignalStore, NavClockStore, NavTimeGpsStore,
+)
 from peppar_fix.extint_reader import TimTm2Store
 from ticc import Ticc
 from peppar_fix import (
@@ -7374,6 +7377,22 @@ def run(args):
     # position fix for the position-consensus watchdog.
     nav2_store = Nav2PositionStore()
 
+    # NAV-SIG store — per-(SV, signal) usage verdict from the receiver.
+    # Consumed by slipDetectUnified-main Phase A logger + Charlie's
+    # Phase A.5 disagreement instrumentation.  Per Bob's framing
+    # 2026-05-12: "we may use SVs the receiver doesn't, and may exclude
+    # SVs it uses, but we must LOG WHEN WE DIFFER."  The store is the
+    # data plane; engine-side disagreement logging consumes via
+    # on_transition() registration.
+    nav_sig_store = Nav2SignalStore()
+
+    # NAV-CLOCK + NAV-TIMEGPS stores — receiver clock-state telemetry
+    # for f9tClockTelemetry-bravo (recoveryRetry-main work item 2).
+    # Diagnostic visibility into receiver-side clock state for the
+    # chip-slip / command-envelope cascade hypotheses (I-115943-main).
+    nav_clock_store = NavClockStore()
+    nav_time_gps_store = NavTimeGpsStore()
+
     # gnss-phase-experiment: TIM-TM2 store for DOFreqEst Arm 3.  When
     # --no-extint is set we don't allocate the store and don't enable
     # the F9T's TIM-TM2 message — the EKF arm stays gated off cleanly
@@ -7470,7 +7489,10 @@ def run(args):
         target=serial_reader,
         args=(args.serial, args.baud, obs_queue, stop_event, beph, systems, ssr),
         kwargs={**serial_kwargs, 'driver': driver, 'nav2_store': nav2_store,
-                'extint_store': extint_store},
+                'extint_store': extint_store,
+                'nav_sig_store': nav_sig_store,
+                'nav_clock_store': nav_clock_store,
+                'nav_time_gps_store': nav_time_gps_store},
         daemon=True,
     )
     t_serial.start()

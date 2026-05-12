@@ -1431,11 +1431,20 @@ class FixedPosFilter:
             )
             if median_pr > baseline * self.CATASTROPHIC_PR_RATIO_TRIP:
                 self._consecutive_catastrophic_rejects += 1
+                # Decorate with GPS L1 chip + ms equivalents to make the
+                # magnitude instantly recognizable in chip-space (e.g.
+                # 21 ms cascade = 21,488 L1 chips × 293.05 m).  Saves
+                # post-incident debugging from running a calculator.
+                # See catRejectLogChips-bravo.
+                chips = median_pr / 293.052257   # GPS L1 chip length, m
+                ms = median_pr / 299_792.458     # 1 ms = c × 1 ms, m
                 log.error(
-                    "[CATASTROPHIC_REJECT] median |PR|=%.1fm > %.0f×baseline "
+                    "[CATASTROPHIC_REJECT] median |PR|=%.1fm "
+                    "(%.2f L1 chips, %.3f ms) > %.0f×baseline "
                     "%.1fm (consecutive rejects: %d) — epoch rejected, "
                     "state unchanged",
-                    median_pr, self.CATASTROPHIC_PR_RATIO_TRIP, baseline,
+                    median_pr, chips, ms,
+                    self.CATASTROPHIC_PR_RATIO_TRIP, baseline,
                     self._consecutive_catastrophic_rejects,
                 )
                 # Preserve pre-fit residuals for downstream visibility.
