@@ -32,14 +32,14 @@ class NavSigDisagreeMonitorTest(unittest.TestCase):
     # ─── Agreement (no log) ──────────────────────────────────────── #
 
     def test_both_admit_no_log(self):
-        self.store.set("G07", "GPS-L1CA", prUsed=True, cno=44, prRes=0.3)
+        self.store.set("G07", "GPS-L1CA", pr_used=True, cno=44, pr_res_m=0.3)
         admit = {("G07", "GPS-L1CA"): {"lock_time_ms": 64500, "cno": 43}}
         n = self.monitor.check_epoch(100, admit, self.store)
         self.assertEqual(n, 0)
         self.assertEqual(self._log_messages(), [])
 
     def test_both_exclude_no_log(self):
-        self.store.set("E19", "GAL-E5aQ", prUsed=False, cno=22, prRes=-3.1)
+        self.store.set("E19", "GAL-E5aQ", pr_used=False, cno=22, pr_res_m=-3.1)
         admit = {}  # we also exclude
         n = self.monitor.check_epoch(100, admit, self.store)
         self.assertEqual(n, 0)
@@ -48,8 +48,8 @@ class NavSigDisagreeMonitorTest(unittest.TestCase):
     # ─── Disagreement: we_admit + receiver_excludes ─────────────── #
 
     def test_we_admit_receiver_excludes_logs(self):
-        self.store.set("E19", "GAL-E5aQ", prUsed=False, cno=39,
-                       prRes=412.7, health=1)
+        self.store.set("E19", "GAL-E5aQ", pr_used=False, cno=39,
+                       pr_res_m=412.7, health=1)
         admit = {("E19", "GAL-E5aQ"): {
             "lock_time_ms": 64500, "cno": 39,
             "gf_phase_m": 0.3, "mw_cycles_smoothed": -2.71,
@@ -77,7 +77,7 @@ class NavSigDisagreeMonitorTest(unittest.TestCase):
     # ─── Disagreement: we_exclude + receiver_admits ─────────────── #
 
     def test_we_exclude_receiver_admits_logs(self):
-        self.store.set("C42", "BDS-B2aI", prUsed=True, cno=37, prRes=0.5)
+        self.store.set("C42", "BDS-B2aI", pr_used=True, cno=37, pr_res_m=0.5)
         admit = {}  # we excluded — perhaps PB_GAP_DROP
         self.monitor.check_epoch(100, admit, self.store)
         msgs = self._log_messages()
@@ -90,7 +90,7 @@ class NavSigDisagreeMonitorTest(unittest.TestCase):
 
     def test_no_log_on_steady_disagreement(self):
         # Persistent disagreement: log on FIRST epoch only.
-        self.store.set("E19", "GAL-E5aQ", prUsed=False, cno=39)
+        self.store.set("E19", "GAL-E5aQ", pr_used=False, cno=39)
         admit = {("E19", "GAL-E5aQ"): {"lock_time_ms": 64500}}
         n1 = self.monitor.check_epoch(100, admit, self.store)
         n2 = self.monitor.check_epoch(101, admit, self.store)
@@ -103,13 +103,13 @@ class NavSigDisagreeMonitorTest(unittest.TestCase):
     def test_log_again_on_transition_back(self):
         # Disagreement → agreement → disagreement: log twice.
         admit = {("E19", "GAL-E5aQ"): {"lock_time_ms": 64500}}
-        self.store.set("E19", "GAL-E5aQ", prUsed=False)
+        self.store.set("E19", "GAL-E5aQ", pr_used=False)
         self.monitor.check_epoch(100, admit, self.store)
         # Receiver now admits — agreement
-        self.store.set("E19", "GAL-E5aQ", prUsed=True)
+        self.store.set("E19", "GAL-E5aQ", pr_used=True)
         self.monitor.check_epoch(101, admit, self.store)
         # Receiver excludes again — disagreement returns
-        self.store.set("E19", "GAL-E5aQ", prUsed=False)
+        self.store.set("E19", "GAL-E5aQ", pr_used=False)
         self.monitor.check_epoch(102, admit, self.store)
         msgs = self._log_messages()
         # First and third epochs should log; second is agreement.
@@ -120,11 +120,11 @@ class NavSigDisagreeMonitorTest(unittest.TestCase):
     def test_log_on_direction_flip(self):
         # we_admit + recv_excludes → we_exclude + recv_admits
         # Both are disagreements but different direction — log twice.
-        self.store.set("E19", "GAL-E5aQ", prUsed=False)
+        self.store.set("E19", "GAL-E5aQ", pr_used=False)
         admit_with = {("E19", "GAL-E5aQ"): {"lock_time_ms": 64500}}
         self.monitor.check_epoch(100, admit_with, self.store)
         # Flip both
-        self.store.set("E19", "GAL-E5aQ", prUsed=True)
+        self.store.set("E19", "GAL-E5aQ", pr_used=True)
         admit_without: dict = {}
         self.monitor.check_epoch(101, admit_without, self.store)
         msgs = self._log_messages()
@@ -157,8 +157,8 @@ class NavSigDisagreeMonitorTest(unittest.TestCase):
         self.assertIsNone(engine_sig_to_ubx_sigid("NOPE-X1Z"))
 
     def test_state_size_tracking(self):
-        self.store.set("E19", "GAL-E5aQ", prUsed=False)
-        self.store.set("G07", "GPS-L1CA", prUsed=True)
+        self.store.set("E19", "GAL-E5aQ", pr_used=False)
+        self.store.set("G07", "GPS-L1CA", pr_used=True)
         admit = {("G07", "GPS-L1CA"): {}}
         self.monitor.check_epoch(100, admit, self.store)
         self.assertEqual(self.monitor.state_size(), 2)

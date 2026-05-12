@@ -10,26 +10,26 @@ flags (``prUsed``, ``crUsed``, ``health``, ``prRes``, ``cno``,
 from our engine's admit decision, the disagreement is data we use
 in Phase B to tune engine-side exclusion.
 
-## Expected ``Nav2SignalStore`` interface
+## ``Nav2SignalStore`` interface (bravo, PR #26)
 
-Bravo is implementing this in ``f9tClockTelemetry-bravo``.  The
-contract this module relies on::
+Bravo's ``realtime_ppp.Nav2SignalStore`` API consumed here::
 
-    class Nav2SignalStore:
-        def get_signal(self, sv: str, sig_id: str,
-                       max_age_s: float = 5.0) -> dict | None:
-            '''Return signal status dict or None if stale/missing.
+    store.snapshot() -> dict[(sv_label, sig_name), SigStatus]
+    store.get(sv_label, sig_name) -> SigStatus | None
 
-            Dict keys (minimum): prUsed (bool), prRes (float, m),
-            cno (float, dB-Hz), health (int).
-            Optional: crUsed, doUsed, prSmoothed, ionoModel, corrUsed.
-            '''
+where ``SigStatus`` has attributes (not dict keys):
+    pr_used, cr_used, do_used, pr_smoothed, health,
+    cno, quality_ind, pr_res_m, sig_name, host_mono, ...
 
-        def iter_signals(self, max_age_s: float = 5.0):
-            '''Yield (sv, sig_id) pairs for all currently-fresh signals.'''
+``sv_label`` is the engine's standard "G07" / "E19" / "C42" form;
+``sig_name`` matches the engine internal signal names ("GPS-L1CA",
+"GAL-E5aQ", "BDS-B2aI", ...) when the driver supplied the lookup
+table, else "sys{gnssId}/sig{sigId}" fallback.
 
 A ``StubSignalStore`` is provided below for unit testing and for
-back-compat when the engine runs without NAV-SIG plumbing.
+back-compat when the engine runs without NAV-SIG plumbing.  It
+mimics bravo's API surface — ``snapshot()``, ``get()``, and a
+``set()`` helper for tests.
 
 ## Hook point in engine
 
@@ -96,29 +96,37 @@ def engine_sig_to_ubx_sigid(engine_sig: str) -> tuple[int, int] | None:
     return _ENGINE_SIG_TO_UBX.get(engine_sig)
 
 
-class StubSignalStore:
-    """Drop-in for Nav2SignalStore until bravo's lands.
+class _StubSigStatus:
+    """Test-only SigStatus mimic — attribute access on a kwargs blob."""
 
-    Pre-populate with ``store.set(sv, sig_id, prUsed=..., prRes=...)``
-    in tests.  Production engine should plug in the real store.
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class StubSignalStore:
+    """Drop-in for Nav2SignalStore in unit tests.
+
+    Mimics bravo's ``Nav2SignalStore`` API surface — ``snapshot()`` and
+    ``get()``.  Pre-populate via ``store.set(sv, sig_name, pr_used=...,
+    pr_res_m=..., cno=..., health=...)``.  Production engine plugs in
+    bravo's real store.
     """
 
     def __init__(self) -> None:
-        self._sigs: dict[tuple[str, str], dict[str, Any]] = {}
+        self._sigs: dict[tuple[str, str], _StubSigStatus] = {}
 
-    def set(self, sv: str, sig_id: str, **fields: Any) -> None:
-        self._sigs[(sv, sig_id)] = dict(fields)
+    def set(self, sv: str, sig_name: str, **fields: Any) -> None:
+        self._sigs[(sv, sig_name)] = _StubSigStatus(**fields)
 
-    def clear(self, sv: str, sig_id: str) -> None:
-        self._sigs.pop((sv, sig_id), None)
+    def clear(self, sv: str, sig_name: str) -> None:
+        self._sigs.pop((sv, sig_name), None)
 
-    def get_signal(self, sv: str, sig_id: str,
-                   max_age_s: float = 5.0) -> dict | None:
-        return self._sigs.get((sv, sig_id))
+    def get(self, sv: str, sig_name: str):
+        return self._sigs.get((sv, sig_name))
 
-    def iter_signals(self, max_age_s: float = 5.0):
-        for k in self._sigs:
-            yield k
+    def snapshot(self):
+        return dict(self._sigs)
 
 
 class NavSigDisagreeMonitor:
@@ -156,37 +164,43 @@ class NavSigDisagreeMonitor:
         if signal_store is None:
             return 0
 
+        # Single snapshot per epoch — atomic w.r.t. signal-store updates,
+        # and one lock acquisition for the whole walk.
+        recv_snap = signal_store.snapshot()
         n_disagree = 0
-        seen: set[tuple[str, str]] = set()
 
-        # Walk receiver's known signals first.  For each, look up our
-        # admit decision and the diagnostic snapshot.
-        for sv, sig_id_engine in self._iter_receiver_signals(
-                our_admit_set, signal_store):
-            seen.add((sv, sig_id_engine))
-            receiver_sig = self._receiver_sig_for(
-                sv, sig_id_engine, signal_store)
+        # Union of receiver-known and engine-admitted signals.  Catches
+        # the rare 'we admit but receiver doesn't know' case.
+        keys: set[tuple[str, str]] = set(recv_snap.keys())
+        keys.update(our_admit_set.keys())
+
+        for sv, sig_name in keys:
+            receiver_sig = recv_snap.get((sv, sig_name))
             if receiver_sig is None:
-                # Receiver-side ID translation failed or stale.
-                # Don't classify — leave last_state untouched.
-                continue
-            receiver_admits = bool(receiver_sig.get('prUsed', False))
-            our_admits = (sv, sig_id_engine) in our_admit_set
+                # We admitted but receiver doesn't even have a record.
+                # Translate via UBX fallback name if applicable.
+                receiver_sig = self._fallback_receiver_lookup(
+                    sv, sig_name, recv_snap)
+                if receiver_sig is None:
+                    # Truly unknown to receiver — defer classification.
+                    continue
+            receiver_admits = bool(getattr(receiver_sig, 'pr_used', False))
+            our_admits = (sv, sig_name) in our_admit_set
             new_state = (receiver_admits, our_admits)
-            last = self._last_state.get((sv, sig_id_engine))
+            last = self._last_state.get((sv, sig_name))
             if last == new_state:
                 continue
-            self._last_state[(sv, sig_id_engine)] = new_state
+            self._last_state[(sv, sig_name)] = new_state
             if receiver_admits == our_admits:
                 # Transitioned, but into agreement — no log spam.
                 continue
             # Disagreement transition.
             n_disagree += 1
-            our_diag = our_admit_set.get((sv, sig_id_engine), {})
+            our_diag = our_admit_set.get((sv, sig_name), {})
             self._emit(
                 epoch=epoch,
                 sv=sv,
-                sig_id=sig_id_engine,
+                sig_id=sig_name,
                 receiver_admits=receiver_admits,
                 our_admits=our_admits,
                 receiver_sig=receiver_sig,
@@ -194,49 +208,20 @@ class NavSigDisagreeMonitor:
             )
         return n_disagree
 
-    def _iter_receiver_signals(self, our_admit_set, signal_store):
-        """Yield (sv, sig_id_engine) for all signals we should classify.
-
-        Union of receiver-known and engine-admitted signals.  Avoids
-        missing the rare ``we_admit + receiver_doesn't_track`` case
-        (e.g., a signal we got via RAWX but the nav engine never saw).
-        """
-        # Receiver-known.  iter_signals() may yield (gnssId, sigId)
-        # numeric pairs or (sv_str, sig_id_str); accept both.
-        for entry in signal_store.iter_signals():
-            sv, sig_id_engine = self._normalize_signal_key(entry)
-            if sv is None:
-                continue
-            yield sv, sig_id_engine
-        # Engine-admitted that receiver didn't yield.
-        for sv, sig_id_engine in our_admit_set:
-            yield sv, sig_id_engine
-
     @staticmethod
-    def _normalize_signal_key(entry):
-        """Accept either ('G07', 'GPS-L1CA') or ((0, 0)) iter_signals shape."""
-        if isinstance(entry, tuple) and len(entry) == 2:
-            a, b = entry
-            if isinstance(a, str) and isinstance(b, str):
-                return a, b
-            if isinstance(a, int) and isinstance(b, int):
-                # numeric (gnssId, sigId) — too ambiguous without sv.
-                # Bravo's store should yield (sv, sig_id_engine) pairs
-                # for cleanest interop.  Defer.
-                return None, None
-        return None, None
+    def _fallback_receiver_lookup(sv, sig_name, recv_snap):
+        """If engine name didn't match a snapshot key, try UBX numeric name.
 
-    def _receiver_sig_for(self, sv: str, sig_id_engine: str, signal_store):
-        """Pull receiver's signal record by either engine-sig or UBX-sigid."""
-        # Try engine-name first (preferred interop).
-        rec = signal_store.get_signal(sv, sig_id_engine)
-        if rec is not None:
-            return rec
-        # Fall back to UBX (gnssId, sigId).
-        ubx = engine_sig_to_ubx_sigid(sig_id_engine)
-        if ubx is not None:
-            return signal_store.get_signal(sv, f"{ubx[0]}:{ubx[1]}")
-        return None
+        Bravo's store names signals via the driver-supplied (gnssId,
+        sigId) → name map when present, else falls back to
+        ``"sys{gnssId}/sig{sigId}"``.  When the driver hasn't populated
+        the map yet, the snapshot may key on numeric names while the
+        engine still uses internal names — try the translation.
+        """
+        ubx = engine_sig_to_ubx_sigid(sig_name)
+        if ubx is None:
+            return None
+        return recv_snap.get((sv, f"sys{ubx[0]}/sig{ubx[1]}"))
 
     @staticmethod
     def _emit(epoch, sv, sig_id, receiver_admits, our_admits,
@@ -245,10 +230,10 @@ class NavSigDisagreeMonitor:
             direction = "receiver=excluded our=admit"
         else:
             direction = "receiver=admitted our=exclude"
-        # Receiver-side fields
-        pr_res = receiver_sig.get('prRes')
-        r_cno = receiver_sig.get('cno')
-        health = receiver_sig.get('health')
+        # Receiver-side fields (SigStatus attribute access)
+        pr_res = getattr(receiver_sig, 'pr_res_m', None)
+        r_cno = getattr(receiver_sig, 'cno', None)
+        health = getattr(receiver_sig, 'health', None)
         # Our-side fields (best-effort, all optional)
         lock_ms = our_diag.get('lock_time_ms')
         e_cno = our_diag.get('cno')
