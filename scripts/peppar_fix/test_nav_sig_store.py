@@ -199,6 +199,92 @@ class _PrUsedTransitions(unittest.TestCase):
         self.assertEqual(events, ['G07'])  # good_cb still fires
 
 
+class _GetSignalContract(unittest.TestCase):
+    """get_signal() + iter_signals() per the Phase A.5 monitor contract
+    (charlie/secondOpinionPinPos @ b42569f).
+    """
+
+    def setUp(self):
+        self.store = Nav2SignalStore()
+        self.store.set_signal_names(_SIGNAL_NAMES)
+
+    def test_get_signal_returns_dict_with_required_keys(self):
+        self.store.update(_FakeNavSig([
+            _sig(0, 7, 0, pr_used=True, cno=44, pr_res=3),
+        ]))
+        d = self.store.get_signal('G07', 'GPS-L1CA')
+        self.assertIsInstance(d, dict)
+        # Required keys per the spec:
+        for k in ('prUsed', 'prRes', 'cno', 'health'):
+            self.assertIn(k, d)
+        # Optional keys:
+        for k in ('crUsed', 'doUsed', 'prSmoothed', 'qualityInd',
+                  'hostMono', 'ageS'):
+            self.assertIn(k, d)
+        self.assertTrue(d['prUsed'])
+        self.assertEqual(d['cno'], 44)
+        self.assertEqual(d['health'], 1)
+
+    def test_get_signal_missing_returns_none(self):
+        # Never seen: not in store yet
+        self.assertIsNone(self.store.get_signal('G07', 'GPS-L1CA'))
+
+    def test_get_signal_stale_returns_none(self):
+        """If the SigStatus is older than max_age_s, return None."""
+        import time as _time
+        self.store.update(_FakeNavSig([
+            _sig(0, 7, 0, pr_used=True),
+        ]))
+        # Force the stored host_mono back so the entry is "stale".
+        st = self.store.get('G07', 'GPS-L1CA')
+        st.host_mono = _time.monotonic() - 10.0  # 10 s old
+        self.assertIsNone(
+            self.store.get_signal('G07', 'GPS-L1CA', max_age_s=5.0))
+        # But within a larger window it returns:
+        self.assertIsNotNone(
+            self.store.get_signal('G07', 'GPS-L1CA', max_age_s=30.0))
+
+    def test_iter_signals_yields_fresh_pairs(self):
+        self.store.update(_FakeNavSig([
+            _sig(0, 7, 0, pr_used=True),
+            _sig(2, 19, 4, pr_used=False),
+            _sig(3, 42, 0, pr_used=True),
+        ]))
+        pairs = list(self.store.iter_signals())
+        self.assertEqual(set(pairs), {
+            ('G07', 'GPS-L1CA'),
+            ('E19', 'GAL-E5aQ'),
+            ('C42', 'BDS-B1I'),
+        })
+
+    def test_iter_signals_filters_stale(self):
+        import time as _time
+        self.store.update(_FakeNavSig([
+            _sig(0, 7, 0, pr_used=True),
+            _sig(2, 19, 4, pr_used=False),
+        ]))
+        # Make E19 stale:
+        st = self.store.get('E19', 'GAL-E5aQ')
+        st.host_mono = _time.monotonic() - 10.0
+        pairs = list(self.store.iter_signals(max_age_s=5.0))
+        self.assertEqual(pairs, [('G07', 'GPS-L1CA')])
+
+    def test_get_signal_camelcase_keys_match_spec(self):
+        """Dict keys are UBX-aligned camelCase to match consumer
+        expectations — NOT snake_case used internally."""
+        self.store.update(_FakeNavSig([
+            _sig(0, 7, 0, pr_used=True, cr_used=True, do_used=False),
+        ]))
+        d = self.store.get_signal('G07', 'GPS-L1CA')
+        # camelCase spec:
+        self.assertIn('prUsed', d)
+        self.assertIn('crUsed', d)
+        self.assertIn('doUsed', d)
+        # NOT snake_case:
+        self.assertNotIn('pr_used', d)
+        self.assertNotIn('cr_used', d)
+
+
 class _NavClockStoreTest(unittest.TestCase):
     def test_empty_then_update(self):
         store = NavClockStore()

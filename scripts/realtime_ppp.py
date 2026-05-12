@@ -784,7 +784,13 @@ class Nav2SignalStore:
         return transitions
 
     def get(self, sv_label, sig_name):
-        """Return latest SigStatus for (sv_label, sig_name) or None."""
+        """Return latest SigStatus for (sv_label, sig_name) or None.
+
+        Polling getter — returns the raw dataclass without staleness
+        gating.  Use ``get_signal()`` for the dict-shaped, stale-aware
+        interface that consumer monitors (e.g. NavSigDisagreeMonitor)
+        prefer.
+        """
         with self._lock:
             return self._by_key.get((sv_label, sig_name))
 
@@ -792,6 +798,66 @@ class Nav2SignalStore:
         """Return shallow copy of the full map."""
         with self._lock:
             return dict(self._by_key)
+
+    def get_signal(self, sv, sig_id, max_age_s=5.0):
+        """Return dict signal status, or None if missing or stale.
+
+        Per the slipDetectUnified-main Phase A.5 monitor contract
+        (charlie/secondOpinionPinPos @ b42569f).  Wraps the internal
+        SigStatus dataclass in a dict with UBX-aligned camelCase
+        keys to match consumer expectations.
+
+        Args:
+            sv: SV label like 'G07', 'E19', 'C42'.
+            sig_id: signal name like 'GPS-L1CA', 'GAL-E5aQ', 'BDS-B2aI'.
+                Engine-internal naming; matches sig_name from the
+                receiver driver's signal_names map.
+            max_age_s: staleness gate.  Returns None if the SigStatus
+                hasn't been refreshed within this window.
+
+        Returns:
+            dict with required keys:
+                prUsed (bool), prRes (float | None, m),
+                cno (float | None, dB-Hz), health (int).
+            Plus optional keys: crUsed, doUsed, prSmoothed,
+            qualityInd, hostMono, ageS.
+            None if the (sv, sig_id) pair was never seen or its
+            status is older than max_age_s.
+        """
+        with self._lock:
+            st = self._by_key.get((sv, sig_id))
+        if st is None:
+            return None
+        age_s = time.monotonic() - st.host_mono
+        if age_s > max_age_s:
+            return None
+        return {
+            'prUsed':      st.pr_used,
+            'prRes':       st.pr_res_m,
+            'cno':         st.cno,
+            'health':      st.health,
+            'crUsed':      st.cr_used,
+            'doUsed':      st.do_used,
+            'prSmoothed':  st.pr_smoothed,
+            'qualityInd':  st.quality_ind,
+            'hostMono':    st.host_mono,
+            'ageS':        age_s,
+        }
+
+    def iter_signals(self, max_age_s=5.0):
+        """Yield (sv, sig_id) tuples for currently-fresh signals.
+
+        Per the Phase A.5 monitor contract — gives the consumer a
+        deterministic iteration order over signals the receiver is
+        actively reporting on.  Stale entries are filtered out by
+        the same max_age_s window as get_signal().
+        """
+        now = time.monotonic()
+        with self._lock:
+            items = [(key, st.host_mono) for key, st in self._by_key.items()]
+        for (sv, sig_id), host_mono in sorted(items):
+            if now - host_mono <= max_age_s:
+                yield sv, sig_id
 
     def on_transition(self, callback):
         """Register callback fired on each prUsed transition.
