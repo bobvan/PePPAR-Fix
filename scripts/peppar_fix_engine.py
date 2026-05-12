@@ -8794,6 +8794,16 @@ Two-phase operation:
     out.add_argument("--duration", type=int, default=None,
                      help="Run duration in seconds (0 = unlimited)")
     out.add_argument("--gate-stats", help="Optional JSON output for strict sink gate statistics")
+    out.add_argument("--log-out", default=None,
+                     help="Append engine log messages to this file in "
+                          "addition to stderr.  Append-mode and "
+                          "independent of any shell `> ...log` redirect, "
+                          "so the log survives wrapper-driven engine "
+                          "relaunches without truncation.  Matches the "
+                          "append-mode behavior of --ticc-log / "
+                          "--extint-log / --qerr-log from "
+                          "recoveryRetry-main.  Default: stderr only "
+                          "(operator's shell redirect captures it).")
     out.add_argument("-v", "--verbose", action="store_true")
 
     peer = ap.add_argument_group("Peer state sharing")
@@ -8960,10 +8970,25 @@ Two-phase operation:
         # Heuristic: if bootstrap adjfine is > 1000 ppb, likely a TCXO.
         args.freerun_max_error_ns = 500_000.0  # conservative default
 
+    # Logging: always to stderr (inherits the wrapper's redirect).
+    # When --log-out PATH is provided, also append to PATH directly.
+    # The append-mode FileHandler is independent of the shell redirect,
+    # so it survives wrapper-driven engine relaunches with no truncation
+    # — fixes the overnight-log-loss observed 2026-05-11/12 on MadHat.
+    _log_handlers = [logging.StreamHandler(sys.stderr)]
+    if getattr(args, 'log_out', None):
+        try:
+            _fh = logging.FileHandler(args.log_out, mode='a', encoding='utf-8')
+            _log_handlers.append(_fh)
+        except OSError as _exc:
+            # Best effort — fall back to stderr only.  Engine bootstrap
+            # shouldn't fail because the log file is unwritable.
+            print(f"WARNING: --log-out {args.log_out!r} open failed: {_exc}",
+                  file=sys.stderr)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
-        stream=sys.stderr,
+        handlers=_log_handlers,
     )
 
     # Log the git hash (and branch + dirty flag) at startup so post-hoc
