@@ -336,3 +336,53 @@ def measure_differential_frequency(ticc_port, ticc_baud=115200,
              len(pairs), n_intervals)
 
     return freq_ppb, sigma, n_intervals
+
+
+def measure_differential_phase(ticc_port, ticc_baud=115200,
+                               do_channel='chA', ref_channel='chB',
+                               n_samples=3, timeout_s=20):
+    """Measure the median phase offset between DO PPS and ref PPS via TICC.
+
+    Like measure_differential_frequency but returns just the median
+    instantaneous |phase| — used by the warm-start gate to decide
+    whether to step (via TADD ARM) or slew the divider.
+
+    Returns (median_diff_ns, n_pairs) or (None, 0) on insufficient
+    samples.  positive median_diff_ns = DO PPS is later than ref PPS.
+    """
+    from ticc import Ticc
+
+    pairs = []
+    pending = {}
+    boot_discard = 5
+
+    with Ticc(ticc_port, ticc_baud, wait_for_boot=True) as ticc:
+        deadline = time.monotonic() + timeout_s
+        for channel, ref_sec, ref_ps in ticc:
+            if time.monotonic() > deadline:
+                break
+            if channel not in (do_channel, ref_channel):
+                continue
+            if ref_sec <= boot_discard:
+                continue
+
+            pending.setdefault(ref_sec, {})[channel] = (ref_sec, ref_ps)
+            if (do_channel in pending.get(ref_sec, {}) and
+                    ref_channel in pending.get(ref_sec, {})):
+                do = pending[ref_sec][do_channel]
+                ref = pending[ref_sec][ref_channel]
+                del pending[ref_sec]
+                diff_ps = ((do[0] - ref[0]) * 1_000_000_000_000
+                           + do[1] - ref[1])
+                pairs.append(diff_ps * 1e-3)
+                if len(pairs) >= n_samples:
+                    break
+
+            cutoff = ref_sec - 4
+            for k in [k for k in pending if k < cutoff]:
+                del pending[k]
+
+    if len(pairs) < 1:
+        return None, 0
+    median = statistics.median(pairs)
+    return median, len(pairs)

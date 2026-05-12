@@ -163,6 +163,124 @@ def save_do_characterization(unique_id, characterization, state_dir=None):
     save_do_state(state, state_dir)
 
 
+def is_do_warm_startable(unique_id, max_age_s=86400, max_ppb=500.0,
+                         state_dir=None):
+    """Decide whether the DO can skip cold-start bootstrap.
+
+    Cold-start bootstrap costs ~15-30 s: DAC center reset + post-ARM
+    settle + freerun PPS measurement.  When the prior run's
+    last_known_freq_offset_ppb is recent and physically plausible,
+    the DAC can be seeded from it directly and the freerun
+    measurement skipped.  This matters across watchdog re-bootstraps
+    where the saved freq is ~seconds old.  See dacWarmStart-main.
+
+    Pass criteria (all must hold):
+      - State file exists and parses
+      - 'last_known_freq_offset_ppb' is present and finite
+      - |freq| <= max_ppb (sanity envelope; a 5000 ppb value is
+        almost certainly a parsing error or stale corruption)
+      - File mtime within max_age_s of now
+
+    Returns:
+        (True, dict) where dict has keys 'freq_ppb', 'age_s',
+            'reason' when warm-startable.
+        (False, dict) where dict has 'reason' describing why not.
+    """
+    import math
+    import time as _time
+    path = _do_path(unique_id, state_dir)
+    if not os.path.exists(path):
+        return (False, {"reason": "no_state_file"})
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError as e:
+        return (False, {"reason": f"stat_failed: {e}"})
+    age_s = _time.time() - mtime
+    if age_s > max_age_s:
+        return (False, {"reason": f"too_old: age={age_s:.0f}s "
+                                 f"max={max_age_s:.0f}s"})
+    state = load_do_state(unique_id, state_dir)
+    if state is None:
+        return (False, {"reason": "load_failed"})
+    freq = state.get("last_known_freq_offset_ppb")
+    if freq is None:
+        return (False, {"reason": "no_last_known_freq"})
+    try:
+        freq_f = float(freq)
+    except (TypeError, ValueError):
+        return (False, {"reason": f"freq_not_numeric: {freq!r}"})
+    if not math.isfinite(freq_f):
+        return (False, {"reason": f"freq_not_finite: {freq_f}"})
+    if abs(freq_f) > max_ppb:
+        return (False, {"reason": f"freq_out_of_envelope: "
+                                 f"|{freq_f:.1f}| > {max_ppb:.1f} ppb"})
+    return (True, {"freq_ppb": freq_f, "age_s": age_s,
+                   "reason": "fresh"})
+
+
+def derive_do_process_noise(characterization):
+    """Extract DOFreqEst process-noise parameters from a DO characterization.
+
+    The DOFreqEst EKF uses (sigma_do_phase_ns, sigma_do_freq_ppb) as
+    random-walk amplitudes per √s for the DO state.  Defaults
+    (0.92 ns, ≈0.05 ppb) are 10–100× looser than well-disciplined
+    OCXO + DAC chains actually wander, which drives the EKF to
+    over-react to GNSS-side measurement noise and inject it into the
+    actuator.  Driving these from measured characterization closes
+    that gap.  See doProcessNoiseFromChar-main.
+
+    Heuristic (v1):
+      sigma_do_phase_ns  = ASD@0.1Hz of the DO's PPS or Carrier
+                           output (units ns/√Hz, used directly as
+                           ns/√s for the random-walk).  Prefer
+                           Carrier > PPS > PPS+qErr.
+      sigma_do_freq_ppb  = ASD@0.1Hz of the `adjfine` source
+                           (units ppb/√Hz).  This is the freq-noise
+                           floor the DO sees on its actuator input.
+
+    Both numbers are conservative — they're the noise floor at the
+    PSD measurement band-center, not the absolute white-FM floor.
+    Refinement: factor in slope and pick a better point on the PSD
+    curve.  Doing the simple thing first.
+
+    Returns:
+        dict with keys 'sigma_do_phase_ns' and/or 'sigma_do_freq_ppb'
+        for whichever were extractable; an empty dict if nothing
+        usable was found; None if characterization is malformed.
+    """
+    if not isinstance(characterization, dict):
+        return None
+    sources = characterization.get("sources")
+    if not isinstance(sources, dict):
+        return {}
+
+    out = {}
+
+    # Phase noise — prefer Carrier (cleanest DO output) > PPS > PPS+qErr.
+    for key in ("Carrier", "PPS", "PPS+qErr"):
+        src = sources.get(key)
+        if not isinstance(src, dict):
+            continue
+        if src.get("units") != "ns":
+            continue
+        v = src.get("asd_at_0.1Hz")
+        if isinstance(v, (int, float)) and v > 0:
+            out["sigma_do_phase_ns"] = float(v)
+            out["sigma_do_phase_source"] = key
+            break
+
+    # Frequency noise — adjfine ASD measures the DO's freq-domain
+    # noise floor at the actuator input.
+    src = sources.get("adjfine")
+    if isinstance(src, dict) and src.get("units") == "ppb":
+        v = src.get("asd_at_0.1Hz")
+        if isinstance(v, (int, float)) and v > 0:
+            out["sigma_do_freq_ppb"] = float(v)
+            out["sigma_do_freq_source"] = "adjfine"
+
+    return out
+
+
 # ── PHC state ────────────────────────────────────────────────────────────── #
 
 def _phc_path(unique_id, state_dir=None):

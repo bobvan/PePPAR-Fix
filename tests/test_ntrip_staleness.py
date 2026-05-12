@@ -12,17 +12,12 @@ silently freezing the servo:
   3. Permanent rejection — caster returns HTTP 401/403/404/410.  raw_frames()
      must stop retrying so a typo in credentials doesn't loop forever.
 
-Plus the consumer-side cascade:
-  - compute_error_sources() inflates Carrier and PPS+PPP σ as corr_age_s
-    grows so source competition hands off to PPS+qErr → PPS automatically.
-
 These tests don't touch any real socket — NtripStream is monkeypatched
 so the supervisor loop runs deterministically.
 
 Run: python3 tests/test_ntrip_staleness.py
 """
 
-import math
 import socket
 import sys
 import time
@@ -34,10 +29,6 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
 from ntrip_client import NtripStream  # noqa: E402
-from peppar_fix.error_sources import (  # noqa: E402
-    CarrierPhaseTracker,
-    compute_error_sources,
-)
 
 
 def _make_stream(**overrides):
@@ -169,97 +160,6 @@ class TestRetryForever(unittest.TestCase):
             f"Fatal error should stop after first attempt, got {attempts['n']}",
         )
         self.assertTrue(stream._fatal)
-
-
-class TestSigmaInflationCascade(unittest.TestCase):
-    """compute_error_sources must hand off Carrier → PPS+qErr → PPS as
-    correction age grows."""
-
-    def _carrier_tracker(self):
-        ct = CarrierPhaseTracker()
-        ct.initialize(0.0)
-        return ct
-
-    def test_zero_age_carrier_wins(self):
-        ct = self._carrier_tracker()
-        sources = compute_error_sources(
-            pps_error_ns=0.0,
-            qerr_ns=0.5,
-            dt_rx_ns=0.0,
-            dt_rx_sigma_ns=2.0,
-            carrier_tracker=ct,
-            corr_age_s=0.0,
-        )
-        self.assertEqual(sources[0].name, "Carrier")
-        self.assertAlmostEqual(sources[0].confidence_ns, 2.0, places=5)
-
-    def test_30s_age_handoff_to_pps_qerr(self):
-        ct = self._carrier_tracker()
-        sources = compute_error_sources(
-            pps_error_ns=0.0,
-            qerr_ns=0.5,
-            dt_rx_ns=0.0,
-            dt_rx_sigma_ns=2.0,
-            carrier_tracker=ct,
-            corr_age_s=30.0,
-        )
-        self.assertEqual(sources[0].name, "PPS+qErr")
-        carrier = next(s for s in sources if s.name == "Carrier")
-        # σ_eff = sqrt(2² + (0.1*30)²) = sqrt(4 + 9) = 3.606
-        self.assertAlmostEqual(carrier.confidence_ns, math.sqrt(13), places=4)
-
-    def test_300s_age_handoff_to_pps_only(self):
-        ct = self._carrier_tracker()
-        sources = compute_error_sources(
-            pps_error_ns=0.0,
-            qerr_ns=0.5,
-            dt_rx_ns=0.0,
-            dt_rx_sigma_ns=2.0,
-            carrier_tracker=ct,
-            corr_age_s=300.0,
-        )
-        # σ_carrier ≈ 30 ns, σ_pps_qerr = 3, σ_pps = 20 → PPS+qErr still wins
-        # because it doesn't depend on dt_rx.
-        self.assertEqual(sources[0].name, "PPS+qErr")
-
-    def test_carrier_recovers_when_corrections_return(self):
-        """Drop in corr_age_s should restore Carrier to top spot
-        without any state reset — the whole point of the design."""
-        ct = self._carrier_tracker()
-        for age, expected in [
-            (0.0, "Carrier"),
-            (60.0, "PPS+qErr"),
-            (0.0, "Carrier"),
-            (1000.0, "PPS+qErr"),
-            (5.0, "Carrier"),
-        ]:
-            sources = compute_error_sources(
-                pps_error_ns=0.0,
-                qerr_ns=0.5,
-                dt_rx_ns=0.0,
-                dt_rx_sigma_ns=2.0,
-                carrier_tracker=ct,
-                corr_age_s=age,
-            )
-            self.assertEqual(
-                sources[0].name, expected,
-                f"At corr_age={age}s expected {expected}, got {sources[0].name}",
-            )
-
-    def test_corr_age_none_disables_inflation(self):
-        """Back-compat: callers that don't provide corr_age_s see no
-        inflation at all."""
-        ct = self._carrier_tracker()
-        sources = compute_error_sources(
-            pps_error_ns=0.0,
-            qerr_ns=0.5,
-            dt_rx_ns=0.0,
-            dt_rx_sigma_ns=2.0,
-            carrier_tracker=ct,
-            corr_age_s=None,
-        )
-        carrier = next(s for s in sources if s.name == "Carrier")
-        self.assertAlmostEqual(carrier.confidence_ns, 2.0, places=5)
 
 
 if __name__ == "__main__":

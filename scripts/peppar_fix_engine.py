@@ -580,7 +580,13 @@ class RxTcxoTracker:
             this call, and the unwrapped phase after the final sample
             (or self._accumulated_ns if zero drained).
         """
-        floor = self._prev_t_s if self._prev_t_s is not None else 0.0
+        # drain_since uses strict t > floor.  On a fresh tracker we
+        # want every retained sample; floor=0.0 worked accidentally in
+        # production (real monotonic timestamps are positive) but
+        # dropped legitimate t=0.0 samples in unit tests.  Use -inf as
+        # the "before all samples" sentinel — any finite t is strictly
+        # greater.
+        floor = self._prev_t_s if self._prev_t_s is not None else float("-inf")
         samples = qerr_store.drain_since(floor)
         for host_time, qerr_ns in samples:
             self.update(qerr_ns, t_s=host_time,
@@ -4016,7 +4022,58 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
         # servo starts.  Skipped if --skip-bootstrap or --freerun.
         # For PHC DOs: phase step + adjfine.
         # For VCOCXO DOs: TADD ARM + DAC frequency seed.
-        if not getattr(args, 'skip_bootstrap', False) and not args.freerun:
+        #
+        # dacWarmStart-main: when --warm-start-if-fresh is set, gate the
+        # bootstrap on the freshness of state/dos/<uid>.json.  Recent
+        # last_known_freq_offset_ppb seeds _bootstrap_freq_ppb directly,
+        # which _setup_servo's "Restored bootstrap frequency" path
+        # re-applies after actuator.setup().  Saves 15-30s on watchdog
+        # re-bootstrap where the saved freq is seconds old.
+        skip_for_warm_start = False
+        if (getattr(args, 'warm_start_if_fresh', False)
+                and not args.freerun
+                and not getattr(args, 'skip_bootstrap', False)):
+            try:
+                from peppar_fix.do_state import is_do_warm_startable
+                _do_uid_ws = (getattr(args, 'do_unique_id', None)
+                              or _resolve_do_uid(args))
+                if _do_uid_ws is not None:
+                    ok, info = is_do_warm_startable(
+                        _do_uid_ws,
+                        max_age_s=args.warm_start_max_age_s,
+                        max_ppb=args.warm_start_max_ppb)
+                    if ok:
+                        args._bootstrap_freq_ppb = info["freq_ppb"]
+                        skip_for_warm_start = True
+                        log.info("Warm-start: skipping DO bootstrap "
+                                 "(freq=%.1f ppb, age=%.0fs from state)",
+                                 info["freq_ppb"], info["age_s"])
+                        # Phase-conditional TADD ARM.  Warm-start skips
+                        # _do_bootstrap_init() which is where ARM runs;
+                        # check phase and step if beyond the threshold.
+                        # Divider phase state isn't persisted in any
+                        # state file, so any physical event between the
+                        # last save and now can leave the divider at a
+                        # wrong sub-second phase.  See
+                        # project_warm_start_sign_blind_spot memory.
+                        _maybe_step_divider_on_phase(args)
+                        if dfe_sm is not None:
+                            dfe_sm.transition(DOFreqEstState.TRACKING,
+                                              "warm-start from saved freq")
+                    else:
+                        log.info("Warm-start gate failed (%s) — "
+                                 "falling back to cold-start bootstrap",
+                                 info.get("reason", "unknown"))
+                else:
+                    log.info("Warm-start: no do_unique_id resolvable — "
+                             "falling back to cold-start bootstrap")
+            except Exception as e:
+                log.warning("Warm-start gate raised %s — "
+                            "falling back to cold-start bootstrap", e)
+
+        if (not skip_for_warm_start
+                and not getattr(args, 'skip_bootstrap', False)
+                and not args.freerun):
             if not _do_bootstrap_init(args, ptp, known_ecef, obs_queue,
                                         beph, ssr, stop_event,
                                         dfe_sm=dfe_sm):
@@ -5117,6 +5174,78 @@ def _do_tadd_arm(args):
         log.info("No TADD GPIO configured — assuming DO PPS already synced")
 
 
+def _maybe_step_divider_on_phase(args):
+    """Phase-conditional TADD ARM for the warm-start path.
+
+    Warm-start skips ``_do_bootstrap_init`` (which is where TADD ARM
+    normally runs).  Divider phase state isn't persisted in any state
+    file — after any physical event (cable swap, power glitch, even
+    just a watchdog re-bootstrap on a host where the divider draws
+    power from the engine board) the divider may be at a wrong
+    sub-second phase.
+
+    This helper measures the current DO-vs-ref phase via a brief TICC
+    differential read and calls ``_do_tadd_arm`` if the magnitude
+    exceeds ``--divider-step-threshold-us``.  Below threshold the
+    EKF's normal slewing closes the gap in seconds; above threshold
+    stepping is dramatically faster (≤400 ns post-step vs minutes of
+    slew at max actuator authority).
+
+    Returns True if a step was performed, False otherwise.
+    """
+    # Disabled by flag.
+    if getattr(args, 'no_divider_step', False):
+        log.info("--no-divider-step set — skipping phase-conditional ARM")
+        return False
+    # No divider configured — nothing to step.
+    if getattr(args, 'tadd_gpio', None) is None:
+        return False
+    # TICC port is the only phase-measurement source on TICC-only
+    # (VCOCXO) hosts.  Without it we can't decide; default to ARM
+    # (conservative — small false-positive ARM cost is preferable to
+    # missing a real phase divergence).
+    ticc_port = getattr(args, 'ticc_port', None)
+    if ticc_port is None:
+        log.info("No TICC port — defaulting to ARM (no phase observation "
+                 "available)")
+        _do_tadd_arm(args)
+        return True
+
+    threshold_us = getattr(args, 'divider_step_threshold_us', 5.0)
+    log.info("Warm-start phase check: measuring DO-vs-ref via TICC...")
+    try:
+        from peppar_fix.timestamper import measure_differential_phase
+        ticc_baud = getattr(args, 'ticc_baud', 115200)
+        do_ch = getattr(args, 'ticc_phc_channel', 'chA')
+        ref_ch = getattr(args, 'ticc_ref_channel', 'chB')
+        median_ns, n = measure_differential_phase(
+            ticc_port, ticc_baud, do_ch, ref_ch,
+            n_samples=3, timeout_s=20)
+    except Exception as e:
+        log.warning("Phase-conditional ARM measurement failed (%s) — "
+                    "defaulting to ARM", e)
+        _do_tadd_arm(args)
+        return True
+
+    if median_ns is None:
+        log.warning("TICC produced no phase samples — defaulting to ARM")
+        _do_tadd_arm(args)
+        return True
+
+    threshold_ns = threshold_us * 1000.0
+    if abs(median_ns) > threshold_ns:
+        log.info("Phase offset %.1f µs > %.1f µs threshold (n=%d) — "
+                 "stepping divider via TADD ARM",
+                 median_ns / 1000.0, threshold_us, n)
+        _do_tadd_arm(args)
+        return True
+    else:
+        log.info("Phase offset %.2f µs ≤ %.1f µs threshold (n=%d) — "
+                 "within slew envelope, no ARM",
+                 median_ns / 1000.0, threshold_us, n)
+        return False
+
+
 def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
                           dt_rx_ns, dt_rx_series):
     """Bootstrap an external VCOCXO: ARM TADD divider, seed DAC frequency.
@@ -5812,10 +5941,46 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                  "(current_adj=%.1f, glide=%.1f)",
                  bootstrap_base_freq, current_adj,
                  current_adj - bootstrap_base_freq)
+
+    # doProcessNoiseFromChar-main: override sigma_do_{phase,freq} from
+    # measured DO characterization when available.  Defaults (0.92 ns,
+    # args.kalman_sigma_freq) describe a generic PHC + TCXO; real OCXO
+    # noise floors are 10-100× tighter, and the gap drives over-
+    # aggressive servo response.  Falls back to defaults if no char or
+    # extraction fails.
+    sigma_do_phase_ns_eff = 0.92
+    sigma_do_freq_ppb_eff = args.kalman_sigma_freq
+    if do_uid_local is not None:
+        try:
+            from peppar_fix.do_state import derive_do_process_noise
+            _ds = load_do_state(do_uid_local)
+            if _ds and _ds.get('characterization'):
+                derived = derive_do_process_noise(_ds['characterization'])
+                if derived:
+                    p = derived.get('sigma_do_phase_ns')
+                    f = derived.get('sigma_do_freq_ppb')
+                    if p is not None:
+                        log.info("DOFreqEst: sigma_do_phase override from "
+                                 "characterization: %.4f ns/√s (source=%s, "
+                                 "was %.4f)",
+                                 p, derived.get('sigma_do_phase_source'),
+                                 sigma_do_phase_ns_eff)
+                        sigma_do_phase_ns_eff = p
+                    if f is not None:
+                        log.info("DOFreqEst: sigma_do_freq override from "
+                                 "characterization: %.4f ppb/√s (source=%s, "
+                                 "was %.4f)",
+                                 f, derived.get('sigma_do_freq_source'),
+                                 sigma_do_freq_ppb_eff)
+                        sigma_do_freq_ppb_eff = f
+        except Exception as e:
+            log.warning("Could not derive DO process noise from "
+                        "characterization: %s", e)
+
     servo = DOFreqEst(
         sigma_ticc_ns=sigma_ticc,
-        sigma_do_phase_ns=0.92,
-        sigma_do_freq_ppb=args.kalman_sigma_freq,
+        sigma_do_phase_ns=sigma_do_phase_ns_eff,
+        sigma_do_freq_ppb=sigma_do_freq_ppb_eff,
         sigma_tcxo_phase_ns=2.0,                          # rx TCXO PPS TDEV(1s)
         sigma_tcxo_freq_ppb=args.kalman_sigma_tcxo_freq,  # rx TCXO drift rate
         max_ppb=caps['max_adj'],
@@ -5824,10 +5989,10 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         base_freq=bootstrap_base_freq,
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
-             "sigma_do=[0.92 ns, %.4f ppb], "
+             "sigma_do=[%.4f ns, %.4f ppb], "
              "sigma_tcxo=[2.0 ns, %.3f ppb], "
              "initial_freq=%.1f ppb, base_freq=%s, tcxo_init=%s",
-             sigma_ticc, args.kalman_sigma_freq,
+             sigma_ticc, sigma_do_phase_ns_eff, sigma_do_freq_ppb_eff,
              args.kalman_sigma_tcxo_freq, current_adj,
              f"{bootstrap_base_freq:.1f}" if bootstrap_base_freq else "None",
              bootstrap_dt_rx_ns is not None)
@@ -5960,11 +6125,26 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             # realtime-to-PHC offset known from bootstrap.
             ticc_pps_estimator = TimebaseRelationEstimator()
 
+            # Stale-TICC detector (2026-05-12).  Track consecutive
+            # reopens that produced ZERO events.  Spamming "TICC reader
+            # started" every 2 s without measurements means the TICC
+            # opened but isn't producing data — typically because one
+            # of its PPS BNC inputs (chA = DO, chB = ref) was bumped
+            # or unplugged, or the TICC firmware hung.  Emit a clear
+            # [TICC_STALE] warning at threshold + on each subsequent
+            # cycle rather than burying the operator in repeated INFOs.
+            empty_reopens = 0
+            STALE_THRESHOLD_REOPENS = 5      # ≈ 10 s with 2 s reopen cadence
+            last_stale_log_mono = 0.0
+            STALE_LOG_INTERVAL_S = 30.0      # how often to repeat the warning
+
             while not stop_ticc.is_set():
+                events_this_open = 0
                 try:
                     with Ticc(args.ticc_port, args.ticc_baud, wait_for_boot=True) as ticc:
                         log.info("TICC reader started on %s", args.ticc_port)
                         for event in ticc.iter_events():
+                            events_this_open += 1
                             if stop_ticc.is_set():
                                 return
                             if ticc_log_w is not None:
@@ -6046,6 +6226,38 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                         return
                     log.warning("TICC reader reconnect after error: %s", exc)
                     time.sleep(1.0)
+
+                # ── Stale-TICC detector ────────────────────────────── #
+                # We exit the `with` block either via an exception
+                # (above) or via iter_events() returning.  Either way,
+                # if zero events were processed during this open, the
+                # TICC opened cleanly but produced nothing.  Count
+                # consecutive such opens; emit a clear warning at the
+                # threshold and at STALE_LOG_INTERVAL_S afterward.
+                if events_this_open == 0:
+                    empty_reopens += 1
+                else:
+                    if empty_reopens >= STALE_THRESHOLD_REOPENS:
+                        log.info("[TICC_STALE] /dev/ticc%s: recovered "
+                                 "after %d empty reopens — events flowing again",
+                                 args.ticc_port, empty_reopens)
+                    empty_reopens = 0
+
+                now_mono = time.monotonic()
+                if (empty_reopens >= STALE_THRESHOLD_REOPENS
+                        and (now_mono - last_stale_log_mono)
+                            >= STALE_LOG_INTERVAL_S):
+                    log.warning(
+                        "[TICC_STALE] %s: opened cleanly but received 0 "
+                        "events on the last %d reopens.  Likely cause: PPS "
+                        "BNC input(s) disconnected, TICC firmware hung, or "
+                        "no PPS pulses arriving on chA/chB.  Engine will "
+                        "keep retrying.  Try wiggling/reseating the BNCs, "
+                        "or DTR-reset via "
+                        "`python -c \"import serial; serial.Serial('%s', "
+                        "115200, dsrdtr=True).close()\"` then wait 15 s.",
+                        args.ticc_port, empty_reopens, args.ticc_port)
+                    last_stale_log_mono = now_mono
 
         t_ticc = threading.Thread(target=ticc_reader, daemon=True)
         t_ticc.start()
@@ -8684,11 +8896,36 @@ Two-phase operation:
                       help="Frequency sanity threshold in ppb (default: 10.0)")
     boot.add_argument("--skip-bootstrap", action="store_true",
                       help="Skip DO bootstrap even when --servo is set")
+    boot.add_argument("--warm-start-if-fresh", action="store_true",
+                      help="Skip DO bootstrap when state/dos/<uid>.json has a "
+                           "recent last_known_freq_offset_ppb (saves 15-30s "
+                           "on watchdog re-bootstrap).  Gate: mtime age <= "
+                           "--warm-start-max-age-s AND |freq| <= "
+                           "--warm-start-max-ppb.  Falls back to cold-start "
+                           "if the gate fails.  See dacWarmStart-main.")
+    boot.add_argument("--warm-start-max-age-s", type=float, default=86400.0,
+                      help="Max DO-state age (s) for warm-start gate "
+                           "(default: 86400 = 24h)")
+    boot.add_argument("--warm-start-max-ppb", type=float, default=500.0,
+                      help="Physical sanity envelope for saved freq "
+                           "(default: 500 ppb)")
     boot.add_argument("--tadd-gpio", type=int, default=None,
                       help="BCM GPIO pin for TADD-2 Mini ARM sync (enables TADD ARM "
                            "during bootstrap for external DOs with a divider)")
     boot.add_argument("--tadd-hold-s", type=float, default=1.1,
                       help="TADD ARM hold time in seconds (default: 1.1, spec requires >1s)")
+    boot.add_argument("--divider-step-threshold-us", type=float, default=5.0,
+                      help="Phase offset (µs) above which warm-start steps the "
+                           "divider via TADD ARM instead of slewing.  At |phase| "
+                           "≤ threshold the EKF closes the residual by slewing; "
+                           "above threshold a step is dramatically faster "
+                           "(≤400 ns post-ARM vs ~1.2 µs/s slew at max actuator "
+                           "authority).  Default: 5.0 (5 µs).  See "
+                           "project_warm_start_sign_blind_spot memory.")
+    boot.add_argument("--no-divider-step", action="store_true",
+                      help="Disable warm-start's phase-conditional TADD ARM.  "
+                           "Use when divider wiring is broken or you want pure "
+                           "slewing for diagnostic purposes.")
 
     ticc = ap.add_argument_group("TICC experimental input (optional)")
     ticc.add_argument("--ticc-port", default=None,
