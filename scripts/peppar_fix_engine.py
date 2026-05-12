@@ -7426,12 +7426,23 @@ def run(args):
         extint_store = TimTm2Store(log_writer=_ext_log_writer,
                                    log_file=extint_log_f)
 
-    # Enable NAV2 secondary engine and TIM-TM2 emission on the F9T.
-    # This is done here (before serial_reader starts) because the
-    # ensure_receiver step only runs the full config when dual-freq
-    # observations are missing — if the F9T was already configured
-    # for L5 from a previous run, these keys would never be sent.
-    # The config burst is harmless if values are already correct.
+    # Enable NAV2 + diagnostic UBX messages on the F9T.  This is done
+    # here (before serial_reader starts) because the ensure_receiver
+    # step only runs the full config when dual-freq observations are
+    # missing — if the F9T was already configured for L5 from a
+    # previous run, these keys would never be sent.  The config burst
+    # is harmless if values are already correct.
+    #
+    # NAV2 + NAV-SIG + NAV-CLOCK + NAV-TIMEGPS are unconditional: the
+    # engine instantiates their consumer stores regardless of CLI
+    # flags, and the cohort tonight needs the data plane reliably
+    # populated on every engine start (slipDetectUnified Phase A,
+    # recoveryRetry telemetry).
+    #
+    # TIM-TM2 is gated on extint_store (the --no-extint flag) per
+    # the existing pattern.  Receiver-side enabling is also handled
+    # by configure_messages(), but that only runs on first-time
+    # config; this burst guarantees enablement on every restart.
     try:
         from peppar_fix.receiver import send_cfg, PORT_SUFFIX
         from peppar_fix.gnss_stream import open_gnss
@@ -7442,19 +7453,25 @@ def run(args):
         _cfg_keys = {
             "CFG_NAV2_OUT_ENABLED": 1,
             f"CFG_MSGOUT_UBX_NAV2_PVT_{_pname}": 5,
+            f"CFG_MSGOUT_UBX_NAV_SIG_{_pname}": 1,
+            f"CFG_MSGOUT_UBX_NAV_CLOCK_{_pname}": 1,
+            f"CFG_MSGOUT_UBX_NAV_TIMEGPS_{_pname}": 5,
         }
         if extint_store is not None:
             _cfg_keys[f"CFG_MSGOUT_UBX_TIM_TM2_{_pname}"] = 1
         _nav2_ok = send_cfg(_nav2_ser, _nav2_ubr, _cfg_keys,
-                            "NAV2 + TIM-TM2 enable")
+                            "NAV2 + NAV-SIG/CLOCK/TIMEGPS + TIM-TM2 enable")
         _nav2_ser.close()
         if _nav2_ok:
             extras = ", TIM-TM2" if extint_store is not None else ""
-            log.info(f"NAV2 secondary engine enabled (position consensus){extras}")
+            log.info("NAV2 + NAV-SIG + NAV-CLOCK + NAV-TIMEGPS%s"
+                     " enabled (position consensus + cascade diagnostics)",
+                     extras)
         else:
-            log.warning("NAV2 config failed (position consensus unavailable)")
+            log.warning("Post-config burst failed "
+                        "(position consensus + diagnostics may be unavailable)")
     except Exception as e:
-        log.warning("NAV2 config attempt failed: %s (continuing without)", e)
+        log.warning("Post-config burst attempt failed: %s (continuing)", e)
 
     # Warm TICC port BEFORE the serial reader starts.
     # Opening the TICC may reboot the Arduino (DTR edge), which causes

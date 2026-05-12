@@ -866,6 +866,14 @@ def configure_messages(ser, ubr, port_id, sfrbx_rate=1):
     # See docs/architecture-vision.md "Three-source position consensus".
     messages["CFG_NAV2_OUT_ENABLED"] = 1
     messages[f"CFG_MSGOUT_UBX_NAV2_PVT_{pname}"] = 5  # every 5th epoch (~0.2 Hz)
+    # TIM-TM2: DO PPS edge timestamps for DOFreqEst Arm 3.  Fires only
+    # on rising edges of the F9T's EXTINT pin, so on hosts with no
+    # signal wired (e.g., E810 without DO PPS to F9T EXTINT) it
+    # produces zero output and costs zero bandwidth.  Safe to enable
+    # unconditionally; consumer-side gating happens at engine level
+    # via the --no-extint flag (engine instantiates extint_store=None
+    # which makes the dispatch a no-op).
+    messages[f"CFG_MSGOUT_UBX_TIM_TM2_{pname}"] = 1
     # Diagnostic streams for f9tClockTelemetry-bravo +
     # slipDetectUnified-main Phase A logger.  Gated on sfrbx_rate > 0
     # so bandwidth-limited transports (E810 I2C, ~1.6 kB/s ceiling)
