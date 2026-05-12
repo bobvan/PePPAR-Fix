@@ -263,30 +263,35 @@ helps or hurts.
 5. **Receiver and we both wrong**: caught by cat-reject + recoveryRetry
    downstream.  No worse than current behavior.
 
-## Open questions
+## Resolved questions
 
-1. **Per-band exclusion semantics**: if NAV-SIG says `L1CA prUsed=0`
-   but `L5Q prUsed=1` for the same SV, do we exclude just L1 or the
-   whole SV?  Default proposal: exclude the band, keep the other.
-   Most cycle slips are per-band; per-SV exclusion is too aggressive
-   on dual-frequency hosts.
+1. **Per-band exclusion semantics**: per-band, not per-SV.  *Resolved
+   by Bob 2026-05-12: "One bad signal doesn't make for a bad SV."*
+   If NAV-SIG says `L1CA prUsed=0` but `L5Q prUsed=1` for the same
+   GPS SV, exclude L1CA only, keep L5Q.  Both observables stay in
+   their respective per-frequency admission paths.
 
-2. **NAV-SIG iteration when AR fix-set is being maintained**:  Should
-   a signal that the receiver de-admits temporarily get its NL
-   ambiguity flushed by us, or kept warm?  Lean toward flushed (the
-   receiver thinks the tracking loop is questionable, we shouldn't
-   trust the cycle count).
+2. **NL ambiguity handling on receiver-de-admit**: **decision-by-data.
+   Defer to NAV-SIG_DISAGREE empirics.**  *Resolved by Bob: the
+   disagreement logger should give us evidence — when the receiver
+   de-admits and re-admits, do we see (a) the ambiguity holds and
+   resumes cleanly (keep-warm wins), or (b) we eat bad data on
+   re-admit because the cycle count was corrupted (flush wins)?*
+   Phase B2 captures the data; resolve before Phase B3 deploy.
 
-3. **Log volume of [NAV-SIG_DISAGREE]**: if disagreements happen
-   often (say 5/epoch × 14 hours = 250k lines/night), log volume
-   becomes a concern.  Mitigation: throttle per-(sv, sigid) — emit
-   first 10 disagreements per signal per hour, then summary.
+3. **Log volume rate-limit**: per-(sv, sigid), first 10 disagreements
+   per hour, summary thereafter.  *Resolved by Bob.*
+
+## Open question (deferred)
 
 4. **Interaction with PB_GAP_DROP**: PB_GAP_DROP is a SSR-coverage
    gap, not a receiver-quality issue.  Should disagreements with
    reason `PB_GAP_DROP` be suppressed from the log (since they're
-   not really "we know better")?  Lean: keep them logged but in a
-   separate counter so they don't dominate the disagreement rate.
+   not really "we know better")?  Bob: "Not sure."  Default for
+   implementation: keep them logged but in a SEPARATE counter
+   (`disagree_pb_gap_drop` vs `disagree_quality`) so the dominant
+   coverage-gap pattern doesn't drown out the receiver-quality
+   signal.  Revisit after Phase B2 data.
 
 ## Validation criteria (for merge)
 
