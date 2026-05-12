@@ -4025,6 +4025,15 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                         log.info("Warm-start: skipping DO bootstrap "
                                  "(freq=%.1f ppb, age=%.0fs from state)",
                                  info["freq_ppb"], info["age_s"])
+                        # Phase-conditional TADD ARM.  Warm-start skips
+                        # _do_bootstrap_init() which is where ARM runs;
+                        # check phase and step if beyond the threshold.
+                        # Divider phase state isn't persisted in any
+                        # state file, so any physical event between the
+                        # last save and now can leave the divider at a
+                        # wrong sub-second phase.  See
+                        # project_warm_start_sign_blind_spot memory.
+                        _maybe_step_divider_on_phase(args)
                         if dfe_sm is not None:
                             dfe_sm.transition(DOFreqEstState.TRACKING,
                                               "warm-start from saved freq")
@@ -5140,6 +5149,78 @@ def _do_tadd_arm(args):
             tadd.teardown()
     else:
         log.info("No TADD GPIO configured — assuming DO PPS already synced")
+
+
+def _maybe_step_divider_on_phase(args):
+    """Phase-conditional TADD ARM for the warm-start path.
+
+    Warm-start skips ``_do_bootstrap_init`` (which is where TADD ARM
+    normally runs).  Divider phase state isn't persisted in any state
+    file — after any physical event (cable swap, power glitch, even
+    just a watchdog re-bootstrap on a host where the divider draws
+    power from the engine board) the divider may be at a wrong
+    sub-second phase.
+
+    This helper measures the current DO-vs-ref phase via a brief TICC
+    differential read and calls ``_do_tadd_arm`` if the magnitude
+    exceeds ``--divider-step-threshold-us``.  Below threshold the
+    EKF's normal slewing closes the gap in seconds; above threshold
+    stepping is dramatically faster (≤400 ns post-step vs minutes of
+    slew at max actuator authority).
+
+    Returns True if a step was performed, False otherwise.
+    """
+    # Disabled by flag.
+    if getattr(args, 'no_divider_step', False):
+        log.info("--no-divider-step set — skipping phase-conditional ARM")
+        return False
+    # No divider configured — nothing to step.
+    if getattr(args, 'tadd_gpio', None) is None:
+        return False
+    # TICC port is the only phase-measurement source on TICC-only
+    # (VCOCXO) hosts.  Without it we can't decide; default to ARM
+    # (conservative — small false-positive ARM cost is preferable to
+    # missing a real phase divergence).
+    ticc_port = getattr(args, 'ticc_port', None)
+    if ticc_port is None:
+        log.info("No TICC port — defaulting to ARM (no phase observation "
+                 "available)")
+        _do_tadd_arm(args)
+        return True
+
+    threshold_us = getattr(args, 'divider_step_threshold_us', 5.0)
+    log.info("Warm-start phase check: measuring DO-vs-ref via TICC...")
+    try:
+        from peppar_fix.timestamper import measure_differential_phase
+        ticc_baud = getattr(args, 'ticc_baud', 115200)
+        do_ch = getattr(args, 'ticc_phc_channel', 'chA')
+        ref_ch = getattr(args, 'ticc_ref_channel', 'chB')
+        median_ns, n = measure_differential_phase(
+            ticc_port, ticc_baud, do_ch, ref_ch,
+            n_samples=3, timeout_s=20)
+    except Exception as e:
+        log.warning("Phase-conditional ARM measurement failed (%s) — "
+                    "defaulting to ARM", e)
+        _do_tadd_arm(args)
+        return True
+
+    if median_ns is None:
+        log.warning("TICC produced no phase samples — defaulting to ARM")
+        _do_tadd_arm(args)
+        return True
+
+    threshold_ns = threshold_us * 1000.0
+    if abs(median_ns) > threshold_ns:
+        log.info("Phase offset %.1f µs > %.1f µs threshold (n=%d) — "
+                 "stepping divider via TADD ARM",
+                 median_ns / 1000.0, threshold_us, n)
+        _do_tadd_arm(args)
+        return True
+    else:
+        log.info("Phase offset %.2f µs ≤ %.1f µs threshold (n=%d) — "
+                 "within slew envelope, no ARM",
+                 median_ns / 1000.0, threshold_us, n)
+        return False
 
 
 def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
@@ -8762,6 +8843,18 @@ Two-phase operation:
                            "during bootstrap for external DOs with a divider)")
     boot.add_argument("--tadd-hold-s", type=float, default=1.1,
                       help="TADD ARM hold time in seconds (default: 1.1, spec requires >1s)")
+    boot.add_argument("--divider-step-threshold-us", type=float, default=5.0,
+                      help="Phase offset (µs) above which warm-start steps the "
+                           "divider via TADD ARM instead of slewing.  At |phase| "
+                           "≤ threshold the EKF closes the residual by slewing; "
+                           "above threshold a step is dramatically faster "
+                           "(≤400 ns post-ARM vs ~1.2 µs/s slew at max actuator "
+                           "authority).  Default: 5.0 (5 µs).  See "
+                           "project_warm_start_sign_blind_spot memory.")
+    boot.add_argument("--no-divider-step", action="store_true",
+                      help="Disable warm-start's phase-conditional TADD ARM.  "
+                           "Use when divider wiring is broken or you want pure "
+                           "slewing for diagnostic purposes.")
 
     ticc = ap.add_argument_group("TICC experimental input (optional)")
     ticc.add_argument("--ticc-port", default=None,
