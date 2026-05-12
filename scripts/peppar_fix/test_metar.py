@@ -199,10 +199,14 @@ class CacheRoundtripTest(unittest.TestCase):
         self.addCleanup(self.td.cleanup)
 
     def test_write_then_read(self):
+        # Use a fresh report_ts so the 2h staleness gate doesn't
+        # reject the record after the test's hardcoded date slips
+        # behind wall-clock.
+        recent_ts = datetime.now(timezone.utc) - timedelta(minutes=5)
         rec = {
-            'report_ts': datetime(2026, 5, 12, 18, 0, tzinfo=timezone.utc),
+            'report_ts': recent_ts,
             'temp_C': 22.0, 'dewp_C': 12.0, 'altim_hPa': 1013.0,
-            'slp_hPa': 1013.5, 'raw_metar': 'KDPA 121800Z ...',
+            'slp_hPa': 1013.5, 'raw_metar': 'KDPA latest',
             'station': 'KDPA',
         }
         metar._write_cache('KDPA', rec)
