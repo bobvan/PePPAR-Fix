@@ -72,25 +72,75 @@ startup fails with a clear error.
 
 ## UBX command/response sequencing
 
-UBX CFG-VALSET commands produce an ACK-ACK (success) or ACK-NAK (failure)
-response. These responses are sequenced: each ACK/NAK corresponds to the
-oldest unacknowledged command.
+UBX CFG-VALSET messages produce one ACK-ACK (success) or ACK-NAK (failure)
+response **per VALSET message** — not per key inside the message.  A
+single VALSET that carries multiple keys returns a single ACK/NAK for
+the bundle.
 
-**Always wait for ACK/NAK before sending the next command.** If you send
-multiple commands without waiting, the responses arrive in order but you
-lose the ability to correlate a NAK with the specific command that failed.
+### Policy: no bundled CFG-VALSET at the wire level
 
-The `send_cfg()` function in `receiver.py` enforces this by calling
-`wait_ack()` synchronously after each VALSET. A timeout (default 3s) is
-treated as equivalent to NAK — the command is assumed to have failed.
+**Every CFG-VALSET sent to a receiver MUST carry exactly one key, and
+the caller MUST synchronously wait for the ACK/NAK before sending the
+next.**  Multi-key VALSETs are prohibited.
 
-This matters because:
+Why: a bundled VALSET that NAKs tells us "at least one key failed" but
+not which one.  When something goes wrong (firmware version mismatch,
+key renamed across chipsets, unsupported feature on this hardware), the
+identity of the failing key is lost — undiagnosable spray-and-pray.
+
+### Acceptable: dict at the caller, single-key on the wire
+
+Higher-level code is welcome to compose multi-key dicts for
+organizational purposes — `configure_messages()` groups MSGOUT keys,
+`configure_signals()` groups signal-enable keys, etc.  These are passed
+through `send_cfg()` or `send_cfg_per_key()`, both of which **serialize
+the dict to one-key-at-a-time at the wire level** and log each ACK/NAK
+individually.
+
+Wire-level helper: `_send_cfg_one(ser, ubr, key, value)` — sends one
+key, waits one ACK/NAK, returns bool.  The only place that writes a
+VALSET to the serial port.
+
+Caller-facing helpers:
+- `send_cfg(ser, ubr, dict)` → bool (True iff every key ACK'd)
+- `send_cfg_per_key(ser, ubr, dict)` → `(ok_set, nak_set)` partition
+
+Both call `_send_cfg_one` per key; choose between them by return shape.
+Use `send_cfg_per_key()` when the caller needs to act on the specific
+failing key (e.g., retry, fall back, log a structured diagnostic).
+Use `send_cfg()` when an aggregate pass/fail is enough.
+
+### Why this matters
+
 - Signal configuration, message routing, and rate changes are separate
-  VALSET commands
-- A NAK on signal config (wrong key for this firmware) is very different
-  from a NAK on message routing (wrong port ID)
-- Without synchronous waiting, a NAK from command 1 might be misattributed
-  to command 2
+  groups of VALSET keys; a NAK in one group has a different meaning
+  than a NAK in another
+- Receiver chipsets diverge on key names (F9 vs F10 vs Timebeat) and
+  on which features the chip supports — without per-key ACK/NAK we
+  can't tell whether the burst failed because of a typo, a chipset
+  difference, or a firmware-version gap
+- A 3-second timeout per key is acceptable startup latency
+  (typical config burst: 5-15 keys, 15-45s worst-case); a silent
+  startup failure with no log evidence of which key broke is not
+
+### History
+
+- 2026-04-17 ptpmon: L5 signal enable bundled as 15 keys → NAK on
+  the whole bundle → no way to identify the rejected key without a
+  per-key rebuild.  Led to `send_cfg_per_key()` being added as a
+  diagnostic helper.
+- 2026-05-12 MadHat F10T: post-config burst bundled 5 keys
+  (NAV2_OUT_ENABLED + NAV_SIG + NAV_CLOCK + NAV_TIMEGPS + TIM_TM2)
+  → suspected NAK → same undiagnosable failure.  Led to making
+  per-key behavior the default for all callers.
+
+### DO NOT add a new bundled-VALSET helper
+
+If a future caller has a documented need for raw multi-key VALSET
+semantics (e.g., the receiver explicitly documents atomic key-group
+behavior for a specific feature), document the departure inline at
+the call site and justify why the diagnostic loss is acceptable
+for that case.  No new general-purpose bundled helpers.
 
 ## Port types
 

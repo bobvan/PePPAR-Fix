@@ -655,55 +655,108 @@ def _wait_ack_parsed(ubr, cls_name, msg_name, timeout):
     return False
 
 
-def send_cfg(ser, ubr, key_values, description="", layers=7):
-    """Send a VALSET configuration and wait for ACK.
+# ─── POLICY: never bundle CFG-VALSET keys at the wire level ────────── #
+#
+# UBX CFG-VALSET messages can carry multiple key=value pairs.  The
+# receiver replies with a SINGLE ACK or NAK per VALSET message — not
+# per key.  A multi-key VALSET that NAKs tells us "at least one key
+# failed" but NOT which one.  That's spray-and-pray: when something
+# goes wrong (firmware version mismatch, key renamed across chipsets,
+# unsupported feature on this hardware), we lose the identity of the
+# failing key.  Undiagnosable.
+#
+# RULE: any code path that sends CFG to a receiver and expects
+# ACK/NAK MUST send one key per VALSET and synchronously wait for
+# the ACK/NAK before sending the next.  Higher-level code is welcome
+# to compose multi-key dicts for organizational purposes and pass
+# them through these helpers — both ``send_cfg()`` and
+# ``send_cfg_per_key()`` accept a dict — but the helpers serialize
+# the dict to one-key-at-a-time at the wire level.
+#
+# DO NOT add a new bundled-VALSET helper.  If a future caller needs
+# raw multi-key VALSET (e.g., for a feature where the receiver
+# explicitly documents atomic key-group semantics), document the
+# departure inline and justify why the diagnostic loss is acceptable
+# for that specific case.
+#
+# History: bundling burned us on 2026-04-17 ptpmon L5 signal enable
+# (15-key bundle NAK'd — couldn't tell which key) and on 2026-05-12
+# MadHat F10T post-config burst (5-key bundle NAK'd — couldn't
+# tell which key without a diagnostic rebuild).  See
+# docs/receiver-signals.md "UBX command/response sequencing".
 
-    UBX ACK/NAK responses are sequenced against commands but asynchronous.
-    We MUST wait for the ACK/NAK from each command before sending the next,
-    or a NAK could be misattributed to the wrong command. A timeout (3s)
-    is treated as equivalent to NAK. See docs/receiver-signals.md.
+def _send_cfg_one(ser, ubr, key, value, layers=7):
+    """Send a single key=value VALSET, wait synchronously for ACK/NAK.
+
+    Wire-level helper — one key per VALSET, one ACK or NAK per call.
+    Returns True on ACK, False on NAK or 3-second timeout (timeout
+    treated as NAK).  This is the only place in the codebase that
+    actually writes a VALSET to the serial port.
+    """
+    _ensure_imports()
+    msg = _UBXMessage.config_set(layers, 0, [(key, value)])
+    ser.write(msg.serialize())
+    return wait_ack(ubr, "CFG", "VALSET", timeout=3.0)
+
+
+def send_cfg(ser, ubr, key_values, description="", layers=7):
+    """Send each key as a single-key VALSET, return True iff all ACK'd.
+
+    Bundling prohibited at the wire level — see the POLICY block above
+    this function.  Multi-key dicts are accepted as a convenience for
+    callers that organize related keys together; this function
+    serializes them to one-key-per-VALSET and logs each ACK/NAK
+    individually.
 
     Args:
         layers: 1=RAM, 2=BBR, 4=Flash, 7=all (default).
+
+    Returns:
+        bool: True iff every key ACK'd.  False if any single key
+              NAK'd or timed out.  Per-key outcomes are logged at
+              INFO (ACK) or WARNING (NAK) so a downstream reader
+              can always identify which specific key failed.
     """
-    _ensure_imports()
-    cfg_data = list(key_values.items())
-    msg = _UBXMessage.config_set(layers, 0, cfg_data)
-    log.info(f"  {description}...")
-    ser.write(msg.serialize())
-    ack = wait_ack(ubr, "CFG", "VALSET", timeout=3.0)
-    if ack:
-        log.info(f"  {description}... OK")
-    else:
-        log.warning(f"  {description}... TIMEOUT (no ACK)")
-    return ack
+    if description:
+        log.info(f"  {description}...")
+    n_ok, n_nak = 0, 0
+    for key, value in key_values.items():
+        if _send_cfg_one(ser, ubr, key, value, layers=layers):
+            log.info(f"    {key}={value}  OK")
+            n_ok += 1
+        else:
+            log.warning(f"    {key}={value}  NAK")
+            n_nak += 1
+    if description:
+        if n_nak == 0:
+            log.info(f"  {description}... OK ({n_ok} keys)")
+        else:
+            log.warning(
+                f"  {description}... {n_nak}/{n_ok + n_nak} NAK")
+    return n_nak == 0
 
 
 def send_cfg_per_key(ser, ubr, key_values, description="", layers=7):
-    """Send each key individually, wait for ACK between.
+    """Send each key individually, return (ok_keys, nak_keys) sets.
 
-    Prefer this over send_cfg(dict) when we care about which specific
-    key(s) NAK — a bundled VALSET ACKs/NAKs atomically, so a NAK loses
-    the identity of the failing key.  Per-key sends are slower
-    (~3s/key worst-case) but tell us exactly what the receiver rejects.
-
-    Used on signal configuration where any single unsupported key can
-    blanket-NAK a 15-key bundle and block startup.  2026-04-17 ptpmon:
-    L5 signal enable NAK'd as a bundle — we couldn't tell which key
-    (the F9T rejected) without this diagnostic.
+    Wire behavior identical to ``send_cfg()`` (both call
+    ``_send_cfg_one`` for each key — bundling is prohibited at the
+    wire level; see POLICY above).  Difference is the return shape:
+    this returns the set partition so callers can act on the
+    specific failing keys (e.g. retry with a different value,
+    log a structured diagnostic, fall back to a feature-disable
+    path).  ``send_cfg()`` returns a bool aggregate; pick whichever
+    matches the caller's needs.
 
     Returns:
         (ok_keys, nak_keys): sets of key names that ACK'd vs NAK'd.
     """
-    _ensure_imports()
     ok_keys = set()
     nak_keys = set()
     if description:
         log.info(f"{description} (per-key, {len(key_values)} keys):")
     for key, value in key_values.items():
-        msg = _UBXMessage.config_set(layers, 0, [(key, value)])
-        ser.write(msg.serialize())
-        if wait_ack(ubr, "CFG", "VALSET", timeout=3.0):
+        if _send_cfg_one(ser, ubr, key, value, layers=layers):
             log.info(f"  {key}={value}  OK")
             ok_keys.add(key)
         else:
