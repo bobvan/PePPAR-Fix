@@ -152,7 +152,14 @@ class NavSigDisagreeMonitorTest(unittest.TestCase):
         self.assertEqual(engine_sig_to_ubx_sigid("GPS-L5Q"), (0, 7))
         self.assertEqual(engine_sig_to_ubx_sigid("GAL-E1C"), (2, 0))
         self.assertEqual(engine_sig_to_ubx_sigid("GAL-E5aQ"), (2, 4))
+        # F9T-fleet legacy BDS
+        self.assertEqual(engine_sig_to_ubx_sigid("BDS-B1I"), (3, 0))
         self.assertEqual(engine_sig_to_ubx_sigid("BDS-B2aI"), (3, 5))
+        # F10T modernized BDS — per peppar_fix/receiver.py F10_BDS_SIG_NAMES
+        self.assertEqual(engine_sig_to_ubx_sigid("BDS-B1CP"), (3, 5))
+        self.assertEqual(engine_sig_to_ubx_sigid("BDS-B1CD"), (3, 6))
+        self.assertEqual(engine_sig_to_ubx_sigid("BDS-B2aP"), (3, 7))
+        self.assertEqual(engine_sig_to_ubx_sigid("BDS-B2aD"), (3, 8))
         # Unknown signal returns None
         self.assertIsNone(engine_sig_to_ubx_sigid("NOPE-X1Z"))
 
