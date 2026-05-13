@@ -54,28 +54,67 @@ Beating PPS or PPS+qErr alone is not the goal — those are limited by
 the F9T's measurement resolution, not by what either oscillator can
 actually deliver.
 
-### Cross-host PPS OUT agreement
+### Cross-host PPS OUT agreement — the two-clock excursion bound
 
 An equal-weight goal: **any pair of PePPAR Fix clocks must produce
-PPS OUT edges that agree in frequency and phase, ideally sub-ns.**
-Measured by connecting the two PPS OUT signals to two channels of a
-shared-reference TICC (chA and chB on the same unit), so the
-differential TDEV is unaffected by that TICC's own reference noise.
+PPS OUT edges that agree in phase, with a probability-bounded
+maximum excursion.**  Measured by connecting the two PPS OUT
+signals to two channels of a shared-reference TICC (chA and chB on
+the same unit), so the differential measurement is unaffected by
+that TICC's own reference noise.
 
-Two stages:
+**Numerical targets** (derived in `docs/two-site-sync-budget.md` —
+read that doc before changing servo, DO, or actuator architecture):
+
+| Configuration | Bound | Probability | Window |
+|---|---|---|---|
+| Shared antenna (same RF via splitter) | \|Δ\| ≤ 1 ns | 95% | any τ from 0.1 s to ~1000 s |
+| Separate antennas, baseline ≤ 5 km | \|Δ\| ≤ 2 ns | 95% | any 1-hour window |
+
+These are excursion bounds, not TDEV values.  TDEV is a variance
+metric and does **not** bound the phase-difference trajectory between
+two clocks — two clocks with TDEV(1s) = 250 ps can still drift ≥ 1 ns
+in seconds when white-frequency noise dominates.  The budget that
+backs out from these excursion targets is roughly:
+
+- Per-clock σ_phase vs GPS ≤ ~350 ps RMS at all τ
+- Equivalent TDEV(τ) ≤ ~150 ps at τ = 1 s, no positive-slope regions
+  below τ ≈ 1000 s
+- Carrier-phase TD-CP in the time filter (~5-10 ps per-epoch
+  precision) is well within budget; the limiters are **DO
+  free-running noise above the servo bandwidth** and **actuator
+  resolution**, not measurement noise
+
+**DO classification — what's part of the sync target vs best-effort**:
+
+- **OCXO-class hosts** (Isotemp/CTI/Microchip OCXOs, or the
+  Renesas 8A34002 ClockMatrix architecture used on ptBoat/otcBob1)
+  are the sync targets.  ADEV(1s) ≤ 1e-11 is necessary to meet the
+  per-clock budget at 1 Hz servo cadence.
+- **TCXO-class hosts** (TimeHat i226 internal TCXO, similar) are
+  **best-effort**.  At ADEV(1s) ≈ 1e-10, the integrated free-running
+  noise above 1 Hz loop BW already eats the entire per-clock budget;
+  no amount of servo tuning recovers it.  TCXO hosts continue to
+  serve as F9T-PPS / measurement-chain validators but are not
+  graded against the 1 ns / 2 ns excursion bounds.
+
+**Two stages of validation**:
 
 1. **Shared antenna first** — two clocks driven by the same RF via a
    splitter.  Eliminates atmospheric, multipath, and orbit/clock
    correction variability as sources of disagreement.  What remains
-   is the discipline loop's own contribution to phase noise plus any
-   per-receiver biases or per-filter integer-resolution errors.  This
-   is the cleanest test bed for servo design and for catching
-   ambiguity-resolution bugs.
+   is the discipline loop's own contribution plus any per-receiver
+   biases or per-filter integer-resolution errors.  This is the
+   cleanest test bed for servo design and for catching
+   ambiguity-resolution bugs.  **Target: 1 ns excursion bound,
+   95% probability.**
 
 2. **Separate antennas next** — the real-world goal.  Two clocks at
    independent sites driving independent antennas must agree in
-   phase/frequency after both converge, limited only by per-site
-   atmospheric and multipath differentials.
+   phase/frequency after both converge, limited by per-site
+   atmospheric and multipath differentials.  **Target: 2 ns
+   excursion bound, 95% probability, baseline ≤ 5 km, clean sky at
+   both sites.**
 
 Cross-host PPS agreement is downstream of cross-host *position*
 agreement: until two PePPAR Fix receivers converge to the same ARP,
@@ -547,6 +586,7 @@ here before changing anything in the areas they cover.
 |---|---|
 | [dayplan-cooperation.md](docs/dayplan-cooperation.md) | **Read this first if you're new to a multi-agent session.** How to use the shared dayplan tool (`propose` / `discuss` / `ack` / `amend` / `status` / `render`).  Storage model, I-number convention, threading conventions, and the load-bearing rule "don't edit /tmp/dp-*.txt — that's render output, not storage." |
 | [stream-timescale-correlation.md](docs/stream-timescale-correlation.md) | **Read this first.** How to correctly correlate events from independent timescales (GNSS, PPS, TICC, NTRIP). Covers why queue-order matching fails, the strict correlation gate design, confidence scoring, and fault injection testing. |
+| [two-site-sync-budget.md](docs/two-site-sync-budget.md) | **Read before changing servo/DO/actuator architecture.** Math behind the moonshot's 1 ns shared-antenna / 2 ns separate-antenna excursion bounds.  Decomposes σ_Δ(τ) into measurement floor + servo residual + DO above-BW noise + actuator quantization.  Per-DO-class achievability analysis.  Survey of DC-OCXOs vs 18-bit-DAC-upgrade path; recommends OCXO + AD5781 at ~$80/host as best price-performance. |
 | [clock-state-modeling.md](docs/clock-state-modeling.md) | Where time-domain knowledge enters the position filter.  Maps the three oscillators (rx TCXO, DO, RO) to filter states, lays out four levers (stochastic rx TCXO model, TICC+qErr pseudo-measurement, full co-estimation, RO characterization), and the recommended ordering.  Attacks the null-mode clock axis identified in the 2026-04-23 PRIDE arc. |
 | [full-data-flow.md](docs/full-data-flow.md) | Complete inventory of live data sources, their timescales, sink policies (freshest-only vs loss-free vs correlated-window), freshness requirements, and decimation effects. |
 | [platform-support.md](docs/platform-support.md) | Per-platform status for TimeHat (i226) and ocxo (E810). Documents device paths, PHC behavior, GNSS transport differences, and bring-up checklists. |
