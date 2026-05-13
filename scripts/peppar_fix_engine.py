@@ -7207,6 +7207,18 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                      f"adj={adjfine_ppb:+.1f}ppb "
                      f"gain={gain_scale:.2f}x "
                      f"interval={scheduler.interval}")
+        # Periodic servo-filter health report (innov-vs-control monitor).
+        # Pure observer; no behavior change.  Status != "OK" surfaces
+        # plant-model errors (DAC scale/sign, B coeff) that "actuator
+        # near rail" symptoms would catch much later.
+        if n_epochs % 60 == 0 and hasattr(servo, "innov_monitor"):
+            hr = servo.innov_monitor.evaluate()
+            log.info(
+                "  [DO_EKF_HEALTH] n=%d corr=%+.3f bias=%+.3f NIS=%.2f "
+                "status=%s consec_bad=%d",
+                hr.epochs, hr.corr_u_innov, hr.norm_bias, hr.nis,
+                hr.status, hr.consec_bad,
+            )
     else:
         if n_epochs % 10 == 0:
             log.info(f"  [{n_epochs}] EKF: "
