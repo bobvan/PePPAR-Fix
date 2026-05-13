@@ -82,12 +82,28 @@ _ENGINE_SIG_TO_UBX: dict[str, tuple[int, int]] = {
     "GAL-E5aQ": (2, 4),
     "GAL-E5bI": (2, 5),
     "GAL-E5bQ": (2, 6),
-    # BeiDou (gnssId=3)
+    # BeiDou (gnssId=3) — F9T-fleet signal IDs (legacy + BDS-3 L5 fleet)
     "BDS-B1I":  (3, 0),
     "BDS-B2I":  (3, 2),
     "BDS-B2aI": (3, 5),
     "BDS-B2aQ": (3, 6),
     "BDS-B3I":  (3, 7),
+    # F10T modernized BDS signals.  Note: (3, 5) collides with F9T's
+    # BDS-B2aI per peppar_fix/receiver.py:F10_BDS_SIG_NAMES — same UBX
+    # wire bytes, different carrier frequency on F10 vs F9T silicon.
+    # The receiver-driver's signal_names map disambiguates by chipset,
+    # so receiver snapshots key by engine-internal name (BDS-B1CP vs
+    # BDS-B2aI), not by raw (gnssId, sigId).  These entries exist so
+    # the fallback UBX-numeric-name lookup matches and the unknown-
+    # signal counter surfaces gaps correctly when (if) the engine
+    # admits F10T modernized BDS obs in a future iteration.
+    "BDS-B1CP":  (3, 5),
+    "BDS-B1CD":  (3, 6),
+    "BDS-B2aP":  (3, 7),
+    "BDS-B2aD":  (3, 8),
+    "BDS-B1ID2": (3, 1),
+    "BDS-B2ID2": (3, 3),
+    "BDS-B3ID2": (3, 10),
 }
 
 
