@@ -125,7 +125,15 @@ CLOCK_MODELS = ('random_walk', 'calibrated_white', 'wno')
 # per-epoch prior reset is the analogous operation.
 WNO_CLK_PRIOR_VAR = 1e10  # m² — wide-open prior, like initialize() uses
 
-# F9T signal name → RINEX observation code mapping
+# Engine signal name → RINEX observation code mapping.
+# Covers both F9T fleet (legacy BDS-2/BDS-3 signals: B1I, B2I, B2aI) and
+# F10T (modernized BDS-3 signals: B1C Pilot/Data, B2a Pilot/Data).
+# Missing F10T entries here was the root cause of MadHat
+# [CB_APPLIED] C=0 on 2026-05-12 afternoon: SIG_TO_RINEX.get('BDS-B1CP')
+# returned None, gating off the SSR bias lookup, so F10T BDS obs flowed
+# into the engine with no RINEX-code translation and dropped out of the
+# position-filter pathway despite being "PASS dual=Y" upstream.  See
+# wrongIntBasin-charlie analyzer-run dayplan entry 2026-05-12.
 SIG_TO_RINEX = {
     'GPS-L1CA': ('C1C', 'L1C'),   # Code, Phase
     'GPS-L2CL': ('C2L', 'L2L'),
@@ -137,6 +145,22 @@ SIG_TO_RINEX = {
     'BDS-B1I':  ('C2I', 'L2I'),
     'BDS-B2I':  ('C7I', 'L7I'),
     'BDS-B2aI': ('C5I', 'L5I'),   # u-blox B2aI → RINEX C5I
+    # F10T modernized BDS-3 signals (RINEX 3.04 §5.1 BDS observation
+    # codes).  Pilot signals use RINEX attr 'P'; data signals 'D';
+    # combined signals 'X'.  The receiver driver emits these names via
+    # F10_BDS_SIG_NAMES (peppar_fix/receiver.py:208).
+    #
+    # SSR phase/code biases for these signals may not be available
+    # from CNES / WHU streams yet — the per-filter MISS-bias gate
+    # (I-175645 Fix #2) routes obs without phase biases to the time
+    # filter only.  TD-CP cancels phase-bias constants epoch-to-epoch,
+    # so even MISS-bias BDS-3-modernized obs still contribute usefully
+    # to dt_rx; they're just excluded from the position filter where
+    # absolute bias correction matters.
+    'BDS-B1CP': ('C1P', 'L1P'),   # B1C Pilot
+    'BDS-B1CD': ('C1D', 'L1D'),   # B1C Data
+    'BDS-B2aP': ('C5P', 'L5P'),   # B2a Pilot
+    'BDS-B2aD': ('C5D', 'L5D'),   # B2a Data
 }
 
 # EKF state layout
