@@ -276,6 +276,27 @@ def main():
     # PHC actuator (alternative)
     ap.add_argument("--phc", default=None,
                     help="PTP device for PHC adjfine sweep (e.g. /dev/ptp0)")
+    # PHC PEROUT setup — needed when the engine was just stopped and
+    # PEROUT (which drives TICC chA on TimeHat / MadHat) is disabled.
+    # See ``peppar_fix.perout_setup.setup_perout``.  Skip if PEROUT is
+    # already running or chA is driven by something other than PHC
+    # PEROUT (e.g., PiFace's TADD-2 Mini divider).
+    ap.add_argument("--enable-perout-pin", type=int, default=None,
+                    metavar="PIN",
+                    help="With --phc: SDP pin index to bring up for "
+                         "PEROUT (drives TICC chA).  Typically 0 for "
+                         "SDP0 on i226 hosts.  Omit to skip PEROUT "
+                         "setup (already running, or chA driven "
+                         "differently).")
+    ap.add_argument("--enable-perout-channel", type=int, default=0,
+                    metavar="CH",
+                    help="With --enable-perout-pin: PEROUT channel "
+                         "(default: 0)")
+    ap.add_argument("--no-perout-verify", action="store_true",
+                    help="With --enable-perout-pin: skip TICC phase "
+                         "verification + retry-on-misalignment.  Use "
+                         "if you trust the host's hardware not to hit "
+                         "the i226 half-period latch bug.")
 
     # Output
     ap.add_argument("--output", default=None,
@@ -292,6 +313,37 @@ def main():
     from ticc import Ticc
 
     actuator, actuator_label = build_actuator(args)
+
+    # PHC-path PEROUT setup.  Engine teardown disables PEROUT, so TICC
+    # chA stays empty until we explicitly bring it back up.  Done here
+    # (in main, after building actuator) so the PHC fd is open and the
+    # path is shared with phc_bootstrap + perout_kick.
+    if args.enable_perout_pin is not None:
+        if args.phc is None:
+            log.error("--enable-perout-pin requires --phc (no PHC opened)")
+            return 1
+        from peppar_fix.perout_setup import setup_perout
+        # actuator was built from --phc, so it holds a PtpDevice already.
+        # PhcAdjfineActuator exposes .ptp.
+        ptp = getattr(actuator, "ptp", None) or getattr(actuator, "_ptp", None)
+        if ptp is None:
+            log.error("PHC actuator has no .ptp attribute — cannot share fd")
+            return 1
+        log.info("Enabling PEROUT: pin=%d channel=%d (verify=%s)",
+                 args.enable_perout_pin, args.enable_perout_channel,
+                 "off" if args.no_perout_verify else "via TICC")
+        ok = setup_perout(
+            ptp,
+            pin_index=args.enable_perout_pin,
+            channel=args.enable_perout_channel,
+            program_pin=True,
+            ptp_dev_path=args.phc,
+            verify_via_ticc_port=(None if args.no_perout_verify
+                                   else args.ticc_port),
+        )
+        if not ok:
+            log.error("PEROUT setup failed — chA will be empty")
+            return 1
 
     # Measure-only mode (no actuator, no sweep)
     if actuator is None and args.sweep_ppb is None and args.sweep_codes is None:
