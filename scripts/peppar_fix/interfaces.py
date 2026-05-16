@@ -1,8 +1,20 @@
 """Abstract interfaces for phase measurement and frequency actuation.
 
-These ABCs decouple the servo loop from specific hardware. Current
-implementations: PhcAdjfineActuator (Linux PHC), ClockMatrixActuator
-(Renesas 8A34002 I2C). Future: White Rabbit, other timing chips.
+These ABCs decouple the servo loop from specific hardware.  Current
+implementations of ``FrequencyActuator``:
+
+  - ``DacActuator`` (AD5693R/MCP4725 → VCOCXO varactor) — see
+    ``dac_actuator.py``.  Used by PiFace + clkPoC3.
+  - ``PhcAdjfineActuator`` (Linux PHC ``clock_adjtime``) — see
+    ``phc_actuator.py``.  Used by TimeHat + MadHat (i226 NIC TCXO).
+  - ``ClockmatrixActuator`` (Renesas 8A34002 I²C DPLL FCW) — see
+    ``clockmatrix_actuator.py``.  Used by Timebeat OTC hosts
+    (otcBob1, ptBoat).
+
+Future: White Rabbit, other timing chips.  Adding a new DO architecture
+means implementing this interface; servo, characterization
+(``tools/calibrate_do.py``), and engine startup discovery work
+unchanged.
 """
 
 from abc import ABC, abstractmethod
