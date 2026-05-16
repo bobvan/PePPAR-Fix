@@ -194,26 +194,45 @@ def setup_perout(ptp,
             break
 
         # Wait for PEROUT to start (start_sec = phc_now + 2 in
-        # enable_perout) before TICC sees edges.
-        time.sleep(4)
+        # enable_perout) before TICC sees edges.  4s is the
+        # bootstrap-tested floor; 6s gives more headroom on the
+        # re-enable path where the disable→sleep→enable cycle can
+        # leave the comparator unsettled for an extra second or two.
+        time.sleep(6 if attempt > 1 else 4)
         result = ticc_check_perout_phase(verify_via_ticc_port)
         if result is None:
-            log.warning("TICC phase check inconclusive — accepting")
-            break
+            # Inconclusive — either no chA yet (PEROUT still warming
+            # up or didn't start), or chB missing (TICC issue).  Try
+            # the next offset rather than accepting silently.  Only
+            # accept after exhausting attempts.
+            if attempt < max_attempts:
+                log.warning("TICC phase check inconclusive on attempt "
+                            "%d/%d — trying next offset",
+                            attempt, max_attempts)
+                try:
+                    ptp.disable_perout(channel)
+                except OSError:
+                    pass
+                time.sleep(2)
+                continue
+            else:
+                log.warning("TICC phase check still inconclusive after "
+                            "%d attempts — accepting", max_attempts)
+                break
         aligned, _chA, _chB = result
         if aligned:
             log.info("PEROUT phase verified via TICC on attempt %d", attempt)
             break
         if attempt < max_attempts:
-            log.warning("PEROUT 500ms off — trying opposite offset "
+            log.warning("PEROUT misaligned — trying opposite offset "
                         "(attempt %d/%d)", attempt, max_attempts)
             try:
                 ptp.disable_perout(channel)
             except OSError:
                 pass
-            time.sleep(1)
+            time.sleep(2)
         else:
-            log.error("PEROUT still 500ms off after %d attempts — "
+            log.error("PEROUT still misaligned after %d attempts — "
                       "hardware half-period latch.  May need driver "
                       "reload (rmmod igc && modprobe igc).",
                       max_attempts)
