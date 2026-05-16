@@ -16,35 +16,57 @@ eph_mount = "BCEP00BKG0"
 ssr_ntrip_conf = "ntrip-cnes.conf"
 
 # BDS B2a-I phase biases are not published by any IGS-IP AC as of
-# 2026-05-09 (CNES has only B1I/B3I/B2I-legacy; WHU has GPS phase
-# only; CAS has B1I+B1C; rest none).  See
-# docs/bds-b2a-phase-bias-survey-2026-05-09.md.  But: I-175645 Fix #2
-# (per-filter MISS-bias gate; this PR) routes BDS B2a-I observations
-# correctly even without phase biases — dropped from PPPFilter / MW
-# / WL math (where MISS bias would basin position), kept for
-# FixedPosFilter via TD-CP (where the phase-bias constant cancels
-# epoch-to-epoch).  So BDS contributes ~6-8 SVs/epoch to time-side
-# dt_rx σ tightening without poisoning position.  systems= safely
-# enables BDS post-Fix-#2; would have been the wrong call pre-Fix-#2.
+# 2026-05-09 — see docs/bds-b2a-phase-bias-survey-2026-05-09.md.
+# Per-filter MISS-bias gate routes BDS B2a-I correctly even without
+# phase biases; BDS contributes to dt_rx without poisoning position.
 systems = "gps,gal,bds"
 
-# CTI OSC5A2B02 OCXO via AD5693R DAC on I2C bus 1.
-# Characterized 2026-04-14: gain=1.062, linearity <5 ppb over ±200 ppb.
-# OCXO runs +149 ppb high at DAC midscale.
+# IsoTemp OCXO via AD5693R DAC on I2C bus 1, 2× output mode.
+#
+# Empirical characterization 2026-05-16 by 3 independent runs of
+# tools/calibrate_do.py + tools/calibrate_do_consensus.py:
+#   data/clkpoc3-cal-2026-05-16-run{1,2,3}.json
+#
+# Results (median across 3 runs, 0.004% spread — PASS 1% target):
+#   ppb_per_code     = +0.02309 ppb/code  (POSITIVE — higher code →
+#                                          higher DO freq)
+#   gain             = 1.0039  (commanded vs measured)
+#   OCXO at center   = +17.75 ppb  (with 2× mode → Vctrl ≈ 2.5V at
+#                                   code 32768, the IsoTemp's nominal
+#                                   operating point)
+#   Full range       = 1495 ppb  (half-range 747 ppb either way)
+#   Linearity        = 9 ppb max residual from best-fit line
+#
+# 2× gain is REQUIRED for IsoTemp OCXO: part expects 0..5V Vctrl
+# swing; AD5693R 1× mode only delivers 0..Vref = 0..2.5V which leaves
+# the OCXO operating near the bottom of its pull range and ~10 ppb
+# of headroom from rail (insufficient for thermal/aging drift).  2×
+# mode delivers 0..2×Vref = 0..5V, centering the operating point
+# and providing ~730 ppb of headroom either direction.
+#
+# History (pre-2026-05-16):
+#   - Previous TOML had dac_ppb_per_code = "0.0361" (lifted from
+#     PiFace's CTI characterization — wrong oscillator).  Sign was
+#     correct; magnitude was 3.1× too large.  Engine commanded N ppb
+#     but actuator delivered N × 0.32 ppb.  Servo wound up to
+#     compensate, eventually railing at adj=+1183 ppb.
+#   - Previous TOML omitted dac_gain — defaulted to 0 (1× mode),
+#     incompatible with the IsoTemp's Vctrl spec, compounding the
+#     rail-pinning issue.
+#   - Closed: dayplan item dacPpbSignClean-main (I-010246).
 do_label = "ocxo-clkpoc3"
 do_type = "vcocxo"
 dac_bus = 1
 dac_addr = "0x4C"
 dac_bits = 16
-# Sign verified 2026-04-14: freerun at center shows -149 ppb (slow),
-# not +149 as previously characterized.  Positive ppb_per_code means
-# higher code → higher frequency → corrects the slow crystal.
-dac_ppb_per_code = "0.0361"
+dac_ppb_per_code = "0.02309"
+dac_max_ppb = 740.0
 dac_type = "ad5693r"
+dac_gain = 1
 
 # TADD-2 Mini divider: ARM on GPIO 16, syncs 10 MHz → 1 PPS.
 tadd_gpio = 16
 
-# TICC #3: chA = DO PPS, chB = GNSS PPS.
+# TICC #5: chA = DO PPS, chB = GNSS PPS.
 # TICC competes as a servo source whenever ticc_port is configured.
 ticc_port = "/dev/ticc5"
