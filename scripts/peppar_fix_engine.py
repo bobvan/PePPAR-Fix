@@ -4854,19 +4854,26 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             }
         if servo_ctx is not None:
             _cleanup_servo(servo_ctx)
+        # The runtime summary + I-145915 bake-in summary live in
+        # the finally block so they fire on ANY exit path:
+        #   - Normal end-of-run (--duration completed)
+        #   - SIGTERM via on_signal → stop_event.set()
+        #   - SIGINT / KeyboardInterrupt
+        #   - Unhandled exception (still emits before exception
+        #     propagates up; bake-in numbers preserved for the
+        #     orchestrator's restart cycle)
+        elapsed = time.time() - start_time
+        log.info(f"Steady state complete: {elapsed:.0f}s, {n_epochs} epochs")
+        rs = resid_log_stats
+        log.info(
+            "[FIXEDPOS_RESID_SUMMARY] epochs=%d active_trips=%d "
+            "proposed_trips=%d both_alarmed=%d only_active=%d "
+            "pr_disturbances=%d "
+            "(only_active = trips that would have STAYED under proposed gate)",
+            rs['epochs'], rs['active_trips'], rs['proposed_trips'],
+            rs['both_alarmed'], rs['only_active'], rs['pr_disturbances'],
+        )
 
-    elapsed = time.time() - start_time
-    log.info(f"Steady state complete: {elapsed:.0f}s, {n_epochs} epochs")
-    # I-145915 bake-in summary — side-by-side gate verdicts.
-    rs = resid_log_stats
-    log.info(
-        "[FIXEDPOS_RESID_SUMMARY] epochs=%d active_trips=%d "
-        "proposed_trips=%d both_alarmed=%d only_active=%d "
-        "pr_disturbances=%d "
-        "(only_active = trips that would have STAYED under proposed gate)",
-        rs['epochs'], rs['active_trips'], rs['proposed_trips'],
-        rs['both_alarmed'], rs['only_active'], rs['pr_disturbances'],
-    )
     return gate_stats
 
 
@@ -7611,6 +7618,12 @@ def run(args):
         log.info("Signal received, shutting down")
         stop_event.set()
     signal.signal(signal.SIGTERM, on_signal)
+    # SIGINT also routes through stop_event so Ctrl-C exits cleanly
+    # via the run_steady_state finally block — that's where the
+    # [FIXEDPOS_RESID_SUMMARY] + servo cleanup live.  Without this,
+    # Ctrl-C raises KeyboardInterrupt mid-syscall and may bypass
+    # the summary on quick double-tap.
+    signal.signal(signal.SIGINT, on_signal)
     if args.pid_file:
         with open(args.pid_file, "w") as f:
             f.write(f"{os.getpid()}\n")
