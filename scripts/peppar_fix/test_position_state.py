@@ -9,6 +9,7 @@ from peppar_fix.position_state import (
     PppStateWriter,
     SURVEY_TIE_BREAK_RATIO,
     _format_toml,
+    compute_horizontal_displacement,
     filter_current_mount,
     load_current_mount_sn,
     load_ppp_state,
@@ -515,6 +516,77 @@ class TestPppStateWriter(unittest.TestCase):
             self.assertAlmostEqual(loaded.ecef_m[0], 100.0)
             self.assertAlmostEqual(loaded.sigma_m, 0.04)
             self.assertEqual(loaded.extra.get("n_epochs"), 999)
+
+
+class TestComputeHorizontalDisplacement(unittest.TestCase):
+    """Pure geometry: decompose ECEF Δ into horizontal + vertical
+    against geocentric-up at point_a."""
+
+    # A lab-class reference point (Chicago-ish at sea level — ECEF
+    # values from real CHOKE1 antPos for plausibility).
+    POINT = (157469.3814, -4756189.0729, 4232768.5274)
+
+    def test_zero_displacement(self):
+        d3, h, v = compute_horizontal_displacement(self.POINT, self.POINT)
+        self.assertAlmostEqual(d3, 0.0, places=9)
+        self.assertAlmostEqual(h, 0.0, places=9)
+        self.assertAlmostEqual(v, 0.0, places=9)
+
+    def test_pure_radial_displacement_is_all_vertical(self):
+        """A radial-outward move at point_a should decompose to
+        v ≈ delta, h ≈ 0."""
+        import math
+        ax, ay, az = self.POINT
+        norm = math.sqrt(ax * ax + ay * ay + az * az)
+        scale = 1.0 + 1.0 / norm  # move 1 m radially outward
+        b = (ax * scale, ay * scale, az * scale)
+        # b - point = +1m radial from origin (so point - b is -1m radial)
+        d3, h, v = compute_horizontal_displacement(self.POINT, b)
+        # Vertical magnitude ≈ 1 m, horizontal ≈ 0
+        self.assertAlmostEqual(v, 1.0, places=3)
+        self.assertLess(h, 1e-6)
+        self.assertAlmostEqual(d3, 1.0, places=3)
+
+    def test_pure_horizontal_displacement_is_all_horizontal(self):
+        """A move perpendicular to geocentric-up should decompose
+        to h ≈ delta, v ≈ 0."""
+        import math
+        ax, ay, az = self.POINT
+        norm = math.sqrt(ax * ax + ay * ay + az * az)
+        # Tangent vector at point_a in the X-Y plane around the polar
+        # axis — perpendicular to "up" by construction.
+        # u_hat = (ax, ay, az) / norm.  A vector orthogonal to u_hat
+        # that lies in the X-Y plane: (-ay, ax, 0) normalised.
+        tx, ty, tz = -ay, ax, 0.0
+        tnorm = math.sqrt(tx * tx + ty * ty)
+        tx, ty = tx / tnorm, ty / tnorm
+        # Move 1m along the tangent.
+        b = (ax + tx, ay + ty, az + tz)
+        d3, h, v = compute_horizontal_displacement(self.POINT, b)
+        self.assertAlmostEqual(h, 1.0, places=3)
+        self.assertLess(v, 1e-6)
+        self.assertAlmostEqual(d3, 1.0, places=3)
+
+    def test_3d_magnitude_independent_of_decomposition(self):
+        b = (self.POINT[0] + 1.0,
+             self.POINT[1] - 2.0,
+             self.POINT[2] + 0.5)
+        d3, h, v = compute_horizontal_displacement(self.POINT, b)
+        import math
+        expected_d3 = math.sqrt(1.0 ** 2 + 2.0 ** 2 + 0.5 ** 2)
+        self.assertAlmostEqual(d3, expected_d3, places=6)
+        # Pythagoras: d3² ≈ h² + v²
+        self.assertAlmostEqual(d3 * d3, h * h + v * v, places=4)
+
+    def test_origin_point_a_falls_back_safely(self):
+        """Pathological point_a at Earth's centre — function shouldn't
+        crash and should return finite values."""
+        d3, h, v = compute_horizontal_displacement(
+            (0.0, 0.0, 0.0), (1.0, 0.0, 0.0))
+        self.assertAlmostEqual(d3, 1.0)
+        # In the degenerate case h = d3, v = 0 (documented fallback).
+        self.assertAlmostEqual(h, 1.0)
+        self.assertAlmostEqual(v, 0.0)
 
 
 class TestUtcNowIso(unittest.TestCase):

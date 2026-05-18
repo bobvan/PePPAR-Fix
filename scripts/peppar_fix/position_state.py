@@ -198,6 +198,52 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ── Geometry: ECEF displacement decomposition ────────────────────── #
+
+
+def compute_horizontal_displacement(
+    point_a: tuple, point_b: tuple
+) -> tuple[float, float, float]:
+    """Decompose the ECEF displacement (point_a - point_b) into
+    horizontal and vertical components, using geocentric-up at
+    point_a as the local frame's up direction.
+
+    Returns (disp_3d_m, disp_h_m, disp_v_m).
+
+    The horizontal magnitude is what matters for antenna-move
+    detection — physical mount moves are dominantly horizontal,
+    while PPP vertical wander (mainly tropo/iono residuals) is
+    not an antenna-move signature.  Established empirically on
+    clkPoC3 in 2026-04-18 when altitude-based watchdog reset
+    cascaded 22 times in 3 h.
+
+    Geocentric-up is the unit vector at point_a; for positions
+    near Earth's surface this is accurate to ~0.2% as a stand-in
+    for true local up.  Good enough for any threshold we care
+    about (cm-scale tolerances at km-scale baselines).
+    """
+    import math
+    ax, ay, az = float(point_a[0]), float(point_a[1]), float(point_a[2])
+    bx, by, bz = float(point_b[0]), float(point_b[1]), float(point_b[2])
+    dx, dy, dz = ax - bx, ay - by, az - bz
+    norm_a = math.sqrt(ax * ax + ay * ay + az * az)
+    if norm_a == 0:
+        # Pathological: point_a at Earth's centre.  Fall back to 3D mag
+        # for horizontal, zero for vertical — caller will see a clearly
+        # garbage NAV2 fix anyway.
+        d3 = math.sqrt(dx * dx + dy * dy + dz * dz)
+        return d3, d3, 0.0
+    ux, uy, uz = ax / norm_a, ay / norm_a, az / norm_a
+    vertical = dx * ux + dy * uy + dz * uz
+    hx = dx - vertical * ux
+    hy = dy - vertical * uy
+    hz = dz - vertical * uz
+    disp_h = math.sqrt(hx * hx + hy * hy + hz * hz)
+    disp_v = abs(vertical)
+    disp_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
+    return disp_3d, disp_h, disp_v
+
+
 # ── Periodic writer ───────────────────────────────────────────────── #
 
 

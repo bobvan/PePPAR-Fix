@@ -2278,7 +2278,20 @@ class AntPosEstThread(threading.Thread):
             pass
 
     def _check_nav2(self, filt, mw, nl, pos_ecef, sigma_3d, n_nl_fixed):
-        """Horizontal antenna-movement watchdog using NAV2 as second opinion.
+        """**Disabled in slice 5 of docs/position-state-and-monitoring.md.**
+
+        The old watchdog (10 m horizontal sustained over N checks →
+        unfix NLs + reseed filter from NAV2) conflicts with the new
+        design's slew (<1 m) / step (≥1 m → mount_sn bump + clean
+        shutdown) action model in slice 7.  Keeping both action paths
+        running would let them race / cancel each other.
+
+        Code preserved as reference for slice 7's replacement; the
+        new [CONFIDENCE …] periodic log in run_steady_state surfaces
+        the same NAV2-vs-pin displacement so operators see it during
+        the slice 5-to-7 gap.
+
+        Horizontal antenna-movement watchdog using NAV2 as second opinion.
 
         NAV2's unique value is independence from our PPP filter — an
         in-receiver single-epoch code-only fix, unaffected by our float
@@ -2307,6 +2320,10 @@ class AntPosEstThread(threading.Thread):
         checks.  On reset, reseed lat/lon from NAV2, keep the filter's
         altitude (NAV2 altitude is noisier than NAV2 horizontal).
         """
+        # Slice 5 disable — see docstring.  Returns immediately so no
+        # action is taken; old logic below preserved for slice 7
+        # reference.
+        return
         opinion = self._nav2_store.get_opinion(max_age_s=30.0)
         if opinion is None:
             return
@@ -3975,6 +3992,15 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     lat, lon, alt = ecef_to_lla(known_ecef[0], known_ecef[1], known_ecef[2])
     log.info(f"Position: {lat:.6f}, {lon:.6f}, {alt:.1f}m")
 
+    # Cache mount_sn for the [CONFIDENCE] periodic log line.  See
+    # docs/position-state-and-monitoring.md.  Defaults to 0 when the
+    # receiver state file is absent or missing the field.
+    from peppar_fix.position_state import (
+        compute_horizontal_displacement, load_current_mount_sn,
+    )
+    _confidence_mount_sn = load_current_mount_sn(
+        getattr(args, 'receiver_unique_id', None))
+
     # Compute METAR-seeded ZTD residual when --init-ztd-from-met is set.
     # Default 0.0 preserves prior behavior.  See I-024942 and 2026-05-04
     # overnight: under --pin-position the cold-start ZTD spent hours
@@ -4845,6 +4871,37 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 qvir = servo_ctx.get('qvir') if servo_ctx else None
                 log.info("[STATUS] %s", format_status(ape_sm, dfe_sm,
                          ticc_ok=ticc_ok, qvir=qvir))
+
+            # [CONFIDENCE] periodic log line — see
+            # docs/position-state-and-monitoring.md.  Surfaces NAV2
+            # displacement vs pin, σ on position seed and current
+            # clock estimate, mount_sn, mode.  Instrumentation only
+            # in slice 5 — no action taken.  Slice 7 will turn
+            # NAV2 excursions into slew/step.
+            if n_epochs % 60 == 0:
+                _nav2_disp_3d = _nav2_disp_h = _nav2_disp_v = None
+                _nav2_h_acc = None
+                if nav2_store is not None:
+                    _op = nav2_store.get_opinion(max_age_s=30.0)
+                    if _op is not None:
+                        _nav2_disp_3d, _nav2_disp_h, _nav2_disp_v = (
+                            compute_horizontal_displacement(
+                                tuple(known_ecef),
+                                tuple(_op['ecef'])))
+                        _nav2_h_acc = _op.get('h_acc_m')
+                _pos_s = (f"{pos_sigma_m:.3f}m"
+                          if pos_sigma_m is not None else "?")
+                _time_s = (f"{dt_rx_sigma:.2f}ns"
+                           if dt_rx_sigma is not None else "?")
+                _nav2_str = ("nav2=stale" if _nav2_disp_3d is None
+                             else (f"nav2_disp_h={_nav2_disp_h:.3f}m "
+                                   f"nav2_disp_v={_nav2_disp_v:.3f}m "
+                                   f"nav2_hAcc={_nav2_h_acc or 0:.2f}m"))
+                log.info(
+                    "[CONFIDENCE] pos_sigma=%s time_sigma=%s "
+                    "%s mount_sn=%d mode=pinned",
+                    _pos_s, _time_s, _nav2_str, _confidence_mount_sn,
+                )
             now = time.time()
             if now - last_skip_log >= 60.0:
                 log.info(f"  Skip stats: {skip_stats}")
