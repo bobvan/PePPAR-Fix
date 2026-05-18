@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from peppar_fix.position_state import (
+    AntPosEstWatchdog,
     PositionState,
     PppStateWriter,
     SURVEY_TIE_BREAK_RATIO,
@@ -587,6 +588,109 @@ class TestComputeHorizontalDisplacement(unittest.TestCase):
         # In the degenerate case h = d3, v = 0 (documented fallback).
         self.assertAlmostEqual(h, 1.0)
         self.assertAlmostEqual(v, 0.0)
+
+
+class TestAntPosEstWatchdog(unittest.TestCase):
+    """Running-mean AntPosEst-vs-pin watchdog.  Pure-state, no
+    threading; consumers read the dict snapshot via .state."""
+
+    PIN = (100.0, 200.0, 300.0)
+
+    def test_empty_state_before_set_pin(self):
+        w = AntPosEstWatchdog()
+        self.assertFalse(w.state["active"])
+        self.assertEqual(w.state["n_in_mean"], 0)
+        self.assertIsNone(w.state["sigma_3d_m"])
+
+    def test_update_before_set_pin_is_noop(self):
+        w = AntPosEstWatchdog()
+        w.update((1.0, 2.0, 3.0), 0.01)
+        # State unchanged.
+        self.assertFalse(w.state["active"])
+        self.assertEqual(w.state["n_in_mean"], 0)
+        self.assertEqual(w.n_updates, 0)
+
+    def test_set_pin_then_update_activates(self):
+        w = AntPosEstWatchdog()
+        w.set_pin(self.PIN)
+        w.update(self.PIN, sigma_3d_m=0.01)
+        self.assertTrue(w.state["active"])
+        self.assertEqual(w.state["n_in_mean"], 1)
+        self.assertEqual(w.state["sigma_3d_m"], 0.01)
+
+    def test_zero_displacement_when_at_pin(self):
+        w = AntPosEstWatchdog()
+        w.set_pin(self.PIN)
+        w.update(self.PIN, sigma_3d_m=0.01)
+        self.assertAlmostEqual(w.state["displ_3d_m"], 0.0, places=6)
+        self.assertAlmostEqual(w.state["displ_h_m"], 0.0, places=6)
+
+    def test_high_sigma_skips_buffer(self):
+        w = AntPosEstWatchdog(activation_sigma_m=0.05)
+        w.set_pin(self.PIN)
+        w.update((self.PIN[0] + 1.0, self.PIN[1], self.PIN[2]),
+                 sigma_3d_m=10.0)  # cold-start σ
+        self.assertFalse(w.state["active"])
+        # σ field updated for visibility even on disarm.
+        self.assertEqual(w.state["sigma_3d_m"], 10.0)
+        # Buffer empty.
+        self.assertEqual(w.state["n_in_mean"], 0)
+        self.assertEqual(w.n_skipped_sigma, 1)
+        self.assertEqual(w.n_updates, 0)
+
+    def test_running_mean_tightens_with_n(self):
+        """σ_mean = σ_per_epoch / √N; after 60 epochs with σ=0.012
+        per epoch, σ_mean should be ~0.00155."""
+        import math
+        w = AntPosEstWatchdog(window_epochs=60)
+        w.set_pin(self.PIN)
+        for _ in range(60):
+            w.update(self.PIN, sigma_3d_m=0.012)
+        self.assertEqual(w.state["n_in_mean"], 60)
+        expected_sigma_mean = 0.012 / math.sqrt(60)
+        self.assertAlmostEqual(w.state["sigma_mean_m"],
+                               expected_sigma_mean, places=6)
+
+    def test_running_mean_is_actual_mean_of_buffer(self):
+        """displ should reflect the mean of the buffered positions,
+        not the latest reading."""
+        w = AntPosEstWatchdog(window_epochs=10)
+        w.set_pin(self.PIN)
+        # Half at pin, half displaced 0.01 m along X.
+        for _ in range(5):
+            w.update(self.PIN, sigma_3d_m=0.01)
+        for _ in range(5):
+            w.update((self.PIN[0] + 0.01, self.PIN[1], self.PIN[2]),
+                     sigma_3d_m=0.01)
+        # Mean position is 0.005 m off in X — but X at our PIN is
+        # purely along the geocentric-up direction (since pin is
+        # along the +X axis when at (100, 200, 300)... actually it's
+        # not perfectly radial).  Just check the 3D displacement.
+        self.assertAlmostEqual(w.state["displ_3d_m"], 0.005, places=4)
+
+    def test_buffer_is_ring_window_epochs(self):
+        w = AntPosEstWatchdog(window_epochs=5)
+        w.set_pin(self.PIN)
+        for _ in range(20):
+            w.update(self.PIN, sigma_3d_m=0.01)
+        # Buffer capped at 5.
+        self.assertEqual(w.state["n_in_mean"], 5)
+
+    def test_set_pin_replace_for_slew(self):
+        """Slice 7 will slew by re-calling set_pin with the
+        refined ARP.  Verify the watchdog accepts that."""
+        w = AntPosEstWatchdog()
+        w.set_pin(self.PIN)
+        w.update(self.PIN, sigma_3d_m=0.01)
+        # Slew: new pin 0.1 m off.
+        new_pin = (self.PIN[0] + 0.1, self.PIN[1], self.PIN[2])
+        w.set_pin(new_pin)
+        w.update(new_pin, sigma_3d_m=0.01)
+        # We still have BOTH samples in the buffer.  Running mean
+        # is halfway between PIN and new_pin.  Displacement vs
+        # NEW pin is 0.05 m.  Slice 7 design accepts this — the
+        # watchdog naturally re-tightens as the buffer ages out.
+        self.assertEqual(w.state["n_in_mean"], 2)
 
 
 class TestUtcNowIso(unittest.TestCase):

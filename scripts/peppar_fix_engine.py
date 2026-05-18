@@ -2102,7 +2102,7 @@ class AntPosEstThread(threading.Thread):
         # mount_sn is cached at startup; auto-move bumps trigger
         # restart so the next process re-reads.
         from peppar_fix.position_state import (
-            PppStateWriter, load_current_mount_sn,
+            AntPosEstWatchdog, PppStateWriter, load_current_mount_sn,
         )
         mount_sn = (load_current_mount_sn(receiver_uid)
                     if receiver_uid is not None else 0)
@@ -2112,6 +2112,11 @@ class AntPosEstThread(threading.Thread):
             period_s=float(ppp_state_write_period_s),
             max_sigma_m=float(ppp_state_write_max_sigma_m),
         )
+        # Running-mean AntPosEst-vs-pin watchdog (slice 6).  Pin set
+        # below to the engine's known_ecef seed.  run_steady_state's
+        # [CONFIDENCE] log reads the published state cross-thread.
+        self._antpos_watchdog = AntPosEstWatchdog()
+        self._antpos_watchdog.set_pin(known_ecef)
         self._nav2_tension_streak = 0  # consecutive high-tension checks
         self._nav2_cooldown_until = 0  # epoch number: skip checks until this
         # Per-SV ambiguity state machine + the three monitors that
@@ -3521,6 +3526,10 @@ class AntPosEstThread(threading.Thread):
             # Throttled + sigma-gated by PppStateWriter; no-op when
             # receiver_uid is None.
             self._ppp_writer.maybe_write(pos_ecef, sigma_3d, self._n_epochs)
+            # AntPosEst-vs-pin watchdog (slice 6 instrumentation).
+            # State is published on self._antpos_watchdog.state for
+            # cross-thread read by run_steady_state's [CONFIDENCE] log.
+            self._antpos_watchdog.update(pos_ecef, sigma_3d)
             # Two separate counts drive the two thresholds:
             #   n_nl_fixed   — union of ANCHORING + ANCHORED.
             #                  Drives CONVERGING ↔ ANCHORING (fallback:
@@ -4874,10 +4883,12 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
 
             # [CONFIDENCE] periodic log line — see
             # docs/position-state-and-monitoring.md.  Surfaces NAV2
+            # displacement vs pin, AntPosEst running-mean
             # displacement vs pin, σ on position seed and current
             # clock estimate, mount_sn, mode.  Instrumentation only
-            # in slice 5 — no action taken.  Slice 7 will turn
-            # NAV2 excursions into slew/step.
+            # in slice 5/6 — no action taken.  Slice 7 will turn
+            # the larger of (nav2_disp_h, antpos_disp_h) into
+            # slew/step.
             if n_epochs % 60 == 0:
                 _nav2_disp_3d = _nav2_disp_h = _nav2_disp_v = None
                 _nav2_h_acc = None
@@ -4897,10 +4908,28 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                              else (f"nav2_disp_h={_nav2_disp_h:.3f}m "
                                    f"nav2_disp_v={_nav2_disp_v:.3f}m "
                                    f"nav2_hAcc={_nav2_h_acc or 0:.2f}m"))
+                # AntPosEst watchdog state — read cross-thread.  When
+                # the thread isn't running or hasn't reported yet, fall
+                # back to "antpos=cold".
+                _antpos_str = "antpos=cold"
+                if ape_thread is not None:
+                    _aw = getattr(ape_thread, '_antpos_watchdog', None)
+                    if _aw is not None:
+                        _s = _aw.state
+                        if _s["active"]:
+                            _antpos_str = (
+                                f"antpos_disp_h={_s['displ_h_m']:.4f}m "
+                                f"antpos_disp_v={_s['displ_v_m']:.4f}m "
+                                f"antpos_sigma_mean={_s['sigma_mean_m']:.4f}m "
+                                f"antpos_n={_s['n_in_mean']}")
+                        elif _s["sigma_3d_m"] is not None:
+                            _antpos_str = (
+                                f"antpos=unarmed (σ={_s['sigma_3d_m']:.3f}m)")
                 log.info(
                     "[CONFIDENCE] pos_sigma=%s time_sigma=%s "
-                    "%s mount_sn=%d mode=pinned",
-                    _pos_s, _time_s, _nav2_str, _confidence_mount_sn,
+                    "%s %s mount_sn=%d mode=pinned",
+                    _pos_s, _time_s, _nav2_str, _antpos_str,
+                    _confidence_mount_sn,
                 )
             now = time.time()
             if now - last_skip_log >= 60.0:

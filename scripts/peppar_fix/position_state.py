@@ -198,6 +198,123 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ── AntPosEst watchdog ────────────────────────────────────────────── #
+
+
+# σ above which the per-epoch AntPosEst estimate is too noisy to
+# feed the running mean.  Cold-start AntPosEst σ is meters; only
+# once it drops below this do we start accumulating.
+DEFAULT_ANTPOS_ACTIVATION_SIGMA_M = 0.05
+
+# Running-mean window — σ on the mean tightens as √N for independent
+# epochs.  60 at 1 Hz observation cadence (AntPosEst's own clock,
+# typically /10 decimation = 6 sec wall time per epoch) is enough
+# for the mean to be useful well before per-epoch σ would.
+DEFAULT_ANTPOS_WINDOW_EPOCHS = 60
+
+
+class AntPosEstWatchdog:
+    """Running-mean position from AntPosEst output for use as a
+    sub-cm watchdog against a pinned ARP.
+
+    Updated every AntPosEst epoch by the thread.  State exposed as
+    a dict snapshot via the ``state`` attribute — atomic replace
+    makes cross-thread reads safe.
+
+    Per docs/position-state-and-monitoring.md: instrumentation only
+    in slice 6 (logs the displacement).  Slice 7 turns these
+    numbers into slew (< 1 m) / step (≥ 1 m + mount_sn bump) action.
+
+    Two arming gates layered:
+
+      1. Per-epoch σ-gate: ``sigma_3d_m`` must be below
+         ``activation_sigma_m`` to feed the running mean.  Filters
+         out cold-start AntPosEst noise (meters-class σ) so a
+         single noisy epoch doesn't poison the average.
+      2. Running-mean N-gate: ``n_in_mean`` < some minimum means
+         the mean isn't yet trustworthy.  This is a soft signal —
+         we still emit the (small-N) mean for diagnostics; slice
+         7 will compare ``displ_h_m`` against
+         ``slew_step_threshold_m`` only once N is at the full
+         window.
+    """
+
+    def __init__(self,
+                 *,
+                 activation_sigma_m: float = DEFAULT_ANTPOS_ACTIVATION_SIGMA_M,
+                 window_epochs: int = DEFAULT_ANTPOS_WINDOW_EPOCHS):
+        from collections import deque
+        self.activation_sigma_m = float(activation_sigma_m)
+        self.window_epochs = int(window_epochs)
+        self._buf = deque(maxlen=self.window_epochs)
+        self._pin: Optional[tuple] = None
+        self.state = self._empty_state()
+        # Diagnostic counters.
+        self.n_updates = 0
+        self.n_skipped_sigma = 0
+
+    @staticmethod
+    def _empty_state() -> dict:
+        return {
+            "active": False,
+            "n_in_mean": 0,
+            "sigma_3d_m": None,
+            "sigma_mean_m": None,
+            "displ_3d_m": None,
+            "displ_h_m": None,
+            "displ_v_m": None,
+        }
+
+    def set_pin(self, pin_ecef) -> None:
+        """Tell the watchdog where the pin is.  Called at startup
+        after the engine settled on a pinned position.  Calling
+        again replaces the pin — used by slice 7's slew action to
+        update the pin in-place after a small ARP refinement."""
+        self._pin = tuple(float(v) for v in pin_ecef)
+
+    def update(self, pos_ecef, sigma_3d_m) -> None:
+        """Feed one AntPosEst epoch.  Drops the per-epoch reading
+        when σ > activation threshold (don't poison the running
+        mean with high-σ junk).  Result published to ``self.state``
+        as an atomic dict replace for cross-thread read."""
+        import math
+        if self._pin is None:
+            return  # no pin yet — caller must set_pin first
+        if sigma_3d_m is None or sigma_3d_m > self.activation_sigma_m:
+            # Per-epoch σ too noisy — don't feed.  Still update the
+            # `active` field so consumers see the disarmed state.
+            old = self.state
+            new = dict(old)
+            new["active"] = False
+            new["sigma_3d_m"] = (float(sigma_3d_m)
+                                 if sigma_3d_m is not None else None)
+            self.state = new
+            self.n_skipped_sigma += 1
+            return
+        self._buf.append(tuple(float(v) for v in pos_ecef))
+        n = len(self._buf)
+        mx = sum(p[0] for p in self._buf) / n
+        my = sum(p[1] for p in self._buf) / n
+        mz = sum(p[2] for p in self._buf) / n
+        d3, dh, dv = compute_horizontal_displacement(
+            self._pin, (mx, my, mz))
+        # σ on the mean tightens as √N if epochs are independent.
+        # This is an estimate, not a rigorous covariance — good
+        # enough for the slice 7 threshold check and for operator
+        # visibility now.
+        sigma_mean = float(sigma_3d_m) / math.sqrt(n) if n > 0 else None
+        self.state = {
+            "active": True,
+            "n_in_mean": n,
+            "sigma_3d_m": float(sigma_3d_m),
+            "sigma_mean_m": sigma_mean,
+            "displ_3d_m": d3,
+            "displ_h_m": dh,
+            "displ_v_m": dv,
+        }
+        self.n_updates += 1
+
+
 # ── Geometry: ECEF displacement decomposition ────────────────────── #
 
 
