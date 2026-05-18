@@ -519,6 +519,71 @@ GPS+GAL and NTRIP broadcast ephemeris. The convergence requires:
 - Satellite clock sanity check (|sat_clk| < 2ms)
 - LS outlier rejection (>50m residuals excluded)
 
+### Survey vs PPP terminology — load-bearing distinction
+
+Three distinct sources of position knowledge.  Don't conflate them
+in code, log lines, or operator-facing docs:
+
+- **Survey** = external authoritative measurement from a
+  surveying-grade pipeline.  Examples: OPUS-Static multi-day mean,
+  PRIDE PPP-AR, a quick NTRIP CORS-RTK check against a nearby
+  reference station, NGS-calibrated antenna setup.  Sub-cm typical,
+  authoritative.  Lives in `timelab/antPos.json` (operational
+  ARP) and survey writeups under `timelab/surveys/`.  At runtime
+  goes to `state/positions/<uid>.survey.toml` (written by
+  `peppar-survey`, which has no implemented backend yet — design
+  in `docs/position-state-and-monitoring.md`).
+- **PPP solution** = the engine's own AntPosEst output, written
+  to `state/positions/<uid>.ppp.toml` by the engine itself.
+  Convergence depends on AR mode: WL-only ~m-class; PPP-AR with
+  resolved narrow-lane integers can reach cm-class.
+- **NAV2** = the F9T/F10T's onboard secondary navigation engine.
+  Single-epoch code-only fix, intrinsically 1–5 m accurate, often
+  exhibits a multi-meter receiver-specific bias (see below).
+
+`peppar-survey --from-ppp` (removed 2026-05-18) was the offender
+that conflated PPP solution → survey.  Don't reintroduce that
+pattern in any new tool.
+
+### NAV2 bias — the floor on NAV2-based thresholds
+
+NAV2 SPP solutions exhibit a persistent receiver-specific bias of
+**~1.5–4 m** relative to the surveyed ARP.  Documented in
+`docs/wrong-int-basin-2026-05-11.md` (4 m on MadHat post-CHOKE1)
+and surfaced again 2026-05-18 by the new `[CONFIDENCE_PHASE]`
+log lines.  CHOKE1 surveys (`timelab/surveys/2026-05-05-choke1-
+cors-rtk.md`, `timelab/surveys/2026-05-07-choke1-opus-static.md`)
+agree sub-cm across CORS-RTK / OPUS / tape methods, so the bias
+is in NAV2, not in the survey.  NAV2 can also drift further than
+the bias under multipath or sky-view changes.
+
+**Operational implication**: any NAV2-based watchdog threshold
+must be loose enough to absorb both the bias and the noise on top
+of it.  Tight thresholds (e.g., 0.5 m) generate continuous false
+positives and trigger spurious reset / step / re-bootstrap
+cascades.  The pre-existing `_check_nav2` uses 10 m horizontal
+sustained-N-checks for "antenna moved" detection — that's the
+right order of magnitude.  Slice 7's `WatchdogActor.nav2_threshold_m`
+was retuned to match 2026-05-18.
+
+NAV2 is useful for catching **gross** physical events (antenna
+fell off the mast, cable kicked) where the displacement dwarfs
+the bias.  For sub-cm-scale antenna stability monitoring, use
+AntPosEst's running-mean watchdog instead.
+
+### Authoritative ARP — always `timelab/antPos.json`
+
+Operational ARPs live in `timelab/antPos.json` (gitignored
+single-source-of-truth).  Current entry: `choke1` (CHOKE1 antenna
+on the lab roof, shared via GUS splitter across all F9T/F10T hosts).
+ARP came from OPUS-Static multi-day mean, σ=12 mm.
+
+If you need the surveyed ARP for `--known-pos`, `state/positions/
+<uid>.survey.toml`, or any other purpose, **read it from
+`timelab/antPos.json`** rather than copying coordinates into
+scripts/wrappers/docs — the coordinates evolve as new survey runs
+land and the JSON file is the truth.
+
 ### Unified CLI
 
 `peppar_fix_cmd.py` is the unified entry point:

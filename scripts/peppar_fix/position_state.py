@@ -328,8 +328,18 @@ DEFAULT_SLEW_STEP_THRESHOLD_M = 1.0
 # Sustain windows.  At [CONFIDENCE] cadence of 60 epochs = ~60 s,
 # nav2/antpos_sustain_s = 60 means "at least one full cycle of
 # consistent bark".  Step requires much longer to avoid declaring
-# a mount move on a transient that just happens to cross 1 m.
-DEFAULT_NAV2_THRESHOLD_M = 0.5
+# a mount move on a transient that just happens to cross the
+# threshold.
+#
+# NAV2 threshold: NAV2 SPP has a documented receiver-specific bias
+# of ~1.5–4 m vs the surveyed ARP (see docs/wrong-int-basin-
+# 2026-05-11.md and CLAUDE.md "NAV2 bias" section).  Tighter
+# thresholds than ~10 m generate continuous false positives.  10 m
+# matches the pre-existing _check_nav2's "antenna moved" threshold
+# and is appropriate for catching gross physical events (antenna
+# fell off the mast, cable kicked).  Sub-cm antenna-stability
+# monitoring should use the AntPosEst watchdog, not NAV2.
+DEFAULT_NAV2_THRESHOLD_M = 10.0
 DEFAULT_NAV2_SUSTAIN_S = 60.0
 DEFAULT_ANTPOS_THRESHOLD_M = 0.03
 DEFAULT_ANTPOS_SUSTAIN_S = 60.0

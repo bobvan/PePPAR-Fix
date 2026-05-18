@@ -899,7 +899,11 @@ class TestWatchdogActor(unittest.TestCase):
         self.assertEqual(out["remaining_s"], float("inf"))
 
     def test_nav2_bark_drives_slew(self):
-        a = WatchdogActor(nav2_sustain_s=60.0)
+        # Explicit nav2_threshold_m=0.5 — tests the actor's logic
+        # in isolation from the default 10 m threshold (which exists
+        # to absorb the known 1.5-4 m NAV2 bias; see CLAUDE.md
+        # "NAV2 bias" section).
+        a = WatchdogActor(nav2_sustain_s=60.0, nav2_threshold_m=0.5)
         new_pin = (self.PIN[0] + 0.4, self.PIN[1], self.PIN[2])
         a.evaluate(100.0, 0.6, new_pin, self._inactive_antpos_state())
         out = a.evaluate(170.0, 0.6, new_pin,
@@ -910,8 +914,10 @@ class TestWatchdogActor(unittest.TestCase):
 
     def test_larger_displacement_wins(self):
         """When both nav2 and antpos are barking, the source with
-        larger displacement gets the action."""
-        a = WatchdogActor(antpos_sustain_s=60.0, nav2_sustain_s=60.0)
+        larger displacement gets the action.  Explicit
+        nav2_threshold_m so the test value of 0.7 m barks."""
+        a = WatchdogActor(antpos_sustain_s=60.0, nav2_sustain_s=60.0,
+                          nav2_threshold_m=0.5)
         antpos = self._antpos_state(self.SMALL_OFFSET_M)  # 0.05 m
         nav2_disp = 0.7  # 0.7 m
         nav2_pin = (self.PIN[0] + 0.7, self.PIN[1], self.PIN[2])
@@ -920,6 +926,29 @@ class TestWatchdogActor(unittest.TestCase):
         self.assertEqual(out["action"], "slew")
         # NAV2 has larger displacement → its source/pin used.
         self.assertEqual(out["source"], "nav2")
+
+    def test_nav2_default_threshold_absorbs_known_bias(self):
+        """Documented NAV2 bias of 1.5-4 m must not trigger the
+        default WatchdogActor.  This pins the regression we just
+        fixed: 0.5 m threshold caused continuous false positives
+        on the lab hosts."""
+        a = WatchdogActor()  # all defaults — nav2_threshold_m=10.0
+        # MadHat's observed 1.6 m NAV2 disagreement (CONFIDENCE
+        # cycles on 2026-05-18).  Must NOT bark.
+        a.evaluate(100.0, 1.6, self.PIN, self._inactive_antpos_state())
+        out = a.evaluate(200.0, 1.6, self.PIN,
+                         self._inactive_antpos_state())
+        self.assertEqual(out["action"], "none")
+        # 11 m DOES bark (real antenna-fell-off-mast event).
+        a2 = WatchdogActor()
+        a2.evaluate(100.0, 11.0, self.PIN,
+                    self._inactive_antpos_state())
+        out2 = a2.evaluate(200.0, 11.0, self.PIN,
+                           self._inactive_antpos_state())
+        # 11 m > slew_step_threshold (1 m default) → step path,
+        # but auto_move_threshold_s (3600 s default) not yet
+        # elapsed → step_pending.
+        self.assertEqual(out2["action"], "step_pending")
 
     def test_inactive_antpos_ignored(self):
         """When AntPosEst is unarmed (cold start), NAV2 alone can
