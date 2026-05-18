@@ -7903,7 +7903,7 @@ def run(args):
     #
     # Receiver state file (state/receivers/<uid>.json) is no longer
     # read for position — it's identity-only now (TCXO calibration,
-    # qErr characterization, slot mapping, mount_id).  The
+    # qErr characterization, slot mapping, mount_sn).  The
     # last_known_position field, if present from older runs, is
     # logged for diagnostic comparison only and is NOT used to seed
     # the filter.  Per Q3 of the I-133648-main consensus call.
@@ -7939,7 +7939,7 @@ def run(args):
 
     # 2. State files — state/positions/<uid>.{ppp,survey}.toml.
     # Most-confident wins (smallest σ), with a 2x tie-break to .survey.toml.
-    # mount_id mismatch → stale → filtered out.  See
+    # mount_sn mismatch → stale → filtered out.  See
     # docs/position-state-and-monitoring.md.
     if known_ecef is None and not args.ignore_arp_state:
         from peppar_fix.position_state import seed_from_state_files
@@ -7953,7 +7953,7 @@ def run(args):
             pos_sigma_m = picked.sigma_m
             pos_source = (f"{picked.kind} state file "
                           f"(σ={picked.sigma_m:.3f}m, "
-                          f"mount_id={picked.mount_id})")
+                          f"mount_sn={picked.mount_sn})")
             ape_sm.transition(
                 AntPosEstState.VERIFYING,
                 f"{picked.kind} state σ={picked.sigma_m:.3f}m")

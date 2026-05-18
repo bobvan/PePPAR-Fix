@@ -104,7 +104,7 @@ class AppendAndReadTest(unittest.TestCase):
             self.assertEqual(len(recs), 1)
             r = recs[0]
             self.assertAlmostEqual(r["ecef_m"][0], 1.57e5)
-            self.assertEqual(r["mount_id"], 0)
+            self.assertEqual(r["mount_sn"], 0)
             self.assertTrue(r["quality_ok"])
             self.assertEqual(r["name"], "ufo1")
 
@@ -123,11 +123,11 @@ class AppendAndReadTest(unittest.TestCase):
         with TemporaryDirectory() as td:
             p = Path(td) / "history.jsonl"
             p.write_text(
-                '{"mjd": 1.0, "ecef_m":[1,2,3], "mount_id":0, '
+                '{"mjd": 1.0, "ecef_m":[1,2,3], "mount_sn":0, '
                 '"quality_ok":true, "sigma_xyz_m":[0,0,0]}\n'
                 '\n'
                 'this-is-not-json\n'
-                '{"mjd": 2.0, "ecef_m":[4,5,6], "mount_id":0, '
+                '{"mjd": 2.0, "ecef_m":[4,5,6], "mount_sn":0, '
                 '"quality_ok":true, "sigma_xyz_m":[0,0,0]}\n'
             )
             recs = read_history(p)
@@ -197,7 +197,7 @@ class RunningMeanTest(unittest.TestCase):
                     r.ecef_m[axis] - self._BASE_ECEF[axis],
                     0.050, places=6)
 
-    def test_mount_id_partition(self):
+    def test_mount_sn_partition(self):
         with TemporaryDirectory() as td:
             p = Path(td) / "h.jsonl"
             # mount 0: tight cluster.
@@ -205,16 +205,16 @@ class RunningMeanTest(unittest.TestCase):
                 append_solution(p, _make_sol(
                     mjd=61156.0 + i,
                     ecef=(self._BASE_ECEF[0], self._BASE_ECEF[1], self._BASE_ECEF[2]),
-                ), mount_id=0)
+                ), mount_sn=0)
             # mount 1: 100 m east shift.
             for i in range(3):
                 append_solution(p, _make_sol(
                     mjd=61159.0 + i,
                     ecef=(self._BASE_ECEF[0] + 100.0,
                           self._BASE_ECEF[1], self._BASE_ECEF[2]),
-                ), mount_id=1)
-            r0 = running_mean(p, mount_id=0)
-            r1 = running_mean(p, mount_id=1)
+                ), mount_sn=1)
+            r0 = running_mean(p, mount_sn=0)
+            r1 = running_mean(p, mount_sn=1)
             self.assertEqual(r0.count, 3)
             self.assertEqual(r1.count, 3)
             self.assertAlmostEqual(r0.ecef_m[0], self._BASE_ECEF[0])

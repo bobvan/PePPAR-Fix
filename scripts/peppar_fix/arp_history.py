@@ -7,10 +7,10 @@ record per line).  Running mean across the most recent N days
 plus the cross-day spread gives σ_arp — the single number the
 I-013239 orchestrator gates on.
 
-mount_id partitions the history: when an antenna is moved, the
-orchestrator increments mount_id, and post-move records live in
+mount_sn partitions the history: when an antenna is moved, the
+orchestrator increments mount_sn, and post-move records live in
 their own append window.  running_mean() considers only one
-mount_id at a time so old solutions don't pollute new mount geometry.
+mount_sn at a time so old solutions don't pollute new mount geometry.
 
 This module is intentionally schema-shy about state/arp/<uid>.json
 itself — that's I-013239's territory.  We expose a `RunningArp`
@@ -61,7 +61,7 @@ class RunningArp:
     sigma_xyz_m    — per-axis cross-day standard deviation (m)
     sigma_3d_m     — RSS of sigma_xyz_m
     count          — number of solutions in the window
-    mount_id       — partition this aggregate covers
+    mount_sn       — partition this aggregate covers
     oldest_mjd     — earliest solution included
     newest_mjd     — latest solution included
     n_total        — total records in history (may exceed count)
@@ -70,7 +70,7 @@ class RunningArp:
     sigma_xyz_m: tuple[float, float, float]
     sigma_3d_m: float
     count: int
-    mount_id: int
+    mount_sn: int
     oldest_mjd: float
     newest_mjd: float
     n_total: int
@@ -106,7 +106,7 @@ def apply_quality_filter(
 def append_solution(
     history_path: str | Path,
     sol: PrideSolution, *,
-    mount_id: int = 0,
+    mount_sn: int = 0,
     quality_ok: bool | None = None,
     ingested_at: datetime | None = None,
 ) -> dict:
@@ -140,7 +140,7 @@ def append_solution(
         "products": sol.products,
         "ambiguity_enabled": sol.ambiguity_enabled,
         "ambiguity_fixing": sol.ambiguity_fixing,
-        "mount_id": int(mount_id),
+        "mount_sn": int(mount_sn),
         "quality_ok": bool(quality_ok),
         "ingested_at": (ingested_at
                         or datetime.now(timezone.utc)).isoformat(),
@@ -177,14 +177,14 @@ def read_history(history_path: str | Path) -> list[dict]:
 def running_mean(
     history_path: str | Path, *,
     n_days: int = DEFAULT_N_DAYS,
-    mount_id: int = 0,
+    mount_sn: int = 0,
     require_quality_ok: bool = True,
 ) -> RunningArp | None:
     """Compute the running ECEF mean + cross-day std over the last
-    n_days of solutions on the given mount_id partition.
+    n_days of solutions on the given mount_sn partition.
 
     Returns None when history is empty or no solutions match the
-    mount_id + quality filters.
+    mount_sn + quality filters.
 
     Std uses sample formula (ddof=1) when count ≥ 2; for a single
     solution sigma_xyz_m is the formal sigma from that day's PRIDE
@@ -192,7 +192,7 @@ def running_mean(
     """
     records = read_history(history_path)
     pool = [r for r in records
-            if r.get("mount_id", 0) == mount_id
+            if r.get("mount_sn", 0) == mount_sn
             and (not require_quality_ok or r.get("quality_ok", False))]
     pool.sort(key=lambda r: r.get("mjd", 0.0))
     if not pool:
@@ -229,7 +229,7 @@ def running_mean(
         sigma_xyz_m=sigma_xyz,
         sigma_3d_m=sigma_3d,
         count=n,
-        mount_id=mount_id,
+        mount_sn=mount_sn,
         oldest_mjd=float(window[0]["mjd"]),
         newest_mjd=float(window[-1]["mjd"]),
         n_total=len(records),

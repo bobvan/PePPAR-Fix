@@ -56,16 +56,16 @@ data/rinex/<uid>-{date}.obs          # engine-written
 **Disjoint writers.**  Each file has exactly one writer.  No locking,
 no schema discipline, no shared-key conflict mode.
 
-### `state/receivers/<uid>.json` — receiver identity + mount_id
+### `state/receivers/<uid>.json` — receiver identity + mount_sn
 
 Engine-written.  Holds hardware identity, runtime telemetry, and
-**the current `mount_id`**.  mount_id is incremented by the engine on
+**the current `mount_sn`**.  mount_sn is incremented by the engine on
 step-class watchdog events (= antenna probably moved) or by operator
 action via CLI.
 
-Position files (`*.ppp.toml`, `*.survey.toml`) embed the mount_id
+Position files (`*.ppp.toml`, `*.survey.toml`) embed the mount_sn
 they were written under.  At startup the engine compares stored
-`mount_id` against the receiver's current `mount_id`; mismatch → file
+`mount_sn` against the receiver's current `mount_sn`; mismatch → file
 is stale (previous antenna mount), ignore.
 
 ### `state/positions/<uid>.ppp.toml` — PPP filter's converged estimate
@@ -77,7 +77,7 @@ plus its sigma to this file.  Survives engine restarts.
 Useful for warm-start when no survey has run.
 
 ```toml
-mount_id = 3
+mount_sn = 3
 ecef_m = [157469.3814, -4756189.0729, 4232768.5274]
 sigma_m = 0.087
 updated = "2026-05-18T03:42:11Z"
@@ -95,7 +95,7 @@ post-processing-grade analysis and multi-day fusion.
 Absence is fine — engine handles "no survey ever ran" gracefully.
 
 ```toml
-mount_id = 3
+mount_sn = 3
 ecef_m = [157469.3812, -4756189.0731, 4232768.5276]
 sigma_m = 0.008
 updated = "2026-05-18T00:00:00Z"
@@ -119,12 +119,12 @@ Decision tree on engine startup, in order:
    immediately with operator-supplied sigma (default 0.10 m if not
    given).  Overrides all files.
 
-2. **Read receiver UID + current `mount_id`** from
+2. **Read receiver UID + current `mount_sn`** from
    `state/receivers/<uid>.json`.  If file absent (first run on this
-   receiver), `mount_id = 0`.
+   receiver), `mount_sn = 0`.
 
 3. **Load `*.ppp.toml` and `*.survey.toml`** if present and their
-   embedded `mount_id` matches current.  Mismatch → ignore (stale).
+   embedded `mount_sn` matches current.  Mismatch → ignore (stale).
    - `--ignore-ppp` skips `.ppp.toml` (e.g., when PPP filter
      diverged badly and you don't trust the snapshot).
    - `--ignore-survey` skips `.survey.toml` (e.g., when survey
@@ -214,19 +214,19 @@ between current best estimate and the pinned ARP):
 - **Slew (< slew_step_threshold_m, default 1 m)**: update the
   FixedPosFilter's pinned position in place.  Next epoch uses the
   new value.  Residuals briefly attribute to clock; absorb.  No
-  mount_id bump.  No restart.  Log emits
+  mount_sn bump.  No restart.  Log emits
   `[WATCHDOG_SLEW from=... to=... displ=...]`.
 
 - **Step (≥ slew_step_threshold_m)**: treat as a probable antenna
   move.  Engine atomically:
-  1. Increments mount_id in `state/receivers/<uid>.json`.
+  1. Increments mount_sn in `state/receivers/<uid>.json`.
   2. Truncates / invalidates `.ppp.toml` (a fresh one will be
      written when the new-mount filter reconverges).
   3. Logs `[WATCHDOG_STEP_AUTO_MOVE old_mount=N new_mount=N+1
      displ=...]`.
   4. Initiates clean shutdown.  Wrapper/systemd respawns; the new
      engine instance starts in survey mode (since `.ppp.toml` was
-     invalidated and `.survey.toml` has stale mount_id).
+     invalidated and `.survey.toml` has stale mount_sn).
 
 The 1 m / 3 ns slew-step boundary is the starting recommendation
 based on the c ≈ 30 cm/ns relationship — 1 m position step is
@@ -295,7 +295,7 @@ RTKLIB.  The contract is just:
 
 - **Input:** zero or more `data/rinex/<uid>-*.obs` files.
 - **Output:** atomic temp+rename write of
-  `state/positions/<uid>.survey.toml` with current mount_id tag,
+  `state/positions/<uid>.survey.toml` with current mount_sn tag,
   fresh ECEF, sigma, and provenance metadata.
 
 Installations that skip peppar-survey entirely simply have no
@@ -303,12 +303,12 @@ Installations that skip peppar-survey entirely simply have no
 `.ppp.toml` or NAV2.
 
 The engine **watches `.survey.toml` mtime** during runtime.  When the
-file appears or updates with a matching mount_id, the engine
+file appears or updates with a matching mount_sn, the engine
 evaluates the new position vs. its current pin:
 
 - Within slew threshold → update pin in place (gentle slew).
 - Beyond step threshold → treat as a probable mount move (handled
-  by the watchdog step path, including mount_id bump + restart).
+  by the watchdog step path, including mount_sn bump + restart).
 
 This means peppar-survey can be added to an existing installation
 without coordinated downtime — engine notices the first
@@ -395,7 +395,7 @@ overrides when a host's behavior diverges from default.
 | `antpos_watchdog_threshold_m` | 0.03 | AntPosEst-vs-pin displacement that fires AntPos dog |
 | `antpos_sustain_epochs` | 60 | Consecutive over-threshold epochs to bark |
 | `slew_step_threshold_m` | 1.0 | Bark displacement below = slew, above = step |
-| `auto_move_threshold_s` | 3600 | Sustained step-class bark before auto mount_id bump |
+| `auto_move_threshold_s` | 3600 | Sustained step-class bark before auto mount_sn bump |
 | `confidence_log_period_epochs` | 60 | How often to emit `[CONFIDENCE ...]` log line |
 | `ppp_state_write_period_s` | 600 | How often engine snapshots PPP filter to `.ppp.toml` |
 

@@ -2,13 +2,13 @@
 
 Three files cooperate to seed the engine's starting position:
 
-  state/receivers/<uid>.json        — engine-written, holds mount_id
+  state/receivers/<uid>.json        — engine-written, holds mount_sn
   state/positions/<uid>.ppp.toml    — engine-written PPP filter snapshot
   state/positions/<uid>.survey.toml — peppar-survey-written (optional)
 
 The two position files share the same flat schema; each tags its
-``mount_id`` at write time.  At engine startup, readers compare the
-embedded mount_id to the receiver's current mount_id (from
+``mount_sn`` at write time.  At engine startup, readers compare the
+embedded mount_sn to the receiver's current mount_sn (from
 state/receivers/<uid>.json) and discard stale-mount entries.
 
 Selection: ``pick_most_confident`` returns the file with the smallest
@@ -49,9 +49,9 @@ class PositionState:
     """A snapshot of antenna position from one source.
 
     Attributes:
-        mount_id: integer tag identifying the antenna mount this
+        mount_sn: integer tag identifying the antenna mount this
             estimate is valid for.  Compared against the receiver's
-            current mount_id at read time; mismatched entries are
+            current mount_sn at read time; mismatched entries are
             discarded as stale.
         ecef_m: (X, Y, Z) in meters, WGS84/ITRF.
         sigma_m: 1-sigma uncertainty on the ECEF position.
@@ -64,7 +64,7 @@ class PositionState:
         extra: any additional file-specific keys preserved verbatim
             for diagnostic logging.  Not part of the selection logic.
     """
-    mount_id: int
+    mount_sn: int
     ecef_m: tuple[float, float, float]
     sigma_m: float
     updated: str
@@ -103,10 +103,10 @@ def _load_toml(path: str, kind: str) -> Optional[PositionState]:
         if len(ecef) != 3:
             raise ValueError(f"ecef_m must be 3-tuple, got {len(ecef)}")
         # Extract known fields; preserve the rest in `extra`.
-        known = {"mount_id", "ecef_m", "sigma_m", "updated", "source"}
+        known = {"mount_sn", "ecef_m", "sigma_m", "updated", "source"}
         extra = {k: v for k, v in data.items() if k not in known}
         return PositionState(
-            mount_id=int(data["mount_id"]),
+            mount_sn=int(data["mount_sn"]),
             ecef_m=(float(ecef[0]), float(ecef[1]), float(ecef[2])),
             sigma_m=float(data["sigma_m"]),
             updated=str(data["updated"]),
@@ -147,7 +147,7 @@ def _format_toml(state: PositionState) -> str:
       - operator-readable output we control exactly
     """
     lines = [
-        f"mount_id = {int(state.mount_id)}",
+        f"mount_sn = {int(state.mount_sn)}",
         f"ecef_m = [{state.ecef_m[0]:.4f}, {state.ecef_m[1]:.4f}, "
         f"{state.ecef_m[2]:.4f}]",
         f"sigma_m = {state.sigma_m:.6f}",
@@ -202,35 +202,35 @@ def utc_now_iso() -> str:
 
 
 def filter_current_mount(states: list[Optional[PositionState]],
-                         current_mount_id: int) -> list[PositionState]:
-    """Drop None and any state whose mount_id != current_mount_id.
+                         current_mount_sn: int) -> list[PositionState]:
+    """Drop None and any state whose mount_sn != current_mount_sn.
 
     Stale-mount entries arise after antenna moves: the operator (or
-    auto-move logic) bumps the receiver's mount_id and the existing
-    position files become stale.  Filtering keyed on mount_id is the
+    auto-move logic) bumps the receiver's mount_sn and the existing
+    position files become stale.  Filtering keyed on mount_sn is the
     atomic discard mechanism.
     """
     out: list[PositionState] = []
     for s in states:
         if s is None:
             continue
-        if s.mount_id != current_mount_id:
+        if s.mount_sn != current_mount_sn:
             log.info("Discarding stale-mount %s state "
-                     "(file mount_id=%d, current=%d)",
-                     s.kind, s.mount_id, current_mount_id)
+                     "(file mount_sn=%d, current=%d)",
+                     s.kind, s.mount_sn, current_mount_sn)
             continue
         out.append(s)
     return out
 
 
-def load_current_mount_id(uid,
+def load_current_mount_sn(uid,
                           receivers_dir: Optional[str] = None) -> int:
-    """Read the receiver's current ``mount_id`` from
+    """Read the receiver's current ``mount_sn`` from
     ``state/receivers/<uid>.json``.  Returns 0 when the file is absent
     or the field is missing — this is the "first run after this
     feature lands" default and matches the fresh-install case.
 
-    The mount_id lives in receivers/, not positions/, because it's a
+    The mount_sn lives in receivers/, not positions/, because it's a
     property of "which antenna is this receiver currently connected
     to" — receiver-side identity that the engine writes.
     """
@@ -239,15 +239,15 @@ def load_current_mount_id(uid,
     try:
         from peppar_fix.receiver_state import load_receiver_state
     except ImportError:  # pragma: no cover — should never happen in production
-        log.warning("Cannot import receiver_state; defaulting mount_id=0")
+        log.warning("Cannot import receiver_state; defaulting mount_sn=0")
         return 0
     rstate = load_receiver_state(uid, state_dir=receivers_dir)
     if not rstate:
         return 0
     try:
-        return int(rstate.get("mount_id", 0))
+        return int(rstate.get("mount_sn", 0))
     except (TypeError, ValueError):
-        log.warning("mount_id in receiver state is not an int; "
+        log.warning("mount_sn in receiver state is not an int; "
                     "defaulting to 0")
         return 0
 
@@ -261,7 +261,7 @@ def seed_from_state_files(
     receivers_dir: Optional[str] = None,
 ) -> Optional[PositionState]:
     """One-shot helper for engine startup.  Reads .ppp.toml and
-    .survey.toml, filters by current mount_id, returns the
+    .survey.toml, filters by current mount_sn, returns the
     most-confident state (or None when no usable state exists).
 
     Caller behavior on None: fall back to NAV2 / bootstrap.
@@ -272,7 +272,7 @@ def seed_from_state_files(
         ignore_ppp: skip the .ppp.toml file (CLI --ignore-ppp).
         ignore_survey: skip the .survey.toml file (CLI --ignore-survey).
         positions_dir: override DEFAULT_POSITIONS_DIR (for testing).
-        receivers_dir: passed to load_current_mount_id for mount_id
+        receivers_dir: passed to load_current_mount_sn for mount_sn
             lookup (for testing).
 
     Returns:
@@ -280,13 +280,13 @@ def seed_from_state_files(
     """
     if uid is None:
         return None
-    current_mount_id = load_current_mount_id(uid, receivers_dir=receivers_dir)
+    current_mount_sn = load_current_mount_sn(uid, receivers_dir=receivers_dir)
     candidates: list[Optional[PositionState]] = []
     if not ignore_ppp:
         candidates.append(load_ppp_state(uid, positions_dir=positions_dir))
     if not ignore_survey:
         candidates.append(load_survey_state(uid, positions_dir=positions_dir))
-    usable = filter_current_mount(candidates, current_mount_id)
+    usable = filter_current_mount(candidates, current_mount_sn)
     return pick_most_confident(usable)
 
 

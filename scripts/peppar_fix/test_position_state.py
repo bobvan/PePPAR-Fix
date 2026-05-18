@@ -9,7 +9,7 @@ from peppar_fix.position_state import (
     SURVEY_TIE_BREAK_RATIO,
     _format_toml,
     filter_current_mount,
-    load_current_mount_id,
+    load_current_mount_sn,
     load_ppp_state,
     load_survey_state,
     pick_most_confident,
@@ -19,9 +19,9 @@ from peppar_fix.position_state import (
 )
 
 
-def _make_state(kind="ppp", mount_id=0, sigma_m=0.05, source="test"):
+def _make_state(kind="ppp", mount_sn=0, sigma_m=0.05, source="test"):
     return PositionState(
-        mount_id=mount_id,
+        mount_sn=mount_sn,
         ecef_m=(157469.3814, -4756189.0729, 4232768.5274),
         sigma_m=sigma_m,
         updated=utc_now_iso(),
@@ -34,12 +34,12 @@ class TestSaveLoadRoundTrip(unittest.TestCase):
 
     def test_ppp_round_trip(self):
         with tempfile.TemporaryDirectory() as d:
-            s = _make_state(kind="ppp", mount_id=3, sigma_m=0.087,
+            s = _make_state(kind="ppp", mount_sn=3, sigma_m=0.087,
                             source="peppar_fix_engine PPP-AR")
             save_ppp_state(s, "12345", positions_dir=d)
             loaded = load_ppp_state("12345", positions_dir=d)
             self.assertIsNotNone(loaded)
-            self.assertEqual(loaded.mount_id, 3)
+            self.assertEqual(loaded.mount_sn, 3)
             self.assertEqual(loaded.kind, "ppp")
             self.assertAlmostEqual(loaded.sigma_m, 0.087, places=4)
             self.assertAlmostEqual(loaded.ecef_m[0], 157469.3814, places=3)
@@ -48,7 +48,7 @@ class TestSaveLoadRoundTrip(unittest.TestCase):
     def test_extra_round_trip(self):
         with tempfile.TemporaryDirectory() as d:
             s = PositionState(
-                mount_id=1,
+                mount_sn=1,
                 ecef_m=(1.0, 2.0, 3.0),
                 sigma_m=0.01,
                 updated=utc_now_iso(),
@@ -96,7 +96,7 @@ class TestLoadMissingOrMalformed(unittest.TestCase):
             p = os.path.join(d, "1.ppp.toml")
             with open(p, "w") as f:
                 # Missing sigma_m
-                f.write('mount_id = 1\necef_m = [1.0, 2.0, 3.0]\n'
+                f.write('mount_sn = 1\necef_m = [1.0, 2.0, 3.0]\n'
                         'updated = "2026-05-18T00:00:00Z"\n'
                         'source = "x"\n')
             self.assertIsNone(load_ppp_state("1", positions_dir=d))
@@ -105,7 +105,7 @@ class TestLoadMissingOrMalformed(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "1.ppp.toml")
             with open(p, "w") as f:
-                f.write('mount_id = 1\necef_m = [1.0, 2.0]\n'
+                f.write('mount_sn = 1\necef_m = [1.0, 2.0]\n'
                         'sigma_m = 0.05\nupdated = "x"\nsource = "x"\n')
             self.assertIsNone(load_ppp_state("1", positions_dir=d))
 
@@ -128,20 +128,20 @@ class TestLoadMissingOrMalformed(unittest.TestCase):
 class TestFilterCurrentMount(unittest.TestCase):
 
     def test_drops_none(self):
-        out = filter_current_mount([None, None], current_mount_id=0)
+        out = filter_current_mount([None, None], current_mount_sn=0)
         self.assertEqual(out, [])
 
     def test_keeps_matching_mount(self):
-        s1 = _make_state(mount_id=3)
-        s2 = _make_state(mount_id=3, kind="survey")
-        out = filter_current_mount([s1, s2], current_mount_id=3)
+        s1 = _make_state(mount_sn=3)
+        s2 = _make_state(mount_sn=3, kind="survey")
+        out = filter_current_mount([s1, s2], current_mount_sn=3)
         self.assertEqual(len(out), 2)
 
     def test_drops_stale_mount(self):
-        s_stale = _make_state(mount_id=2)
-        s_curr = _make_state(mount_id=3, kind="survey")
+        s_stale = _make_state(mount_sn=2)
+        s_curr = _make_state(mount_sn=3, kind="survey")
         out = filter_current_mount([s_stale, s_curr, None],
-                                   current_mount_id=3)
+                                   current_mount_sn=3)
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0].kind, "survey")
 
@@ -205,14 +205,14 @@ class TestFormatToml(unittest.TestCase):
 
     def test_format_minimal(self):
         s = PositionState(
-            mount_id=3,
+            mount_sn=3,
             ecef_m=(1.0, 2.0, 3.0),
             sigma_m=0.05,
             updated="2026-05-18T00:00:00Z",
             source="test",
         )
         out = _format_toml(s)
-        self.assertIn("mount_id = 3", out)
+        self.assertIn("mount_sn = 3", out)
         self.assertIn("ecef_m = [1.0000, 2.0000, 3.0000]", out)
         self.assertIn("sigma_m = 0.050000", out)
         self.assertIn('updated = "2026-05-18T00:00:00Z"', out)
@@ -221,7 +221,7 @@ class TestFormatToml(unittest.TestCase):
 
     def test_format_with_extras(self):
         s = PositionState(
-            mount_id=0,
+            mount_sn=0,
             ecef_m=(1.0, 2.0, 3.0),
             sigma_m=0.01,
             updated="x",
@@ -239,36 +239,36 @@ class TestFormatToml(unittest.TestCase):
 class TestLoadCurrentMountId(unittest.TestCase):
 
     def test_uid_none_returns_zero(self):
-        self.assertEqual(load_current_mount_id(None), 0)
+        self.assertEqual(load_current_mount_sn(None), 0)
 
     def test_no_receiver_file_returns_zero(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(
-                load_current_mount_id("nope", receivers_dir=d), 0)
+                load_current_mount_sn("nope", receivers_dir=d), 0)
 
-    def test_reads_mount_id_from_receiver_state(self):
+    def test_reads_mount_sn_from_receiver_state(self):
         import json
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "12345.json"), "w") as f:
-                json.dump({"unique_id": 12345, "mount_id": 7}, f)
+                json.dump({"unique_id": 12345, "mount_sn": 7}, f)
             self.assertEqual(
-                load_current_mount_id("12345", receivers_dir=d), 7)
+                load_current_mount_sn("12345", receivers_dir=d), 7)
 
-    def test_missing_mount_id_field_returns_zero(self):
+    def test_missing_mount_sn_field_returns_zero(self):
         import json
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "12345.json"), "w") as f:
                 json.dump({"unique_id": 12345}, f)
             self.assertEqual(
-                load_current_mount_id("12345", receivers_dir=d), 0)
+                load_current_mount_sn("12345", receivers_dir=d), 0)
 
-    def test_non_int_mount_id_returns_zero(self):
+    def test_non_int_mount_sn_returns_zero(self):
         import json
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "12345.json"), "w") as f:
-                json.dump({"unique_id": 12345, "mount_id": "garbage"}, f)
+                json.dump({"unique_id": 12345, "mount_sn": "garbage"}, f)
             self.assertEqual(
-                load_current_mount_id("12345", receivers_dir=d), 0)
+                load_current_mount_sn("12345", receivers_dir=d), 0)
 
 
 class TestSeedFromStateFiles(unittest.TestCase):
@@ -278,18 +278,18 @@ class TestSeedFromStateFiles(unittest.TestCase):
         self.recv_dir = tempfile.mkdtemp()
         self.pos_dir = tempfile.mkdtemp()
         self.uid = "55555"
-        # Default: mount_id=3
+        # Default: mount_sn=3
         with open(os.path.join(self.recv_dir, f"{self.uid}.json"), "w") as f:
-            json.dump({"unique_id": int(self.uid), "mount_id": 3}, f)
+            json.dump({"unique_id": int(self.uid), "mount_sn": 3}, f)
 
     def tearDown(self):
         import shutil
         shutil.rmtree(self.recv_dir)
         shutil.rmtree(self.pos_dir)
 
-    def _write_state(self, name, mount_id, sigma_m, kind):
+    def _write_state(self, name, mount_sn, sigma_m, kind):
         s = PositionState(
-            mount_id=mount_id,
+            mount_sn=mount_sn,
             ecef_m=(1.0, 2.0, 3.0),
             sigma_m=sigma_m,
             updated=utc_now_iso(),
@@ -304,7 +304,7 @@ class TestSeedFromStateFiles(unittest.TestCase):
                                        f"{self.uid}.survey.toml")
             with open(survey_path, "w") as f:
                 f.write(
-                    f'mount_id = {mount_id}\n'
+                    f'mount_sn = {mount_sn}\n'
                     f'ecef_m = [1.0, 2.0, 3.0]\n'
                     f'sigma_m = {sigma_m}\n'
                     f'updated = "{s.updated}"\n'
@@ -318,7 +318,7 @@ class TestSeedFromStateFiles(unittest.TestCase):
         self.assertIsNone(out)
 
     def test_picks_ppp_when_only_ppp(self):
-        self._write_state("ppp", mount_id=3, sigma_m=0.05, kind="ppp")
+        self._write_state("ppp", mount_sn=3, sigma_m=0.05, kind="ppp")
         out = seed_from_state_files(self.uid,
                                     positions_dir=self.pos_dir,
                                     receivers_dir=self.recv_dir)
@@ -326,7 +326,7 @@ class TestSeedFromStateFiles(unittest.TestCase):
         self.assertEqual(out.kind, "ppp")
 
     def test_picks_survey_when_only_survey(self):
-        self._write_state("survey", mount_id=3, sigma_m=0.05, kind="survey")
+        self._write_state("survey", mount_sn=3, sigma_m=0.05, kind="survey")
         out = seed_from_state_files(self.uid,
                                     positions_dir=self.pos_dir,
                                     receivers_dir=self.recv_dir)
@@ -334,25 +334,25 @@ class TestSeedFromStateFiles(unittest.TestCase):
         self.assertEqual(out.kind, "survey")
 
     def test_picks_survey_when_both_comparable(self):
-        self._write_state("ppp", mount_id=3, sigma_m=0.020, kind="ppp")
-        self._write_state("survey", mount_id=3, sigma_m=0.025, kind="survey")
+        self._write_state("ppp", mount_sn=3, sigma_m=0.020, kind="ppp")
+        self._write_state("survey", mount_sn=3, sigma_m=0.025, kind="survey")
         out = seed_from_state_files(self.uid,
                                     positions_dir=self.pos_dir,
                                     receivers_dir=self.recv_dir)
         self.assertEqual(out.kind, "survey")
 
     def test_stale_mount_filtered(self):
-        # Engine state says mount_id=3, files tagged with mount_id=2
-        self._write_state("ppp", mount_id=2, sigma_m=0.01, kind="ppp")
-        self._write_state("survey", mount_id=2, sigma_m=0.005, kind="survey")
+        # Engine state says mount_sn=3, files tagged with mount_sn=2
+        self._write_state("ppp", mount_sn=2, sigma_m=0.01, kind="ppp")
+        self._write_state("survey", mount_sn=2, sigma_m=0.005, kind="survey")
         out = seed_from_state_files(self.uid,
                                     positions_dir=self.pos_dir,
                                     receivers_dir=self.recv_dir)
         self.assertIsNone(out)
 
     def test_ignore_ppp_skips_ppp_file(self):
-        self._write_state("ppp", mount_id=3, sigma_m=0.01, kind="ppp")
-        self._write_state("survey", mount_id=3, sigma_m=0.05, kind="survey")
+        self._write_state("ppp", mount_sn=3, sigma_m=0.01, kind="ppp")
+        self._write_state("survey", mount_sn=3, sigma_m=0.05, kind="survey")
         out = seed_from_state_files(self.uid,
                                     ignore_ppp=True,
                                     positions_dir=self.pos_dir,
@@ -360,8 +360,8 @@ class TestSeedFromStateFiles(unittest.TestCase):
         self.assertEqual(out.kind, "survey")
 
     def test_ignore_survey_skips_survey_file(self):
-        self._write_state("ppp", mount_id=3, sigma_m=0.05, kind="ppp")
-        self._write_state("survey", mount_id=3, sigma_m=0.01, kind="survey")
+        self._write_state("ppp", mount_sn=3, sigma_m=0.05, kind="ppp")
+        self._write_state("survey", mount_sn=3, sigma_m=0.01, kind="survey")
         out = seed_from_state_files(self.uid,
                                     ignore_survey=True,
                                     positions_dir=self.pos_dir,
@@ -369,8 +369,8 @@ class TestSeedFromStateFiles(unittest.TestCase):
         self.assertEqual(out.kind, "ppp")
 
     def test_ignore_both_returns_none(self):
-        self._write_state("ppp", mount_id=3, sigma_m=0.05, kind="ppp")
-        self._write_state("survey", mount_id=3, sigma_m=0.05, kind="survey")
+        self._write_state("ppp", mount_sn=3, sigma_m=0.05, kind="ppp")
+        self._write_state("survey", mount_sn=3, sigma_m=0.05, kind="survey")
         out = seed_from_state_files(self.uid,
                                     ignore_ppp=True, ignore_survey=True,
                                     positions_dir=self.pos_dir,
