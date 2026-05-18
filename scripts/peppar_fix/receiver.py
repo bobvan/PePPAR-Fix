@@ -547,30 +547,46 @@ def usb_serial_for_tty(port: str) -> str | None:
     """Read the USB hardware serial for a tty device path.
 
     Resolves ``port`` (which may be a udev symlink like ``/dev/f10t``)
-    to its real ``/dev/ttyUSBN`` or ``/dev/ttyACMN`` node, then reads
-    ``/sys/class/tty/<name>/device/../serial`` — the FTDI / cdc_acm
-    factory-programmed serial string.
+    to its real ``/dev/ttyUSBN`` or ``/dev/ttyACMN`` node, then walks
+    up the sysfs device tree from ``/sys/class/tty/<name>/device``
+    until it finds a node with a ``serial`` attribute.
+
+    The walk-up is needed because the device-tree depth varies by
+    driver:
+      - ftdi_sio: device → .../usb3/3-2/3-2:1.0/ttyUSB0; serial at
+        .../usb3/3-2/serial (two ancestors up).
+      - cdc_acm: device → .../usb1/1-2/1-2:1.0; serial at
+        .../usb1/1-2/serial (one ancestor up).
+    The first ``serial`` file encountered going up is the closest
+    parent device's serial — typically the FTDI / USB device's
+    factory-programmed string.  Hubs further up the chain also have
+    ``serial`` attributes (e.g. ``xhci-hcd.1`` for the controller)
+    but we stop at the first match.
 
     Used as a stable-identity fallback for receivers that don't
-    support UBX SEC-UNIQID (e.g., NEO-F10T on ArduSimple, which has
-    no SEC-UNIQID but does have an FTDI serial like "D30GD1PE").
+    support UBX SEC-UNIQID (e.g. NEO-F10T on ArduSimple).
 
     Returns the serial string on success, ``None`` if the port isn't
-    USB-backed, the serial attribute is absent, or any read fails.
+    USB-backed, no ``serial`` attribute is found within 6 levels of
+    walk, or any read fails.
     """
     import os
     try:
         real = os.path.realpath(port)
         name = os.path.basename(real)
-        # Two-level walk: tty/<name>/device is the tty platform_device;
-        # its parent is the USB interface device with the `serial`
-        # attribute.  Identical layout for cdc_acm + ftdi_sio.
-        sysfs = os.path.join(
-            "/sys/class/tty", name, "device", "..", "serial")
-        with open(sysfs) as f:
-            serial = f.read().strip()
-        return serial if serial else None
-    except (OSError, FileNotFoundError):
+        d = os.path.realpath(f"/sys/class/tty/{name}/device")
+        for _ in range(6):
+            candidate = os.path.join(d, "serial")
+            if os.path.isfile(candidate):
+                with open(candidate) as f:
+                    s = f.read().strip()
+                return s if s else None
+            parent = os.path.dirname(d)
+            if parent == d or parent in ("/sys/devices", "/"):
+                break
+            d = parent
+        return None
+    except OSError:
         return None
 
 
