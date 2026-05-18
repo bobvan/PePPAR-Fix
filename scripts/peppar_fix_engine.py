@@ -5008,27 +5008,39 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 # Slice 7 — slew/step decision based on the
                 # displacements just logged.  See
                 # docs/position-state-and-monitoring.md.
-                _antpos_state_for_actor = (
-                    ape_thread._antpos_watchdog.state
-                    if (ape_thread is not None
-                        and getattr(ape_thread, '_antpos_watchdog', None)
-                        is not None)
-                    else {"active": False})
-                _nav2_for_actor = None
-                _nav2_ecef_for_actor = None
-                if nav2_store is not None:
-                    _op_a = nav2_store.get_opinion(max_age_s=30.0)
-                    if _op_a is not None:
-                        _nav2_d3, _, _ = compute_horizontal_displacement(
-                            tuple(known_ecef), tuple(_op_a['ecef']))
-                        _nav2_for_actor = _nav2_d3
-                        _nav2_ecef_for_actor = tuple(_op_a['ecef'])
-                _decision = _watchdog_actor.evaluate(
-                    t_now=time.monotonic(),
-                    nav2_disp_3d_m=_nav2_for_actor,
-                    nav2_ecef_m=_nav2_ecef_for_actor,
-                    antpos_state=_antpos_state_for_actor,
-                )
+                #
+                # --pin-position gate: when the operator has
+                # explicitly pinned the position (e.g., a surveyed
+                # --known-pos truth they want NOT to be auto-moved),
+                # the WatchdogActor is bypassed entirely.  The
+                # CONFIDENCE log lines still surface NAV2/AntPosEst
+                # displacement for diagnostic visibility, but no
+                # automated slew or step is taken — operator intent
+                # wins over watchdog action.
+                if getattr(args, 'pin_position', False):
+                    _decision = {"action": "none"}
+                else:
+                    _antpos_state_for_actor = (
+                        ape_thread._antpos_watchdog.state
+                        if (ape_thread is not None
+                            and getattr(ape_thread, '_antpos_watchdog', None)
+                            is not None)
+                        else {"active": False})
+                    _nav2_for_actor = None
+                    _nav2_ecef_for_actor = None
+                    if nav2_store is not None:
+                        _op_a = nav2_store.get_opinion(max_age_s=30.0)
+                        if _op_a is not None:
+                            _nav2_d3, _, _ = compute_horizontal_displacement(
+                                tuple(known_ecef), tuple(_op_a['ecef']))
+                            _nav2_for_actor = _nav2_d3
+                            _nav2_ecef_for_actor = tuple(_op_a['ecef'])
+                    _decision = _watchdog_actor.evaluate(
+                        t_now=time.monotonic(),
+                        nav2_disp_3d_m=_nav2_for_actor,
+                        nav2_ecef_m=_nav2_ecef_for_actor,
+                        antpos_state=_antpos_state_for_actor,
+                    )
                 _act = _decision["action"]
                 if _act == "step_pending":
                     log.warning(
@@ -7803,9 +7815,24 @@ def run(args):
         driver = get_driver(args.receiver)
         log.warning("Receiver check failed — falling back to %s (may lack dual-freq)",
                     driver.name)
-    # Stash receiver identity for position persistence
+    # Stash receiver identity for position persistence.  Priority:
+    #   1. SEC-UNIQID from the receiver itself (F9T-class chips).
+    #   2. Synthetic UID derived from the USB hardware serial — for
+    #      receivers that don't support SEC-UNIQID (e.g. NEO-F10T on
+    #      the ArduSimple board has an FTDI serial like "D30GD1PE"
+    #      but no SEC-UNIQID).  Prefixed "synth_" so it's visually
+    #      distinct from a real chip-side ID and can't collide.
+    #   3. None — state persistence stays disabled.
     args.receiver_unique_id = (receiver_identity.get("unique_id")
                                if receiver_identity else None)
+    if args.receiver_unique_id is None:
+        from peppar_fix.receiver import usb_serial_for_tty
+        usb_serial = usb_serial_for_tty(args.serial)
+        if usb_serial:
+            args.receiver_unique_id = f"synth_{usb_serial}"
+            log.info("Synthetic receiver UID from USB serial: %s "
+                     "(receiver doesn't support SEC-UNIQID)",
+                     args.receiver_unique_id)
     mute_controller = get_source_mute_controller()
     mute_controller.install_signal_handlers()
 

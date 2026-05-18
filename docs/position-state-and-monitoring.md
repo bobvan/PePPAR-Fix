@@ -232,10 +232,20 @@ The 1 m / 3 ns slew-step boundary is the starting recommendation
 based on the c ≈ 30 cm/ns relationship — 1 m position step is
 roughly 3.3 ns clock-equivalent.  Both values are tunable in code.
 
-**Auto-move is on by default** when the AntPosEst watchdog sustains
-barking past the step threshold.  An installation that prefers
-operator-confirmed mount moves can set
-`auto_move_threshold_s = 0` to disable.  Slew is always automatic
+**`--pin-position` bypasses both slew and step.**  When the operator
+explicitly pins (e.g., a surveyed `--known-pos` they want NOT to be
+auto-moved), the WatchdogActor is skipped entirely.  The CONFIDENCE
+log lines still surface NAV2/AntPosEst displacement for diagnostic
+visibility, but no automated action is taken — operator intent wins
+over watchdog action.  This is the right behaviour for surveyed
+truth pins where any disagreement reflects measurement bias, not a
+real mount move.
+
+**Auto-move is on by default** (when `--pin-position` is not set)
+once the AntPosEst watchdog sustains barking past the step
+threshold.  An installation that prefers operator-confirmed mount
+moves can set `auto_move_threshold_s = 0` to disable.  Slew is
+always automatic
 (it's just a refinement, not a move declaration).
 
 ## Confidence disclosure

@@ -543,6 +543,37 @@ def query_receiver_identity(port, baud=9600, ser=None, ubr=None,
     return result
 
 
+def usb_serial_for_tty(port: str) -> str | None:
+    """Read the USB hardware serial for a tty device path.
+
+    Resolves ``port`` (which may be a udev symlink like ``/dev/f10t``)
+    to its real ``/dev/ttyUSBN`` or ``/dev/ttyACMN`` node, then reads
+    ``/sys/class/tty/<name>/device/../serial`` — the FTDI / cdc_acm
+    factory-programmed serial string.
+
+    Used as a stable-identity fallback for receivers that don't
+    support UBX SEC-UNIQID (e.g., NEO-F10T on ArduSimple, which has
+    no SEC-UNIQID but does have an FTDI serial like "D30GD1PE").
+
+    Returns the serial string on success, ``None`` if the port isn't
+    USB-backed, the serial attribute is absent, or any read fails.
+    """
+    import os
+    try:
+        real = os.path.realpath(port)
+        name = os.path.basename(real)
+        # Two-level walk: tty/<name>/device is the tty platform_device;
+        # its parent is the USB interface device with the `serial`
+        # attribute.  Identical layout for cdc_acm + ftdi_sio.
+        sysfs = os.path.join(
+            "/sys/class/tty", name, "device", "..", "serial")
+        with open(sysfs) as f:
+            serial = f.read().strip()
+        return serial if serial else None
+    except (OSError, FileNotFoundError):
+        return None
+
+
 def discover_receivers(ports=None, baud_rates=None):
     """Scan serial ports for u-blox receivers.
 
