@@ -62,22 +62,39 @@ when confidence is lost:
 | Servo settled | 6 | 0x20 (25 ns) | 0x20 (GPS) | Primary GNSS reference |
 | Holdover | 7 | 0x23 (1 µs) | 0x20 (GPS) | Previously locked, coasting |
 
-### Promotion gates
+### Promotion gates (confidence-driven, with hysteresis)
 
-- **248 → 52**: PHC bootstrap succeeds (phase within ±10 µs, frequency
-  within ±5 ppb of GNSS).  Set by the wrapper after `phc_bootstrap.py`
-  completes.
-- **52 → 6**: Servo scheduler declares settled (N consecutive corrections
-  with error < threshold, default 10 corrections < 100 ns).  Set by the
-  engine.
+The engine computes σ_total = RSS(σ_phase, σ_frequency) every
+[CONFIDENCE_TOTAL] cycle and compares it to thresholds with a
+deliberate hysteresis gap around each band boundary.  See
+`docs/position-state-and-monitoring.md` for σ_phase / σ_frequency
+definitions and the `[CONFIDENCE_*]` log line shape.
 
-### Degradation triggers
+- **248 → 52**: σ_total falls below 800 ns.  The wrapper still
+  asserts class 52 right after `phc_bootstrap.py` completes as a
+  conservative default before the first [CONFIDENCE_TOTAL] cycle
+  arrives; that path is unchanged.
+- **52 → 6**: σ_total falls below 20 ns.  (5 ns margin under the
+  25 ns clockAccuracy band edge.)
 
-- **6 → 52**: Scheduler leaves settled state (transient exceeds
-  threshold × unconverge_factor).
+### Degradation triggers (confidence-driven where applicable)
+
+- **6 → 52**: σ_total rises above 30 ns.  (5 ns margin above the
+  band edge; together with the 20 ns rising threshold this gives
+  a 10 ns dead band that prevents flapping when σ wobbles around
+  25 ns.)
+- **52 → 248**: σ_total rises above 1200 ns.  (200 ns margin above
+  the 1 µs band edge, symmetric with the 800 ns rising threshold.)
 - **6 → 7**: Observation idle timeout (holdover entry).
-- **any → 248**: PHC diverged (exit code 5), watchdog alarm, engine
-  crash, wrapper exit.
+- **any → 248**: PHC diverged (exit code 5), watchdog alarm step
+  action, engine crash, wrapper exit.
+
+The σ-driven gates supersede the previous
+`DisciplineScheduler._converging` boolean, which was a pure
+frequency-tracking signal that ignored absolute-time uncertainty
+from position.  The scheduler still runs and its `_converging`
+state is still meaningful for the servo logic; it is no longer
+the sole gate for clockClass promotion.
 
 ## Layer 1: Engine
 
@@ -87,11 +104,13 @@ latency-sensitive transitions.  Pass `--pmc /var/run/ptp4l` to enable.
 
 Transitions:
 
-- **Scheduler settled**: promote clockClass 52 → 6.
-- **Scheduler unsettled**: demote clockClass 6 → 52.
+- **σ_total falls below 20 ns**: promote clockClass 52 → 6.
+- **σ_total rises above 30 ns**: demote clockClass 6 → 52.
+- **σ_total falls below 800 ns**: promote clockClass 248 → 52.
+- **σ_total rises above 1200 ns**: demote clockClass 52 → 248.
 - **Holdover entry**: set clockClass 7.
 - **PHC diverged (exit code 5)**: set clockClass 248 before exiting.
-- **Watchdog alarm**: set clockClass 248 before exiting.
+- **Watchdog alarm (step action)**: set clockClass 248 before exiting.
 
 If the UDS send fails (ptp4l not running, wrong path), the engine logs
 a warning but continues — the servo's job is clock discipline, not PTP

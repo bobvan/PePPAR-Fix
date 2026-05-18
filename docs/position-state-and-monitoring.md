@@ -240,32 +240,87 @@ operator-confirmed mount moves can set
 
 ## Confidence disclosure
 
-The engine never hides its confidence.  Three disclosure surfaces:
+The engine never hides its confidence.  GPS time has two
+independently-recovered components and the confidence reporting
+respects that split:
 
-### Periodic log line
+- **Phase confidence** — how well we know *absolute* GPS time.
+  Dominated by antenna-position uncertainty: a position error
+  couples into clock-phase error via geometry (c ≈ 30 cm/ns, so 1
+  m of position σ contributes ≈ 3.3 ns of phase σ in the worst
+  case).  Recovered by the position filter chain (NAV2 seed →
+  AntPosEst convergence → survey refinement).
+- **Frequency confidence** — how well we know the *rate* of GPS
+  time.  Dominated by servo tracking residual against the PPS
+  measurement.  Recovered by the time filter (FixedPosFilter
+  clock states).
 
-Every M epochs (default 60 = once per minute at 1 Hz):
+The two are aggregated by RSS into a single total σ that drives
+ptp4l clockClass.  Three disclosure surfaces follow.
+
+### Periodic log lines
+
+Every M epochs (default 60 = once per minute at 1 Hz), three
+sibling log lines:
 
 ```
-[CONFIDENCE pos_sigma=0.012m time_sigma=0.8ns nav2_displ=0.18m
-  antpos_displ=0.003m antpos_sigma=0.018m mode=pinned mount=3]
+[CONFIDENCE_PHASE] sigma=0.034ns pos_sigma=0.0010m
+  source=antpos_mean mount_sn=3 mode=pinned
+[CONFIDENCE_FREQ]  sigma=0.840ns dt_rx_sigma=0.840ns
+  scheduler=settled
+[CONFIDENCE_TOTAL] sigma=0.841ns class_target=6 class_current=6
 ```
 
 Searchable, joinable to other log streams, no separate "replay
-watchdog state" tooling needed.  All current watchdog state lives
-in this log line and in engine memory.
+watchdog state" tooling needed.
+
+The `source=` field on `[CONFIDENCE_PHASE]` reports which σ_position
+source dominated.  Priority order (best to worst):
+
+1. `antpos_mean` — AntPosEst running-mean σ from the watchdog
+   (sub-cm once armed)
+2. `antpos_epoch` — AntPosEst per-epoch σ (when watchdog is
+   unarmed but the thread is publishing)
+3. `seed` — σ from the chosen state file at startup
+   (`.survey.toml` or `.ppp.toml`)
+4. `nav2_hAcc` — NAV2's reported horizontal accuracy
+5. `unknown` — none of the above available (cold-start gap)
 
 ### ptp4l clockClass
 
-The engine's `time_sigma` (estimated 1-σ uncertainty on its PPS
-output relative to GPS time) maps to a ptp4l clockClass via the
-existing layered supervision in `docs/ptp4l-supervision.md`.  Low
-confidence → high clockClass → BMC elects an alternate GM if one is
-available.
+The aggregate `total_sigma` from `[CONFIDENCE_TOTAL]` drives the
+GM's clockClass via PMC management messages (existing layered
+supervision in `docs/ptp4l-supervision.md`).  Low confidence → high
+clockClass → BMC elects an alternate GM if one is available.
 
-This is the proper place for downstream PTP-network consumers to see
-degraded confidence — they don't have to parse logs or watch state
-files.  BMC handles it.
+**Promotion thresholds with hysteresis** (separate rising/falling
+to avoid clockClass flapping at band boundaries):
+
+| Transition | σ_total threshold | Class result |
+|---|---|---|
+| Promote 248 → 52 | rises through < **800 ns** | 52 (initialized) |
+| Promote 52 → 6   | rises through < **20 ns** | 6 (locked) |
+| Demote 6 → 52    | falls below > **30 ns** | 52 (initialized) |
+| Demote 52 → 248  | falls below > **1200 ns** | 248 (freerun) |
+
+The 5 ns dead band around the 6↔52 boundary (20–30 ns) and the
+400 ns dead band around the 52↔248 boundary (800–1200 ns) are
+intentionally wide enough to absorb minute-scale σ_total wobble
+without flapping the BMC.
+
+The accuracy fields (`ACCURACY_25NS` for class 6, `ACCURACY_1US`
+for class 52) align with these bands: class 6 promises ≤ 25 ns,
+which we honour by promoting only when σ_total < 20 ns.
+
+**Event-driven transitions** (unchanged by this design):
+
+- Any → 7 (holdover): observation idle timeout.
+- Any → 248: PHC divergence (exit code 5), watchdog alarm step
+  action, engine crash, wrapper exit.
+
+This is the proper place for downstream PTP-network consumers to
+see degraded confidence — they don't have to parse logs or watch
+state files.  BMC handles it.
 
 ### Optional PPS squelch
 
