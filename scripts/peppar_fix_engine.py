@@ -7042,27 +7042,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             # diff_ns = chA-chB = do_pps-gnss_pps (positive = DO PPS late).
             # Negate so that pps_err_ticc_ns has the same sign as the
             # DOFreqEst measurement model: negative when DO is late.
-            #
-            # Auto-capture: on the first valid TICC measurement, set the
-            # target to the current differential.  This zeros the initial
-            # offset (cable delay, ARM alignment) so the servo starts at
-            # ~0 error and tracks drift from there.  Only used when
-            # --ticc-target-auto is explicitly set; default behaviour
-            # is to actively pull chA-chB to zero (= PEROUT edge at
-            # local TICC chA aligned with F9T PPS at TICC chB, which
-            # is GPS top-of-second modulo F9T qErr).  See
-            # docs/peroutVS-phc-time.md for what "GPS-aligned" means
-            # in this system: it's the rising edge of PEROUT as seen
-            # by the local TICC chA, not the PHC's internal counter
-            # (those differ by a per-host PHC→PEROUT→cable delay).
-            if (getattr(args, 'ticc_target_auto', False)
-                    and ctx.get('ticc_target_auto') is None
-                    and args.ticc_target_ns == 0.0):
-                args.ticc_target_ns = ticc_measurement.diff_ns
-                ctx['ticc_target_auto'] = ticc_measurement.diff_ns
-                log.info("TICC target auto-captured: %.1f ns (initial chA-chB)",
-                         args.ticc_target_ns)
-            pps_err_ticc_ns = -(ticc_measurement.diff_ns - args.ticc_target_ns)
+            pps_err_ticc_ns = -ticc_measurement.diff_ns
             # Sanity: if the TICC diff is larger than 100 ms, PEROUT is
             # grossly misaligned (e.g., 500 ms offset).  Log loudly and
             # do NOT silently use this as a servo input.
@@ -9481,25 +9461,6 @@ Two-phase operation:
                       help="TICC channel carrying raw reference PPS (default: chB)")
     ticc.add_argument("--ticc-max-age-s", type=float, default=2.0,
                       help="Maximum age for a paired TICC measurement to be used")
-    ticc.add_argument("--ticc-target-ns", type=float, default=0.0,
-                      help="Target chPHC-chREF offset in ns for TICC-driven "
-                           "servo mode.  Default 0 means actively pull "
-                           "PEROUT-vs-F9T_PPS to zero (so the local TICC chA "
-                           "rising edge marks GPS top-of-second, modulo F9T "
-                           "qErr).  See docs/peroutVS-phc-time.md for the "
-                           "implications: the PHC's internal counter remains "
-                           "offset from this edge by PHC→PEROUT→cable "
-                           "propagation latency, which is per-host fixed.  "
-                           "To preserve the legacy auto-capture-of-initial-"
-                           "diff behaviour (servo only corrects drift "
-                           "around the bootstrap residual, not the residual "
-                           "itself), pass --ticc-target-auto.")
-    ticc.add_argument("--ticc-target-auto", action="store_true", default=False,
-                      help="At the first epoch, capture the TICC chA-chB "
-                           "diff and use that as the servo setpoint.  "
-                           "Legacy behaviour, retained for diagnostic runs "
-                           "where you want to track drift around an arbitrary "
-                           "starting point rather than pulling chA-chB to zero.")
     ticc.add_argument("--ticc-confidence-ns", type=float, default=3.0,
                       help="Assumed confidence of TICC differential error when driving servo")
     # --ticc-drive removed: TICC competes as a source whenever --ticc-port
