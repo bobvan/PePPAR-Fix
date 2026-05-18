@@ -263,6 +263,7 @@ class AntPosEstWatchdog:
             "displ_3d_m": None,
             "displ_h_m": None,
             "displ_v_m": None,
+            "mean_ecef_m": None,  # running-mean (x, y, z) — slew target
         }
 
     def set_pin(self, pin_ecef) -> None:
@@ -311,8 +312,172 @@ class AntPosEstWatchdog:
             "displ_3d_m": d3,
             "displ_h_m": dh,
             "displ_v_m": dv,
+            "mean_ecef_m": (mx, my, mz),
         }
         self.n_updates += 1
+
+
+# ── Watchdog action decision (slice 7) ────────────────────────────── #
+
+
+# Below this magnitude → slew (gentle, in-place pin update).
+# Above → step (probable antenna move; mount_sn bump + restart).
+# 1 m ≈ 3 ns equivalent clock-equivalent error via c ≈ 30 cm/ns.
+DEFAULT_SLEW_STEP_THRESHOLD_M = 1.0
+
+# Sustain windows.  At [CONFIDENCE] cadence of 60 epochs = ~60 s,
+# nav2/antpos_sustain_s = 60 means "at least one full cycle of
+# consistent bark".  Step requires much longer to avoid declaring
+# a mount move on a transient that just happens to cross 1 m.
+DEFAULT_NAV2_THRESHOLD_M = 0.5
+DEFAULT_NAV2_SUSTAIN_S = 60.0
+DEFAULT_ANTPOS_THRESHOLD_M = 0.03
+DEFAULT_ANTPOS_SUSTAIN_S = 60.0
+
+# Auto-move guard: how long sustained step-class bark before we
+# declare an antenna move.  Set to 0 to disable auto-move (operator
+# must intervene; the bark continues showing in [CONFIDENCE] logs).
+DEFAULT_AUTO_MOVE_THRESHOLD_S = 3600.0
+
+
+class WatchdogActor:
+    """Decides slew / step / no-action from per-cycle watchdog state.
+
+    Pure state machine — no side effects.  Caller (run_steady_state)
+    consumes the decision dict and performs the actual actions
+    (update FixedPosFilter.pos, bump mount_sn, invalidate ppp.toml,
+    stop the engine).
+
+    Inputs per evaluate() call:
+      - t_now: wall-clock monotonic time
+      - nav2_disp_3d_m: latest 3D NAV2-vs-pin displacement (None if
+        NAV2 opinion stale)
+      - antpos_state: dict snapshot of AntPosEstWatchdog.state
+
+    Returns one of these decisions:
+      {'action': 'none', ...}
+      {'action': 'slew', 'source': 'nav2'|'antpos', 'displ_m': X,
+       'new_pin_ecef': (x, y, z)}
+      {'action': 'step', 'source': 'nav2'|'antpos', 'displ_m': X,
+       'step_held_s': S}  (only after step sustain window elapses)
+      {'action': 'step_pending', 'source': ..., 'displ_m': X,
+       'remaining_s': T}  (large displacement seen; counting down)
+
+    Sustained-bark mechanics:
+      - Each watchdog has a separate bark-start timestamp; reset
+        when the watchdog goes quiet (below its threshold).
+      - "Sustained" = (t_now - bark_start_t) >= sustain_s.
+      - For slew the sustain is short; for step the sustain is
+        auto_move_threshold_s (1 hr default).
+      - The `_slewed_for_bark` latch prevents re-slewing on the
+        same bark; resets when bark goes quiet.
+    """
+
+    def __init__(self,
+                 *,
+                 slew_step_threshold_m: float = DEFAULT_SLEW_STEP_THRESHOLD_M,
+                 nav2_threshold_m: float = DEFAULT_NAV2_THRESHOLD_M,
+                 nav2_sustain_s: float = DEFAULT_NAV2_SUSTAIN_S,
+                 antpos_threshold_m: float = DEFAULT_ANTPOS_THRESHOLD_M,
+                 antpos_sustain_s: float = DEFAULT_ANTPOS_SUSTAIN_S,
+                 auto_move_threshold_s: float = DEFAULT_AUTO_MOVE_THRESHOLD_S):
+        self.slew_step_threshold_m = float(slew_step_threshold_m)
+        self.nav2_threshold_m = float(nav2_threshold_m)
+        self.nav2_sustain_s = float(nav2_sustain_s)
+        self.antpos_threshold_m = float(antpos_threshold_m)
+        self.antpos_sustain_s = float(antpos_sustain_s)
+        self.auto_move_threshold_s = float(auto_move_threshold_s)
+        # Per-watchdog bark-start timestamps (None = currently quiet).
+        self._nav2_bark_start_t: Optional[float] = None
+        self._antpos_bark_start_t: Optional[float] = None
+        # Latch: once we slewed for a bark, don't slew again until the
+        # bark goes quiet.  Indexed by source.
+        self._slewed_sources: set = set()
+        # Diagnostic counters.
+        self.n_slew = 0
+        self.n_step = 0
+
+    def evaluate(self,
+                 t_now: float,
+                 nav2_disp_3d_m: Optional[float],
+                 nav2_ecef_m: Optional[tuple],
+                 antpos_state: dict) -> dict:
+        """One evaluation cycle.  Updates bark-start timestamps and
+        returns the action dict."""
+        # Update NAV2 bark state.
+        nav2_barking = (nav2_disp_3d_m is not None
+                        and nav2_disp_3d_m > self.nav2_threshold_m)
+        if nav2_barking:
+            if self._nav2_bark_start_t is None:
+                self._nav2_bark_start_t = t_now
+        else:
+            self._nav2_bark_start_t = None
+            self._slewed_sources.discard("nav2")
+
+        # Update AntPosEst bark state (only meaningful when armed).
+        antpos_armed = bool(antpos_state.get("active"))
+        antpos_disp_3d = antpos_state.get("displ_3d_m")
+        antpos_barking = (antpos_armed
+                          and antpos_disp_3d is not None
+                          and antpos_disp_3d > self.antpos_threshold_m)
+        if antpos_barking:
+            if self._antpos_bark_start_t is None:
+                self._antpos_bark_start_t = t_now
+        else:
+            self._antpos_bark_start_t = None
+            self._slewed_sources.discard("antpos")
+
+        # Compute sustain status for each source.
+        candidates = []
+        if (self._nav2_bark_start_t is not None
+                and t_now - self._nav2_bark_start_t >= self.nav2_sustain_s):
+            candidates.append(("nav2", float(nav2_disp_3d_m),
+                               self._nav2_bark_start_t, nav2_ecef_m))
+        if (self._antpos_bark_start_t is not None
+                and t_now - self._antpos_bark_start_t
+                >= self.antpos_sustain_s):
+            candidates.append(("antpos", float(antpos_disp_3d),
+                               self._antpos_bark_start_t,
+                               antpos_state.get("mean_ecef_m")))
+
+        if not candidates:
+            return {"action": "none"}
+
+        # Largest sustained displacement decides.
+        source, disp, bark_start_t, new_pin = max(
+            candidates, key=lambda c: c[1])
+        bark_age_s = t_now - bark_start_t
+
+        # Step path: large displacement, must hold for the full
+        # auto_move_threshold_s window before we declare a move.
+        # auto_move_threshold_s == 0 disables auto-move entirely;
+        # the caller just sees step_pending forever and acts manually.
+        if disp >= self.slew_step_threshold_m:
+            if (self.auto_move_threshold_s > 0
+                    and bark_age_s >= self.auto_move_threshold_s):
+                self.n_step += 1
+                return {"action": "step", "source": source,
+                        "displ_m": disp, "step_held_s": bark_age_s}
+            return {
+                "action": "step_pending",
+                "source": source,
+                "displ_m": disp,
+                "remaining_s": (self.auto_move_threshold_s - bark_age_s
+                                if self.auto_move_threshold_s > 0
+                                else float("inf")),
+            }
+
+        # Slew path: smaller displacement, sustained, latch not held.
+        if source in self._slewed_sources:
+            return {"action": "none"}
+        if new_pin is None:
+            # Source didn't give us a target ECEF.  Can't slew without
+            # somewhere to slew to; treat as no-op.
+            return {"action": "none"}
+        self._slewed_sources.add(source)
+        self.n_slew += 1
+        return {"action": "slew", "source": source, "displ_m": disp,
+                "new_pin_ecef": tuple(float(v) for v in new_pin)}
 
 
 # ── Geometry: ECEF displacement decomposition ────────────────────── #
@@ -480,6 +645,58 @@ def filter_current_mount(states: list[Optional[PositionState]],
             continue
         out.append(s)
     return out
+
+
+def bump_mount_sn(uid, receivers_dir: Optional[str] = None) -> int:
+    """Atomically increment ``mount_sn`` in
+    ``state/receivers/<uid>.json``, return the new value.
+
+    Used by the step-action path (slice 7).  When the receiver state
+    file is absent or lacks ``mount_sn``, we treat that as
+    ``mount_sn = 0`` and write ``mount_sn = 1``.
+
+    Refuses (and returns -1) when ``uid`` is None.
+    """
+    if uid is None:
+        return -1
+    from peppar_fix.receiver_state import (
+        load_receiver_state, save_receiver_state,
+    )
+    state = load_receiver_state(uid, state_dir=receivers_dir)
+    if state is None:
+        # Build minimal state so the bump is recorded somewhere.
+        state = {"unique_id": int(uid) if str(uid).isdigit() else uid,
+                 "mount_sn": 0}
+    current = int(state.get("mount_sn", 0))
+    state["mount_sn"] = current + 1
+    save_receiver_state(state, state_dir=receivers_dir)
+    log.info("Bumped mount_sn for uid=%s: %d → %d",
+             uid, current, current + 1)
+    return current + 1
+
+
+def invalidate_ppp_state(uid,
+                         positions_dir: Optional[str] = None) -> bool:
+    """Delete the receiver's .ppp.toml — the next engine launch falls
+    back to .survey.toml (if present) or NAV2.  Used by the step
+    action path (slice 7) when an antenna move makes the cached
+    PPP snapshot stale.
+
+    Returns True if a file was removed, False if there was nothing
+    to remove (no-op).  No-ops on uid=None.
+    """
+    if uid is None:
+        return False
+    path = _ppp_path(uid, positions_dir)
+    if not os.path.exists(path):
+        return False
+    try:
+        os.remove(path)
+        log.info("Invalidated PPP state: removed %s", path)
+        return True
+    except OSError as e:
+        log.warning("Failed to remove %s: %s", path, e)
+        return False
 
 
 def load_current_mount_sn(uid,

@@ -9,9 +9,12 @@ from peppar_fix.position_state import (
     PositionState,
     PppStateWriter,
     SURVEY_TIE_BREAK_RATIO,
+    WatchdogActor,
     _format_toml,
+    bump_mount_sn,
     compute_horizontal_displacement,
     filter_current_mount,
+    invalidate_ppp_state,
     load_current_mount_sn,
     load_ppp_state,
     load_survey_state,
@@ -691,6 +694,205 @@ class TestAntPosEstWatchdog(unittest.TestCase):
         # NEW pin is 0.05 m.  Slice 7 design accepts this — the
         # watchdog naturally re-tightens as the buffer ages out.
         self.assertEqual(w.state["n_in_mean"], 2)
+
+
+class TestBumpMountSn(unittest.TestCase):
+
+    def test_uid_none_returns_minus_one(self):
+        self.assertEqual(bump_mount_sn(None), -1)
+
+    def test_no_file_creates_with_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            new = bump_mount_sn("12345", receivers_dir=d)
+            self.assertEqual(new, 1)
+            # Re-read to confirm persistence.
+            self.assertEqual(load_current_mount_sn("12345",
+                                                   receivers_dir=d), 1)
+
+    def test_existing_file_increments(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "12345.json"), "w") as f:
+                json.dump({"unique_id": 12345, "mount_sn": 7}, f)
+            new = bump_mount_sn("12345", receivers_dir=d)
+            self.assertEqual(new, 8)
+            self.assertEqual(load_current_mount_sn("12345",
+                                                   receivers_dir=d), 8)
+
+
+class TestInvalidatePppState(unittest.TestCase):
+
+    def test_uid_none_returns_false(self):
+        self.assertFalse(invalidate_ppp_state(None))
+
+    def test_no_file_returns_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(invalidate_ppp_state("nope",
+                                                  positions_dir=d))
+
+    def test_removes_existing(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = PositionState(
+                mount_sn=0,
+                ecef_m=(1.0, 2.0, 3.0),
+                sigma_m=0.01,
+                updated=utc_now_iso(),
+                source="test",
+            )
+            save_ppp_state(s, "1", positions_dir=d)
+            self.assertTrue(os.path.exists(os.path.join(d, "1.ppp.toml")))
+            removed = invalidate_ppp_state("1", positions_dir=d)
+            self.assertTrue(removed)
+            self.assertFalse(os.path.exists(
+                os.path.join(d, "1.ppp.toml")))
+
+
+class TestWatchdogActor(unittest.TestCase):
+    """Slice 7 action decision logic.  Pure state, no side effects."""
+
+    PIN = (100.0, 200.0, 300.0)
+    SMALL_OFFSET_M = 0.05  # > antpos_threshold 0.03, < slew_step 1.0
+    BIG_OFFSET_M = 2.5     # > slew_step 1.0
+
+    def _antpos_state(self, displ_3d_m, n=60):
+        return {
+            "active": True,
+            "n_in_mean": n,
+            "sigma_3d_m": 0.01,
+            "sigma_mean_m": 0.01 / max(n, 1) ** 0.5,
+            "displ_3d_m": displ_3d_m,
+            "displ_h_m": displ_3d_m,
+            "displ_v_m": 0.0,
+            "mean_ecef_m": (self.PIN[0] + displ_3d_m,
+                            self.PIN[1], self.PIN[2]),
+        }
+
+    def _quiet_antpos_state(self):
+        return self._antpos_state(displ_3d_m=0.0, n=60)
+
+    def _inactive_antpos_state(self):
+        st = self._antpos_state(displ_3d_m=0.0, n=0)
+        st["active"] = False
+        return st
+
+    def test_no_bark_returns_none(self):
+        a = WatchdogActor()
+        out = a.evaluate(t_now=100.0,
+                         nav2_disp_3d_m=0.1,
+                         nav2_ecef_m=self.PIN,
+                         antpos_state=self._quiet_antpos_state())
+        self.assertEqual(out["action"], "none")
+
+    def test_antpos_bark_before_sustain_no_action(self):
+        a = WatchdogActor(antpos_sustain_s=60.0)
+        # First bark — sustain hasn't accumulated yet.
+        out = a.evaluate(t_now=100.0,
+                         nav2_disp_3d_m=0.1,
+                         nav2_ecef_m=self.PIN,
+                         antpos_state=self._antpos_state(
+                             self.SMALL_OFFSET_M))
+        self.assertEqual(out["action"], "none")
+
+    def test_antpos_slew_after_sustain(self):
+        a = WatchdogActor(antpos_sustain_s=60.0,
+                          slew_step_threshold_m=1.0)
+        s = self._antpos_state(self.SMALL_OFFSET_M)
+        # Bark starts at t=100.
+        a.evaluate(100.0, 0.1, self.PIN, s)
+        # Re-bark at t=160 (60 s elapsed) — slew fires.
+        out = a.evaluate(160.0, 0.1, self.PIN, s)
+        self.assertEqual(out["action"], "slew")
+        self.assertEqual(out["source"], "antpos")
+        self.assertAlmostEqual(out["displ_m"], self.SMALL_OFFSET_M)
+        self.assertEqual(out["new_pin_ecef"], s["mean_ecef_m"])
+        self.assertEqual(a.n_slew, 1)
+
+    def test_antpos_slew_latch_blocks_repeat(self):
+        a = WatchdogActor(antpos_sustain_s=60.0)
+        s = self._antpos_state(self.SMALL_OFFSET_M)
+        a.evaluate(100.0, 0.0, None, s)
+        a.evaluate(160.0, 0.0, None, s)  # slew #1
+        out = a.evaluate(220.0, 0.0, None, s)  # latched
+        self.assertEqual(out["action"], "none")
+        self.assertEqual(a.n_slew, 1)
+
+    def test_antpos_latch_resets_when_quiet(self):
+        a = WatchdogActor(antpos_sustain_s=60.0)
+        s_bark = self._antpos_state(self.SMALL_OFFSET_M)
+        s_quiet = self._quiet_antpos_state()
+        a.evaluate(100.0, 0.0, None, s_bark)
+        a.evaluate(160.0, 0.0, None, s_bark)  # slew #1
+        # Caller actually slewed; next mean is at the new pin (zero
+        # displacement) → bark goes quiet.
+        a.evaluate(200.0, 0.0, None, s_quiet)
+        # New bark with fresh start time.
+        a.evaluate(260.0, 0.0, None, s_bark)
+        out = a.evaluate(330.0, 0.0, None, s_bark)
+        self.assertEqual(out["action"], "slew")
+        self.assertEqual(a.n_slew, 2)
+
+    def test_step_pending_before_auto_move_threshold(self):
+        a = WatchdogActor(antpos_sustain_s=60.0,
+                          auto_move_threshold_s=3600.0)
+        s = self._antpos_state(self.BIG_OFFSET_M)
+        a.evaluate(100.0, 0.0, None, s)
+        out = a.evaluate(200.0, 0.0, None, s)
+        self.assertEqual(out["action"], "step_pending")
+        self.assertAlmostEqual(out["remaining_s"], 3500.0)
+
+    def test_step_after_auto_move_threshold(self):
+        a = WatchdogActor(antpos_sustain_s=60.0,
+                          auto_move_threshold_s=3600.0)
+        s = self._antpos_state(self.BIG_OFFSET_M)
+        a.evaluate(100.0, 0.0, None, s)
+        out = a.evaluate(100.0 + 3601.0, 0.0, None, s)
+        self.assertEqual(out["action"], "step")
+        self.assertEqual(out["source"], "antpos")
+        self.assertEqual(a.n_step, 1)
+
+    def test_auto_move_disabled_yields_persistent_pending(self):
+        a = WatchdogActor(antpos_sustain_s=60.0,
+                          auto_move_threshold_s=0.0)
+        s = self._antpos_state(self.BIG_OFFSET_M)
+        a.evaluate(100.0, 0.0, None, s)
+        out = a.evaluate(100.0 + 10000.0, 0.0, None, s)
+        self.assertEqual(out["action"], "step_pending")
+        self.assertEqual(out["remaining_s"], float("inf"))
+
+    def test_nav2_bark_drives_slew(self):
+        a = WatchdogActor(nav2_sustain_s=60.0)
+        new_pin = (self.PIN[0] + 0.4, self.PIN[1], self.PIN[2])
+        a.evaluate(100.0, 0.6, new_pin, self._inactive_antpos_state())
+        out = a.evaluate(170.0, 0.6, new_pin,
+                         self._inactive_antpos_state())
+        self.assertEqual(out["action"], "slew")
+        self.assertEqual(out["source"], "nav2")
+        self.assertEqual(out["new_pin_ecef"], new_pin)
+
+    def test_larger_displacement_wins(self):
+        """When both nav2 and antpos are barking, the source with
+        larger displacement gets the action."""
+        a = WatchdogActor(antpos_sustain_s=60.0, nav2_sustain_s=60.0)
+        antpos = self._antpos_state(self.SMALL_OFFSET_M)  # 0.05 m
+        nav2_disp = 0.7  # 0.7 m
+        nav2_pin = (self.PIN[0] + 0.7, self.PIN[1], self.PIN[2])
+        a.evaluate(100.0, nav2_disp, nav2_pin, antpos)
+        out = a.evaluate(170.0, nav2_disp, nav2_pin, antpos)
+        self.assertEqual(out["action"], "slew")
+        # NAV2 has larger displacement → its source/pin used.
+        self.assertEqual(out["source"], "nav2")
+
+    def test_inactive_antpos_ignored(self):
+        """When AntPosEst is unarmed (cold start), NAV2 alone can
+        still drive action."""
+        a = WatchdogActor(antpos_sustain_s=60.0, nav2_sustain_s=60.0)
+        antpos = self._inactive_antpos_state()
+        # AntPosEst is unarmed so its displ shouldn't enter the
+        # candidates — even if displ field happens to be nonzero.
+        antpos["displ_3d_m"] = 5.0  # would-be huge if armed
+        a.evaluate(100.0, 0.0, None, antpos)
+        out = a.evaluate(200.0, 0.0, None, antpos)
+        self.assertEqual(out["action"], "none")
 
 
 class TestUtcNowIso(unittest.TestCase):

@@ -4005,10 +4005,14 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     # docs/position-state-and-monitoring.md.  Defaults to 0 when the
     # receiver state file is absent or missing the field.
     from peppar_fix.position_state import (
-        compute_horizontal_displacement, load_current_mount_sn,
+        WatchdogActor, bump_mount_sn, compute_horizontal_displacement,
+        invalidate_ppp_state, load_current_mount_sn,
     )
     _confidence_mount_sn = load_current_mount_sn(
         getattr(args, 'receiver_unique_id', None))
+    # Slice 7 — slew/step action.  Consumed at the [CONFIDENCE]
+    # cadence; converts watchdog displacement into action.
+    _watchdog_actor = WatchdogActor()
 
     # Compute METAR-seeded ZTD residual when --init-ztd-from-met is set.
     # Default 0.0 preserves prior behavior.  See I-024942 and 2026-05-04
@@ -4931,6 +4935,72 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     _pos_s, _time_s, _nav2_str, _antpos_str,
                     _confidence_mount_sn,
                 )
+
+                # Slice 7 — slew/step decision based on the
+                # displacements just logged.  See
+                # docs/position-state-and-monitoring.md.
+                _antpos_state_for_actor = (
+                    ape_thread._antpos_watchdog.state
+                    if (ape_thread is not None
+                        and getattr(ape_thread, '_antpos_watchdog', None)
+                        is not None)
+                    else {"active": False})
+                _nav2_for_actor = None
+                _nav2_ecef_for_actor = None
+                if nav2_store is not None:
+                    _op_a = nav2_store.get_opinion(max_age_s=30.0)
+                    if _op_a is not None:
+                        _nav2_d3, _, _ = compute_horizontal_displacement(
+                            tuple(known_ecef), tuple(_op_a['ecef']))
+                        _nav2_for_actor = _nav2_d3
+                        _nav2_ecef_for_actor = tuple(_op_a['ecef'])
+                _decision = _watchdog_actor.evaluate(
+                    t_now=time.monotonic(),
+                    nav2_disp_3d_m=_nav2_for_actor,
+                    nav2_ecef_m=_nav2_ecef_for_actor,
+                    antpos_state=_antpos_state_for_actor,
+                )
+                _act = _decision["action"]
+                if _act == "step_pending":
+                    log.warning(
+                        "[WATCHDOG_STEP_PENDING] source=%s displ=%.3fm "
+                        "remaining_s=%.0f — sustained step-class "
+                        "bark; auto-move pending",
+                        _decision["source"], _decision["displ_m"],
+                        _decision["remaining_s"],
+                    )
+                elif _act == "slew":
+                    _new_pin = np.array(_decision["new_pin_ecef"])
+                    _old_pin = tuple(filt.pos)
+                    filt.pos = _new_pin
+                    if (ape_thread is not None
+                            and getattr(ape_thread, '_antpos_watchdog',
+                                        None) is not None):
+                        ape_thread._antpos_watchdog.set_pin(_new_pin)
+                    known_ecef = _new_pin
+                    log.warning(
+                        "[WATCHDOG_SLEW] source=%s displ=%.3fm "
+                        "old_pin=(%.4f,%.4f,%.4f) → "
+                        "new_pin=(%.4f,%.4f,%.4f) mount_sn=%d",
+                        _decision["source"], _decision["displ_m"],
+                        _old_pin[0], _old_pin[1], _old_pin[2],
+                        _new_pin[0], _new_pin[1], _new_pin[2],
+                        _confidence_mount_sn,
+                    )
+                elif _act == "step":
+                    _uid = getattr(args, 'receiver_unique_id', None)
+                    _new_sn = bump_mount_sn(_uid)
+                    invalidate_ppp_state(_uid)
+                    log.error(
+                        "[WATCHDOG_STEP_AUTO_MOVE] source=%s displ=%.3fm "
+                        "held_s=%.0f old_mount_sn=%d new_mount_sn=%d "
+                        "— invalidated .ppp.toml; shutting down for "
+                        "wrapper respawn",
+                        _decision["source"], _decision["displ_m"],
+                        _decision["step_held_s"],
+                        _confidence_mount_sn, _new_sn,
+                    )
+                    stop_event.set()
             now = time.time()
             if now - last_skip_log >= 60.0:
                 log.info(f"  Skip stats: {skip_stats}")
