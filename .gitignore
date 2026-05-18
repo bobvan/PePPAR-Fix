@@ -27,6 +27,10 @@ __pycache__/
 *.pyc
 .venv/
 
+# Editor swap files (vim and friends)
+.*.sw[a-z]
+*~
+
 # Binary dumps
 *.rtcm
 *.bin
