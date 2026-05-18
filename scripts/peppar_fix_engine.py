@@ -4008,11 +4008,20 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
         WatchdogActor, bump_mount_sn, compute_horizontal_displacement,
         invalidate_ppp_state, load_current_mount_sn,
     )
+    from peppar_fix.confidence import (
+        ClockClassPromoter, compute_frequency_confidence,
+        compute_phase_confidence, compute_total_confidence,
+    )
     _confidence_mount_sn = load_current_mount_sn(
         getattr(args, 'receiver_unique_id', None))
     # Slice 7 — slew/step action.  Consumed at the [CONFIDENCE]
     # cadence; converts watchdog displacement into action.
     _watchdog_actor = WatchdogActor()
+    # Slice 9 — confidence-driven clockClass promoter with hysteresis.
+    # Starts in "freerun" matching ptp4l's initial state; promotes
+    # as σ_total drops through the rising thresholds, demotes as it
+    # rises through the (looser) falling thresholds.
+    _clock_class_promoter = ClockClassPromoter("freerun")
 
     # Compute METAR-seeded ZTD residual when --init-ztd-from-met is set.
     # Default 0.0 preserves prior behavior.  See I-024942 and 2026-05-04
@@ -4885,17 +4894,14 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 log.info("[STATUS] %s", format_status(ape_sm, dfe_sm,
                          ticc_ok=ticc_ok, qvir=qvir))
 
-            # [CONFIDENCE] periodic log line — see
-            # docs/position-state-and-monitoring.md.  Surfaces NAV2
-            # displacement vs pin, AntPosEst running-mean
-            # displacement vs pin, σ on position seed and current
-            # clock estimate, mount_sn, mode.  Instrumentation only
-            # in slice 5/6 — no action taken.  Slice 7 will turn
-            # the larger of (nav2_disp_h, antpos_disp_h) into
-            # slew/step.
+            # [CONFIDENCE_*] periodic log lines — see slice 9 of
+            # docs/position-state-and-monitoring.md.  Three sibling
+            # lines: phase, freq, total.  Total drives clockClass.
             if n_epochs % 60 == 0:
+                # Pull NAV2 displacement + hAcc (for log + slice-7 actor).
                 _nav2_disp_3d = _nav2_disp_h = _nav2_disp_v = None
                 _nav2_h_acc = None
+                _nav2_ecef_for_actor = None
                 if nav2_store is not None:
                     _op = nav2_store.get_opinion(max_age_s=30.0)
                     if _op is not None:
@@ -4904,37 +4910,100 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                                 tuple(known_ecef),
                                 tuple(_op['ecef'])))
                         _nav2_h_acc = _op.get('h_acc_m')
-                _pos_s = (f"{pos_sigma_m:.3f}m"
-                          if pos_sigma_m is not None else "?")
-                _time_s = (f"{dt_rx_sigma:.2f}ns"
-                           if dt_rx_sigma is not None else "?")
+                        _nav2_ecef_for_actor = tuple(_op['ecef'])
+                # AntPosEst watchdog snapshot — read cross-thread.
+                _antpos_state = {"active": False}
+                _antpos_log_str = "antpos=cold"
+                if ape_thread is not None:
+                    _aw = getattr(ape_thread, '_antpos_watchdog', None)
+                    if _aw is not None:
+                        _antpos_state = _aw.state
+                        if _antpos_state["active"]:
+                            _antpos_log_str = (
+                                f"antpos_disp_h={_antpos_state['displ_h_m']:.4f}m "
+                                f"antpos_disp_v={_antpos_state['displ_v_m']:.4f}m "
+                                f"antpos_n={_antpos_state['n_in_mean']}")
+                        elif _antpos_state.get("sigma_3d_m") is not None:
+                            _antpos_log_str = (
+                                f"antpos=unarmed (σ_epoch="
+                                f"{_antpos_state['sigma_3d_m']:.3f}m)")
+
+                # Phase / freq / total confidence — slice 9.
+                _phase = compute_phase_confidence(
+                    antpos_state=_antpos_state,
+                    seed_sigma_m=pos_sigma_m,
+                    nav2_h_acc_m=_nav2_h_acc,
+                )
+                _scheduler = (servo_ctx.get('scheduler')
+                              if servo_ctx is not None else None)
+                _settled = (bool(_scheduler and not _scheduler._converging)
+                            if _scheduler is not None else False)
+                _freq = compute_frequency_confidence(
+                    dt_rx_sigma_ns=dt_rx_sigma,
+                    scheduler_settled=_settled,
+                )
+                _total = compute_total_confidence(_phase, _freq)
+
+                # NAV2 line stays in the phase log for context;
+                # operators rely on it to understand the source choice.
                 _nav2_str = ("nav2=stale" if _nav2_disp_3d is None
                              else (f"nav2_disp_h={_nav2_disp_h:.3f}m "
                                    f"nav2_disp_v={_nav2_disp_v:.3f}m "
                                    f"nav2_hAcc={_nav2_h_acc or 0:.2f}m"))
-                # AntPosEst watchdog state — read cross-thread.  When
-                # the thread isn't running or hasn't reported yet, fall
-                # back to "antpos=cold".
-                _antpos_str = "antpos=cold"
-                if ape_thread is not None:
-                    _aw = getattr(ape_thread, '_antpos_watchdog', None)
-                    if _aw is not None:
-                        _s = _aw.state
-                        if _s["active"]:
-                            _antpos_str = (
-                                f"antpos_disp_h={_s['displ_h_m']:.4f}m "
-                                f"antpos_disp_v={_s['displ_v_m']:.4f}m "
-                                f"antpos_sigma_mean={_s['sigma_mean_m']:.4f}m "
-                                f"antpos_n={_s['n_in_mean']}")
-                        elif _s["sigma_3d_m"] is not None:
-                            _antpos_str = (
-                                f"antpos=unarmed (σ={_s['sigma_3d_m']:.3f}m)")
+
+                def _fmt_ns(v):
+                    if v == float('inf'):
+                        return "inf"
+                    return f"{v:.3f}ns"
+
                 log.info(
-                    "[CONFIDENCE] pos_sigma=%s time_sigma=%s "
-                    "%s %s mount_sn=%d mode=pinned",
-                    _pos_s, _time_s, _nav2_str, _antpos_str,
+                    "[CONFIDENCE_PHASE] sigma=%s pos_sigma=%.4fm "
+                    "source=%s %s %s mount_sn=%d mode=pinned",
+                    _fmt_ns(_phase.sigma_ns),
+                    (_phase.pos_sigma_m
+                     if _phase.pos_sigma_m != float('inf') else 0.0),
+                    _phase.source, _nav2_str, _antpos_log_str,
                     _confidence_mount_sn,
                 )
+                log.info(
+                    "[CONFIDENCE_FREQ] sigma=%s dt_rx_sigma=%s "
+                    "scheduler=%s",
+                    _fmt_ns(_freq.sigma_ns),
+                    _fmt_ns(_freq.dt_rx_sigma_ns),
+                    "settled" if _settled else "converging",
+                )
+                # Drive clockClass through the hysteresis-aware promoter.
+                # Re-sync promoter's internal state from ctx in case
+                # an external path (e.g., SSR-stale → freerun, PHC
+                # diverge, holdover entry) set the class out-of-band.
+                _current_class = (
+                    servo_ctx.get('pmc_announced')
+                    if servo_ctx is not None else None)
+                if (_current_class is not None
+                        and _current_class != _clock_class_promoter.current_class):
+                    _clock_class_promoter.override_class(_current_class)
+                _target_class = _clock_class_promoter.evaluate(
+                    _total.sigma_ns)
+                log.info(
+                    "[CONFIDENCE_TOTAL] sigma=%s class_target=%s "
+                    "class_current=%s",
+                    _fmt_ns(_total.sigma_ns),
+                    _target_class,
+                    _current_class or "n/a",
+                )
+                # Promote/demote ptp4l clockClass if our target
+                # changed.  Skip in --freerun mode (no PHC discipline);
+                # skip when the engine has set holdover externally
+                # (event-driven transition outside the promoter's
+                # σ-driven authority).
+                if (not args.freerun and servo_ctx is not None
+                        and _current_class != "holdover"):
+                    if _current_class != _target_class:
+                        _set_clock_class(servo_ctx, _target_class)
+                        # Keep promoter's state in sync — _set_clock_class
+                        # may have logged or vetoed, but we already wrote
+                        # our decision into ctx.  Future cycles continue
+                        # from this state.
 
                 # Slice 7 — slew/step decision based on the
                 # displacements just logged.  See
@@ -7235,15 +7304,11 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                 noise_est.last_channel,
             ])
 
-    # Three-stage clockClass promotion: 248 (boot) → 52 (PHC bootstrapped,
-    # set by wrapper after bootstrap) → 6 (servo settled).  Demote back
-    # to 52 if the scheduler leaves settled state.
-    # In freerun mode, clockClass stays at 248 — PHC is not disciplined.
-    if not args.freerun:
-        if not scheduler._converging:
-            _set_clock_class(ctx, "locked")
-        else:
-            _set_clock_class(ctx, "initialized")
+    # clockClass promotion is now driven by σ_total in
+    # run_steady_state's [CONFIDENCE_TOTAL] block (slice 9), not by
+    # the scheduler-settled flag here.  The scheduler still informs
+    # frequency confidence; it just isn't the sole gate.  See
+    # docs/ptp4l-supervision.md and docs/position-state-and-monitoring.md.
 
     if TRACK_RESTEP_NS is not None and not args.freerun:
         # Use pps_err_extts_ns (raw PHC fractional offset) for the restep
