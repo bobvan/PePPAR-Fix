@@ -466,6 +466,45 @@ class TestPppStateWriter(unittest.TestCase):
         self.assertTrue(
             w.maybe_write((1, 2, 3), sigma_3d=1.0, n_epochs=10))
 
+    def test_nav2_better_gate_preferred_over_absolute(self):
+        """When nav2_h_acc_m is provided, the preferred relative
+        gate (σ ≤ 0.5 × nav2_h_acc) replaces the absolute max."""
+        # NAV2 hAcc 0.78 m → relative threshold 0.78 / 2 = 0.39 m.
+        # σ=0.5 m would pass the absolute max_sigma_m=1.0 gate but
+        # FAILS the relative gate (0.5 > 0.39).  This is exactly the
+        # TimeHat 2026-05-18 incident: σ_ppp=0.95 m beat the
+        # absolute gate but wasn't actually tighter than NAV2's
+        # hAcc=0.78 m.
+        w = self._make_writer(max_sigma_m=1.0)  # nav2_better=0.5
+        wrote = w.maybe_write(
+            (1, 2, 3), sigma_3d=0.5, n_epochs=10, nav2_h_acc_m=0.78)
+        self.assertFalse(wrote)
+        self.assertEqual(w.n_skipped_sigma, 1)
+        # Same σ but NAV2 hAcc widens (e.g. multipath storm): now
+        # PPP is meaningfully better than NAV2 (0.5 < 1.2 / 2 = 0.6)
+        # so the write fires.
+        wrote2 = w.maybe_write(
+            (1, 2, 3), sigma_3d=0.5, n_epochs=11, nav2_h_acc_m=1.2)
+        self.assertTrue(wrote2)
+
+    def test_nav2_unavailable_falls_back_to_absolute(self):
+        """When nav2_h_acc_m is None or non-positive, use the absolute
+        max_sigma_m gate so a host with NAV2 loss can still warm-save."""
+        w = self._make_writer(max_sigma_m=1.0)
+        # No NAV2 hAcc → absolute gate applies.  σ=0.8 passes 1.0.
+        wrote = w.maybe_write(
+            (1, 2, 3), sigma_3d=0.8, n_epochs=10, nav2_h_acc_m=None)
+        self.assertTrue(wrote)
+
+    def test_nav2_zero_h_acc_falls_back_to_absolute(self):
+        """Defensive: nav2_h_acc_m=0 (sentinel/garbage from store)
+        shouldn't divide-by-zero the threshold."""
+        w = self._make_writer(max_sigma_m=1.0)
+        # Should fall back to absolute, not crash.
+        wrote = w.maybe_write(
+            (1, 2, 3), sigma_3d=0.8, n_epochs=10, nav2_h_acc_m=0.0)
+        self.assertTrue(wrote)  # 0.8 ≤ 1.0 absolute
+
     def test_uid_none_is_noop(self):
         w = self._make_writer(uid=None)
         wrote = w.maybe_write((1, 2, 3), sigma_3d=0.05, n_epochs=10)

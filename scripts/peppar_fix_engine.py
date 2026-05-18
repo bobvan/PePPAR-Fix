@@ -3524,8 +3524,19 @@ class AntPosEstThread(threading.Thread):
             pos_ecef = filt.x[:3].copy()
             # Periodic .ppp.toml snapshot for next-startup warm seed.
             # Throttled + sigma-gated by PppStateWriter; no-op when
-            # receiver_uid is None.
-            self._ppp_writer.maybe_write(pos_ecef, sigma_3d, self._n_epochs)
+            # receiver_uid is None.  Pass current NAV2 hAcc so the
+            # writer's preferred gate ("σ ≤ 0.5 × NAV2 hAcc") fires
+            # only when this PPP solution is meaningfully better than
+            # the NAV2 cold-start fallback.
+            _nav2_h_acc_for_writer = None
+            if self._nav2_store is not None:
+                _op_for_writer = self._nav2_store.get_opinion(max_age_s=30.0)
+                if _op_for_writer is not None:
+                    _nav2_h_acc_for_writer = _op_for_writer.get('h_acc_m')
+            self._ppp_writer.maybe_write(
+                pos_ecef, sigma_3d, self._n_epochs,
+                nav2_h_acc_m=_nav2_h_acc_for_writer,
+            )
             # AntPosEst-vs-pin watchdog (slice 6 instrumentation).
             # State is published on self._antpos_watchdog.state for
             # cross-thread read by run_steady_state's [CONFIDENCE] log.
