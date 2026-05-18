@@ -100,7 +100,13 @@ the sole gate for clockClass promotion.
 
 The engine talks directly to ptp4l's UDS from Python
 (`peppar_fix.pmc.PmcClient`), avoiding subprocess overhead for
-latency-sensitive transitions.  Pass `--pmc /var/run/ptp4l` to enable.
+latency-sensitive transitions.  The engine **auto-probes common
+ptp4l UDS paths at startup** (`/var/run/ptp4l`, `/var/run/ptp4l.0`,
+`/var/run/linuxptp/uds`, `/tmp/ptp4l`) and enables PMC management
+when one is found; pass `--pmc <path>` to override or point at a
+non-standard location.  The engine logs which path was discovered
+(or that none were found) as `[PMC] Auto-discovered ...` /
+`[PMC] No ptp4l UDS found ...` at startup.
 
 Transitions:
 

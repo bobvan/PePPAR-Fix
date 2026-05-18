@@ -5150,11 +5150,56 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
 
 # ── Servo helpers (conditional PTP import) ────────────────────────────── #
 
+# Common ptp4l UDS paths to probe when --pmc isn't passed explicitly.
+# Order matters — first existing socket wins.
+PMC_AUTO_PROBE_PATHS = [
+    "/var/run/ptp4l",            # linuxptp default
+    "/var/run/ptp4l.0",          # multi-instance convention
+    "/var/run/linuxptp/uds",     # some distro packaging
+    "/tmp/ptp4l",                # unprivileged installs
+]
+
+
+def _autodetect_pmc_path(candidates=None):
+    """Probe a list of common UDS paths and return the first one that
+    exists and is a socket.  Returns None when none match.
+
+    Writability is intentionally NOT checked here — PmcClient.open()
+    will surface that loudly on the first sendto if it fails.  An
+    operator-visible warning is the right place for "socket exists
+    but I can't write to it"; silently skipping would be worse.
+    """
+    import stat
+    if candidates is None:
+        candidates = PMC_AUTO_PROBE_PATHS
+    for path in candidates:
+        try:
+            st = os.stat(path)
+            if stat.S_ISSOCK(st.st_mode):
+                return path
+        except OSError:
+            continue
+    return None
+
+
 def _open_pmc(args):
-    """Open a PMC client if --pmc is configured.  Returns PmcClient or None."""
+    """Open a PMC client if --pmc is configured or auto-discoverable.
+
+    Returns PmcClient or None.  When --pmc isn't passed, probes
+    PMC_AUTO_PROBE_PATHS and uses the first existing UDS — lets
+    typical ptp4l installs work out of the box without wrapper config.
+    """
     pmc_path = getattr(args, 'pmc', None)
     if not pmc_path:
-        return None
+        pmc_path = _autodetect_pmc_path()
+        if pmc_path:
+            log.info("[PMC] Auto-discovered ptp4l UDS at %s — "
+                     "clockClass updates enabled", pmc_path)
+        else:
+            log.info("[PMC] No ptp4l UDS found at common paths "
+                     "(%s) — clockClass updates disabled",
+                     ", ".join(PMC_AUTO_PROBE_PATHS))
+            return None
     domain = getattr(args, 'pmc_domain', 0)
     try:
         from peppar_fix.pmc import PmcClient
