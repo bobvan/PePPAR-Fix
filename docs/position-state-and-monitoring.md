@@ -350,15 +350,27 @@ no-op and the engine logs a warning at startup.
 
 ## peppar-survey companion (optional)
 
-Independent process that reads `data/rinex/<uid>-*.obs` and writes
-`state/positions/<uid>.survey.toml`.  Triggered by systemd timer,
-`@daily` cron, or any external orchestrator.
+Independent process that runs an **external authoritative
+observation source** (OPUS, PRIDE, a quick NTRIP CORS-RTK check,
+RTKLIB, etc.) and writes `state/positions/<uid>.survey.toml`.
+Triggered by systemd timer, `@daily` cron, or any external
+orchestrator.
+
+**Naming convention** (load-bearing): "survey" is reserved for
+external authoritative observations.  The engine's own AntPosEst
+output is a **PPP solution** — that's what `.ppp.toml` holds, and
+the engine writes it directly.  peppar-survey cannot promote a
+PPP solution to a survey; that conflation was the root cause of
+the TimeHat mount_sn=1 incident 2026-05-18 and the corresponding
+`--from-ppp` backend has been removed.
 
 Implementation is intentionally underspecified — could be a
 Makefile, a shell script, or a Python wrapper around PRIDE / OPUS /
 RTKLIB.  The contract is just:
 
-- **Input:** zero or more `data/rinex/<uid>-*.obs` files.
+- **Input:** an external authoritative source — captured RINEX
+  submitted to OPUS or processed by PRIDE, a quick CORS-RTK fix
+  against a nearby reference, etc.
 - **Output:** atomic temp+rename write of
   `state/positions/<uid>.survey.toml` with current mount_sn tag,
   fresh ECEF, sigma, and provenance metadata.

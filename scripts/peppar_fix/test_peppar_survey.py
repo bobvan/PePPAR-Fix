@@ -1,4 +1,13 @@
-"""Tests for the peppar-survey CLI tool."""
+"""Tests for the peppar-survey CLI tool.
+
+The --from-ppp backend was removed 2026-05-18 — "survey" is reserved
+for external authoritative observation sources (OPUS / PRIDE / CORS)
+per docs/position-state-and-monitoring.md.  Until a real backend
+lands, peppar-survey errors out explicitly.
+
+These tests cover the surviving surfaces: UID auto-discovery and the
+no-backend-implemented error path.
+"""
 
 import json
 import os
@@ -15,15 +24,11 @@ if _SCRIPTS not in sys.path:
 
 import peppar_survey  # noqa: E402
 
-from peppar_fix.position_state import (  # noqa: E402
-    PositionState, load_ppp_state, load_survey_state, save_ppp_state,
-    utc_now_iso,
-)
-
 
 def _write_receiver_json(d, uid, mount_sn=0):
     with open(os.path.join(d, f"{uid}.json"), "w") as f:
-        json.dump({"unique_id": int(uid), "mount_sn": mount_sn}, f)
+        json.dump({"unique_id": int(uid) if str(uid).isdigit() else uid,
+                   "mount_sn": mount_sn}, f)
 
 
 class TestDiscoverSingleReceiverUid(unittest.TestCase):
@@ -39,6 +44,17 @@ class TestDiscoverSingleReceiverUid(unittest.TestCase):
             self.assertEqual(
                 peppar_survey.discover_single_receiver_uid(d), "12345")
 
+    def test_synthetic_uid_filename(self):
+        """Synthetic UIDs (e.g. synth_D30GD1PE) for receivers without
+        SEC-UNIQID should be discoverable just like decimal UIDs."""
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "synth_D30GD1PE.json"), "w") as f:
+                json.dump({"unique_id": "synth_D30GD1PE",
+                           "mount_sn": 0}, f)
+            self.assertEqual(
+                peppar_survey.discover_single_receiver_uid(d),
+                "synth_D30GD1PE")
+
     def test_multiple_receivers_returns_none(self):
         with tempfile.TemporaryDirectory() as d:
             _write_receiver_json(d, "12345")
@@ -49,7 +65,6 @@ class TestDiscoverSingleReceiverUid(unittest.TestCase):
     def test_bak_files_ignored(self):
         with tempfile.TemporaryDirectory() as d:
             _write_receiver_json(d, "12345")
-            # Mimic the lab convention .json.<tag>.bak.
             with open(os.path.join(d,
                       "12345.json.day0424.bak"), "w") as f:
                 f.write("{}")
@@ -61,118 +76,50 @@ class TestDiscoverSingleReceiverUid(unittest.TestCase):
             peppar_survey.discover_single_receiver_uid("/nope/nope"))
 
 
-class TestSurveyFromPpp(unittest.TestCase):
-
-    def setUp(self):
-        self.d = tempfile.mkdtemp()
-        self.uid = "55555"
-        # Seed a .ppp.toml as if the engine had been running.
-        src = PositionState(
-            mount_sn=3,
-            ecef_m=(157469.3814, -4756189.0729, 4232768.5274),
-            sigma_m=0.012,
-            updated=utc_now_iso(),
-            source="peppar_fix_engine AntPosEst",
-            extra={"n_epochs": 12345},
-        )
-        save_ppp_state(src, self.uid, positions_dir=self.d)
-
-    def tearDown(self):
-        import shutil
-        shutil.rmtree(self.d)
-
-    def test_writes_survey_toml(self):
-        rc = peppar_survey.survey_from_ppp(
-            self.uid, positions_dir=self.d)
-        self.assertEqual(rc, 0)
-        loaded = load_survey_state(self.uid, positions_dir=self.d)
-        self.assertIsNotNone(loaded)
-        self.assertEqual(loaded.kind, "survey")
-        self.assertEqual(loaded.mount_sn, 3)
-        self.assertAlmostEqual(loaded.sigma_m, 0.012, places=6)
-        self.assertEqual(loaded.ecef_m,
-                         (157469.3814, -4756189.0729, 4232768.5274))
-        self.assertIn("--from-ppp", loaded.source)
-
-    def test_provenance_extras_preserved(self):
-        peppar_survey.survey_from_ppp(self.uid, positions_dir=self.d)
-        loaded = load_survey_state(self.uid, positions_dir=self.d)
-        self.assertEqual(loaded.extra.get("from_ppp_n_epochs"), 12345)
-        self.assertIn("from_ppp_source", loaded.extra)
-        self.assertIn("from_ppp_updated", loaded.extra)
-
-    def test_atomic_write_no_tmp_leftover(self):
-        peppar_survey.survey_from_ppp(self.uid, positions_dir=self.d)
-        self.assertIn(f"{self.uid}.survey.toml", os.listdir(self.d))
-        self.assertNotIn(f"{self.uid}.survey.toml.tmp",
-                         os.listdir(self.d))
-
-    def test_missing_ppp_returns_nonzero(self):
-        # Wipe the .ppp.toml first.
-        os.remove(os.path.join(self.d, f"{self.uid}.ppp.toml"))
-        rc = peppar_survey.survey_from_ppp(
-            self.uid, positions_dir=self.d)
-        self.assertEqual(rc, 1)
-        # No .survey.toml created.
-        self.assertIsNone(load_survey_state(self.uid,
-                                            positions_dir=self.d))
-
-    def test_dry_run_does_not_write(self):
-        rc = peppar_survey.survey_from_ppp(
-            self.uid, positions_dir=self.d, dry_run=True)
-        self.assertEqual(rc, 0)
-        self.assertIsNone(load_survey_state(self.uid,
-                                            positions_dir=self.d))
-
-
-class TestMainArgsRouting(unittest.TestCase):
-    """End-to-end through the argparse main()."""
+class TestMainNoBackendError(unittest.TestCase):
+    """Until a real backend (PRIDE / OPUS / CORS / RTKLIB) lands,
+    peppar-survey errors out so operators don't think it silently
+    succeeded."""
 
     def setUp(self):
         self.recv = tempfile.mkdtemp()
         self.pos = tempfile.mkdtemp()
         self.uid = "77777"
         _write_receiver_json(self.recv, self.uid, mount_sn=2)
-        src = PositionState(
-            mount_sn=2,
-            ecef_m=(1.0, 2.0, 3.0),
-            sigma_m=0.05,
-            updated=utc_now_iso(),
-            source="test",
-        )
-        save_ppp_state(src, self.uid, positions_dir=self.pos)
 
     def tearDown(self):
         import shutil
         shutil.rmtree(self.recv)
         shutil.rmtree(self.pos)
 
-    def test_explicit_uid_from_ppp(self):
+    def test_explicit_uid_returns_error_no_backend(self):
         rc = peppar_survey.main([
             "--receiver-uid", self.uid,
             "--positions-dir", self.pos,
-            "--from-ppp",
-        ])
-        self.assertEqual(rc, 0)
-        self.assertIsNotNone(load_survey_state(
-            self.uid, positions_dir=self.pos))
-
-    def test_auto_discover_uid_from_ppp(self):
-        rc = peppar_survey.main([
             "--receivers-dir", self.recv,
-            "--positions-dir", self.pos,
-            "--from-ppp",
         ])
-        self.assertEqual(rc, 0)
-        self.assertIsNotNone(load_survey_state(
-            self.uid, positions_dir=self.pos))
+        self.assertEqual(rc, 2)
+        self.assertEqual(os.listdir(self.pos), [])
 
-    def test_no_backend_errors(self):
-        with self.assertRaises(SystemExit):
-            peppar_survey.main([
-                "--receiver-uid", self.uid,
+    def test_auto_discover_uid_returns_error_no_backend(self):
+        rc = peppar_survey.main([
+            "--positions-dir", self.pos,
+            "--receivers-dir", self.recv,
+        ])
+        self.assertEqual(rc, 2)
+        self.assertEqual(os.listdir(self.pos), [])
+
+    def test_no_receivers_returns_one(self):
+        empty = tempfile.mkdtemp()
+        try:
+            rc = peppar_survey.main([
                 "--positions-dir", self.pos,
+                "--receivers-dir", empty,
             ])
+            self.assertEqual(rc, 1)
+        finally:
+            import shutil
+            shutil.rmtree(empty)
 
 
 if __name__ == "__main__":
