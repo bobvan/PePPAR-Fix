@@ -198,6 +198,102 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ── Periodic writer ───────────────────────────────────────────────── #
+
+
+# Default cadence: write at most every 10 min.  More frequent writes
+# would still be correct but add filesystem churn for no useful
+# improvement in cold-start seed quality.
+DEFAULT_PPP_WRITE_PERIOD_S = 600.0
+
+# Sigma above this is "worse than NAV2's typical hAcc" — writing
+# would poison the next cold start because pick_most_confident would
+# pick our noisy snapshot over NAV2's tighter live fix.
+DEFAULT_PPP_WRITE_MAX_SIGMA_M = 1.0
+
+
+class PppStateWriter:
+    """Throttled + sigma-gated writer for state/positions/<uid>.ppp.toml.
+
+    Lives inside the engine's AntPosEstThread.  Engine calls
+    ``maybe_write(pos_ecef, sigma_3d, n_epochs)`` every AntPosEst
+    epoch; this class decides whether to actually persist based on:
+
+      - receiver_uid not None (else no-op for tests/dev)
+      - sigma_3d <= max_sigma_m (else skip, don't poison next start)
+      - time.monotonic() >= next_write_t (throttle)
+
+    ``time_fn`` and ``save_fn`` are injectable for testing.
+    """
+
+    def __init__(self,
+                 receiver_uid,
+                 mount_sn: int,
+                 *,
+                 period_s: float = DEFAULT_PPP_WRITE_PERIOD_S,
+                 max_sigma_m: float = DEFAULT_PPP_WRITE_MAX_SIGMA_M,
+                 positions_dir: Optional[str] = None,
+                 time_fn=None,
+                 save_fn=None):
+        import time as _time
+        self.receiver_uid = receiver_uid
+        self.mount_sn = int(mount_sn)
+        self.period_s = float(period_s)
+        self.max_sigma_m = float(max_sigma_m)
+        self.positions_dir = positions_dir
+        self._time_fn = time_fn or _time.monotonic
+        self._save_fn = save_fn or save_ppp_state
+        self._next_write_t: Optional[float] = None
+        # Diagnostic counters for the engine's status reporting.
+        self.n_writes = 0
+        self.n_skipped_sigma = 0
+        self.n_skipped_throttle = 0
+
+    def maybe_write(self, pos_ecef, sigma_3d: float,
+                    n_epochs: int) -> bool:
+        """Write a PositionState snapshot if the gates allow.
+
+        Returns True iff a write actually happened.
+        """
+        if self.receiver_uid is None:
+            return False
+        if sigma_3d > self.max_sigma_m:
+            self.n_skipped_sigma += 1
+            return False
+        now = self._time_fn()
+        if (self._next_write_t is not None
+                and now < self._next_write_t):
+            self.n_skipped_throttle += 1
+            return False
+        state = PositionState(
+            mount_sn=self.mount_sn,
+            ecef_m=(float(pos_ecef[0]), float(pos_ecef[1]),
+                    float(pos_ecef[2])),
+            sigma_m=float(sigma_3d),
+            updated=utc_now_iso(),
+            source="peppar_fix_engine AntPosEst",
+            kind="ppp",
+            extra={"n_epochs": int(n_epochs)},
+        )
+        try:
+            self._save_fn(state, self.receiver_uid,
+                          positions_dir=self.positions_dir)
+        except OSError as e:
+            log.warning("[PPP_STATE_WRITE] failed: %s", e)
+            # Re-arm the throttle anyway so we don't spin retrying
+            # on persistent filesystem failure.
+            self._next_write_t = now + self.period_s
+            return False
+        self.n_writes += 1
+        self._next_write_t = now + self.period_s
+        log.info(
+            "[PPP_STATE_WRITE] σ=%.4fm n_epochs=%d mount_sn=%d → "
+            "state/positions/%s.ppp.toml",
+            sigma_3d, n_epochs, self.mount_sn, self.receiver_uid,
+        )
+        return True
+
+
 # ── Selection ─────────────────────────────────────────────────────── #
 
 

@@ -6,6 +6,7 @@ import unittest
 
 from peppar_fix.position_state import (
     PositionState,
+    PppStateWriter,
     SURVEY_TIE_BREAK_RATIO,
     _format_toml,
     filter_current_mount,
@@ -382,6 +383,138 @@ class TestSeedFromStateFiles(unittest.TestCase):
         self.assertIsNone(seed_from_state_files(None,
                                                 positions_dir=self.pos_dir,
                                                 receivers_dir=self.recv_dir))
+
+
+class TestPppStateWriter(unittest.TestCase):
+    """The throttled + sigma-gated periodic writer used inside
+    AntPosEstThread.  Tested in isolation via injected time_fn +
+    save_fn."""
+
+    def setUp(self):
+        # Injectable clock that the test advances manually.
+        self.now = 1000.0
+        # Captured save_ppp_state calls.
+        self.saved = []
+
+    def _time_fn(self):
+        return self.now
+
+    def _save_fn(self, state, uid, positions_dir=None):
+        self.saved.append((state, uid))
+
+    def _make_writer(self, *, uid="9999", mount_sn=2,
+                     period_s=600.0, max_sigma_m=1.0):
+        return PppStateWriter(
+            receiver_uid=uid,
+            mount_sn=mount_sn,
+            period_s=period_s,
+            max_sigma_m=max_sigma_m,
+            time_fn=self._time_fn,
+            save_fn=self._save_fn,
+        )
+
+    def test_first_write_succeeds(self):
+        w = self._make_writer()
+        wrote = w.maybe_write((1.0, 2.0, 3.0), sigma_3d=0.05, n_epochs=10)
+        self.assertTrue(wrote)
+        self.assertEqual(len(self.saved), 1)
+        state, uid = self.saved[0]
+        self.assertEqual(uid, "9999")
+        self.assertEqual(state.mount_sn, 2)
+        self.assertEqual(state.ecef_m, (1.0, 2.0, 3.0))
+        self.assertAlmostEqual(state.sigma_m, 0.05)
+        self.assertEqual(state.kind, "ppp")
+        self.assertEqual(state.extra["n_epochs"], 10)
+        self.assertEqual(w.n_writes, 1)
+
+    def test_throttle_blocks_second_write_in_window(self):
+        w = self._make_writer(period_s=600.0)
+        w.maybe_write((1, 2, 3), 0.05, 10)
+        self.now += 100  # well under 600s
+        wrote = w.maybe_write((1, 2, 3), 0.05, 20)
+        self.assertFalse(wrote)
+        self.assertEqual(len(self.saved), 1)
+        self.assertEqual(w.n_skipped_throttle, 1)
+
+    def test_throttle_allows_write_after_period(self):
+        w = self._make_writer(period_s=600.0)
+        w.maybe_write((1, 2, 3), 0.05, 10)
+        self.now += 601.0
+        wrote = w.maybe_write((1, 2, 3), 0.05, 20)
+        self.assertTrue(wrote)
+        self.assertEqual(len(self.saved), 2)
+        self.assertEqual(self.saved[1][0].extra["n_epochs"], 20)
+
+    def test_sigma_gate_blocks_noisy_writes(self):
+        w = self._make_writer(max_sigma_m=1.0)
+        wrote = w.maybe_write((1, 2, 3), sigma_3d=2.5, n_epochs=10)
+        self.assertFalse(wrote)
+        self.assertEqual(w.n_skipped_sigma, 1)
+        self.assertEqual(len(self.saved), 0)
+        # And throttle was NOT armed — the next acceptable σ should
+        # fire immediately, not have to wait 600s.
+        wrote = w.maybe_write((1, 2, 3), sigma_3d=0.05, n_epochs=11)
+        self.assertTrue(wrote)
+
+    def test_sigma_at_boundary_writes(self):
+        w = self._make_writer(max_sigma_m=1.0)
+        self.assertTrue(
+            w.maybe_write((1, 2, 3), sigma_3d=1.0, n_epochs=10))
+
+    def test_uid_none_is_noop(self):
+        w = self._make_writer(uid=None)
+        wrote = w.maybe_write((1, 2, 3), sigma_3d=0.05, n_epochs=10)
+        self.assertFalse(wrote)
+        self.assertEqual(len(self.saved), 0)
+        # No counters bumped — it's a clean no-op.
+        self.assertEqual(w.n_writes, 0)
+        self.assertEqual(w.n_skipped_sigma, 0)
+        self.assertEqual(w.n_skipped_throttle, 0)
+
+    def test_save_oserror_logs_and_throttles(self):
+        """An OSError from save_fn is logged but doesn't crash; the
+        throttle still arms so we don't retry every epoch on a
+        persistent filesystem failure."""
+        def failing_save(state, uid, positions_dir=None):
+            raise OSError("disk full")
+
+        w = PppStateWriter(
+            receiver_uid="1",
+            mount_sn=0,
+            period_s=600.0,
+            max_sigma_m=1.0,
+            time_fn=self._time_fn,
+            save_fn=failing_save,
+        )
+        wrote = w.maybe_write((1, 2, 3), 0.05, 10)
+        self.assertFalse(wrote)
+        self.assertEqual(w.n_writes, 0)
+        # Next attempt in-window should be throttle-blocked.
+        self.now += 100
+        wrote2 = w.maybe_write((1, 2, 3), 0.05, 11)
+        self.assertFalse(wrote2)
+        self.assertEqual(w.n_skipped_throttle, 1)
+
+    def test_end_to_end_with_real_save(self):
+        """Integration: real save_fn writes a file readable by
+        load_ppp_state."""
+        with tempfile.TemporaryDirectory() as d:
+            w = PppStateWriter(
+                receiver_uid="42",
+                mount_sn=5,
+                period_s=600.0,
+                max_sigma_m=1.0,
+                positions_dir=d,
+                time_fn=self._time_fn,
+            )
+            wrote = w.maybe_write((100.0, 200.0, 300.0), 0.04, 999)
+            self.assertTrue(wrote)
+            loaded = load_ppp_state("42", positions_dir=d)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.mount_sn, 5)
+            self.assertAlmostEqual(loaded.ecef_m[0], 100.0)
+            self.assertAlmostEqual(loaded.sigma_m, 0.04)
+            self.assertEqual(loaded.extra.get("n_epochs"), 999)
 
 
 class TestUtcNowIso(unittest.TestCase):

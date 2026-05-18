@@ -1941,7 +1941,10 @@ class AntPosEstThread(threading.Thread):
                  nav2_anchor_enabled=True,
                  nav2_anchor_max_hacc_m=3.0,
                  pin_position=False,
-                 nav_sig_store=None):
+                 nav_sig_store=None,
+                 receiver_uid=None,
+                 ppp_state_write_period_s=600.0,
+                 ppp_state_write_max_sigma_m=1.0):
         super().__init__(daemon=True, name="AntPosEst")
         # Phase 3 wind-up (Wu 1993): per-SV cumulative wind-up tracker
         # + carrier-phase correction applied before filter.update().
@@ -2093,6 +2096,22 @@ class AntPosEstThread(threading.Thread):
         self._n_epochs = 0
         self._prev_t = None
         self._best_sigma = position_sigma_3d(self._filt.P)
+        # Periodic .ppp.toml snapshot — see
+        # docs/position-state-and-monitoring.md.  When receiver_uid is
+        # None the writer's maybe_write is a no-op (test/development).
+        # mount_sn is cached at startup; auto-move bumps trigger
+        # restart so the next process re-reads.
+        from peppar_fix.position_state import (
+            PppStateWriter, load_current_mount_sn,
+        )
+        mount_sn = (load_current_mount_sn(receiver_uid)
+                    if receiver_uid is not None else 0)
+        self._ppp_writer = PppStateWriter(
+            receiver_uid=receiver_uid,
+            mount_sn=mount_sn,
+            period_s=float(ppp_state_write_period_s),
+            max_sigma_m=float(ppp_state_write_max_sigma_m),
+        )
         self._nav2_tension_streak = 0  # consecutive high-tension checks
         self._nav2_cooldown_until = 0  # epoch number: skip checks until this
         # Per-SV ambiguity state machine + the three monitors that
@@ -3481,6 +3500,10 @@ class AntPosEstThread(threading.Thread):
             # Position quality
             sigma_3d = position_sigma_3d(filt.P)
             pos_ecef = filt.x[:3].copy()
+            # Periodic .ppp.toml snapshot for next-startup warm seed.
+            # Throttled + sigma-gated by PppStateWriter; no-op when
+            # receiver_uid is None.
+            self._ppp_writer.maybe_write(pos_ecef, sigma_3d, self._n_epochs)
             # Two separate counts drive the two thresholds:
             #   n_nl_fixed   — union of ANCHORING + ANCHORED.
             #                  Drives CONVERGING ↔ ANCHORING (fallback:
@@ -8199,6 +8222,7 @@ def run(args):
                 getattr(args, "nav2_anchor_max_hacc_m", 3.0)),
             pin_position=bool(getattr(args, "pin_position", False)),
             nav_sig_store=nav_sig_store,
+            receiver_uid=getattr(args, 'receiver_unique_id', None),
         )
         # Phase B NAV-SIG L0 admission gate — attach store + flags to
         # the thread so its fresh-PPPFilter path (warm-start, not
