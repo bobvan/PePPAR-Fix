@@ -7892,16 +7892,23 @@ def run(args):
     # Priority order:
     #   1. --known-pos config — operator override (sigma_m=0, treated
     #      as anchor-quality).
-    #   2. NAV2 seed — fixType=3 + hAcc < 5 m (typical lab path).
-    #   3. LS-init bootstrap — fallback for the regression harness
+    #   2. State files — state/positions/<uid>.{ppp,survey}.toml,
+    #      most-confident wins (smallest σ; 2x tie-break to survey).
+    #      Skipped via --ignore-arp-state (or per-file
+    #      --ignore-ppp / --ignore-survey).  Per
+    #      docs/position-state-and-monitoring.md.
+    #   3. NAV2 seed — fixType=3 + hAcc < 5 m (typical lab path).
+    #   4. LS-init bootstrap — fallback for the regression harness
     #      and any cold-start where NAV2 isn't available within 60s.
     #
     # Receiver state file (state/receivers/<uid>.json) is no longer
     # read for position — it's identity-only now (TCXO calibration,
-    # qErr characterization, slot mapping).  The position field, if
-    # present from older runs, is logged for diagnostic comparison
-    # only and is NOT used to seed the filter.  Per Q3 of the
-    # I-133648-main consensus call.
+    # qErr characterization, slot mapping, mount_id).  The
+    # last_known_position field, if present from older runs, is
+    # logged for diagnostic comparison only and is NOT used to seed
+    # the filter.  Per Q3 of the I-133648-main consensus call.
+    # The new state/positions/<uid>.*.toml files supersede that role
+    # with explicit single-writer authority.
     known_ecef = None
     pos_source = None
     pos_sigma_m = None
@@ -7930,7 +7937,30 @@ def run(args):
         if uid is not None:
             save_position_to_receiver(uid, known_ecef, 0.0, "known_pos")
 
-    # 2. NAV2 seed — the typical lab path.
+    # 2. State files — state/positions/<uid>.{ppp,survey}.toml.
+    # Most-confident wins (smallest σ), with a 2x tie-break to .survey.toml.
+    # mount_id mismatch → stale → filtered out.  See
+    # docs/position-state-and-monitoring.md.
+    if known_ecef is None and not args.ignore_arp_state:
+        from peppar_fix.position_state import seed_from_state_files
+        picked = seed_from_state_files(
+            uid,
+            ignore_ppp=args.ignore_ppp,
+            ignore_survey=args.ignore_survey,
+        )
+        if picked is not None:
+            known_ecef = np.array(picked.ecef_m)
+            pos_sigma_m = picked.sigma_m
+            pos_source = (f"{picked.kind} state file "
+                          f"(σ={picked.sigma_m:.3f}m, "
+                          f"mount_id={picked.mount_id})")
+            ape_sm.transition(
+                AntPosEstState.VERIFYING,
+                f"{picked.kind} state σ={picked.sigma_m:.3f}m")
+            log.info("Position from %s: source=%s updated=%s",
+                     pos_source, picked.source, picked.updated)
+
+    # 3. NAV2 seed — the typical lab path.
     if known_ecef is None and nav2_store is not None:
         seed = wait_for_nav2_seed(nav2_store, stop_event,
                                   timeout_s=60.0, hacc_max_m=5.0)
@@ -8027,10 +8057,12 @@ def run(args):
         #     IS the LS validation, just done by the receiver's own
         #     SPP solver instead of ours.  Per I-024532-charlie #3.
         #
-        # Receiver-state position-read is no longer a seeding path
-        # (file is identity-only now), so the historical
-        # _TRUSTED_POSITION_SIGMA_M trust-skip is mostly vestigial —
-        # it only triggers when --known-pos is used (sigma=0 < threshold).
+        # State-file seeds (.ppp.toml / .survey.toml) get the same
+        # σ-based trust treatment as --known-pos and NAV2.  A
+        # .survey.toml with σ ≈ 1 cm sails past _TRUSTED_POSITION_SIGMA_M
+        # and skips validation; a .ppp.toml with σ ≈ half a metre falls
+        # through to the LS validation below.  Per
+        # docs/position-state-and-monitoring.md.
         seeded_from_nav2 = (pos_source is not None
                             and pos_source.startswith("NAV2"))
         skip_validation = (
@@ -8360,6 +8392,17 @@ Two-phase operation:
     pos = ap.add_argument_group("Position")
     pos.add_argument("--known-pos",
                      help="Known position as lat,lon,alt (skips bootstrap)")
+    pos.add_argument("--ignore-ppp", action="store_true",
+                     help="Don't seed position from state/positions/<uid>.ppp.toml.  "
+                          "Per docs/position-state-and-monitoring.md.")
+    pos.add_argument("--ignore-survey", action="store_true",
+                     help="Don't seed position from "
+                          "state/positions/<uid>.survey.toml.  "
+                          "Per docs/position-state-and-monitoring.md.")
+    pos.add_argument("--ignore-arp-state", action="store_true",
+                     help="Shorthand for --ignore-ppp + --ignore-survey.  "
+                          "Use to force a fresh NAV2/bootstrap seed even "
+                          "when on-disk state would otherwise be picked.")
     pos.add_argument("--pin-position", action="store_true",
                      help="Disable the slow AntPosEst→known_ecef blend in "
                           "run_steady_state.  Use when --known-pos is a "

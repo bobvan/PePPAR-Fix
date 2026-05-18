@@ -9,10 +9,12 @@ from peppar_fix.position_state import (
     SURVEY_TIE_BREAK_RATIO,
     _format_toml,
     filter_current_mount,
+    load_current_mount_id,
     load_ppp_state,
     load_survey_state,
     pick_most_confident,
     save_ppp_state,
+    seed_from_state_files,
     utc_now_iso,
 )
 
@@ -232,6 +234,154 @@ class TestFormatToml(unittest.TestCase):
         self.assertIn("active = true", out)
         self.assertIn('method = "PPP-AR"', out)
         self.assertIn("ratio = 1.7", out)
+
+
+class TestLoadCurrentMountId(unittest.TestCase):
+
+    def test_uid_none_returns_zero(self):
+        self.assertEqual(load_current_mount_id(None), 0)
+
+    def test_no_receiver_file_returns_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(
+                load_current_mount_id("nope", receivers_dir=d), 0)
+
+    def test_reads_mount_id_from_receiver_state(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "12345.json"), "w") as f:
+                json.dump({"unique_id": 12345, "mount_id": 7}, f)
+            self.assertEqual(
+                load_current_mount_id("12345", receivers_dir=d), 7)
+
+    def test_missing_mount_id_field_returns_zero(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "12345.json"), "w") as f:
+                json.dump({"unique_id": 12345}, f)
+            self.assertEqual(
+                load_current_mount_id("12345", receivers_dir=d), 0)
+
+    def test_non_int_mount_id_returns_zero(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "12345.json"), "w") as f:
+                json.dump({"unique_id": 12345, "mount_id": "garbage"}, f)
+            self.assertEqual(
+                load_current_mount_id("12345", receivers_dir=d), 0)
+
+
+class TestSeedFromStateFiles(unittest.TestCase):
+
+    def setUp(self):
+        import json
+        self.recv_dir = tempfile.mkdtemp()
+        self.pos_dir = tempfile.mkdtemp()
+        self.uid = "55555"
+        # Default: mount_id=3
+        with open(os.path.join(self.recv_dir, f"{self.uid}.json"), "w") as f:
+            json.dump({"unique_id": int(self.uid), "mount_id": 3}, f)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.recv_dir)
+        shutil.rmtree(self.pos_dir)
+
+    def _write_state(self, name, mount_id, sigma_m, kind):
+        s = PositionState(
+            mount_id=mount_id,
+            ecef_m=(1.0, 2.0, 3.0),
+            sigma_m=sigma_m,
+            updated=utc_now_iso(),
+            source=f"test-{kind}",
+            kind="ppp" if kind == "ppp" else "ppp",  # save_ppp_state requires ppp
+        )
+        if kind == "ppp":
+            save_ppp_state(s, self.uid, positions_dir=self.pos_dir)
+        else:
+            # Write the survey file directly (peppar-survey is hypothetical)
+            survey_path = os.path.join(self.pos_dir,
+                                       f"{self.uid}.survey.toml")
+            with open(survey_path, "w") as f:
+                f.write(
+                    f'mount_id = {mount_id}\n'
+                    f'ecef_m = [1.0, 2.0, 3.0]\n'
+                    f'sigma_m = {sigma_m}\n'
+                    f'updated = "{s.updated}"\n'
+                    f'source = "test-survey"\n'
+                )
+
+    def test_no_files_returns_none(self):
+        out = seed_from_state_files(self.uid,
+                                    positions_dir=self.pos_dir,
+                                    receivers_dir=self.recv_dir)
+        self.assertIsNone(out)
+
+    def test_picks_ppp_when_only_ppp(self):
+        self._write_state("ppp", mount_id=3, sigma_m=0.05, kind="ppp")
+        out = seed_from_state_files(self.uid,
+                                    positions_dir=self.pos_dir,
+                                    receivers_dir=self.recv_dir)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.kind, "ppp")
+
+    def test_picks_survey_when_only_survey(self):
+        self._write_state("survey", mount_id=3, sigma_m=0.05, kind="survey")
+        out = seed_from_state_files(self.uid,
+                                    positions_dir=self.pos_dir,
+                                    receivers_dir=self.recv_dir)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.kind, "survey")
+
+    def test_picks_survey_when_both_comparable(self):
+        self._write_state("ppp", mount_id=3, sigma_m=0.020, kind="ppp")
+        self._write_state("survey", mount_id=3, sigma_m=0.025, kind="survey")
+        out = seed_from_state_files(self.uid,
+                                    positions_dir=self.pos_dir,
+                                    receivers_dir=self.recv_dir)
+        self.assertEqual(out.kind, "survey")
+
+    def test_stale_mount_filtered(self):
+        # Engine state says mount_id=3, files tagged with mount_id=2
+        self._write_state("ppp", mount_id=2, sigma_m=0.01, kind="ppp")
+        self._write_state("survey", mount_id=2, sigma_m=0.005, kind="survey")
+        out = seed_from_state_files(self.uid,
+                                    positions_dir=self.pos_dir,
+                                    receivers_dir=self.recv_dir)
+        self.assertIsNone(out)
+
+    def test_ignore_ppp_skips_ppp_file(self):
+        self._write_state("ppp", mount_id=3, sigma_m=0.01, kind="ppp")
+        self._write_state("survey", mount_id=3, sigma_m=0.05, kind="survey")
+        out = seed_from_state_files(self.uid,
+                                    ignore_ppp=True,
+                                    positions_dir=self.pos_dir,
+                                    receivers_dir=self.recv_dir)
+        self.assertEqual(out.kind, "survey")
+
+    def test_ignore_survey_skips_survey_file(self):
+        self._write_state("ppp", mount_id=3, sigma_m=0.05, kind="ppp")
+        self._write_state("survey", mount_id=3, sigma_m=0.01, kind="survey")
+        out = seed_from_state_files(self.uid,
+                                    ignore_survey=True,
+                                    positions_dir=self.pos_dir,
+                                    receivers_dir=self.recv_dir)
+        self.assertEqual(out.kind, "ppp")
+
+    def test_ignore_both_returns_none(self):
+        self._write_state("ppp", mount_id=3, sigma_m=0.05, kind="ppp")
+        self._write_state("survey", mount_id=3, sigma_m=0.05, kind="survey")
+        out = seed_from_state_files(self.uid,
+                                    ignore_ppp=True, ignore_survey=True,
+                                    positions_dir=self.pos_dir,
+                                    receivers_dir=self.recv_dir)
+        self.assertIsNone(out)
+
+    def test_uid_none_returns_none(self):
+        # Doesn't even try to read.
+        self.assertIsNone(seed_from_state_files(None,
+                                                positions_dir=self.pos_dir,
+                                                receivers_dir=self.recv_dir))
 
 
 class TestUtcNowIso(unittest.TestCase):

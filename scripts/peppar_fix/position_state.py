@@ -223,6 +223,73 @@ def filter_current_mount(states: list[Optional[PositionState]],
     return out
 
 
+def load_current_mount_id(uid,
+                          receivers_dir: Optional[str] = None) -> int:
+    """Read the receiver's current ``mount_id`` from
+    ``state/receivers/<uid>.json``.  Returns 0 when the file is absent
+    or the field is missing — this is the "first run after this
+    feature lands" default and matches the fresh-install case.
+
+    The mount_id lives in receivers/, not positions/, because it's a
+    property of "which antenna is this receiver currently connected
+    to" — receiver-side identity that the engine writes.
+    """
+    if uid is None:
+        return 0
+    try:
+        from peppar_fix.receiver_state import load_receiver_state
+    except ImportError:  # pragma: no cover — should never happen in production
+        log.warning("Cannot import receiver_state; defaulting mount_id=0")
+        return 0
+    rstate = load_receiver_state(uid, state_dir=receivers_dir)
+    if not rstate:
+        return 0
+    try:
+        return int(rstate.get("mount_id", 0))
+    except (TypeError, ValueError):
+        log.warning("mount_id in receiver state is not an int; "
+                    "defaulting to 0")
+        return 0
+
+
+def seed_from_state_files(
+    uid,
+    *,
+    ignore_ppp: bool = False,
+    ignore_survey: bool = False,
+    positions_dir: Optional[str] = None,
+    receivers_dir: Optional[str] = None,
+) -> Optional[PositionState]:
+    """One-shot helper for engine startup.  Reads .ppp.toml and
+    .survey.toml, filters by current mount_id, returns the
+    most-confident state (or None when no usable state exists).
+
+    Caller behavior on None: fall back to NAV2 / bootstrap.
+
+    Args:
+        uid: receiver unique_id (int or str).  None disables the
+            whole helper (returns None).
+        ignore_ppp: skip the .ppp.toml file (CLI --ignore-ppp).
+        ignore_survey: skip the .survey.toml file (CLI --ignore-survey).
+        positions_dir: override DEFAULT_POSITIONS_DIR (for testing).
+        receivers_dir: passed to load_current_mount_id for mount_id
+            lookup (for testing).
+
+    Returns:
+        Most-confident PositionState, or None.
+    """
+    if uid is None:
+        return None
+    current_mount_id = load_current_mount_id(uid, receivers_dir=receivers_dir)
+    candidates: list[Optional[PositionState]] = []
+    if not ignore_ppp:
+        candidates.append(load_ppp_state(uid, positions_dir=positions_dir))
+    if not ignore_survey:
+        candidates.append(load_survey_state(uid, positions_dir=positions_dir))
+    usable = filter_current_mount(candidates, current_mount_id)
+    return pick_most_confident(usable)
+
+
 def pick_most_confident(states: list[PositionState]
                         ) -> Optional[PositionState]:
     """Choose the most-confident PositionState from the candidates.
