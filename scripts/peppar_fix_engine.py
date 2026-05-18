@@ -1941,7 +1941,10 @@ class AntPosEstThread(threading.Thread):
                  nav2_anchor_enabled=True,
                  nav2_anchor_max_hacc_m=3.0,
                  pin_position=False,
-                 nav_sig_store=None):
+                 nav_sig_store=None,
+                 receiver_uid=None,
+                 ppp_state_write_period_s=600.0,
+                 ppp_state_write_max_sigma_m=1.0):
         super().__init__(daemon=True, name="AntPosEst")
         # Phase 3 wind-up (Wu 1993): per-SV cumulative wind-up tracker
         # + carrier-phase correction applied before filter.update().
@@ -2093,6 +2096,27 @@ class AntPosEstThread(threading.Thread):
         self._n_epochs = 0
         self._prev_t = None
         self._best_sigma = position_sigma_3d(self._filt.P)
+        # Periodic .ppp.toml snapshot — see
+        # docs/position-state-and-monitoring.md.  When receiver_uid is
+        # None the writer's maybe_write is a no-op (test/development).
+        # mount_sn is cached at startup; auto-move bumps trigger
+        # restart so the next process re-reads.
+        from peppar_fix.position_state import (
+            AntPosEstWatchdog, PppStateWriter, load_current_mount_sn,
+        )
+        mount_sn = (load_current_mount_sn(receiver_uid)
+                    if receiver_uid is not None else 0)
+        self._ppp_writer = PppStateWriter(
+            receiver_uid=receiver_uid,
+            mount_sn=mount_sn,
+            period_s=float(ppp_state_write_period_s),
+            max_sigma_m=float(ppp_state_write_max_sigma_m),
+        )
+        # Running-mean AntPosEst-vs-pin watchdog (slice 6).  Pin set
+        # below to the engine's known_ecef seed.  run_steady_state's
+        # [CONFIDENCE] log reads the published state cross-thread.
+        self._antpos_watchdog = AntPosEstWatchdog()
+        self._antpos_watchdog.set_pin(known_ecef)
         self._nav2_tension_streak = 0  # consecutive high-tension checks
         self._nav2_cooldown_until = 0  # epoch number: skip checks until this
         # Per-SV ambiguity state machine + the three monitors that
@@ -2259,7 +2283,20 @@ class AntPosEstThread(threading.Thread):
             pass
 
     def _check_nav2(self, filt, mw, nl, pos_ecef, sigma_3d, n_nl_fixed):
-        """Horizontal antenna-movement watchdog using NAV2 as second opinion.
+        """**Disabled in slice 5 of docs/position-state-and-monitoring.md.**
+
+        The old watchdog (10 m horizontal sustained over N checks →
+        unfix NLs + reseed filter from NAV2) conflicts with the new
+        design's slew (<1 m) / step (≥1 m → mount_sn bump + clean
+        shutdown) action model in slice 7.  Keeping both action paths
+        running would let them race / cancel each other.
+
+        Code preserved as reference for slice 7's replacement; the
+        new [CONFIDENCE …] periodic log in run_steady_state surfaces
+        the same NAV2-vs-pin displacement so operators see it during
+        the slice 5-to-7 gap.
+
+        Horizontal antenna-movement watchdog using NAV2 as second opinion.
 
         NAV2's unique value is independence from our PPP filter — an
         in-receiver single-epoch code-only fix, unaffected by our float
@@ -2288,6 +2325,10 @@ class AntPosEstThread(threading.Thread):
         checks.  On reset, reseed lat/lon from NAV2, keep the filter's
         altitude (NAV2 altitude is noisier than NAV2 horizontal).
         """
+        # Slice 5 disable — see docstring.  Returns immediately so no
+        # action is taken; old logic below preserved for slice 7
+        # reference.
+        return
         opinion = self._nav2_store.get_opinion(max_age_s=30.0)
         if opinion is None:
             return
@@ -3481,6 +3522,14 @@ class AntPosEstThread(threading.Thread):
             # Position quality
             sigma_3d = position_sigma_3d(filt.P)
             pos_ecef = filt.x[:3].copy()
+            # Periodic .ppp.toml snapshot for next-startup warm seed.
+            # Throttled + sigma-gated by PppStateWriter; no-op when
+            # receiver_uid is None.
+            self._ppp_writer.maybe_write(pos_ecef, sigma_3d, self._n_epochs)
+            # AntPosEst-vs-pin watchdog (slice 6 instrumentation).
+            # State is published on self._antpos_watchdog.state for
+            # cross-thread read by run_steady_state's [CONFIDENCE] log.
+            self._antpos_watchdog.update(pos_ecef, sigma_3d)
             # Two separate counts drive the two thresholds:
             #   n_nl_fixed   — union of ANCHORING + ANCHORED.
             #                  Drives CONVERGING ↔ ANCHORING (fallback:
@@ -3951,6 +4000,28 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     log.info("=== Phase 2: Steady state (FixedPosFilter) ===")
     lat, lon, alt = ecef_to_lla(known_ecef[0], known_ecef[1], known_ecef[2])
     log.info(f"Position: {lat:.6f}, {lon:.6f}, {alt:.1f}m")
+
+    # Cache mount_sn for the [CONFIDENCE] periodic log line.  See
+    # docs/position-state-and-monitoring.md.  Defaults to 0 when the
+    # receiver state file is absent or missing the field.
+    from peppar_fix.position_state import (
+        WatchdogActor, bump_mount_sn, compute_horizontal_displacement,
+        invalidate_ppp_state, load_current_mount_sn,
+    )
+    from peppar_fix.confidence import (
+        ClockClassPromoter, compute_frequency_confidence,
+        compute_phase_confidence, compute_total_confidence,
+    )
+    _confidence_mount_sn = load_current_mount_sn(
+        getattr(args, 'receiver_unique_id', None))
+    # Slice 7 — slew/step action.  Consumed at the [CONFIDENCE]
+    # cadence; converts watchdog displacement into action.
+    _watchdog_actor = WatchdogActor()
+    # Slice 9 — confidence-driven clockClass promoter with hysteresis.
+    # Starts in "freerun" matching ptp4l's initial state; promotes
+    # as σ_total drops through the rising thresholds, demotes as it
+    # rises through the (looser) falling thresholds.
+    _clock_class_promoter = ClockClassPromoter("freerun")
 
     # Compute METAR-seeded ZTD residual when --init-ztd-from-met is set.
     # Default 0.0 preserves prior behavior.  See I-024942 and 2026-05-04
@@ -4822,6 +4893,183 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 qvir = servo_ctx.get('qvir') if servo_ctx else None
                 log.info("[STATUS] %s", format_status(ape_sm, dfe_sm,
                          ticc_ok=ticc_ok, qvir=qvir))
+
+            # [CONFIDENCE_*] periodic log lines — see slice 9 of
+            # docs/position-state-and-monitoring.md.  Three sibling
+            # lines: phase, freq, total.  Total drives clockClass.
+            if n_epochs % 60 == 0:
+                # Pull NAV2 displacement + hAcc (for log + slice-7 actor).
+                _nav2_disp_3d = _nav2_disp_h = _nav2_disp_v = None
+                _nav2_h_acc = None
+                _nav2_ecef_for_actor = None
+                if nav2_store is not None:
+                    _op = nav2_store.get_opinion(max_age_s=30.0)
+                    if _op is not None:
+                        _nav2_disp_3d, _nav2_disp_h, _nav2_disp_v = (
+                            compute_horizontal_displacement(
+                                tuple(known_ecef),
+                                tuple(_op['ecef'])))
+                        _nav2_h_acc = _op.get('h_acc_m')
+                        _nav2_ecef_for_actor = tuple(_op['ecef'])
+                # AntPosEst watchdog snapshot — read cross-thread.
+                _antpos_state = {"active": False}
+                _antpos_log_str = "antpos=cold"
+                if ape_thread is not None:
+                    _aw = getattr(ape_thread, '_antpos_watchdog', None)
+                    if _aw is not None:
+                        _antpos_state = _aw.state
+                        if _antpos_state["active"]:
+                            _antpos_log_str = (
+                                f"antpos_disp_h={_antpos_state['displ_h_m']:.4f}m "
+                                f"antpos_disp_v={_antpos_state['displ_v_m']:.4f}m "
+                                f"antpos_n={_antpos_state['n_in_mean']}")
+                        elif _antpos_state.get("sigma_3d_m") is not None:
+                            _antpos_log_str = (
+                                f"antpos=unarmed (σ_epoch="
+                                f"{_antpos_state['sigma_3d_m']:.3f}m)")
+
+                # Phase / freq / total confidence — slice 9.
+                _phase = compute_phase_confidence(
+                    antpos_state=_antpos_state,
+                    seed_sigma_m=pos_sigma_m,
+                    nav2_h_acc_m=_nav2_h_acc,
+                )
+                _scheduler = (servo_ctx.get('scheduler')
+                              if servo_ctx is not None else None)
+                _settled = (bool(_scheduler and not _scheduler._converging)
+                            if _scheduler is not None else False)
+                _freq = compute_frequency_confidence(
+                    dt_rx_sigma_ns=dt_rx_sigma,
+                    scheduler_settled=_settled,
+                )
+                _total = compute_total_confidence(_phase, _freq)
+
+                # NAV2 line stays in the phase log for context;
+                # operators rely on it to understand the source choice.
+                _nav2_str = ("nav2=stale" if _nav2_disp_3d is None
+                             else (f"nav2_disp_h={_nav2_disp_h:.3f}m "
+                                   f"nav2_disp_v={_nav2_disp_v:.3f}m "
+                                   f"nav2_hAcc={_nav2_h_acc or 0:.2f}m"))
+
+                def _fmt_ns(v):
+                    if v == float('inf'):
+                        return "inf"
+                    return f"{v:.3f}ns"
+
+                log.info(
+                    "[CONFIDENCE_PHASE] sigma=%s pos_sigma=%.4fm "
+                    "source=%s %s %s mount_sn=%d mode=pinned",
+                    _fmt_ns(_phase.sigma_ns),
+                    (_phase.pos_sigma_m
+                     if _phase.pos_sigma_m != float('inf') else 0.0),
+                    _phase.source, _nav2_str, _antpos_log_str,
+                    _confidence_mount_sn,
+                )
+                log.info(
+                    "[CONFIDENCE_FREQ] sigma=%s dt_rx_sigma=%s "
+                    "scheduler=%s",
+                    _fmt_ns(_freq.sigma_ns),
+                    _fmt_ns(_freq.dt_rx_sigma_ns),
+                    "settled" if _settled else "converging",
+                )
+                # Drive clockClass through the hysteresis-aware promoter.
+                # Re-sync promoter's internal state from ctx in case
+                # an external path (e.g., SSR-stale → freerun, PHC
+                # diverge, holdover entry) set the class out-of-band.
+                _current_class = (
+                    servo_ctx.get('pmc_announced')
+                    if servo_ctx is not None else None)
+                if (_current_class is not None
+                        and _current_class != _clock_class_promoter.current_class):
+                    _clock_class_promoter.override_class(_current_class)
+                _target_class = _clock_class_promoter.evaluate(
+                    _total.sigma_ns)
+                log.info(
+                    "[CONFIDENCE_TOTAL] sigma=%s class_target=%s "
+                    "class_current=%s",
+                    _fmt_ns(_total.sigma_ns),
+                    _target_class,
+                    _current_class or "n/a",
+                )
+                # Promote/demote ptp4l clockClass if our target
+                # changed.  Skip in --freerun mode (no PHC discipline);
+                # skip when the engine has set holdover externally
+                # (event-driven transition outside the promoter's
+                # σ-driven authority).
+                if (not args.freerun and servo_ctx is not None
+                        and _current_class != "holdover"):
+                    if _current_class != _target_class:
+                        _set_clock_class(servo_ctx, _target_class)
+                        # Keep promoter's state in sync — _set_clock_class
+                        # may have logged or vetoed, but we already wrote
+                        # our decision into ctx.  Future cycles continue
+                        # from this state.
+
+                # Slice 7 — slew/step decision based on the
+                # displacements just logged.  See
+                # docs/position-state-and-monitoring.md.
+                _antpos_state_for_actor = (
+                    ape_thread._antpos_watchdog.state
+                    if (ape_thread is not None
+                        and getattr(ape_thread, '_antpos_watchdog', None)
+                        is not None)
+                    else {"active": False})
+                _nav2_for_actor = None
+                _nav2_ecef_for_actor = None
+                if nav2_store is not None:
+                    _op_a = nav2_store.get_opinion(max_age_s=30.0)
+                    if _op_a is not None:
+                        _nav2_d3, _, _ = compute_horizontal_displacement(
+                            tuple(known_ecef), tuple(_op_a['ecef']))
+                        _nav2_for_actor = _nav2_d3
+                        _nav2_ecef_for_actor = tuple(_op_a['ecef'])
+                _decision = _watchdog_actor.evaluate(
+                    t_now=time.monotonic(),
+                    nav2_disp_3d_m=_nav2_for_actor,
+                    nav2_ecef_m=_nav2_ecef_for_actor,
+                    antpos_state=_antpos_state_for_actor,
+                )
+                _act = _decision["action"]
+                if _act == "step_pending":
+                    log.warning(
+                        "[WATCHDOG_STEP_PENDING] source=%s displ=%.3fm "
+                        "remaining_s=%.0f — sustained step-class "
+                        "bark; auto-move pending",
+                        _decision["source"], _decision["displ_m"],
+                        _decision["remaining_s"],
+                    )
+                elif _act == "slew":
+                    _new_pin = np.array(_decision["new_pin_ecef"])
+                    _old_pin = tuple(filt.pos)
+                    filt.pos = _new_pin
+                    if (ape_thread is not None
+                            and getattr(ape_thread, '_antpos_watchdog',
+                                        None) is not None):
+                        ape_thread._antpos_watchdog.set_pin(_new_pin)
+                    known_ecef = _new_pin
+                    log.warning(
+                        "[WATCHDOG_SLEW] source=%s displ=%.3fm "
+                        "old_pin=(%.4f,%.4f,%.4f) → "
+                        "new_pin=(%.4f,%.4f,%.4f) mount_sn=%d",
+                        _decision["source"], _decision["displ_m"],
+                        _old_pin[0], _old_pin[1], _old_pin[2],
+                        _new_pin[0], _new_pin[1], _new_pin[2],
+                        _confidence_mount_sn,
+                    )
+                elif _act == "step":
+                    _uid = getattr(args, 'receiver_unique_id', None)
+                    _new_sn = bump_mount_sn(_uid)
+                    invalidate_ppp_state(_uid)
+                    log.error(
+                        "[WATCHDOG_STEP_AUTO_MOVE] source=%s displ=%.3fm "
+                        "held_s=%.0f old_mount_sn=%d new_mount_sn=%d "
+                        "— invalidated .ppp.toml; shutting down for "
+                        "wrapper respawn",
+                        _decision["source"], _decision["displ_m"],
+                        _decision["step_held_s"],
+                        _confidence_mount_sn, _new_sn,
+                    )
+                    stop_event.set()
             now = time.time()
             if now - last_skip_log >= 60.0:
                 log.info(f"  Skip stats: {skip_stats}")
@@ -4854,19 +5102,26 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             }
         if servo_ctx is not None:
             _cleanup_servo(servo_ctx)
+        # The runtime summary + I-145915 bake-in summary live in
+        # the finally block so they fire on ANY exit path:
+        #   - Normal end-of-run (--duration completed)
+        #   - SIGTERM via on_signal → stop_event.set()
+        #   - SIGINT / KeyboardInterrupt
+        #   - Unhandled exception (still emits before exception
+        #     propagates up; bake-in numbers preserved for the
+        #     orchestrator's restart cycle)
+        elapsed = time.time() - start_time
+        log.info(f"Steady state complete: {elapsed:.0f}s, {n_epochs} epochs")
+        rs = resid_log_stats
+        log.info(
+            "[FIXEDPOS_RESID_SUMMARY] epochs=%d active_trips=%d "
+            "proposed_trips=%d both_alarmed=%d only_active=%d "
+            "pr_disturbances=%d "
+            "(only_active = trips that would have STAYED under proposed gate)",
+            rs['epochs'], rs['active_trips'], rs['proposed_trips'],
+            rs['both_alarmed'], rs['only_active'], rs['pr_disturbances'],
+        )
 
-    elapsed = time.time() - start_time
-    log.info(f"Steady state complete: {elapsed:.0f}s, {n_epochs} epochs")
-    # I-145915 bake-in summary — side-by-side gate verdicts.
-    rs = resid_log_stats
-    log.info(
-        "[FIXEDPOS_RESID_SUMMARY] epochs=%d active_trips=%d "
-        "proposed_trips=%d both_alarmed=%d only_active=%d "
-        "pr_disturbances=%d "
-        "(only_active = trips that would have STAYED under proposed gate)",
-        rs['epochs'], rs['active_trips'], rs['proposed_trips'],
-        rs['both_alarmed'], rs['only_active'], rs['pr_disturbances'],
-    )
     return gate_stats
 
 
@@ -6787,27 +7042,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             # diff_ns = chA-chB = do_pps-gnss_pps (positive = DO PPS late).
             # Negate so that pps_err_ticc_ns has the same sign as the
             # DOFreqEst measurement model: negative when DO is late.
-            #
-            # Auto-capture: on the first valid TICC measurement, set the
-            # target to the current differential.  This zeros the initial
-            # offset (cable delay, ARM alignment) so the servo starts at
-            # ~0 error and tracks drift from there.  Only used when
-            # --ticc-target-auto is explicitly set; default behaviour
-            # is to actively pull chA-chB to zero (= PEROUT edge at
-            # local TICC chA aligned with F9T PPS at TICC chB, which
-            # is GPS top-of-second modulo F9T qErr).  See
-            # docs/peroutVS-phc-time.md for what "GPS-aligned" means
-            # in this system: it's the rising edge of PEROUT as seen
-            # by the local TICC chA, not the PHC's internal counter
-            # (those differ by a per-host PHC→PEROUT→cable delay).
-            if (getattr(args, 'ticc_target_auto', False)
-                    and ctx.get('ticc_target_auto') is None
-                    and args.ticc_target_ns == 0.0):
-                args.ticc_target_ns = ticc_measurement.diff_ns
-                ctx['ticc_target_auto'] = ticc_measurement.diff_ns
-                log.info("TICC target auto-captured: %.1f ns (initial chA-chB)",
-                         args.ticc_target_ns)
-            pps_err_ticc_ns = -(ticc_measurement.diff_ns - args.ticc_target_ns)
+            pps_err_ticc_ns = -ticc_measurement.diff_ns
             # Sanity: if the TICC diff is larger than 100 ms, PEROUT is
             # grossly misaligned (e.g., 500 ms offset).  Log loudly and
             # do NOT silently use this as a servo input.
@@ -7049,15 +7284,11 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                 noise_est.last_channel,
             ])
 
-    # Three-stage clockClass promotion: 248 (boot) → 52 (PHC bootstrapped,
-    # set by wrapper after bootstrap) → 6 (servo settled).  Demote back
-    # to 52 if the scheduler leaves settled state.
-    # In freerun mode, clockClass stays at 248 — PHC is not disciplined.
-    if not args.freerun:
-        if not scheduler._converging:
-            _set_clock_class(ctx, "locked")
-        else:
-            _set_clock_class(ctx, "initialized")
+    # clockClass promotion is now driven by σ_total in
+    # run_steady_state's [CONFIDENCE_TOTAL] block (slice 9), not by
+    # the scheduler-settled flag here.  The scheduler still informs
+    # frequency confidence; it just isn't the sole gate.  See
+    # docs/ptp4l-supervision.md and docs/position-state-and-monitoring.md.
 
     if TRACK_RESTEP_NS is not None and not args.freerun:
         # Use pps_err_extts_ns (raw PHC fractional offset) for the restep
@@ -7207,6 +7438,18 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                      f"adj={adjfine_ppb:+.1f}ppb "
                      f"gain={gain_scale:.2f}x "
                      f"interval={scheduler.interval}")
+        # Periodic servo-filter health report (innov-vs-control monitor).
+        # Pure observer; no behavior change.  Status != "OK" surfaces
+        # plant-model errors (DAC scale/sign, B coeff) that "actuator
+        # near rail" symptoms would catch much later.
+        if n_epochs % 60 == 0 and hasattr(servo, "innov_monitor"):
+            hr = servo.innov_monitor.evaluate()
+            log.info(
+                "  [DO_EKF_HEALTH] n=%d corr=%+.3f bias=%+.3f NIS=%.2f "
+                "status=%s consec_bad=%d",
+                hr.epochs, hr.corr_u_innov, hr.norm_bias, hr.nis,
+                hr.status, hr.consec_bad,
+            )
     else:
         if n_epochs % 10 == 0:
             log.info(f"  [{n_epochs}] EKF: "
@@ -7599,6 +7842,12 @@ def run(args):
         log.info("Signal received, shutting down")
         stop_event.set()
     signal.signal(signal.SIGTERM, on_signal)
+    # SIGINT also routes through stop_event so Ctrl-C exits cleanly
+    # via the run_steady_state finally block — that's where the
+    # [FIXEDPOS_RESID_SUMMARY] + servo cleanup live.  Without this,
+    # Ctrl-C raises KeyboardInterrupt mid-syscall and may bypass
+    # the summary on quick double-tap.
+    signal.signal(signal.SIGINT, on_signal)
     if args.pid_file:
         with open(args.pid_file, "w") as f:
             f.write(f"{os.getpid()}\n")
@@ -7867,16 +8116,23 @@ def run(args):
     # Priority order:
     #   1. --known-pos config — operator override (sigma_m=0, treated
     #      as anchor-quality).
-    #   2. NAV2 seed — fixType=3 + hAcc < 5 m (typical lab path).
-    #   3. LS-init bootstrap — fallback for the regression harness
+    #   2. State files — state/positions/<uid>.{ppp,survey}.toml,
+    #      most-confident wins (smallest σ; 2x tie-break to survey).
+    #      Skipped via --ignore-arp-state (or per-file
+    #      --ignore-ppp / --ignore-survey).  Per
+    #      docs/position-state-and-monitoring.md.
+    #   3. NAV2 seed — fixType=3 + hAcc < 5 m (typical lab path).
+    #   4. LS-init bootstrap — fallback for the regression harness
     #      and any cold-start where NAV2 isn't available within 60s.
     #
     # Receiver state file (state/receivers/<uid>.json) is no longer
     # read for position — it's identity-only now (TCXO calibration,
-    # qErr characterization, slot mapping).  The position field, if
-    # present from older runs, is logged for diagnostic comparison
-    # only and is NOT used to seed the filter.  Per Q3 of the
-    # I-133648-main consensus call.
+    # qErr characterization, slot mapping, mount_sn).  The
+    # last_known_position field, if present from older runs, is
+    # logged for diagnostic comparison only and is NOT used to seed
+    # the filter.  Per Q3 of the I-133648-main consensus call.
+    # The new state/positions/<uid>.*.toml files supersede that role
+    # with explicit single-writer authority.
     known_ecef = None
     pos_source = None
     pos_sigma_m = None
@@ -7905,7 +8161,30 @@ def run(args):
         if uid is not None:
             save_position_to_receiver(uid, known_ecef, 0.0, "known_pos")
 
-    # 2. NAV2 seed — the typical lab path.
+    # 2. State files — state/positions/<uid>.{ppp,survey}.toml.
+    # Most-confident wins (smallest σ), with a 2x tie-break to .survey.toml.
+    # mount_sn mismatch → stale → filtered out.  See
+    # docs/position-state-and-monitoring.md.
+    if known_ecef is None and not args.ignore_arp_state:
+        from peppar_fix.position_state import seed_from_state_files
+        picked = seed_from_state_files(
+            uid,
+            ignore_ppp=args.ignore_ppp,
+            ignore_survey=args.ignore_survey,
+        )
+        if picked is not None:
+            known_ecef = np.array(picked.ecef_m)
+            pos_sigma_m = picked.sigma_m
+            pos_source = (f"{picked.kind} state file "
+                          f"(σ={picked.sigma_m:.3f}m, "
+                          f"mount_sn={picked.mount_sn})")
+            ape_sm.transition(
+                AntPosEstState.VERIFYING,
+                f"{picked.kind} state σ={picked.sigma_m:.3f}m")
+            log.info("Position from %s: source=%s updated=%s",
+                     pos_source, picked.source, picked.updated)
+
+    # 3. NAV2 seed — the typical lab path.
     if known_ecef is None and nav2_store is not None:
         seed = wait_for_nav2_seed(nav2_store, stop_event,
                                   timeout_s=60.0, hacc_max_m=5.0)
@@ -8002,10 +8281,12 @@ def run(args):
         #     IS the LS validation, just done by the receiver's own
         #     SPP solver instead of ours.  Per I-024532-charlie #3.
         #
-        # Receiver-state position-read is no longer a seeding path
-        # (file is identity-only now), so the historical
-        # _TRUSTED_POSITION_SIGMA_M trust-skip is mostly vestigial —
-        # it only triggers when --known-pos is used (sigma=0 < threshold).
+        # State-file seeds (.ppp.toml / .survey.toml) get the same
+        # σ-based trust treatment as --known-pos and NAV2.  A
+        # .survey.toml with σ ≈ 1 cm sails past _TRUSTED_POSITION_SIGMA_M
+        # and skips validation; a .ppp.toml with σ ≈ half a metre falls
+        # through to the LS validation below.  Per
+        # docs/position-state-and-monitoring.md.
         seeded_from_nav2 = (pos_source is not None
                             and pos_source.startswith("NAV2"))
         skip_validation = (
@@ -8142,6 +8423,7 @@ def run(args):
                 getattr(args, "nav2_anchor_max_hacc_m", 3.0)),
             pin_position=bool(getattr(args, "pin_position", False)),
             nav_sig_store=nav_sig_store,
+            receiver_uid=getattr(args, 'receiver_unique_id', None),
         )
         # Phase B NAV-SIG L0 admission gate — attach store + flags to
         # the thread so its fresh-PPPFilter path (warm-start, not
@@ -8335,6 +8617,17 @@ Two-phase operation:
     pos = ap.add_argument_group("Position")
     pos.add_argument("--known-pos",
                      help="Known position as lat,lon,alt (skips bootstrap)")
+    pos.add_argument("--ignore-ppp", action="store_true",
+                     help="Don't seed position from state/positions/<uid>.ppp.toml.  "
+                          "Per docs/position-state-and-monitoring.md.")
+    pos.add_argument("--ignore-survey", action="store_true",
+                     help="Don't seed position from "
+                          "state/positions/<uid>.survey.toml.  "
+                          "Per docs/position-state-and-monitoring.md.")
+    pos.add_argument("--ignore-arp-state", action="store_true",
+                     help="Shorthand for --ignore-ppp + --ignore-survey.  "
+                          "Use to force a fresh NAV2/bootstrap seed even "
+                          "when on-disk state would otherwise be picked.")
     pos.add_argument("--pin-position", action="store_true",
                      help="Disable the slow AntPosEst→known_ecef blend in "
                           "run_steady_state.  Use when --known-pos is a "
@@ -9168,25 +9461,6 @@ Two-phase operation:
                       help="TICC channel carrying raw reference PPS (default: chB)")
     ticc.add_argument("--ticc-max-age-s", type=float, default=2.0,
                       help="Maximum age for a paired TICC measurement to be used")
-    ticc.add_argument("--ticc-target-ns", type=float, default=0.0,
-                      help="Target chPHC-chREF offset in ns for TICC-driven "
-                           "servo mode.  Default 0 means actively pull "
-                           "PEROUT-vs-F9T_PPS to zero (so the local TICC chA "
-                           "rising edge marks GPS top-of-second, modulo F9T "
-                           "qErr).  See docs/peroutVS-phc-time.md for the "
-                           "implications: the PHC's internal counter remains "
-                           "offset from this edge by PHC→PEROUT→cable "
-                           "propagation latency, which is per-host fixed.  "
-                           "To preserve the legacy auto-capture-of-initial-"
-                           "diff behaviour (servo only corrects drift "
-                           "around the bootstrap residual, not the residual "
-                           "itself), pass --ticc-target-auto.")
-    ticc.add_argument("--ticc-target-auto", action="store_true", default=False,
-                      help="At the first epoch, capture the TICC chA-chB "
-                           "diff and use that as the servo setpoint.  "
-                           "Legacy behaviour, retained for diagnostic runs "
-                           "where you want to track drift around an arbitrary "
-                           "starting point rather than pulling chA-chB to zero.")
     ticc.add_argument("--ticc-confidence-ns", type=float, default=3.0,
                       help="Assumed confidence of TICC differential error when driving servo")
     # --ticc-drive removed: TICC competes as a source whenever --ticc-port

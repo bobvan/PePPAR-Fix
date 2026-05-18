@@ -78,6 +78,47 @@ ssr_bias_ntrip_conf = "ntrip-cnes.conf"
 # the [SLIP_FILTERED] / [PB_APPLIED] log volume.
 systems = "gps,gal,bds"
 
+# DO characterization: i226 internal TCXO via PHC adjfine
+#
+# Empirical characterization 2026-05-17 by 3 independent runs of
+# tools/calibrate_do.py + tools/calibrate_do_consensus.py:
+#   gt:peppar-fix-data/calibrations/madhat-cal-2026-05-17-run{1,2,3}.json
+#
+# Sweep: ±500 ppb × 7 steps × 60 s dwell, --ref-channel chB (F10T PPS).
+# Two prerequisites required for MadHat (both load-bearing):
+#   1. rmmod igc; modprobe igc  (multi-day igc uptime wedges PEROUT;
+#                                same as TimeHat — see calToolPhcPerout-main)
+#   2. PEROUT period_ns=2_000_000_000  (NOT 1_000_000_000)
+#      MadHat's i226 fires PEROUT at BOTH half-period boundaries
+#      regardless of start_nsec.  With 2-second period the half-period
+#      offset coincides with the next 1s boundary, giving 1 pulse/sec
+#      at correct phase.  See memory
+#      project_madhat_perout_both_halves_2026_05_17.md (Bravo's
+#      finding).  The cal was run with PEROUT pre-enabled externally
+#      via the workaround snippet, then calibrate_do.py invoked WITHOUT
+#      --enable-perout-pin (which would default back to period 1e9).
+#
+# Results (median across 3 runs):
+#   gain         = 0.99860 measured/commanded (spread 0.31%, PASS ≤1%)
+#   offset       = -943.67 ppb at adj=0  (TCXO is ~944 ppb slow vs GPS;
+#                                         ~23× larger free-running drift
+#                                         than TimeHat's −41 ppb but
+#                                         plausible part-to-part variation)
+#   range tested = 998.4 ppb (spread 0.42%, PASS ≤1%)
+#   linearity    = ≤1.1 ppb max residual from best-fit line
+#   resolution   = 0.0153 ppb/step = 1/65536 ppm (i226 hardware spec)
+#
+# Offset reproducibility (run-to-run spread 0.046% / 0.43 ppb) is
+# notably tighter than TimeHat's (5.8% / 2.4 ppb).  MadHat was free-
+# running during cal (no engine disciplining); TimeHat's engine had
+# only just stopped, so its TCXO was still close to its steady-state
+# thermal point with residual settling.
+#
+# No active toml fields change — PHC adjfine is hardware-defined with
+# no dac_ppb_per_code / dac_max_ppb to tune.  The 944 ppb free-running
+# offset is well within the i226 max_adj range (much larger than ±1000
+# ppb); engine convergence is unaffected by the larger absolute offset.
+
 # TICC #2: chA = PEROUT (i226 PPS OUT), chB = GNSS PPS.
 ticc_port = "/dev/ticc2"
 

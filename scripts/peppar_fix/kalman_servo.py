@@ -52,6 +52,8 @@ import math
 import numpy as np
 from scipy.linalg import solve_discrete_are
 
+from peppar_fix.innov_control_monitor import InnovControlMonitor
+
 
 class KalmanServo:
     """2-state Kalman filter + LQR for DO frequency steering.
@@ -169,6 +171,15 @@ class KalmanServo:
         self.freq = initial_freq
         self._last_u = 0.0
 
+        # Innovation-vs-control consistency monitor.  Pure observer;
+        # fed in update() after the primary measurement-update step.
+        # Catches plant-model errors (DAC scaling/sign, B-matrix coeff)
+        # epoch-by-epoch rather than waiting for actuator-near-rail
+        # symptoms.  See peppar_fix/innov_control_monitor.py.
+        self.innov_monitor = InnovControlMonitor()
+        self.last_innov = 0.0
+        self.last_S = 0.0
+
     def update(self, offset_ns, dt=1.0,
               delta_dt_rx_ns=None, dt_rx_sigma_ns=None):
         """Process one measurement. Returns frequency adjustment in ppb.
@@ -220,6 +231,13 @@ class KalmanServo:
 
         self.x = x_pred + K.flatten() * innovation
         self.P = P_pred - np.outer(K.flatten(), K.flatten()) * S
+
+        # Feed the innov-vs-control consistency monitor.  The control
+        # input is self._last_u (what we applied last epoch, which the
+        # predict step assumed had B·u effect).
+        self.innov_monitor.observe(self._last_u, innovation, S)
+        self.last_innov = innovation
+        self.last_S = S
 
         # ── Kalman update: time-differenced dt_rx (frequency constraint) ──
         # Δdt_rx = dt_rx[n] - dt_rx[n-1] measures how much the TCXO-to-GPS
@@ -292,6 +310,9 @@ class KalmanServo:
         self.P = np.diag([1000.0 ** 2, 100.0 ** 2])
         self._last_u = 0.0
         self.freq = current_freq
+        self.innov_monitor.reset()
+        self.last_innov = 0.0
+        self.last_S = 0.0
 
     @property
     def estimated_phase_ns(self):

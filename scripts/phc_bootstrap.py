@@ -111,62 +111,9 @@ def _set_pin_function_sysfs(ptp_dev, pin_name, func, channel):
 _E810_PIN_NAMES = {0: "0", 1: "1", 2: "2", 3: "3", 4: "4"}
 
 
-def _ticc_check_perout_phase(ticc_port, timeout_s=8.0):
-    """Read TICC and check if chA and chB are aligned or 500ms apart.
-
-    Returns (aligned, chA_frac, chB_frac) where aligned is True if
-    the fractional seconds are within 100ms, or None if no data.
-    Opens the TICC with HUPCL disabled to avoid resetting the Arduino.
-    """
-    import serial
-    import termios
-    try:
-        ser = serial.Serial(ticc_port, 115200, dsrdtr=False,
-                            rtscts=False, timeout=2.0)
-        attrs = termios.tcgetattr(ser.fd)
-        attrs[2] &= ~termios.HUPCL
-        termios.tcsetattr(ser.fd, termios.TCSANOW, attrs)
-    except (OSError, serial.SerialException) as e:
-        log.warning("Cannot open TICC %s for phase check: %s", ticc_port, e)
-        return None
-
-    chA_frac = None
-    chB_frac = None
-    deadline = time.monotonic() + timeout_s
-    try:
-        while time.monotonic() < deadline:
-            line = ser.readline().decode(errors='replace').strip()
-            if not line:
-                continue
-            parts = line.split()
-            if len(parts) >= 2:
-                try:
-                    ts = float(parts[0])
-                    frac = ts % 1.0
-                    if 'chA' in parts[1]:
-                        chA_frac = frac
-                    elif 'chB' in parts[1]:
-                        chB_frac = frac
-                except ValueError:
-                    continue
-            if chA_frac is not None and chB_frac is not None:
-                break
-    finally:
-        ser.close()
-
-    if chA_frac is None or chB_frac is None:
-        log.warning("TICC phase check: missing channel data "
-                    "(chA=%s chB=%s)", chA_frac, chB_frac)
-        return None
-
-    delta = abs(chA_frac - chB_frac)
-    if delta > 0.5:
-        delta = 1.0 - delta  # handle wrap
-    aligned = delta < 0.1  # within 100ms
-    log.info("TICC phase check: chA=%.3fs chB=%.3fs delta=%.3fs %s",
-             chA_frac, chB_frac, delta,
-             "ALIGNED" if aligned else "500ms OFF")
-    return (aligned, chA_frac, chB_frac)
+# _ticc_check_perout_phase moved to peppar_fix/perout_setup.py
+# (canonical home; used by phc_bootstrap, perout_kick, and
+# tools/calibrate_do.py).  See dayplan: calToolPhcPerout-main.
 
 
 def _enable_pps_out(ptp, args):
@@ -175,83 +122,23 @@ def _enable_pps_out(ptp, args):
     Must be called after any DO phase step — stepping the PHC clock
     invalidates the PEROUT alignment, stopping the output pulse.
 
-    Pin programming: tries PTP_PIN_SETFUNC ioctl first (i226), then
-    sysfs fallback (E810 ice driver rejects the ioctl but accepts sysfs).
-
-    PEROUT phase verification: on igc, the Target Time comparator has a
-    hardware half-period latch that randomly picks the wrong phase ~50%
-    of the time after a PHC step.  If a TICC port is configured, we
-    verify the PEROUT-vs-PPS phase after programming and retry with a
-    different start_nsec until aligned.
+    Wrapper around ``peppar_fix.perout_setup.setup_perout`` that adapts
+    the bootstrap's argparse namespace to the helper's keyword args.
+    The actual pin/PEROUT/verify chain lives in the shared module so
+    ``tools/calibrate_do.py`` and ``scripts/perout_kick.py`` can use
+    the same code path.  See ``dayplan: calToolPhcPerout-main``.
     """
     if args.pps_out_pin < 0:
         return
-    from peppar_fix.ptp_device import PTP_PF_PEROUT
-    try:
-        # Configure pin for PEROUT
-        pin_set = False
-        if args.program_pin:
-            try:
-                ptp.set_pin_function(args.pps_out_pin, PTP_PF_PEROUT,
-                                     args.pps_out_channel)
-                pin_set = True
-            except OSError:
-                pass
-        if not pin_set:
-            pin_name = _E810_PIN_NAMES.get(args.pps_out_pin, str(args.pps_out_pin))
-            _set_pin_function_sysfs(args.ptp_dev, pin_name,
-                                    PTP_PF_PEROUT, args.pps_out_channel)
-
-        ticc_port = getattr(args, 'ticc_port', None)
-        MAX_ATTEMPTS = 4
-        # The igc Target Time comparator's start_nsec polarity varies
-        # by kernel/DKMS version.  On some builds, start_nsec is the
-        # falling edge (need period/2 for rising-edge alignment).  On
-        # others, it's the rising edge (need 0).  We try the default
-        # (auto-detected by enable_perout) first, then alternate with
-        # the opposite offset on each retry.
-        offsets = [None, 0, 500_000_000, 0]  # None = auto, then alternate
-
-        for attempt in range(1, MAX_ATTEMPTS + 1):
-            override = offsets[attempt - 1]
-            if override is not None:
-                ptp.enable_perout(args.pps_out_channel,
-                                  start_nsec_override=override)
-            else:
-                ptp.enable_perout(args.pps_out_channel)
-            log.info("PEROUT programmed (attempt %d/%d, start_nsec=%s)",
-                     attempt, MAX_ATTEMPTS,
-                     "auto" if override is None else override)
-
-            if not ticc_port:
-                log.info("No TICC port — cannot verify PEROUT phase")
-                break
-
-            # Wait for PEROUT to start (start_sec is PHC_now + 2)
-            time.sleep(4)
-            result = _ticc_check_perout_phase(ticc_port)
-            if result is None:
-                log.warning("TICC phase check inconclusive — accepting")
-                break
-            aligned, chA_frac, chB_frac = result
-            if aligned:
-                log.info("PEROUT phase verified via TICC on attempt %d", attempt)
-                break
-            if attempt < MAX_ATTEMPTS:
-                log.warning("PEROUT 500ms off — trying opposite offset "
-                            "(attempt %d/%d)", attempt, MAX_ATTEMPTS)
-                ptp.disable_perout(args.pps_out_channel)
-                time.sleep(1)
-            else:
-                log.error("PEROUT still 500ms off after %d attempts — "
-                          "hardware half-period latch. May need driver "
-                          "reload (rmmod igc && modprobe igc).",
-                          MAX_ATTEMPTS)
-
-        log.info("PPS OUT enabled: pin %d, PEROUT channel %d",
-                 args.pps_out_pin, args.pps_out_channel)
-    except OSError as e:
-        log.warning("Failed to enable PPS OUT: %s", e)
+    from peppar_fix.perout_setup import setup_perout
+    setup_perout(
+        ptp,
+        pin_index=args.pps_out_pin,
+        channel=args.pps_out_channel,
+        program_pin=getattr(args, 'program_pin', True),
+        ptp_dev_path=getattr(args, 'ptp_dev', None),
+        verify_via_ticc_port=getattr(args, 'ticc_port', None),
+    )
 
 
 # ── PPS frequency measurement ────────────────────────────────────── #

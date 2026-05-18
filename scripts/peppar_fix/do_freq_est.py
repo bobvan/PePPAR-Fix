@@ -42,6 +42,8 @@ insight that makes 4-state fusion work where 2-state failed.
 import math
 import numpy as np
 
+from peppar_fix.innov_control_monitor import InnovControlMonitor
+
 
 def _qerr(phi_tcxo_ns, tick_ns=8.0):
     """Compute qErr from rx TCXO phase: sub-tick residual."""
@@ -129,6 +131,12 @@ class DOFreqEst:
         # At startup, bootstrap set adjfine = initial_freq, so
         # the last applied u = initial_freq.
         self._last_u = initial_freq
+
+        # Innov-vs-control consistency monitor (TICC arm, where u enters
+        # the prediction).  See peppar_fix/innov_control_monitor.py.
+        self.innov_monitor = InnovControlMonitor()
+        self.last_innov = 0.0
+        self.last_S = 0.0
         # rx TCXO state must be initialized at construction from bootstrap
         # dt_rx to avoid a mid-run measurement model transition that
         # causes divergence.  If dt_rx wasn't available at construction,
@@ -325,8 +333,16 @@ class DOFreqEst:
             H_ticc = self._H_ticc(x_pred)
             S = (H_ticc @ P_pred @ H_ticc.T + R_ticc).item()
             K = (P_pred @ H_ticc.T) / S
-            x_pred = x_pred + K.flatten() * (ticc_diff_ns - h_pred)
+            innov_ticc = ticc_diff_ns - h_pred
+            x_pred = x_pred + K.flatten() * innov_ticc
             P_pred = P_pred - np.outer(K.flatten(), K.flatten()) * S
+
+            # Feed the innov-vs-control monitor.  TICC arm is the one
+            # that closes the loop on x[2] (DO phase), so its innov is
+            # what carries plant-model error.
+            self.innov_monitor.observe(self._last_u, innov_ticc, S)
+            self.last_innov = innov_ticc
+            self.last_S = S
 
         self.x = x_pred
         self.P = P_pred
@@ -362,6 +378,9 @@ class DOFreqEst:
         self._last_u = 0.0
         self._tcxo_initialized = False
         self.freq = current_freq
+        self.innov_monitor.reset()
+        self.last_innov = 0.0
+        self.last_S = 0.0
 
     @property
     def estimated_phase_ns(self):

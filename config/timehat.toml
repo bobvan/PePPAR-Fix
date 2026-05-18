@@ -38,6 +38,32 @@ ssr_bias_ntrip_conf = "ntrip-cnes.conf"
 systems = "gps,gal"
 phase_step_bias_ns = 2283.0
 
+# DO characterization: i226 internal TCXO via PHC adjfine
+#
+# Empirical characterization 2026-05-17 by 3 independent runs of
+# tools/calibrate_do.py + tools/calibrate_do_consensus.py:
+#   gt:peppar-fix-data/calibrations/timehat-cal-2026-05-17-run{1,2,3}.json
+#
+# Sweep: ±500 ppb × 7 steps × 60 s dwell, --ref-channel chB (F9T PPS).
+# Prerequisite: rmmod igc; modprobe igc (multi-day igc uptime wedges
+# PEROUT + EXTTS — see calToolPhcPerout-main empirical close and
+# igcReloadOnPhcInitFailure-main).
+#
+# Results (median across 3 runs):
+#   gain         = 0.99970 measured/commanded (spread 0.51%, PASS ≤1%)
+#   offset       = -40.96 ppb at adj=0  (TCXO is ~41 ppb slow vs GPS;
+#                                        sign-consistent with engine
+#                                        steady-state adj=+42.9 ppb
+#                                        from state/dos/_dev_ptp_i226.json)
+#   range tested = 1000.5 ppb (spread 0.59%, PASS ≤1%)
+#   linearity    = ≤2.5 ppb max residual from best-fit line
+#   resolution   = 0.0153 ppb/step = 1/65536 ppm (i226 hardware spec)
+#
+# No active toml fields change: PHC adjfine is a hardware-defined
+# actuator with no dac_ppb_per_code / dac_max_ppb to tune.  Cal
+# confirms PHC behaves to spec; gain ≈ 1.000 means engine commands
+# are delivered as-is to within 0.5%.
+
 # TICC #1: chA = PEROUT (i226 PPS OUT), chB = GNSS PPS.
 ticc_port = "/dev/ticc1"
 
