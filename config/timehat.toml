@@ -36,6 +36,14 @@ ssr_ntrip_conf = "ntrip-cnes.conf"
 ssr_bias_mount      = "OSBC00WHU1"
 ssr_bias_ntrip_conf = "ntrip-cnes.conf"
 systems = "gps,gal"
+
+# Operational ARP — engine compiles state/positions/<uid>.survey.toml
+# from timelab/antPos.json[choke1] at startup so the PPP filter seeds
+# at survey truth (σ ≈ 12 mm OPUS) instead of NAV2 (~2 m biased).
+# Single source of truth: timelab/antPos.json.  See CLAUDE.md
+# "Authoritative ARP" section.
+arp_label = "choke1"
+
 phase_step_bias_ns = 2283.0
 
 # DO characterization: i226 internal TCXO via PHC adjfine

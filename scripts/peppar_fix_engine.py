@@ -8244,6 +8244,41 @@ def run(args):
         if uid is not None:
             save_position_to_receiver(uid, known_ecef, 0.0, "known_pos")
 
+    # 1a. Compile timelab/antPos.json → state/positions/<uid>.survey.toml
+    # when ``arp_label`` is configured for this host and antPos.json is
+    # reachable.  This is the "use a survey we already have" path that
+    # gets the engine seeded from authoritative survey truth without
+    # requiring --known-pos on the CLI.  See CLAUDE.md "Authoritative
+    # ARP" section + docs/position-state-and-monitoring.md.
+    #
+    # Runs BEFORE seed_from_state_files so the freshly-written
+    # .survey.toml is in place when the seeder reads.  Skipped when
+    # --ignore-arp-state or --ignore-survey is set, so operators can
+    # force a re-survey path via CLI.
+    _arp_label = getattr(args, 'arp_label', None)
+    if (known_ecef is None
+            and _arp_label
+            and uid is not None
+            and not args.ignore_arp_state
+            and not args.ignore_survey):
+        from peppar_fix.position_state import (
+            compile_survey_from_antpos, load_current_mount_sn,
+            save_survey_state,
+        )
+        _current_mount_sn = load_current_mount_sn(uid)
+        _antpos_path = getattr(args, 'antpos_json', None)
+        _survey_state = compile_survey_from_antpos(
+            _arp_label, _current_mount_sn, antpos_path=_antpos_path)
+        if _survey_state is not None:
+            try:
+                save_survey_state(_survey_state, uid)
+                log.info("Compiled survey from timelab/antPos.json: "
+                         "arp_label=%s σ=%.4fm written to "
+                         "state/positions/%s.survey.toml",
+                         _arp_label, _survey_state.sigma_m, uid)
+            except OSError as e:
+                log.warning("compile_survey_from_antpos: write failed: %s", e)
+
     # 2. State files — state/positions/<uid>.{ppp,survey}.toml.
     # Most-confident wins (smallest σ), with a 2x tie-break to .survey.toml.
     # mount_sn mismatch → stale → filtered out.  See
@@ -8654,6 +8689,8 @@ def _apply_host_config(args):
         "ar_elev_mask_deg": ("ar_elev_mask",         float),
         "pmc_uds":          ("pmc",              str),
         "pmc_domain":       ("pmc_domain",       int),
+        "arp_label":        ("arp_label",        str),
+        "antpos_json":      ("antpos_json",      str),
         "rinex_out":        ("rinex_out",        str),
         "rinex_decimate_s": ("rinex_decimate_s", float),
     }
@@ -8711,6 +8748,20 @@ Two-phase operation:
                      help="Shorthand for --ignore-ppp + --ignore-survey.  "
                           "Use to force a fresh NAV2/bootstrap seed even "
                           "when on-disk state would otherwise be picked.")
+    pos.add_argument("--arp-label", default=None,
+                     help="Key into timelab/antPos.json identifying which "
+                          "operational ARP entry to use (e.g. 'choke1').  "
+                          "When set, engine compiles a .survey.toml from "
+                          "the matching entry at startup.  Usually set in "
+                          "the per-host TOML config, not on the CLI.  See "
+                          "CLAUDE.md 'Authoritative ARP' section.")
+    pos.add_argument("--antpos-json", default=None,
+                     help="Override path to timelab/antPos.json.  Default: "
+                          "probes $PEPPAR_ANTPOS_JSON, "
+                          "/etc/peppar-fix/antPos.json, "
+                          "~/peppar-fix/timelab/antPos.json, "
+                          "~/timelab/antPos.json, "
+                          "./timelab/antPos.json.")
     pos.add_argument("--pin-position", action="store_true",
                      help="Disable the slow AntPosEst→known_ecef blend in "
                           "run_steady_state.  Use when --known-pos is a "

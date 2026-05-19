@@ -198,6 +198,141 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def save_survey_state(state: PositionState, uid,
+                      positions_dir: Optional[str] = None) -> None:
+    """Atomically write .survey.toml for a receiver UID.
+
+    Counterpart to save_ppp_state but targets the .survey.toml path
+    and accepts (requires) kind="survey".  Used when:
+      - peppar-survey-style external backends produce a survey result
+      - the engine compiles a survey from timelab/antPos.json at
+        startup (see compile_survey_from_antpos)
+
+    Writes via tmp+rename so a partial write never leaves a torn
+    file visible to readers.  Creates the positions_dir if missing.
+    """
+    if state.kind != "survey":
+        raise ValueError(f"save_survey_state expects kind='survey', "
+                         f"got '{state.kind}'")
+    d = positions_dir or DEFAULT_POSITIONS_DIR
+    os.makedirs(d, exist_ok=True)
+    path = _survey_path(uid, positions_dir)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(_format_toml(state))
+    os.replace(tmp, path)
+    log.info("Saved survey position state to %s", path)
+
+
+# ── antPos.json reader ────────────────────────────────────────────── #
+
+
+# Where to look for the operational ARP survey database
+# (timelab/antPos.json).  CLAUDE.md "Authoritative ARP" calls this
+# the single source of truth for surveyed ARP coordinates.  Gitignored
+# at both ends; operator-distributed across hosts.
+ANTPOS_JSON_CANDIDATE_PATHS = [
+    "/etc/peppar-fix/antPos.json",
+    "~/peppar-fix/timelab/antPos.json",
+    "~/timelab/antPos.json",
+    "./timelab/antPos.json",
+]
+
+
+def find_antpos_json(explicit_path: Optional[str] = None) -> Optional[str]:
+    """Resolve the path to a readable timelab/antPos.json.
+
+    Probe order:
+      1. ``explicit_path`` if passed (CLI / config override)
+      2. ``$PEPPAR_ANTPOS_JSON`` env var
+      3. The standard candidate paths (see ANTPOS_JSON_CANDIDATE_PATHS)
+
+    Returns None if no readable file is found.
+    """
+    candidates = []
+    if explicit_path:
+        candidates.append(explicit_path)
+    env = os.environ.get("PEPPAR_ANTPOS_JSON")
+    if env:
+        candidates.append(env)
+    candidates.extend(ANTPOS_JSON_CANDIDATE_PATHS)
+    for path in candidates:
+        full = os.path.expanduser(path)
+        if os.path.isfile(full):
+            return full
+    return None
+
+
+def compile_survey_from_antpos(
+    arp_label: str,
+    mount_sn: int,
+    *,
+    antpos_path: Optional[str] = None,
+) -> Optional[PositionState]:
+    """Read timelab/antPos.json, look up ``arp_label``, build a
+    survey-kind PositionState ready for save_survey_state.
+
+    Returns None when:
+      - ``arp_label`` is None/empty
+      - antPos.json can't be found
+      - the json doesn't contain ``arp_label`` as a key
+      - the entry is malformed (missing ecef_m or sigma_m)
+
+    All failures log a warning and return None — caller falls through
+    to its normal seed path (NAV2 / cold bootstrap).
+    """
+    import json
+    if not arp_label:
+        return None
+    path = find_antpos_json(antpos_path)
+    if path is None:
+        log.warning("compile_survey_from_antpos: antPos.json not found "
+                    "(tried explicit + $PEPPAR_ANTPOS_JSON + %s)",
+                    ", ".join(ANTPOS_JSON_CANDIDATE_PATHS))
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("compile_survey_from_antpos: failed to read %s: %s",
+                    path, e)
+        return None
+    entry = data.get(arp_label)
+    if entry is None:
+        log.warning("compile_survey_from_antpos: arp_label '%s' not "
+                    "found in %s (available: %s)",
+                    arp_label, path, ", ".join(sorted(data.keys())))
+        return None
+    try:
+        ecef = entry["ecef_m"]
+        if isinstance(ecef, dict):
+            # antPos.json uses {x, y, z}
+            ecef_m = (float(ecef["x"]), float(ecef["y"]),
+                      float(ecef["z"]))
+        else:
+            ecef_m = (float(ecef[0]), float(ecef[1]), float(ecef[2]))
+        sigma_m = float(entry["sigma_m"])
+    except (KeyError, ValueError, TypeError) as e:
+        log.warning("compile_survey_from_antpos: malformed entry "
+                    "'%s' in %s: %s", arp_label, path, e)
+        return None
+    return PositionState(
+        mount_sn=mount_sn,
+        ecef_m=ecef_m,
+        sigma_m=sigma_m,
+        updated=utc_now_iso(),
+        source=(f"timelab/antPos.json:{arp_label}"
+                f" ({entry.get('method', 'method?')})"),
+        kind="survey",
+        extra={
+            "antpos_method": str(entry.get("method", "")),
+            "antpos_updated": str(entry.get("updated", "")),
+            "arp_label": arp_label,
+            "antpos_source_path": path,
+        },
+    )
+
+
 # ── AntPosEst watchdog ────────────────────────────────────────────── #
 
 

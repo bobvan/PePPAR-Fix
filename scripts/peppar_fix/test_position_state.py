@@ -978,5 +978,183 @@ class TestUtcNowIso(unittest.TestCase):
         self.assertEqual(s[16], ":")
 
 
+class TestSaveSurveyState(unittest.TestCase):
+
+    def test_round_trip(self):
+        from peppar_fix.position_state import save_survey_state
+        with tempfile.TemporaryDirectory() as d:
+            s = PositionState(
+                mount_sn=3,
+                ecef_m=(157469.3707, -4756188.9618, 4232768.4597),
+                sigma_m=0.0125,
+                updated=utc_now_iso(),
+                source="OPUS 6-day mean",
+                kind="survey",
+                extra={"method": "OPUS-Static"},
+            )
+            save_survey_state(s, "12345", positions_dir=d)
+            loaded = load_survey_state("12345", positions_dir=d)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.kind, "survey")
+            self.assertEqual(loaded.mount_sn, 3)
+            self.assertAlmostEqual(loaded.sigma_m, 0.0125, places=6)
+            self.assertEqual(loaded.extra.get("method"), "OPUS-Static")
+
+    def test_rejects_non_survey_kind(self):
+        """Defensive: save_survey_state must refuse kind='ppp' to
+        prevent mis-tagging (counterpart to save_ppp_state's guard)."""
+        from peppar_fix.position_state import save_survey_state
+        with tempfile.TemporaryDirectory() as d:
+            s = PositionState(
+                mount_sn=0,
+                ecef_m=(1.0, 2.0, 3.0),
+                sigma_m=0.01,
+                updated=utc_now_iso(),
+                source="test",
+                kind="ppp",
+            )
+            with self.assertRaises(ValueError):
+                save_survey_state(s, "1", positions_dir=d)
+
+    def test_atomic_write(self):
+        from peppar_fix.position_state import save_survey_state
+        with tempfile.TemporaryDirectory() as d:
+            s = PositionState(
+                mount_sn=0, ecef_m=(1.0, 2.0, 3.0), sigma_m=0.01,
+                updated=utc_now_iso(), source="test", kind="survey")
+            save_survey_state(s, "9", positions_dir=d)
+            entries = os.listdir(d)
+            self.assertIn("9.survey.toml", entries)
+            self.assertNotIn("9.survey.toml.tmp", entries)
+
+
+class TestCompileSurveyFromAntpos(unittest.TestCase):
+    """Read timelab/antPos.json → PositionState."""
+
+    def setUp(self):
+        import json
+        # Synthetic antPos.json matching the real schema, but with
+        # placeholder coords (the hooks/pre-commit hook rejects
+        # literal lab coordinates).  We're testing schema parsing,
+        # not coordinate values.
+        self.tmp = tempfile.mkdtemp()
+        self.antpos_path = os.path.join(self.tmp, "antPos.json")
+        with open(self.antpos_path, "w") as f:
+            json.dump({
+                "test_dict_ecef": {
+                    "lat": 12.345678,
+                    "lon": 45.678901,
+                    "alt_m": 100.0,
+                    "sigma_m": 0.0125,
+                    "ecef_m": {
+                        "x": 1000.111,
+                        "y": -2000.222,
+                        "z": 3000.333,
+                    },
+                    "method": "OPUS-Static, 6-day mean",
+                    "updated": "2026-05-12",
+                },
+                "test_list_ecef": {
+                    "ecef_m": [1111.222, -2222.333, 3333.444],
+                    "sigma_m": 0.009,
+                    "method": "OPUS-Static (legacy ecef format)",
+                },
+            }, f)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp)
+
+    def test_happy_path_dict_ecef(self):
+        from peppar_fix.position_state import compile_survey_from_antpos
+        s = compile_survey_from_antpos(
+            "test_dict_ecef", mount_sn=2,
+            antpos_path=self.antpos_path)
+        self.assertIsNotNone(s)
+        self.assertEqual(s.kind, "survey")
+        self.assertEqual(s.mount_sn, 2)
+        self.assertAlmostEqual(s.ecef_m[0], 1000.111, places=4)
+        self.assertAlmostEqual(s.sigma_m, 0.0125, places=6)
+        self.assertIn("test_dict_ecef", s.source)
+        self.assertIn("OPUS", s.source)
+        self.assertEqual(s.extra.get("arp_label"), "test_dict_ecef")
+        self.assertEqual(s.extra.get("antpos_method"),
+                         "OPUS-Static, 6-day mean")
+
+    def test_list_ecef_format_also_supported(self):
+        """antPos.json's legacy format uses ecef_m as a list, not
+        {x,y,z}.  Reader handles both."""
+        from peppar_fix.position_state import compile_survey_from_antpos
+        s = compile_survey_from_antpos(
+            "test_list_ecef", mount_sn=0,
+            antpos_path=self.antpos_path)
+        self.assertIsNotNone(s)
+        self.assertAlmostEqual(s.ecef_m[0], 1111.222, places=3)
+
+    def test_unknown_arp_label_returns_none(self):
+        from peppar_fix.position_state import compile_survey_from_antpos
+        s = compile_survey_from_antpos(
+            "no-such-label", mount_sn=0,
+            antpos_path=self.antpos_path)
+        self.assertIsNone(s)
+
+    def test_empty_arp_label_returns_none(self):
+        from peppar_fix.position_state import compile_survey_from_antpos
+        for empty in (None, ""):
+            self.assertIsNone(compile_survey_from_antpos(
+                empty, mount_sn=0, antpos_path=self.antpos_path))
+
+    def test_missing_file_returns_none(self):
+        from peppar_fix.position_state import compile_survey_from_antpos
+        s = compile_survey_from_antpos(
+            "test_dict_ecef", mount_sn=0,
+            antpos_path="/nope/nope/antPos.json")
+        self.assertIsNone(s)
+
+    def test_malformed_json_returns_none(self):
+        from peppar_fix.position_state import compile_survey_from_antpos
+        p = os.path.join(self.tmp, "broken.json")
+        with open(p, "w") as f:
+            f.write("not valid json {{{")
+        self.assertIsNone(compile_survey_from_antpos(
+            "test_dict_ecef", mount_sn=0, antpos_path=p))
+
+    def test_entry_missing_required_field_returns_none(self):
+        import json
+        from peppar_fix.position_state import compile_survey_from_antpos
+        p = os.path.join(self.tmp, "missing.json")
+        with open(p, "w") as f:
+            json.dump({"x": {"ecef_m": [1, 2, 3]}}, f)  # no sigma_m
+        self.assertIsNone(compile_survey_from_antpos(
+            "x", mount_sn=0, antpos_path=p))
+
+
+class TestFindAntposJson(unittest.TestCase):
+    """Path discovery: explicit > $PEPPAR_ANTPOS_JSON > standard list."""
+
+    def test_explicit_path_wins(self):
+        from peppar_fix.position_state import find_antpos_json
+        with tempfile.NamedTemporaryFile(mode="w",
+                                          suffix=".json",
+                                          delete=False) as f:
+            f.write("{}")
+            path = f.name
+        try:
+            self.assertEqual(find_antpos_json(path), path)
+        finally:
+            os.unlink(path)
+
+    def test_nonexistent_explicit_falls_through(self):
+        # When the explicit path doesn't exist AND no env var AND no
+        # standard path, return None.  We can't reliably remove the
+        # standard candidates from this test process so we just verify
+        # explicit-doesn't-exist doesn't raise.
+        from peppar_fix.position_state import find_antpos_json
+        # If the dev box has ~/timelab/antPos.json this will be that
+        # path; either way the call must not raise.
+        result = find_antpos_json("/definitely/not/a/path")
+        self.assertTrue(result is None or os.path.isfile(result))
+
+
 if __name__ == "__main__":
     unittest.main()
