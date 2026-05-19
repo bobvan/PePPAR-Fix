@@ -389,6 +389,70 @@ class TestSeedFromStateFiles(unittest.TestCase):
                                                 positions_dir=self.pos_dir,
                                                 receivers_dir=self.recv_dir))
 
+    def test_antennas_json_candidate_picked_when_only_one(self):
+        """arp_label + antennas_path resolves to a survey-class
+        candidate even when no .ppp.toml or .survey.toml exists."""
+        import json
+        ants = os.path.join(self.pos_dir, "antennas.json")
+        with open(ants, "w") as f:
+            json.dump({"choke1": {
+                "ecef_m": [9.0, 8.0, 7.0],
+                "sigma_m": 0.012,
+                "method": "OPUS-Static",
+            }}, f)
+        out = seed_from_state_files(
+            self.uid,
+            arp_label="choke1",
+            antennas_path=ants,
+            positions_dir=self.pos_dir,
+            receivers_dir=self.recv_dir)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.kind, "survey")
+        self.assertEqual(out.mount_sn, 3)  # inherited from current
+        self.assertAlmostEqual(out.ecef_m[0], 9.0)
+        self.assertAlmostEqual(out.sigma_m, 0.012)
+
+    def test_antennas_json_loses_to_tighter_ppp(self):
+        """If .ppp.toml has a much tighter sigma than antennas.json,
+        the picker keeps ppp (no 2x survey tie-break can save a 10x
+        worse survey σ)."""
+        import json
+        self._write_state("ppp", mount_sn=3, sigma_m=0.001, kind="ppp")
+        ants = os.path.join(self.pos_dir, "antennas.json")
+        with open(ants, "w") as f:
+            json.dump({"choke1": {
+                "ecef_m": [9.0, 8.0, 7.0],
+                "sigma_m": 0.020,
+                "method": "OPUS-Static",
+            }}, f)
+        out = seed_from_state_files(
+            self.uid,
+            arp_label="choke1",
+            antennas_path=ants,
+            positions_dir=self.pos_dir,
+            receivers_dir=self.recv_dir)
+        self.assertEqual(out.kind, "ppp")
+
+    def test_ignore_survey_also_blocks_antennas_json(self):
+        """--ignore-survey suppresses both .survey.toml AND
+        antennas.json — both are survey-class data."""
+        import json
+        ants = os.path.join(self.pos_dir, "antennas.json")
+        with open(ants, "w") as f:
+            json.dump({"choke1": {
+                "ecef_m": [9.0, 8.0, 7.0],
+                "sigma_m": 0.001,
+                "method": "OPUS-Static",
+            }}, f)
+        out = seed_from_state_files(
+            self.uid,
+            ignore_survey=True,
+            arp_label="choke1",
+            antennas_path=ants,
+            positions_dir=self.pos_dir,
+            receivers_dir=self.recv_dir)
+        self.assertIsNone(out)
+
 
 class TestPppStateWriter(unittest.TestCase):
     """The throttled + sigma-gated periodic writer used inside
@@ -1028,18 +1092,19 @@ class TestSaveSurveyState(unittest.TestCase):
             self.assertNotIn("9.survey.toml.tmp", entries)
 
 
-class TestCompileSurveyFromAntpos(unittest.TestCase):
-    """Read timelab/antPos.json → PositionState."""
+class TestLoadArpFromAntennas(unittest.TestCase):
+    """Read timelab/antennas.json → in-memory PositionState (read-only;
+    no file write).  See position_state.load_arp_from_antennas."""
 
     def setUp(self):
         import json
-        # Synthetic antPos.json matching the real schema, but with
+        # Synthetic antennas.json matching the real schema, but with
         # placeholder coords (the hooks/pre-commit hook rejects
         # literal lab coordinates).  We're testing schema parsing,
         # not coordinate values.
         self.tmp = tempfile.mkdtemp()
-        self.antpos_path = os.path.join(self.tmp, "antPos.json")
-        with open(self.antpos_path, "w") as f:
+        self.antennas_path = os.path.join(self.tmp, "antennas.json")
+        with open(self.antennas_path, "w") as f:
             json.dump({
                 "test_dict_ecef": {
                     "lat": 12.345678,
@@ -1066,10 +1131,10 @@ class TestCompileSurveyFromAntpos(unittest.TestCase):
         shutil.rmtree(self.tmp)
 
     def test_happy_path_dict_ecef(self):
-        from peppar_fix.position_state import compile_survey_from_antpos
-        s = compile_survey_from_antpos(
+        from peppar_fix.position_state import load_arp_from_antennas
+        s = load_arp_from_antennas(
             "test_dict_ecef", mount_sn=2,
-            antpos_path=self.antpos_path)
+            antennas_path=self.antennas_path)
         self.assertIsNotNone(s)
         self.assertEqual(s.kind, "survey")
         self.assertEqual(s.mount_sn, 2)
@@ -1078,69 +1143,69 @@ class TestCompileSurveyFromAntpos(unittest.TestCase):
         self.assertIn("test_dict_ecef", s.source)
         self.assertIn("OPUS", s.source)
         self.assertEqual(s.extra.get("arp_label"), "test_dict_ecef")
-        self.assertEqual(s.extra.get("antpos_method"),
+        self.assertEqual(s.extra.get("antennas_method"),
                          "OPUS-Static, 6-day mean")
 
     def test_list_ecef_format_also_supported(self):
-        """antPos.json's legacy format uses ecef_m as a list, not
+        """antennas.json's legacy format uses ecef_m as a list, not
         {x,y,z}.  Reader handles both."""
-        from peppar_fix.position_state import compile_survey_from_antpos
-        s = compile_survey_from_antpos(
+        from peppar_fix.position_state import load_arp_from_antennas
+        s = load_arp_from_antennas(
             "test_list_ecef", mount_sn=0,
-            antpos_path=self.antpos_path)
+            antennas_path=self.antennas_path)
         self.assertIsNotNone(s)
         self.assertAlmostEqual(s.ecef_m[0], 1111.222, places=3)
 
     def test_unknown_arp_label_returns_none(self):
-        from peppar_fix.position_state import compile_survey_from_antpos
-        s = compile_survey_from_antpos(
+        from peppar_fix.position_state import load_arp_from_antennas
+        s = load_arp_from_antennas(
             "no-such-label", mount_sn=0,
-            antpos_path=self.antpos_path)
+            antennas_path=self.antennas_path)
         self.assertIsNone(s)
 
     def test_empty_arp_label_returns_none(self):
-        from peppar_fix.position_state import compile_survey_from_antpos
+        from peppar_fix.position_state import load_arp_from_antennas
         for empty in (None, ""):
-            self.assertIsNone(compile_survey_from_antpos(
-                empty, mount_sn=0, antpos_path=self.antpos_path))
+            self.assertIsNone(load_arp_from_antennas(
+                empty, mount_sn=0, antennas_path=self.antennas_path))
 
     def test_missing_file_returns_none(self):
-        from peppar_fix.position_state import compile_survey_from_antpos
-        s = compile_survey_from_antpos(
+        from peppar_fix.position_state import load_arp_from_antennas
+        s = load_arp_from_antennas(
             "test_dict_ecef", mount_sn=0,
-            antpos_path="/nope/nope/antPos.json")
+            antennas_path="/nope/nope/antennas.json")
         self.assertIsNone(s)
 
     def test_malformed_json_returns_none(self):
-        from peppar_fix.position_state import compile_survey_from_antpos
+        from peppar_fix.position_state import load_arp_from_antennas
         p = os.path.join(self.tmp, "broken.json")
         with open(p, "w") as f:
             f.write("not valid json {{{")
-        self.assertIsNone(compile_survey_from_antpos(
-            "test_dict_ecef", mount_sn=0, antpos_path=p))
+        self.assertIsNone(load_arp_from_antennas(
+            "test_dict_ecef", mount_sn=0, antennas_path=p))
 
     def test_entry_missing_required_field_returns_none(self):
         import json
-        from peppar_fix.position_state import compile_survey_from_antpos
+        from peppar_fix.position_state import load_arp_from_antennas
         p = os.path.join(self.tmp, "missing.json")
         with open(p, "w") as f:
             json.dump({"x": {"ecef_m": [1, 2, 3]}}, f)  # no sigma_m
-        self.assertIsNone(compile_survey_from_antpos(
-            "x", mount_sn=0, antpos_path=p))
+        self.assertIsNone(load_arp_from_antennas(
+            "x", mount_sn=0, antennas_path=p))
 
 
-class TestFindAntposJson(unittest.TestCase):
-    """Path discovery: explicit > $PEPPAR_ANTPOS_JSON > standard list."""
+class TestFindAntennasJson(unittest.TestCase):
+    """Path discovery: explicit > $PEPPAR_ANTENNAS_JSON > standard list."""
 
     def test_explicit_path_wins(self):
-        from peppar_fix.position_state import find_antpos_json
+        from peppar_fix.position_state import find_antennas_json
         with tempfile.NamedTemporaryFile(mode="w",
                                           suffix=".json",
                                           delete=False) as f:
             f.write("{}")
             path = f.name
         try:
-            self.assertEqual(find_antpos_json(path), path)
+            self.assertEqual(find_antennas_json(path), path)
         finally:
             os.unlink(path)
 
@@ -1149,10 +1214,10 @@ class TestFindAntposJson(unittest.TestCase):
         # standard path, return None.  We can't reliably remove the
         # standard candidates from this test process so we just verify
         # explicit-doesn't-exist doesn't raise.
-        from peppar_fix.position_state import find_antpos_json
-        # If the dev box has ~/timelab/antPos.json this will be that
+        from peppar_fix.position_state import find_antennas_json
+        # If the dev box has ~/timelab/antennas.json this will be that
         # path; either way the call must not raise.
-        result = find_antpos_json("/definitely/not/a/path")
+        result = find_antennas_json("/definitely/not/a/path")
         self.assertTrue(result is None or os.path.isfile(result))
 
 

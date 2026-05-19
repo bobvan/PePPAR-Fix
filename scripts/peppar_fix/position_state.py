@@ -1,15 +1,24 @@
 """Position state files — load/save .ppp.toml and .survey.toml.
 
-Three files cooperate to seed the engine's starting position:
+Three sources cooperate to seed the engine's starting position:
 
   state/receivers/<uid>.json        — engine-written, holds mount_sn
   state/positions/<uid>.ppp.toml    — engine-written PPP filter snapshot
   state/positions/<uid>.survey.toml — peppar-survey-written (optional)
+  timelab/antennas.json[arp_label]  — lab antenna database (in-memory
+                                       read; never written by engine)
 
 The two position files share the same flat schema; each tags its
 ``mount_sn`` at write time.  At engine startup, readers compare the
 embedded mount_sn to the receiver's current mount_sn (from
 state/receivers/<uid>.json) and discard stale-mount entries.
+
+**Survey vs PPP**: the word "survey" is reserved for results of an
+external survey workflow (OPUS-Static, PRIDE PPP-AR, CORS NTRIP RTK)
+— hours of post-processing of raw observations.  Only peppar-survey
+-class backends may **write** .survey.toml.  The engine **reads**
+survey-class data (from .survey.toml and antennas.json) but never
+writes it; its own position-filter snapshots go to .ppp.toml.
 
 Selection: ``pick_most_confident`` returns the file with the smallest
 ``sigma_m``, with a 2x tie-break in favor of survey when both are
@@ -202,11 +211,14 @@ def save_survey_state(state: PositionState, uid,
                       positions_dir: Optional[str] = None) -> None:
     """Atomically write .survey.toml for a receiver UID.
 
-    Counterpart to save_ppp_state but targets the .survey.toml path
-    and accepts (requires) kind="survey".  Used when:
-      - peppar-survey-style external backends produce a survey result
-      - the engine compiles a survey from timelab/antPos.json at
-        startup (see compile_survey_from_antpos)
+    .survey.toml is **never** written by the engine.  Only peppar-survey
+    -class backends (PRIDE PPP-AR, OPUS-Static, CORS NTRIP RTK) may
+    write it — these are the processes whose output the word "survey"
+    is reserved for in this project.  Writing a survey file from a
+    PPP filter snapshot or from a cached antenna database would
+    inflate confidence in the saved value beyond what the source
+    deserves.  See CLAUDE.md "Authoritative ARP" and
+    docs/position-state-and-monitoring.md.
 
     Writes via tmp+rename so a partial write never leaves a torn
     file visible to readers.  Creates the positions_dir if missing.
@@ -224,38 +236,39 @@ def save_survey_state(state: PositionState, uid,
     log.info("Saved survey position state to %s", path)
 
 
-# ── antPos.json reader ────────────────────────────────────────────── #
+# ── antennas.json reader ──────────────────────────────────────────── #
 
 
-# Where to look for the operational ARP survey database
-# (timelab/antPos.json).  CLAUDE.md "Authoritative ARP" calls this
-# the single source of truth for surveyed ARP coordinates.  Gitignored
-# at both ends; operator-distributed across hosts.
-ANTPOS_JSON_CANDIDATE_PATHS = [
-    "/etc/peppar-fix/antPos.json",
-    "~/peppar-fix/timelab/antPos.json",
-    "~/timelab/antPos.json",
-    "./timelab/antPos.json",
+# Where to look for the lab antenna database (timelab/antennas.json).
+# Each entry is an externally-surveyed ARP (OPUS-Static, PRIDE PPP-AR,
+# CORS NTRIP RTK).  CLAUDE.md "Authoritative ARP" calls this the
+# single source of truth for surveyed coordinates.  Gitignored at
+# both ends; operator-distributed across hosts.
+ANTENNAS_JSON_CANDIDATE_PATHS = [
+    "/etc/peppar-fix/antennas.json",
+    "~/peppar-fix/timelab/antennas.json",
+    "~/timelab/antennas.json",
+    "./timelab/antennas.json",
 ]
 
 
-def find_antpos_json(explicit_path: Optional[str] = None) -> Optional[str]:
-    """Resolve the path to a readable timelab/antPos.json.
+def find_antennas_json(explicit_path: Optional[str] = None) -> Optional[str]:
+    """Resolve the path to a readable timelab/antennas.json.
 
     Probe order:
       1. ``explicit_path`` if passed (CLI / config override)
-      2. ``$PEPPAR_ANTPOS_JSON`` env var
-      3. The standard candidate paths (see ANTPOS_JSON_CANDIDATE_PATHS)
+      2. ``$PEPPAR_ANTENNAS_JSON`` env var
+      3. The standard candidate paths (see ANTENNAS_JSON_CANDIDATE_PATHS)
 
     Returns None if no readable file is found.
     """
     candidates = []
     if explicit_path:
         candidates.append(explicit_path)
-    env = os.environ.get("PEPPAR_ANTPOS_JSON")
+    env = os.environ.get("PEPPAR_ANTENNAS_JSON")
     if env:
         candidates.append(env)
-    candidates.extend(ANTPOS_JSON_CANDIDATE_PATHS)
+    candidates.extend(ANTENNAS_JSON_CANDIDATE_PATHS)
     for path in candidates:
         full = os.path.expanduser(path)
         if os.path.isfile(full):
@@ -263,57 +276,65 @@ def find_antpos_json(explicit_path: Optional[str] = None) -> Optional[str]:
     return None
 
 
-def compile_survey_from_antpos(
+def load_arp_from_antennas(
     arp_label: str,
     mount_sn: int,
     *,
-    antpos_path: Optional[str] = None,
+    antennas_path: Optional[str] = None,
 ) -> Optional[PositionState]:
-    """Read timelab/antPos.json, look up ``arp_label``, build a
-    survey-kind PositionState ready for save_survey_state.
+    """Read timelab/antennas.json, look up ``arp_label``, return a
+    survey-kind PositionState ready for the engine's seed picker.
+
+    **This is a pure in-memory read** — the result is never written
+    to disk by the engine.  Only peppar-survey-class backends may
+    write .survey.toml (see save_survey_state docstring).  The
+    antennas.json entry is itself the product of a survey workflow
+    (OPUS-Static / PRIDE / CORS RTK), so the returned state is
+    tagged kind="survey" and benefits from the picker's survey
+    tie-break.
 
     Returns None when:
       - ``arp_label`` is None/empty
-      - antPos.json can't be found
+      - antennas.json can't be found
       - the json doesn't contain ``arp_label`` as a key
       - the entry is malformed (missing ecef_m or sigma_m)
 
     All failures log a warning and return None — caller falls through
-    to its normal seed path (NAV2 / cold bootstrap).
+    to its normal seed path (.ppp.toml / NAV2 / cold bootstrap).
     """
     import json
     if not arp_label:
         return None
-    path = find_antpos_json(antpos_path)
+    path = find_antennas_json(antennas_path)
     if path is None:
-        log.warning("compile_survey_from_antpos: antPos.json not found "
-                    "(tried explicit + $PEPPAR_ANTPOS_JSON + %s)",
-                    ", ".join(ANTPOS_JSON_CANDIDATE_PATHS))
+        log.warning("load_arp_from_antennas: antennas.json not found "
+                    "(tried explicit + $PEPPAR_ANTENNAS_JSON + %s)",
+                    ", ".join(ANTENNAS_JSON_CANDIDATE_PATHS))
         return None
     try:
         with open(path) as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        log.warning("compile_survey_from_antpos: failed to read %s: %s",
+        log.warning("load_arp_from_antennas: failed to read %s: %s",
                     path, e)
         return None
     entry = data.get(arp_label)
     if entry is None:
-        log.warning("compile_survey_from_antpos: arp_label '%s' not "
+        log.warning("load_arp_from_antennas: arp_label '%s' not "
                     "found in %s (available: %s)",
                     arp_label, path, ", ".join(sorted(data.keys())))
         return None
     try:
         ecef = entry["ecef_m"]
         if isinstance(ecef, dict):
-            # antPos.json uses {x, y, z}
+            # antennas.json uses {x, y, z}
             ecef_m = (float(ecef["x"]), float(ecef["y"]),
                       float(ecef["z"]))
         else:
             ecef_m = (float(ecef[0]), float(ecef[1]), float(ecef[2]))
         sigma_m = float(entry["sigma_m"])
     except (KeyError, ValueError, TypeError) as e:
-        log.warning("compile_survey_from_antpos: malformed entry "
+        log.warning("load_arp_from_antennas: malformed entry "
                     "'%s' in %s: %s", arp_label, path, e)
         return None
     return PositionState(
@@ -321,14 +342,14 @@ def compile_survey_from_antpos(
         ecef_m=ecef_m,
         sigma_m=sigma_m,
         updated=utc_now_iso(),
-        source=(f"timelab/antPos.json:{arp_label}"
+        source=(f"timelab/antennas.json:{arp_label}"
                 f" ({entry.get('method', 'method?')})"),
         kind="survey",
         extra={
-            "antpos_method": str(entry.get("method", "")),
-            "antpos_updated": str(entry.get("updated", "")),
+            "antennas_method": str(entry.get("method", "")),
+            "antennas_updated": str(entry.get("updated", "")),
             "arp_label": arp_label,
-            "antpos_source_path": path,
+            "antennas_source_path": path,
         },
     )
 
@@ -917,12 +938,26 @@ def seed_from_state_files(
     *,
     ignore_ppp: bool = False,
     ignore_survey: bool = False,
+    arp_label: Optional[str] = None,
+    antennas_path: Optional[str] = None,
     positions_dir: Optional[str] = None,
     receivers_dir: Optional[str] = None,
 ) -> Optional[PositionState]:
-    """One-shot helper for engine startup.  Reads .ppp.toml and
-    .survey.toml, filters by current mount_sn, returns the
-    most-confident state (or None when no usable state exists).
+    """One-shot helper for engine startup.  Considers up to three
+    candidates and returns the most-confident usable one:
+
+      1. state/positions/<uid>.ppp.toml — engine-written PPP filter
+         snapshot from a prior run.
+      2. state/positions/<uid>.survey.toml — peppar-survey-written
+         (only present when an external survey backend has produced
+         a result for this receiver).
+      3. timelab/antennas.json[arp_label] — externally-surveyed ARP
+         from the lab antenna database.  Read in-memory only; the
+         engine never writes a .survey.toml from it.
+
+    Candidates are filtered by ``current_mount_sn`` (stale-mount
+    entries discarded) and then ``pick_most_confident`` chooses by
+    smallest sigma_m with a 2x survey tie-break.
 
     Caller behavior on None: fall back to NAV2 / bootstrap.
 
@@ -930,7 +965,13 @@ def seed_from_state_files(
         uid: receiver unique_id (int or str).  None disables the
             whole helper (returns None).
         ignore_ppp: skip the .ppp.toml file (CLI --ignore-ppp).
-        ignore_survey: skip the .survey.toml file (CLI --ignore-survey).
+        ignore_survey: skip both the .survey.toml file *and* the
+            antennas.json read (CLI --ignore-survey).  Both are
+            survey-class data and a single flag toggles them together.
+        arp_label: key into antennas.json for this host's antenna.
+            None disables the antennas.json candidate.
+        antennas_path: override path to antennas.json (CLI / config
+            override).  None uses the standard probe order.
         positions_dir: override DEFAULT_POSITIONS_DIR (for testing).
         receivers_dir: passed to load_current_mount_sn for mount_sn
             lookup (for testing).
@@ -946,6 +987,10 @@ def seed_from_state_files(
         candidates.append(load_ppp_state(uid, positions_dir=positions_dir))
     if not ignore_survey:
         candidates.append(load_survey_state(uid, positions_dir=positions_dir))
+        if arp_label:
+            candidates.append(load_arp_from_antennas(
+                arp_label, current_mount_sn,
+                antennas_path=antennas_path))
     usable = filter_current_mount(candidates, current_mount_sn)
     return pick_most_confident(usable)
 

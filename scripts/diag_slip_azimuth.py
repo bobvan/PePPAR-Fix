@@ -21,7 +21,7 @@ Usage:
         --window sunrise=12:00,14:00 \\
         --window quiet=05:00,07:00
 
-(Supply LAT,LON,ALT from timelab/antPos.json — coords aren't in
+(Supply LAT,LON,ALT from timelab/antennas.json — coords aren't in
 the repo.)
 
 Log timestamps are assumed local; ``--tz-offset-hours`` converts to

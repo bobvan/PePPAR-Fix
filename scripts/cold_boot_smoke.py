@@ -33,8 +33,8 @@ Usage (on the lab host, in ~/peppar-fix):
     --truth-lla LAT,LON,ALT \\
     --out data/cold_boot_smoke_$(date +%Y%m%d_%H%M%S).json
 
-(LAT,LON,ALT from timelab/antPos.json or surveys/, never hardcoded
-in the repo.  Lab usage: source the value from antPos.json at the
+(LAT,LON,ALT from timelab/antennas.json or surveys/, never hardcoded
+in the repo.  Lab usage: source the value from antennas.json at the
 host's repo root.)
 """
 

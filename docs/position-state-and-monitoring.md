@@ -42,19 +42,27 @@ Specifically:
 
 ## State files (receiver-keyed)
 
-Four files per receiver UID.  All keyed by the receiver's
-`SEC-UNIQID` (the F9T-side hardware identifier, decimal-encoded as
-the filename).
+Four files per receiver UID, plus one shared lab antenna database.
+All receiver-keyed files use the receiver's `SEC-UNIQID` (the F9T-
+side hardware identifier, decimal-encoded as the filename).
 
 ```
 state/receivers/<uid>.json           # engine-written
 state/positions/<uid>.ppp.toml       # engine-written
 state/positions/<uid>.survey.toml    # peppar-survey-written (optional)
 data/rinex/<uid>-{date}.obs          # engine-written
+timelab/antennas.json                # lab antenna DB (operator-curated)
 ```
 
 **Disjoint writers.**  Each file has exactly one writer.  No locking,
 no schema discipline, no shared-key conflict mode.
+
+**The engine never writes `.survey.toml`.**  The word "survey" is
+reserved for results of an external survey workflow — OPUS-Static,
+PRIDE PPP-AR, CORS NTRIP RTK, etc. — and only peppar-survey-class
+backends may produce that file.  The engine reads survey-class data
+(both `.survey.toml` and `antennas.json`) but never writes it; its
+own position-filter snapshots go to `.ppp.toml`.
 
 ### `state/receivers/<uid>.json` — receiver identity + mount_sn
 
@@ -123,13 +131,20 @@ Decision tree on engine startup, in order:
    `state/receivers/<uid>.json`.  If file absent (first run on this
    receiver), `mount_sn = 0`.
 
-3. **Load `*.ppp.toml` and `*.survey.toml`** if present and their
-   embedded `mount_sn` matches current.  Mismatch → ignore (stale).
+3. **Load up to three candidates:**
+   - `state/positions/<uid>.ppp.toml` (engine-written PPP snapshot)
+   - `state/positions/<uid>.survey.toml` (peppar-survey-written)
+   - `timelab/antennas.json[arp_label]` (lab antenna DB; in-memory
+     read only, never produces a `.survey.toml` on disk)
+
+   Position files must have their embedded `mount_sn` match the
+   receiver's current `mount_sn`; mismatch → ignore (stale).
    - `--ignore-ppp` skips `.ppp.toml` (e.g., when PPP filter
      diverged badly and you don't trust the snapshot).
-   - `--ignore-survey` skips `.survey.toml` (e.g., when survey
-     solution is suspect and you want to rebuild from current PPP).
-   - `--ignore-arp-state` is shorthand for both.
+   - `--ignore-survey` skips **both** `.survey.toml` and the
+     `antennas.json` read — both are survey-class data and a single
+     flag toggles them together.
+   - `--ignore-arp-state` is shorthand for both ignore flags.
 
 4. **Pick most-confident.**  Smallest σ wins.  Tie-break (within ~2×)
    to `.survey.toml` because PPP-filter σ can be optimistic — random

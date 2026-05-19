@@ -10,7 +10,7 @@ live in the committed repo; they come from one of:
 
   1. The `ANTENNA_POS_LLA` environment variable, formatted
      "<lat>,<lon>,<alt_m>".
-  2. `~/git/timelab/antPos.json` (gitignored in the timelab repo),
+  2. `~/git/timelab/antennas.json` (gitignored in the timelab repo),
      with a keyed structure:
          {
            "ufo1": {"lat": ..., "lon": ..., "alt_m": ...},
@@ -32,6 +32,8 @@ from typing import Optional, Tuple
 
 _DEFAULT_KEY = 'ufo1'
 _DEFAULT_PATHS = (
+    os.path.expanduser('~/git/timelab/antennas.json'),
+    '/home/bob/git/timelab/antennas.json',
     os.path.expanduser('~/git/timelab/antPos.json'),
     '/home/bob/git/timelab/antPos.json',
 )

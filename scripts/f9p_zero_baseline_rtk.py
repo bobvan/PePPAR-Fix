@@ -21,7 +21,7 @@ What this script does, in order:
   2. Drain any in-flight bytes so configuration responses don't get
      mis-parsed.
   3. Send a single CFG-VALSET to the BASE that:
-       - sets TMODE3 to fixed-position ECEF at UFO1 antPos.json
+       - sets TMODE3 to fixed-position ECEF at UFO1 antennas.json
          (the absolute position is moot for a zero-baseline test —
          only the relative vector matters — but using a real lab
          coordinate keeps base-rover messaging sane);
@@ -46,10 +46,10 @@ Dependencies: pyubx2, pyserial.  Already in the clkPoC3 venv.
 
 Base coordinates are passed as required CLI args (--base-lat,
 --base-lon, --base-alt) — never hardcoded.  Load them from
-``timelab/antPos.json`` on the running host, e.g.:
+``timelab/antennas.json`` on the running host, e.g.:
 
     BASE=$(jq -r '.ufo1 | "\\(.lat) \\(.lon) \\(.alt_m)"' \\
-        ~/git/timelab/antPos.json)
+        ~/git/timelab/antennas.json)
     python3 f9p_zero_baseline_rtk.py /dev/ttyACM0 /dev/ttyACM1 \\
         --base-lat ${BASE% *} ...
 
@@ -271,7 +271,7 @@ def main() -> int:
                     help="seconds to run (default 5 min)")
     ap.add_argument("--base-lat", type=float, required=True,
                     help="base latitude in decimal degrees "
-                         "(read from timelab/antPos.json on the host)")
+                         "(read from timelab/antennas.json on the host)")
     ap.add_argument("--base-lon", type=float, required=True,
                     help="base longitude in decimal degrees")
     ap.add_argument("--base-alt", type=float, required=True,

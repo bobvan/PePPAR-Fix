@@ -387,7 +387,7 @@ re-deploy.
    comparable or faster.
 
 4. **Saastamoinen ZTD prior** requires surveyed altitude.  We have
-   it from `timelab/antPos.json` (or fresh from sub-change 1's
+   it from `timelab/antennas.json` (or fresh from sub-change 1's
    NAV2 seed).  Implementation is small (< 30 LOC); the model is
    already implicit in `solve_ppp`'s tropospheric mapping function.
 

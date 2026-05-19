@@ -8294,51 +8294,27 @@ def run(args):
         if uid is not None:
             save_position_to_receiver(uid, known_ecef, 0.0, "known_pos")
 
-    # 1a. Compile timelab/antPos.json → state/positions/<uid>.survey.toml
-    # when ``arp_label`` is configured for this host and antPos.json is
-    # reachable.  This is the "use a survey we already have" path that
-    # gets the engine seeded from authoritative survey truth without
-    # requiring --known-pos on the CLI.  See CLAUDE.md "Authoritative
-    # ARP" section + docs/position-state-and-monitoring.md.
+    # 2. State files + lab antenna database.
     #
-    # Runs BEFORE seed_from_state_files so the freshly-written
-    # .survey.toml is in place when the seeder reads.  Skipped when
-    # --ignore-arp-state or --ignore-survey is set, so operators can
-    # force a re-survey path via CLI.
-    _arp_label = getattr(args, 'arp_label', None)
-    if (known_ecef is None
-            and _arp_label
-            and uid is not None
-            and not args.ignore_arp_state
-            and not args.ignore_survey):
-        from peppar_fix.position_state import (
-            compile_survey_from_antpos, load_current_mount_sn,
-            save_survey_state,
-        )
-        _current_mount_sn = load_current_mount_sn(uid)
-        _antpos_path = getattr(args, 'antpos_json', None)
-        _survey_state = compile_survey_from_antpos(
-            _arp_label, _current_mount_sn, antpos_path=_antpos_path)
-        if _survey_state is not None:
-            try:
-                save_survey_state(_survey_state, uid)
-                log.info("Compiled survey from timelab/antPos.json: "
-                         "arp_label=%s σ=%.4fm written to "
-                         "state/positions/%s.survey.toml",
-                         _arp_label, _survey_state.sigma_m, uid)
-            except OSError as e:
-                log.warning("compile_survey_from_antpos: write failed: %s", e)
-
-    # 2. State files — state/positions/<uid>.{ppp,survey}.toml.
-    # Most-confident wins (smallest σ), with a 2x tie-break to .survey.toml.
-    # mount_sn mismatch → stale → filtered out.  See
-    # docs/position-state-and-monitoring.md.
+    # Three candidates considered by seed_from_state_files:
+    #   - state/positions/<uid>.ppp.toml    (engine-written)
+    #   - state/positions/<uid>.survey.toml (peppar-survey-written)
+    #   - timelab/antennas.json[arp_label]  (in-memory read of the
+    #     lab antenna database; engine never writes a .survey.toml
+    #     from it — the "survey" word is reserved for actual
+    #     peppar-survey-class output)
+    #
+    # Most-confident wins (smallest σ), with a 2x tie-break to
+    # survey-class entries.  mount_sn mismatch → stale → filtered
+    # out.  See docs/position-state-and-monitoring.md.
     if known_ecef is None and not args.ignore_arp_state:
         from peppar_fix.position_state import seed_from_state_files
         picked = seed_from_state_files(
             uid,
             ignore_ppp=args.ignore_ppp,
             ignore_survey=args.ignore_survey,
+            arp_label=getattr(args, 'arp_label', None),
+            antennas_path=getattr(args, 'antennas_json', None),
         )
         if picked is not None:
             known_ecef = np.array(picked.ecef_m)
@@ -8756,7 +8732,7 @@ def _apply_host_config(args):
         "pmc_uds":          ("pmc",              str),
         "pmc_domain":       ("pmc_domain",       int),
         "arp_label":        ("arp_label",        str),
-        "antpos_json":      ("antpos_json",      str),
+        "antennas_json":    ("antennas_json",    str),
         "rinex_out":        ("rinex_out",        str),
         "rinex_decimate_s": ("rinex_decimate_s", float),
     }
@@ -8815,19 +8791,21 @@ Two-phase operation:
                           "Use to force a fresh NAV2/bootstrap seed even "
                           "when on-disk state would otherwise be picked.")
     pos.add_argument("--arp-label", default=None,
-                     help="Key into timelab/antPos.json identifying which "
+                     help="Key into timelab/antennas.json identifying which "
                           "operational ARP entry to use (e.g. 'choke1').  "
-                          "When set, engine compiles a .survey.toml from "
-                          "the matching entry at startup.  Usually set in "
-                          "the per-host TOML config, not on the CLI.  See "
-                          "CLAUDE.md 'Authoritative ARP' section.")
-    pos.add_argument("--antpos-json", default=None,
-                     help="Override path to timelab/antPos.json.  Default: "
-                          "probes $PEPPAR_ANTPOS_JSON, "
-                          "/etc/peppar-fix/antPos.json, "
-                          "~/peppar-fix/timelab/antPos.json, "
-                          "~/timelab/antPos.json, "
-                          "./timelab/antPos.json.")
+                          "When set, engine reads the matching entry at "
+                          "startup as a survey-class seed candidate (read-"
+                          "only — engine never writes .survey.toml from it).  "
+                          "Usually set in the per-host TOML config, not on "
+                          "the CLI.  See CLAUDE.md 'Authoritative ARP' "
+                          "section.")
+    pos.add_argument("--antennas-json", default=None,
+                     help="Override path to timelab/antennas.json.  Default: "
+                          "probes $PEPPAR_ANTENNAS_JSON, "
+                          "/etc/peppar-fix/antennas.json, "
+                          "~/peppar-fix/timelab/antennas.json, "
+                          "~/timelab/antennas.json, "
+                          "./timelab/antennas.json.")
     pos.add_argument("--nav2-seed-sigma-floor-m", type=float, default=0.0,
                      help="Inflate NAV2's reported hAcc to at least this "
                           "many metres when used as the position seed.  "

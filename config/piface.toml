@@ -16,6 +16,11 @@ eph_mount = "BCEP00BKG0"
 ssr_ntrip_conf = "ntrip-cnes.conf"
 systems = "gps,gal,bds"
 
+# Operational ARP — engine reads timelab/antennas.json[choke1] at
+# startup as an in-memory survey-class seed candidate.  Read-only;
+# only peppar-survey writes state/positions/<uid>.survey.toml.
+arp_label = "choke1"
+
 # CTI OSC5A2B02 OCXO via AD5693R DAC on I2C bus 1, 1× output mode.
 #
 # Empirical characterization 2026-05-16 by 3 independent runs of

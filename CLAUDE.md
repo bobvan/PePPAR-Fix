@@ -528,11 +528,13 @@ in code, log lines, or operator-facing docs:
   surveying-grade pipeline.  Examples: OPUS-Static multi-day mean,
   PRIDE PPP-AR, a quick NTRIP CORS-RTK check against a nearby
   reference station, NGS-calibrated antenna setup.  Sub-cm typical,
-  authoritative.  Lives in `timelab/antPos.json` (operational
-  ARP) and survey writeups under `timelab/surveys/`.  At runtime
-  goes to `state/positions/<uid>.survey.toml` (written by
-  `peppar-survey`, which has no implemented backend yet — design
-  in `docs/position-state-and-monitoring.md`).
+  authoritative.  Lives in `timelab/antennas.json` (operational
+  ARP database) and survey writeups under `timelab/surveys/`.  At
+  runtime goes to `state/positions/<uid>.survey.toml` — **only
+  ever written by `peppar-survey`-class backends, never by the
+  engine** (design in `docs/position-state-and-monitoring.md`).
+  The engine *reads* survey-class data (both .survey.toml and
+  `antennas.json`) but never writes it.
 - **PPP solution** = the engine's own AntPosEst output, written
   to `state/positions/<uid>.ppp.toml` by the engine itself.
   Convergence depends on AR mode: WL-only ~m-class; PPP-AR with
@@ -571,18 +573,25 @@ fell off the mast, cable kicked) where the displacement dwarfs
 the bias.  For sub-cm-scale antenna stability monitoring, use
 AntPosEst's running-mean watchdog instead.
 
-### Authoritative ARP — always `timelab/antPos.json`
+### Authoritative ARP — always `timelab/antennas.json`
 
-Operational ARPs live in `timelab/antPos.json` (gitignored
-single-source-of-truth).  Current entry: `choke1` (CHOKE1 antenna
-on the lab roof, shared via GUS splitter across all F9T/F10T hosts).
-ARP came from OPUS-Static multi-day mean, σ=12 mm.
+Operational ARPs live in `timelab/antennas.json` (gitignored
+antenna database, one entry per antenna).  Current entries: `ufo1`
+(decommissioned 2026-05-05) and `choke1` (CHOKE1 antenna on the
+lab roof, shared via GUS splitter across all F9T/F10T hosts).
+Each ARP comes from an OPUS-Static multi-day mean, σ ≈ 12 mm.
 
 If you need the surveyed ARP for `--known-pos`, `state/positions/
 <uid>.survey.toml`, or any other purpose, **read it from
-`timelab/antPos.json`** rather than copying coordinates into
+`timelab/antennas.json`** rather than copying coordinates into
 scripts/wrappers/docs — the coordinates evolve as new survey runs
 land and the JSON file is the truth.
+
+**File access pattern**: the engine reads `antennas.json` directly
+as an in-memory survey-class seed candidate (gated by per-host
+`arp_label = "..."` in the host config TOML).  No `.survey.toml`
+is written from this read — the "survey" word stays reserved for
+files actually produced by a peppar-survey-class backend.
 
 ### Unified CLI
 
@@ -712,13 +721,13 @@ The `timelab/` directory at the town root has authoritative lab state:
 | `timelab/calibration.md` | TICC calibration procedures |
 | `timelab/99-timelab.rules` | Universal udev rules (deployed to all Pis) |
 | `timelab/scripts/` | Lab utility scripts (ticc_read.py, calibration_capture.py, etc.) |
-| `timelab/antPos.json` | Surveyed antenna positions (UFO1 and any others).  Gitignored at both ends — coords stay out of the public PePPAR-Fix repo.  Read this when you need the lab ARP (e.g., to seed `--known-pos` for a dev/test run, or to validate a cold-start convergence against a reference). |
+| `timelab/antennas.json` | Lab antenna database — one entry per antenna with surveyed ARP, σ, history, cross-checks.  Gitignored at both ends — coords stay out of the public PePPAR-Fix repo.  Read this when you need the lab ARP (e.g., to seed `--known-pos` for a dev/test run, or to validate a cold-start convergence against a reference).  Engine reads it in-memory at startup via `arp_label = "..."` in the host config; never written by the engine. |
 
 If you need to know what's physically connected where, start with
 `topology.md`. If you need device specs, start with `gear.md`.
 Operational positions are **not** hardcoded in PePPAR-Fix — they're
 loaded from `state/receivers/<uid>.json` at runtime (written by
-Phase 1 bootstrap) and verified against `timelab/antPos.json`.
+Phase 1 bootstrap) and verified against `timelab/antennas.json`.
 
 ## Code style — naming honesty
 
