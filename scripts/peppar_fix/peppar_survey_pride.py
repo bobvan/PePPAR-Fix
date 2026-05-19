@@ -150,12 +150,22 @@ def invoke_pdp3(
 
     cmd = [pdp3_bin, "-m", "S", "-sys", sys_str] + list(extra_args) + [obs_local.name]
     log.info("Running pdp3 in %s: %s", work_dir, " ".join(cmd))
+    # pdp3 (the bash wrapper) does `$(dirname $(which pdp3))/config_template`
+    # to find its config template.  That `which` returns empty when pdp3
+    # is invoked by absolute path without being on PATH, producing a
+    # silent dirname-of-empty → "/config_template" error.  Ensure the
+    # bin dir is on PATH so `which` succeeds.
+    env = os.environ.copy()
+    pdp3_dir = os.path.dirname(os.path.abspath(pdp3_bin))
+    if pdp3_dir and pdp3_dir not in env.get("PATH", "").split(os.pathsep):
+        env["PATH"] = pdp3_dir + os.pathsep + env.get("PATH", "")
     try:
         proc = subprocess.run(
             cmd, cwd=str(work_dir),
             capture_output=True, text=True,
             timeout=timeout_s,
             check=False,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return PrideRunResult(
