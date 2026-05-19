@@ -9,7 +9,7 @@ methodology, different chipset family.
 
 | Name | Module | Firmware | PROTVER | Host | Interface |
 |------|--------|----------|---------|------|-----------|
-| F10T (ArduSimple) | NEO-F10T-00B-01 | TIM 3.02 | 42 | MadHat | UART1 @ 38400 baud |
+| F10T (ArduSimple) | NEO-F10T-00B-01 | TIM 3.01 | 42.01 | MadHat | UART1 @ 38400 baud |
 
 The NEO-F10T module datasheet lists UART, I2C, and SPI interfaces.
 **No USB.**  What appears as `/dev/f10t` on the host is the
@@ -38,7 +38,7 @@ Tested by sending CFG-VALSET (RAM+BBR+Flash layers) for each key
 individually after the 2026-05-12 `aac39ba` no-bundle refactor.
 ACK = accepted; NAK = rejected by firmware.
 
-| Message | CFG key on `_UART1` | F10T (TIM 3.02 / PROTVER 42) | Notes |
+| Message | CFG key on `_UART1` | F10T (TIM 3.01 / PROTVER 42.01) | Notes |
 |---|---|---|---|
 | NAV2 secondary engine | `CFG_NAV2_OUT_ENABLED` | **NAK (idempotent)** | NAV2-PVT flows; the NAK appears to indicate "already enabled" rather than "unsupported."  Skip the enable; let MSGOUT do the work. |
 | NAV2-PVT | `CFG_MSGOUT_UBX_NAV2_PVT_UART1=5` | ACK | Position consensus stream |
