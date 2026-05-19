@@ -40,6 +40,31 @@ def _make_writer(tmp_rnx):
     )
 
 
+def test_version_line_col21_is_obs_type(tmp_rnx):
+    """RINEX 3 spec § 5.1: the OBS file type marker ('O') must land
+    at column 21 of the VERSION / TYPE line.  PRIDE-PPP-AR's pdp3.sh
+    enforces this via `cut -c 21-21 == "O"`; getting it wrong makes
+    every .obs file unconsumable by pdp3 (validated on MadHat 2026-05-18).
+    """
+    w = _make_writer(tmp_rnx)
+    epoch = datetime(2026, 4, 25, 22, 0, 0, tzinfo=timezone.utc)
+    w.write_epoch(epoch, {
+        "G16": {
+            "GPS-L1CA": {"pr": 23e6, "cp": 1.2e8, "cno": 45.0,
+                         "half_cyc": True, "lock_ms": 5000},
+        },
+    })
+    w.close()
+    with open(tmp_rnx) as f:
+        first_line = f.readline()
+    # Spec: cols 1-9 version, 10-20 blanks, col 21 = 'O'
+    assert first_line[20] == "O", (
+        f"col 21 (0-indexed 20) is {first_line[20]!r}, expected 'O'.  "
+        f"First line: {first_line!r}")
+    # Sanity: label ends at col 80
+    assert first_line[60:80] == "RINEX VERSION / TYPE"
+
+
 def test_header_round_trip(tmp_rnx):
     """Write minimal session, parse header back, check fields."""
     w = _make_writer(tmp_rnx)
