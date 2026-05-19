@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Sequence
 
 from peppar_fix.arp_history import (
-    DEFAULT_N_DAYS, RunningArp,
+    DEFAULT_MAX_SIG0_M, DEFAULT_MIN_N_OBS, DEFAULT_N_DAYS, RunningArp,
     append_solution, apply_quality_filter, running_mean,
 )
 from peppar_fix.position_state import (
@@ -304,6 +304,8 @@ def run_pride_backend(
     mount_sn: int = 0,
     sys_attempts: Sequence[str] = DEFAULT_SYS_ATTEMPTS,
     n_days: int = DEFAULT_N_DAYS,
+    max_sig0_m: float = DEFAULT_MAX_SIG0_M,
+    min_n_obs: int = DEFAULT_MIN_N_OBS,
     pdp3_bin: str = DEFAULT_PDP3,
     timeout_s: int = DEFAULT_PDP3_TIMEOUT_S,
     dry_run: bool = False,
@@ -347,7 +349,8 @@ def run_pride_backend(
             log.warning("FAILED %s: %s",
                         obs.name, last.error if last else "no attempt completed")
             continue
-        quality_ok = apply_quality_filter(sol)
+        quality_ok = apply_quality_filter(
+            sol, max_sig0_m=max_sig0_m, min_n_obs=min_n_obs)
         n_solved += 1
         if quality_ok:
             n_quality_ok += 1

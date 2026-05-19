@@ -147,6 +147,22 @@ def main(argv: list[str] | None = None) -> int:
         help="Comma-separated -sys strings to try in order.  Default "
              "'GREC,GR' (multi-GNSS first, GPS+GLO fallback).",
     )
+    pride.add_argument(
+        "--max-sig0-m", type=float, default=None,
+        help="Quality gate: reject solutions with sig0_m above this "
+             "(formal-precision check).  Default 10.0 m (catches "
+             "catastrophically bad days while accepting weather-noisy "
+             "ones).  Lower for stricter labs; higher to accept short "
+             "fragment captures from a non-24h-continuous engine.",
+    )
+    pride.add_argument(
+        "--min-n-obs", type=int, default=None,
+        help="Quality gate: reject solutions with fewer than N "
+             "observations USED by PRIDE.  Default 10000 (defends "
+             "against truncated runs; a healthy 24h F9T capture "
+             "clears this 2-10x).  Lower (e.g. 100) when validating "
+             "against short engine-fragment captures.",
+    )
 
     args = ap.parse_args(argv)
 
@@ -182,6 +198,7 @@ def _run_pride(args) -> int:
     from glob import glob
     from pathlib import Path
 
+    from peppar_fix.arp_history import DEFAULT_MAX_SIG0_M, DEFAULT_MIN_N_OBS
     from peppar_fix.peppar_survey_pride import run_pride_backend
 
     if not args.rinex_glob:
@@ -206,6 +223,10 @@ def _run_pride(args) -> int:
         mount_sn=args.mount_sn,
         sys_attempts=sys_attempts,
         n_days=args.n_days,
+        max_sig0_m=(args.max_sig0_m if args.max_sig0_m is not None
+                    else DEFAULT_MAX_SIG0_M),
+        min_n_obs=(args.min_n_obs if args.min_n_obs is not None
+                   else DEFAULT_MIN_N_OBS),
         dry_run=args.dry_run,
     )
 
