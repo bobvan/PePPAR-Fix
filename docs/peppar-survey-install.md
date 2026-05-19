@@ -31,9 +31,10 @@ PRIDE-PPP-AR upstream installer's default; respected by
 need to relocate).
 
 ```bash
-# 1. Build deps (Debian / Raspberry Pi OS / Ubuntu).
+# 1. Build + runtime deps (Debian / Raspberry Pi OS / Ubuntu).
+# bc is needed at pdp3 runtime — pdp3.sh shells out for arithmetic.
 sudo apt-get update
-sudo apt-get install -y gfortran gcc make
+sudo apt-get install -y gfortran gcc make bc
 
 # 2. Fetch + build PRIDE-PPP-AR.  ~/PRIDE-PPPAR.install is a build
 #    tree only — the installed binaries land in ~/.PRIDE_PPPAR_BIN.

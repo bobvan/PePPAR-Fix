@@ -13,14 +13,18 @@ set -euo pipefail
 INSTALL_DIR="${HOME}/PRIDE-PPPAR.install"
 BIN_DIR="${HOME}/.PRIDE_PPPAR_BIN"
 
-echo "=== 1/4 apt deps (gfortran gcc make) ==="
+echo "=== 1/4 apt deps (gfortran gcc make bc) ==="
+# bc is needed at pdp3 runtime (pdp3.sh line ~852 does arithmetic via bc).
+# Not strictly a build dep but easier to bundle here than to ask the
+# operator to install it separately on first --pride invocation.
 if ! command -v gfortran >/dev/null 2>&1 \
    || ! command -v gcc >/dev/null 2>&1 \
-   || ! command -v make >/dev/null 2>&1; then
+   || ! command -v make >/dev/null 2>&1 \
+   || ! command -v bc >/dev/null 2>&1; then
     sudo apt-get update
-    sudo apt-get install -y gfortran gcc make
+    sudo apt-get install -y gfortran gcc make bc
 else
-    echo "  all compilers present, skipping apt"
+    echo "  all build + runtime deps present, skipping apt"
 fi
 
 echo "=== 2/4 fetch PRIDE-PPP-AR ==="

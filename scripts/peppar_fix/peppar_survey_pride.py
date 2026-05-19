@@ -180,12 +180,13 @@ def invoke_pdp3(
             error=f"pdp3 binary not found: {e}",
         )
 
-    # Find the pos file by glob in work_dir — pdp3 names it
-    # pos_YYYYDDD_<site>.  We don't pre-compute the expected name
-    # because the site comes from the RINEX header inside pdp3 and
-    # may not match our doy_from_obs_name() prediction perfectly.
-    pos_candidates = sorted(work_dir.glob("pos_*"))
-    log_candidates = sorted(work_dir.glob("log_*"))
+    # Find the pos file by recursive glob — pdp3 writes outputs to
+    # a nested $work_dir/<year>/<doy>/pos_YYYYDDD_<site> tree, not
+    # the top-level work dir.  Recursive search means we don't have
+    # to predict the site name (which comes from the RINEX header
+    # MARKER NAME) or the year/doy directory layout.
+    pos_candidates = sorted(work_dir.rglob("pos_*"))
+    log_candidates = sorted(work_dir.rglob("log_*"))
     # Most recent pos file wins (in case work_dir holds prior attempts).
     pos_path = max(pos_candidates, key=lambda p: p.stat().st_mtime) \
         if pos_candidates else None
