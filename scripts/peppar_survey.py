@@ -102,9 +102,52 @@ def main(argv: list[str] | None = None) -> int:
                     help="Override state/receivers/ directory.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Compute the survey snapshot, log what would "
-                         "be written, but don't write the file.  "
-                         "(No-op until a backend is implemented.)")
+                         "be written, but don't write the file.")
     ap.add_argument("-v", "--verbose", action="store_true")
+
+    # --- backends --- #
+    backends = ap.add_argument_group(
+        "backends",
+        "Select exactly one backend.  Each one consumes its own "
+        "additional flags from the relevant group below.",
+    )
+    backends.add_argument(
+        "--pride", action="store_true",
+        help="Use PRIDE-PPP-AR over captured RINEX.  Requires "
+             "--rinex-glob and pdp3 installed (PEPPAR_PDP3_BIN env var "
+             "or default ~/.PRIDE_PPPAR_BIN/pdp3).",
+    )
+    pride = ap.add_argument_group("--pride options")
+    pride.add_argument(
+        "--rinex-glob", default=None,
+        help="Glob matching the daily RINEX obs files for this "
+             "receiver, e.g. 'data/rinex/MadHat-*.obs'.",
+    )
+    pride.add_argument(
+        "--pride-work-dir", default=None,
+        help="Scratch directory for pdp3 (per-day subdirs created "
+             "inside).  Default: $TMPDIR/peppar-survey-pride/.",
+    )
+    pride.add_argument(
+        "--history-dir", default=None,
+        help="Override state/arp/ directory (history.jsonl lives "
+             "under <history-dir>/<uid>/history.jsonl).",
+    )
+    pride.add_argument(
+        "--mount-sn", type=int, default=0,
+        help="Antenna mount serial (per-mount history partition).  "
+             "Default 0.",
+    )
+    pride.add_argument(
+        "--n-days", type=int, default=7,
+        help="Window size for the running ARP mean (default 7).",
+    )
+    pride.add_argument(
+        "--pride-sys", default="GREC,GR",
+        help="Comma-separated -sys strings to try in order.  Default "
+             "'GREC,GR' (multi-GNSS first, GPS+GLO fallback).",
+    )
+
     args = ap.parse_args(argv)
 
     logging.basicConfig(
@@ -123,15 +166,48 @@ def main(argv: list[str] | None = None) -> int:
         args.receiver_uid = uid
         log.info("Auto-discovered receiver_uid=%s", uid)
 
-    # No backend implemented yet.  Error out explicitly so operators
-    # see this is a stub, not a silent success.
+    if args.pride:
+        return _run_pride(args)
+
     log.error(
-        "peppar-survey has no backend implemented yet.  "
-        "Future backends: --pride, --opus, --cors, --rtklib.  "
-        "Until one lands, the engine's own .ppp.toml warm-start is "
-        "the only seeding path."
+        "No backend selected.  Pass one of: --pride, --opus, --cors, "
+        "--rtklib.  Only --pride is implemented today."
     )
     return 2
+
+
+def _run_pride(args) -> int:
+    """Dispatch to the PRIDE backend with CLI args."""
+    import tempfile
+    from glob import glob
+    from pathlib import Path
+
+    from peppar_fix.peppar_survey_pride import run_pride_backend
+
+    if not args.rinex_glob:
+        log.error("--pride requires --rinex-glob "
+                  "(e.g. 'data/rinex/MadHat-*.obs')")
+        return 2
+    obs_files = [Path(p) for p in sorted(glob(args.rinex_glob))]
+    if not obs_files:
+        log.error("--rinex-glob %r matched no files", args.rinex_glob)
+        return 1
+    work_dir = Path(args.pride_work_dir or os.path.join(
+        tempfile.gettempdir(), "peppar-survey-pride"))
+
+    sys_attempts = tuple(s.strip() for s in args.pride_sys.split(",") if s.strip())
+
+    return run_pride_backend(
+        obs_files=obs_files,
+        work_dir=work_dir,
+        receiver_uid=args.receiver_uid,
+        positions_dir=args.positions_dir,
+        history_dir=args.history_dir,
+        mount_sn=args.mount_sn,
+        sys_attempts=sys_attempts,
+        n_days=args.n_days,
+        dry_run=args.dry_run,
+    )
 
 
 if __name__ == "__main__":
