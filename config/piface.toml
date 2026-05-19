@@ -60,3 +60,9 @@ tadd_gpio = 16
 # TICC #3: chA = DO PPS, chB = GNSS PPS.
 # TICC competes as a servo source whenever ticc_port is configured.
 ticc_port = "/dev/ticc3"
+
+# RINEX archival for offline PRIDE comparison + peppar-survey --pride.
+# Decimation to 30 s matches PRIDE/RTKLIB standard input; engine
+# continues to consume RAWX at 1 Hz for its own PPP filter.
+rinex_out = "data/rinex/{host}-{date}.obs"
+rinex_decimate_s = 30.0
