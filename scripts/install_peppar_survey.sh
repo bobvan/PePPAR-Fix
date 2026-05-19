@@ -10,6 +10,11 @@
 
 set -euo pipefail
 
+# Resolve our own script directory at the top, before any cd into other
+# trees.  Needed to find inject_lab_antennas.sh after we cd into PRIDE's
+# build tree later.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 INSTALL_DIR="${HOME}/PRIDE-PPPAR.install"
 BIN_DIR="${HOME}/.PRIDE_PPPAR_BIN"
 
@@ -96,11 +101,10 @@ echo "=== 5/5 inject lab-specific antenna calibrations ==="
 # the matching antex block, pdp3 silently falls back to a different
 # or zero calibration and ARP results bias by ~1 m vs OPUS-Static.
 # Injecting now is part of the install, not an afterthought.
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -x "${script_dir}/inject_lab_antennas.sh" ]; then
-    "${script_dir}/inject_lab_antennas.sh" "${INSTALL_DIR}"
+if [ -f "${SCRIPT_DIR}/inject_lab_antennas.sh" ]; then
+    bash "${SCRIPT_DIR}/inject_lab_antennas.sh" "${INSTALL_DIR}"
 else
-    echo "WARNING: ${script_dir}/inject_lab_antennas.sh not found — "
+    echo "WARNING: ${SCRIPT_DIR}/inject_lab_antennas.sh not found — "
     echo "         PRIDE will fall back to default antex for lab antennas."
     echo "         Run scripts/inject_lab_antennas.sh manually after pulling peppar-fix."
 fi
