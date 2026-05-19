@@ -1,13 +1,27 @@
 [peppar]
-# F9T EVKs share one USB descriptor (no unique serial), so udev can't
-# make a stable name and /dev/ttyACMx is fragile (enumeration shifts
-# when any USB device is added/removed).  Bind to the physical USB
-# port via /dev/serial/by-path — only breaks if the F9T's USB cable
-# is moved to a different port.  See docs/lab-operations.md §12.
-serial = "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:1:1.0"
-baud = 115200
-ubx_port = "USB"
-receiver = "f9t-l5"
+# MadHat has run a NEO-F10T (ArduSimple breakout) since the F9T
+# swap-out on 2026-05-12.  Two F10T-specific realities encoded
+# below (see docs/f10t-firmware-capabilities.md):
+#
+# 1. The NEO-F10T module has no USB port.  /dev/f10t is the
+#    ArduSimple board's USB-UART bridge (FTDI-class) — so as far
+#    as the engine is concerned this is a UART connection, not a
+#    USB one.  The udev rule at timelab/99-timelab.rules maps the
+#    FTDI serial 'D30GD1PE' to /dev/f10t.
+# 2. F10T factory default baud is 38400, not the F9T's 115200.
+#    configure_uart_baud can raise it but we leave it at default
+#    for now.
+#
+# If MadHat is ever flipped back to an F9T (e.g., for an
+# F9T-vs-F10T A/B), revert these four lines to the F9T defaults:
+#   serial = "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:1:1.0"
+#   baud = 115200
+#   ubx_port = "USB"
+#   receiver = "f9t-l5"
+serial = "/dev/f10t"
+baud = 38400
+ubx_port = "UART"
+receiver = "f10t"
 ptp_profile = "i226"
 ptp_dev = "/dev/ptp_i226"
 ntrip_conf = "ntrip.conf"
