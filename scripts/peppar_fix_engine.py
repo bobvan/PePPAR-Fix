@@ -181,13 +181,17 @@ def _periodic_ztd_tie(filt, args, lat_deg, alt_m, n_epochs, log):
         log.warning("[ZTD_TIE] epoch=%d Saastamoinen failed (%s); skipping tie",
                     n_epochs, exc)
         return
-    pre_ztd_m = float(filt.x[filt.IDX_ZTD])
+    # ZTD state index differs between FixedPosFilter (IDX_ZTD
+    # class attribute) and PPPFilter (PPP_IDX_ZTD module constant).
+    # Use the same getattr fallback the engine uses elsewhere.
+    ztd_idx = getattr(filt, 'IDX_ZTD', PPP_IDX_ZTD)
+    pre_ztd_m = float(filt.x[ztd_idx])
     pre_sigma_m = math.sqrt(max(0.0,
-        float(filt.P[filt.IDX_ZTD, filt.IDX_ZTD])))
+        float(filt.P[ztd_idx, ztd_idx])))
     filt.apply_ztd_tie(sigma_m, target_m=target_m)
-    post_ztd_m = float(filt.x[filt.IDX_ZTD])
+    post_ztd_m = float(filt.x[ztd_idx])
     post_sigma_m = math.sqrt(max(0.0,
-        float(filt.P[filt.IDX_ZTD, filt.IDX_ZTD])))
+        float(filt.P[ztd_idx, ztd_idx])))
     log.info(
         "[ZTD_TIE] epoch=%d %s age=%.0fmin target=%+.0fmm σ_tie=%.0fmm "
         "ZTD %+.0f→%+.0fmm (Δ=%+.0f) σ %.0f→%.0fmm",
