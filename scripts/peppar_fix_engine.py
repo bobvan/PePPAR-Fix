@@ -8309,10 +8309,25 @@ def run(args):
         if seed is not None:
             nav2_ecef, nav2_h_acc, nav2_n_sv = seed
             known_ecef = nav2_ecef
-            pos_sigma_m = nav2_h_acc
-            pos_source = f"NAV2 (hAcc={nav2_h_acc:.2f}m, nSV={nav2_n_sv})"
+            # --nav2-seed-sigma-floor-m: NAV2 SPP is systematically
+            # overconfident relative to the surveyed ARP (1.5-4 m
+            # bias on our lab F9T/F10T; see CLAUDE.md "NAV2 bias").
+            # Honest-seed-σ floor inflates the reported h_acc_m
+            # upward so the PPP filter's initial position-state
+            # covariance reflects the *actual* uncertainty against
+            # truth.  Test variable for the "does bad seed doom
+            # the filter?" experiment (2026-05-18 nav2-seed-basin).
+            nav2_floor = getattr(args, 'nav2_seed_sigma_floor_m', 0.0)
+            if nav2_floor and nav2_h_acc < nav2_floor:
+                log.info("NAV2 seed σ inflated: hAcc=%.2fm < floor=%.2fm",
+                         nav2_h_acc, nav2_floor)
+                pos_sigma_m = float(nav2_floor)
+            else:
+                pos_sigma_m = nav2_h_acc
+            pos_source = (f"NAV2 (hAcc={nav2_h_acc:.2f}m → "
+                          f"σ={pos_sigma_m:.2f}m, nSV={nav2_n_sv})")
             ape_sm.transition(AntPosEstState.VERIFYING,
-                              f"NAV2 seed @ hAcc={nav2_h_acc:.2f}m")
+                              f"NAV2 seed @ σ={pos_sigma_m:.2f}m")
     if known_ecef is not None:
         # --seed-pos-offset: apply (E,N,U) displacement in meters to
         # whatever known_ecef was loaded.  Used for seed-error
@@ -8762,6 +8777,16 @@ Two-phase operation:
                           "~/peppar-fix/timelab/antPos.json, "
                           "~/timelab/antPos.json, "
                           "./timelab/antPos.json.")
+    pos.add_argument("--nav2-seed-sigma-floor-m", type=float, default=0.0,
+                     help="Inflate NAV2's reported hAcc to at least this "
+                          "many metres when used as the position seed.  "
+                          "NAV2 SPP is systematically overconfident vs "
+                          "the surveyed ARP by 1.5-4 m on our lab "
+                          "receivers (see CLAUDE.md 'NAV2 bias').  This "
+                          "flag lets the PPP filter start with a realistic "
+                          "initial-state covariance.  Default 0 = no floor "
+                          "(use NAV2 hAcc as reported).  Used for the "
+                          "'does bad seed doom the filter?' experiment.")
     pos.add_argument("--pin-position", action="store_true",
                      help="Disable the slow AntPosEst→known_ecef blend in "
                           "run_steady_state.  Use when --known-pos is a "
