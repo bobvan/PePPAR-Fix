@@ -5136,13 +5136,16 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     log.error(
                         "[WATCHDOG_STEP_AUTO_MOVE] source=%s displ=%.3fm "
                         "held_s=%.0f old_mount_sn=%d new_mount_sn=%d "
-                        "— invalidated .ppp.toml; shutting down for "
-                        "wrapper respawn",
+                        "— invalidated .ppp.toml; exiting for wrapper "
+                        "respawn (exit code 5)",
                         _decision["source"], _decision["displ_m"],
                         _decision["step_held_s"],
                         _confidence_mount_sn, _new_sn,
                     )
-                    stop_event.set()
+                    if servo_ctx is not None:
+                        _set_clock_class(servo_ctx, "freerun")
+                        servo_ctx['phc_diverged'] = True
+                    return 5
             now = time.time()
             if now - last_skip_log >= 60.0:
                 log.info(f"  Skip stats: {skip_stats}")

@@ -226,11 +226,17 @@ class RinexWriter:
     def _write_header(self, first_epoch: datetime) -> None:
         """Emit the RINEX 3.04 OBS header with TIME OF FIRST OBS set."""
         f = self._fp
-        # Version line — fixed columns.  Type field is "M (MIXED)" not
-        # bare "M" — PRIDE-PPPAR (pdp3) rejects the bare form even though
-        # the RINEX 3.04 spec only mandates the single character.  Same
-        # column width (20), label still lands at col 61.
-        f.write(f"{'3.04':>9} {'':<11}"
+        # Version line — fixed columns per RINEX 3.04 spec § 5.1:
+        #   A9: version (right-justified)
+        #   11X: 11 blanks (cols 10-20)
+        #   A20: file type — first char ("O") must land at col 21
+        #   A20: satellite system
+        #   A20: label "RINEX VERSION / TYPE"
+        # Type field is "OBSERVATION DATA" with sat-system "M (MIXED)";
+        # PRIDE-PPPAR (pdp3.sh:213) rejects the bare "M" form via a
+        # strict `cut -c 21-21 == "O"` check so getting both the
+        # spelling AND the column alignment right is load-bearing.
+        f.write(f"{'3.04':>9}{'':<11}"
                 f"{'OBSERVATION DATA':<20}{'M (MIXED)':<20}"
                 f"RINEX VERSION / TYPE\n")
         # Pgm / Run by / Date

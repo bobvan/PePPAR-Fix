@@ -64,6 +64,18 @@ def test_header_round_trip(tmp_rnx):
     assert "L1C" in hdr.sys_obs_types["G"]
     assert "L5Q" in hdr.sys_obs_types["G"]
 
+    # PRIDE-PPPAR (pdp3.sh:213) checks the file-type at col 21 with
+    # `cut -c 21-21 == "O"`.  Off-by-one bug here previously caused
+    # PRIDE to reject our captured RINEX with "unsupported RINEX
+    # observation type" — see 2026-05-19 MadHat overnight post-mortem.
+    with open(tmp_rnx, "rb") as f:
+        line1 = f.readline()
+    # Col 21 is index 20 (0-indexed); must be 'O' of "OBSERVATION DATA"
+    assert line1[20:21] == b"O", (
+        f"RINEX line 1 col 21 must be 'O' for PRIDE-PPPAR, got "
+        f"{line1[20:21]!r}; full line: {line1!r}"
+    )
+
 
 def test_observation_values_round_trip(tmp_rnx):
     """Values written should come back via the reader within float precision."""
