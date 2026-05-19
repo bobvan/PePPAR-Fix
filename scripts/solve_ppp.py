@@ -1264,7 +1264,8 @@ class FixedPosFilter:
         Q = np.zeros((self.N_STATES, self.N_STATES))
         Q[0, 0] = 0.01 * dt      # phase noise (m²/s)
         Q[1, 1] = 0.01 * dt      # frequency noise (m²/s³)
-        Q[self.IDX_ZTD, self.IDX_ZTD] = (5e-5)**2 * dt  # ~5 cm/hour RMS (IGS standard)
+        # q = σ_hr / √3600 = 0.05 / 60 ≈ 8.33e-4 m/√s yields 5 cm/hr RMS.
+        Q[self.IDX_ZTD, self.IDX_ZTD] = (8.33e-4)**2 * dt  # 5 cm/hour RMS (IGS standard)
         Q[self.IDX_ISB_GAL, self.IDX_ISB_GAL] = 1e-6 * dt  # GAL ISB random walk
         Q[self.IDX_ISB_BDS, self.IDX_ISB_BDS] = 1e-6 * dt  # BDS ISB random walk
         self.P += Q
