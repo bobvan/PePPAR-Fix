@@ -1944,7 +1944,8 @@ class AntPosEstThread(threading.Thread):
                  nav_sig_store=None,
                  receiver_uid=None,
                  ppp_state_write_period_s=600.0,
-                 ppp_state_write_max_sigma_m=1.0):
+                 ppp_state_write_max_sigma_m=1.0,
+                 args=None):
         super().__init__(daemon=True, name="AntPosEst")
         # Phase 3 wind-up (Wu 1993): per-SV cumulative wind-up tracker
         # + carrier-phase correction applied before filter.update().
@@ -2117,6 +2118,29 @@ class AntPosEstThread(threading.Thread):
         # [CONFIDENCE] log reads the published state cross-thread.
         self._antpos_watchdog = AntPosEstWatchdog()
         self._antpos_watchdog.set_pin(known_ecef)
+
+        # METAR-tied periodic ZTD constraint on the AntPosEst filter.
+        # Mirrors run_steady_state's _periodic_ztd_tie on the
+        # FixedPosFilter.  Without this, AntPosEst's ZTD wanders by
+        # meters because position is a free state — every error
+        # source (multipath, antenna PCO, signal modeling) can flow
+        # into ZTD or position, and ZTD is unconstrained.  TimeHat
+        # 2026-05-18 day0518g observed +4.7 m ZTD residual after
+        # 30 min of unconstrained AntPosEst.  Stash args (for
+        # _periodic_ztd_tie's station / sigma access) and lat/alt
+        # (for Saastamoinen lookup at our site).  Cadence tracked
+        # via wall-clock since AntPosEst runs decimated.
+        self._args = args
+        try:
+            _lat0, _lon0, _alt0 = ecef_to_lla(
+                float(known_ecef[0]), float(known_ecef[1]),
+                float(known_ecef[2]))
+            self._ztd_tie_lat_deg = _lat0
+            self._ztd_tie_alt_m = _alt0
+        except Exception:
+            self._ztd_tie_lat_deg = None
+            self._ztd_tie_alt_m = None
+        self._last_ztd_tie_t = None
         self._nav2_tension_streak = 0  # consecutive high-tension checks
         self._nav2_cooldown_until = 0  # epoch number: skip checks until this
         # Per-SV ambiguity state machine + the three monitors that
@@ -3758,6 +3782,28 @@ class AntPosEstThread(threading.Thread):
                     mw.summary(), nl.summary(), nav2_tag, ztd_tag,
                     strength_tag, readmit_tag, tide_tag, pcv_tag, worst_tag,
                 )
+
+                # METAR-tied periodic ZTD constraint on AntPosEst's
+                # filter (companion to run_steady_state's
+                # FixedPosFilter tie at line ~4856).  Wall-clock
+                # cadence — AntPosEst runs decimated so we can't reuse
+                # the epoch-modulo gate from run_steady_state.
+                if (self._args is not None
+                        and self._ztd_tie_lat_deg is not None
+                        and hasattr(filt, 'apply_ztd_tie')):
+                    _tie_int_s = float(getattr(
+                        self._args, 'ztd_tie_interval_s', 300))
+                    if _tie_int_s > 0:
+                        _now_t = time.monotonic()
+                        if (self._last_ztd_tie_t is None
+                                or _now_t - self._last_ztd_tie_t
+                                >= _tie_int_s):
+                            _periodic_ztd_tie(
+                                filt, self._args,
+                                self._ztd_tie_lat_deg,
+                                self._ztd_tie_alt_m,
+                                self._n_epochs, log)
+                            self._last_ztd_tie_t = _now_t
                 # [OBS_COUNTS] — fleet visibility breakdown for the
                 # peppar-mon Untracked + Tracking columns per dayplan
                 # I-143806-main.  Combines upstream counters from
@@ -8557,6 +8603,7 @@ def run(args):
             pin_position=bool(getattr(args, "pin_position", False)),
             nav_sig_store=nav_sig_store,
             receiver_uid=getattr(args, 'receiver_unique_id', None),
+            args=args,
         )
         # Phase B NAV-SIG L0 admission gate — attach store + flags to
         # the thread so its fresh-PPPFilter path (warm-start, not
