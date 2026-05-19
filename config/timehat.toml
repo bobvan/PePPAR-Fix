@@ -37,14 +37,15 @@ ssr_bias_mount      = "OSBC00WHU1"
 ssr_bias_ntrip_conf = "ntrip-cnes.conf"
 systems = "gps,gal"
 
-# Operational ARP — engine reads timelab/antennas.json[choke1] at
+# Operational ARP — engine reads timelab/antennas.json[ufo1] at
 # startup as an in-memory survey-class seed candidate so the PPP
-# filter seeds at survey truth (σ ≈ 12 mm OPUS) instead of NAV2
+# filter seeds at survey truth (σ ≈ 9 mm OPUS) instead of NAV2
 # (~2 m biased).  The antennas.json read is in-memory only; only
 # peppar-survey writes state/positions/<uid>.survey.toml.  Single
 # source of truth: timelab/antennas.json.  See CLAUDE.md
-# "Authoritative ARP" section.
-arp_label = "choke1"
+# "Authoritative ARP" section.  UFO1 restored 2026-05-19 (CHOKE1
+# removed); see antennas.json[ufo1].history.
+arp_label = "ufo1"
 
 phase_step_bias_ns = 2283.0
 

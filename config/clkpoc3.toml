@@ -21,10 +21,11 @@ ssr_ntrip_conf = "ntrip-cnes.conf"
 # phase biases; BDS contributes to dt_rx without poisoning position.
 systems = "gps,gal,bds"
 
-# Operational ARP — engine reads timelab/antennas.json[choke1] at
+# Operational ARP — engine reads timelab/antennas.json[ufo1] at
 # startup as an in-memory survey-class seed candidate.  Read-only;
 # only peppar-survey writes state/positions/<uid>.survey.toml.
-arp_label = "choke1"
+# UFO1 restored 2026-05-19 (CHOKE1 swap-out); see antennas.json.
+arp_label = "ufo1"
 
 # IsoTemp OCXO via AD5693R DAC on I2C bus 1, 2× output mode.
 #
