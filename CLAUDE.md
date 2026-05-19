@@ -239,6 +239,31 @@ wrapper in scripts/peppar-fix. That's over 500 lines of code that should be test
 possible. Always prefer testing using the wrapper as a user would, but it's ok to
 run components individually for diagnosis or troubleshooting.
 
+## Optional component: peppar-survey
+
+`peppar-survey` is the optional companion to `peppar-fix` that writes
+authoritative ARP estimates to `state/positions/<uid>.survey.toml`
+from external observation backends (currently `--pride` only).  Native
+deps are tracked separately from `peppar-fix`'s `pyproject.toml`
+because PRIDE-PPP-AR is Fortran, not pip-installable.
+
+Full install procedure: [`docs/peppar-survey-install.md`](docs/peppar-survey-install.md).
+TL;DR: `bash scripts/install_peppar_survey.sh` on each lab host.
+
+**Required step that's easy to miss: edit PRIDE's antex database.**
+PRIDE-PPP-AR ships the IGS antex catalog, which does NOT include
+receiver-specific NGS antenna calibrations like `SFESPK6618H NONE`
+(the CHOKE1 + UFO1 antenna we use).  Without the matching block,
+pdp3 silently falls back to a different (or zero) calibration and
+the ARP biases by ~1 m vs OPUS-Static.  `scripts/install_peppar_survey.sh`
+calls `scripts/inject_lab_antennas.sh` automatically at install time
+to append the lab-relevant blocks from `support/antex/`.  When adding
+a new antenna to the lab, append its NGS antex (e.g. from
+`https://geodesy.noaa.gov/ANTCAL/`) to `support/antex/` AND update the
+`LAB_ANTENNAS` list in `scripts/inject_lab_antennas.sh`, then re-run
+the injector on every host that has PRIDE installed.  Idempotent —
+already-injected blocks are skipped.
+
 ## Lab Hosts and Access
 
 All lab hosts are Raspberry Pis or similar SBCs. SSH access is

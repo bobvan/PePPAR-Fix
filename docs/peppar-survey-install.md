@@ -56,18 +56,37 @@ Build time on a Raspberry Pi 5 (Cortex-A76 @ 2.4 GHz, ARM64):
 
 Disk: ~80 MB for the source tree, ~30 MB for installed binaries.
 
-## ANTEX file
+## ANTEX file — required injection step
 
-PRIDE ships its own ANTEX file at
+PRIDE ships the IGS antex catalog at
 `~/PRIDE-PPPAR.install/table/igs20_<NNNN>.atx` where `<NNNN>` is the
 GPS week the calibration was issued.  At time of writing the bundled
 file is `igs20_2415.atx`.
 
-For deployments using a non-IGS-cataloged antenna (e.g. the CHOKE1
-SFESPK6618H pattern that appears in the lab's surveys), append the
-custom calibration block to the ANTEX before pdp3 runs.  See
-`timelab/surveys/2026-05-03-ufo1-opus-static.md` for the
-SFESPK6618H block we use.
+**The IGS catalog does NOT include receiver-specific NGS antennas
+like `SFESPK6618H NONE`** (the CHOKE1 + UFO1 antenna the lab uses).
+Without the matching antex block, pdp3 silently falls back to a
+different (or zero) calibration and the resulting ARP biases by ~1 m
+vs OPUS-Static (validated empirically on MadHat 2026-05-18: PRIDE
+without SFESPK6618H showed 1.46 m offset from antPos.json[choke1]).
+
+The `install_peppar_survey.sh` script handles this automatically by
+calling `scripts/inject_lab_antennas.sh` after the PRIDE build.  The
+injector is idempotent — already-injected blocks are skipped, so
+re-running it on subsequent PRIDE updates is safe.
+
+When adding a new antenna to the lab:
+
+1. Fetch its NGS antex from `https://geodesy.noaa.gov/ANTCAL/` (or
+   extract from an `ngsXX.atx` composite).  Save under
+   `support/antex/<TYPE>_<RADOME>.atx` in the peppar-fix repo, one
+   antenna block per file.
+2. Append the basename (without `.atx`) to the `LAB_ANTENNAS` array
+   in `scripts/inject_lab_antennas.sh`.
+3. Commit + push + pull on every lab host that has PRIDE installed.
+4. Re-run `scripts/inject_lab_antennas.sh` on each PRIDE host (idempotent;
+   only the new antenna is appended on hosts already injected with
+   prior antennas).
 
 ## Running peppar-survey --pride
 

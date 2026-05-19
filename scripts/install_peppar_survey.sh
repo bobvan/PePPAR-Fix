@@ -44,7 +44,7 @@ cd "${INSTALL_DIR}"
 # internet + ~1h).  Subsequent runs can be Y if you want to validate.
 echo N | bash install.sh
 
-echo "=== 4/4 verify pdp3 ==="
+echo "=== 4/5 verify pdp3 ==="
 if [ ! -x "${BIN_DIR}/pdp3" ]; then
     echo "ERROR: ${BIN_DIR}/pdp3 not found after install.sh"
     exit 1
@@ -54,9 +54,25 @@ fi
     exit 1
 }
 
+echo "=== 5/5 inject lab-specific antenna calibrations ==="
+# PRIDE's bundled IGS antex doesn't include receiver-specific NGS
+# calibrations like SFESPK6618H NONE (CHOKE1/UFO1 antennas).  Without
+# the matching antex block, pdp3 silently falls back to a different
+# or zero calibration and ARP results bias by ~1 m vs OPUS-Static.
+# Injecting now is part of the install, not an afterthought.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -x "${script_dir}/inject_lab_antennas.sh" ]; then
+    "${script_dir}/inject_lab_antennas.sh" "${INSTALL_DIR}"
+else
+    echo "WARNING: ${script_dir}/inject_lab_antennas.sh not found — "
+    echo "         PRIDE will fall back to default antex for lab antennas."
+    echo "         Run scripts/inject_lab_antennas.sh manually after pulling peppar-fix."
+fi
+
 echo
 echo "peppar-survey --pride backend ready on this host."
 echo "  pdp3:  ${BIN_DIR}/pdp3"
 echo "  build: ${INSTALL_DIR}"
+echo "  antex injected: SFESPK6618H NONE"
 echo
 echo "Next: ./scripts/peppar_survey.py --pride --rinex-glob '...'"
