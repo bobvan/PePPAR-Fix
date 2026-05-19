@@ -34,3 +34,4 @@ __pycache__/
 # Binary dumps
 *.rtcm
 *.bin
+.claude/
