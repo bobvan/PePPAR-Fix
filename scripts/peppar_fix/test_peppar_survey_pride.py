@@ -14,9 +14,11 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from peppar_fix.peppar_survey_pride import (
-    PrideRunResult, brdm_filename, doy_from_obs_name, expected_pos_name,
-    invoke_pdp3, process_one_obs, resolve_brdm_source, run_pride_backend,
-    site_from_obs_header, write_survey_from_running,
+    PrideRunResult, WUM_KINDS, WUM_VARIANTS, brdm_filename,
+    doy_from_obs_name, expected_pos_name, gnsswhu_url, invoke_pdp3,
+    process_one_obs, resolve_brdm_source, resolve_wum_source,
+    run_pride_backend, site_from_obs_header, stage_wum_products,
+    wum_filename, write_survey_from_running, ydoy_to_gpsweek,
 )
 from peppar_fix.arp_history import (
     RunningArp, append_solution, apply_quality_filter, running_mean,
@@ -414,6 +416,384 @@ class ProcessOneObsBrdmPassthroughTest(unittest.TestCase):
             )
         self.assertEqual(len(seen_brdm), 1)
         self.assertEqual(seen_brdm[0], brdm)
+
+
+# ─── --wum-source plumbing ──────────────────────────────────────── #
+#
+# Mirrors the --brdm-source test shape.  Same idea: operator pre-
+# fetches WUM orbit/clock/bias/ERP into a directory; peppar-survey
+# gunzips matching files into pdp3's product/common before each run.
+
+
+class WumFilenameTest(unittest.TestCase):
+
+    def test_orbit_filename_format(self):
+        self.assertEqual(
+            wum_filename("orbit", "RTS", 2026, 140),
+            "WUM0MGXRTS_20261400000_01D_05M_ORB.SP3",
+        )
+        self.assertEqual(
+            wum_filename("orbit", "FIN", 2026, 140, gzipped=True),
+            "WUM0MGXFIN_20261400000_01D_05M_ORB.SP3.gz",
+        )
+
+    def test_clock_variant_dependent_interval(self):
+        """RAP/FIN clocks have 30S, RTS has 05S (per pdp3.sh)."""
+        self.assertEqual(
+            wum_filename("clock", "RAP", 2026, 140),
+            "WUM0MGXRAP_20261400000_01D_30S_CLK.CLK",
+        )
+        self.assertEqual(
+            wum_filename("clock", "RTS", 2026, 140),
+            "WUM0MGXRTS_20261400000_01D_05S_CLK.CLK",
+        )
+        self.assertEqual(
+            wum_filename("clock", "FIN", 2026, 140),
+            "WUM0MGXFIN_20261400000_01D_30S_CLK.CLK",
+        )
+
+    def test_bias_variant_dependent_interval(self):
+        """RAP/FIN biases are 01D, RTS is 05M (per pdp3.sh)."""
+        self.assertEqual(
+            wum_filename("bias", "RAP", 2026, 140),
+            "WUM0MGXRAP_20261400000_01D_01D_OSB.BIA",
+        )
+        self.assertEqual(
+            wum_filename("bias", "RTS", 2026, 140),
+            "WUM0MGXRTS_20261400000_01D_05M_OSB.BIA",
+        )
+
+    def test_erp_filename_format(self):
+        self.assertEqual(
+            wum_filename("erp", "RTS", 2026, 140),
+            "WUM0MGXRTS_20261400000_01D_01D_ERP.ERP",
+        )
+
+    def test_unknown_kind_raises(self):
+        with self.assertRaises(ValueError):
+            wum_filename("position", "RTS", 2026, 140)
+
+    def test_unknown_variant_raises(self):
+        with self.assertRaises(ValueError):
+            wum_filename("orbit", "NEAT", 2026, 140)
+
+
+class YdoyToGpsweekTest(unittest.TestCase):
+
+    def test_gps_epoch(self):
+        # 1980-01-06 is GPS week 0 day 0
+        self.assertEqual(ydoy_to_gpsweek(1980, 6), 0)
+
+    def test_known_2026_140(self):
+        # 2026 DOY 140 = 2026-05-20 = GPS week 2419 (verified against
+        # the dayplan note "weeks 2418 and prior at writing").
+        self.assertEqual(ydoy_to_gpsweek(2026, 140), 2419)
+
+    def test_week_boundary(self):
+        # 2026-01-03 is the last day of GPS week 2399 (Saturday);
+        # 2026-01-04 is the first day of week 2400 (Sunday).
+        # DOY 3 = Jan 3; DOY 4 = Jan 4.
+        self.assertEqual(ydoy_to_gpsweek(2026, 3), 2399)
+        self.assertEqual(ydoy_to_gpsweek(2026, 4), 2400)
+
+
+class GnsswhuUrlTest(unittest.TestCase):
+
+    def test_rts_under_phasebias_per_kind(self):
+        """RTS lives under /pub/whu/phasebias/{year}/{subdir}/ where
+        subdir varies by kind (orbit/clock/bias/orbit-for-ERP)."""
+        self.assertEqual(
+            gnsswhu_url("orbit", "RTS", 2026, 140),
+            "ftp://igs.gnsswhu.cn/pub/whu/phasebias/2026/orbit/"
+            "WUM0MGXRTS_20261400000_01D_05M_ORB.SP3.gz",
+        )
+        self.assertEqual(
+            gnsswhu_url("clock", "RTS", 2026, 140),
+            "ftp://igs.gnsswhu.cn/pub/whu/phasebias/2026/clock/"
+            "WUM0MGXRTS_20261400000_01D_05S_CLK.CLK.gz",
+        )
+        self.assertEqual(
+            gnsswhu_url("bias", "RTS", 2026, 140),
+            "ftp://igs.gnsswhu.cn/pub/whu/phasebias/2026/bias/"
+            "WUM0MGXRTS_20261400000_01D_05M_OSB.BIA.gz",
+        )
+        self.assertEqual(
+            gnsswhu_url("erp", "RTS", 2026, 140),
+            "ftp://igs.gnsswhu.cn/pub/whu/phasebias/2026/orbit/"
+            "WUM0MGXRTS_20261400000_01D_01D_ERP.ERP.gz",
+        )
+
+    def test_fin_under_products_mgex_by_gpsweek(self):
+        """FIN lives under /pub/gps/products/mgex/{gpsweek}/."""
+        # DOY 140 of 2026 → GPS week 2419
+        url = gnsswhu_url("bias", "FIN", 2026, 140)
+        self.assertEqual(
+            url,
+            "ftp://igs.gnsswhu.cn/pub/gps/products/mgex/2419/"
+            "WUM0MGXFIN_20261400000_01D_01D_OSB.BIA.gz",
+        )
+
+
+class ResolveWumSourceTest(unittest.TestCase):
+
+    def _make_gz(self, path: Path, content: bytes = b"dummy\n") -> None:
+        import gzip
+        with gzip.open(path, "wb") as fout:
+            fout.write(content)
+
+    def test_none_returns_empty(self):
+        self.assertEqual(resolve_wum_source(None, 2026, 140), {})
+
+    def test_non_directory_returns_empty(self):
+        with TemporaryDirectory() as td:
+            p = Path(td) / "not-a-dir"
+            p.write_text("oops")
+            self.assertEqual(resolve_wum_source(p, 2026, 140), {})
+        self.assertEqual(
+            resolve_wum_source("/nonexistent/path", 2026, 140), {})
+
+    def test_empty_directory_returns_empty(self):
+        with TemporaryDirectory() as td:
+            self.assertEqual(resolve_wum_source(Path(td), 2026, 140), {})
+
+    def test_matching_rts_files_picked_up(self):
+        with TemporaryDirectory() as td:
+            d = Path(td)
+            self._make_gz(d / wum_filename("orbit", "RTS", 2026, 140,
+                                            gzipped=True))
+            self._make_gz(d / wum_filename("clock", "RTS", 2026, 140,
+                                            gzipped=True))
+            self._make_gz(d / wum_filename("bias", "RTS", 2026, 140,
+                                            gzipped=True))
+            self._make_gz(d / wum_filename("erp", "RTS", 2026, 140,
+                                            gzipped=True))
+            got = resolve_wum_source(d, 2026, 140)
+            self.assertEqual(sorted(got.keys()), sorted(WUM_KINDS))
+
+    def test_other_day_files_ignored(self):
+        with TemporaryDirectory() as td:
+            d = Path(td)
+            self._make_gz(d / wum_filename("orbit", "RTS", 2026, 139,
+                                            gzipped=True))
+            self.assertEqual(resolve_wum_source(d, 2026, 140), {})
+
+    def test_decompressed_files_also_resolve(self):
+        """Operator may have already gunzipped — accept either form."""
+        with TemporaryDirectory() as td:
+            d = Path(td)
+            (d / wum_filename("orbit", "RTS", 2026, 140)).write_text("plain")
+            got = resolve_wum_source(d, 2026, 140)
+            self.assertEqual(set(got.keys()), {"orbit"})
+
+    def test_variant_preference_order(self):
+        """RAP > RTS > FIN when multiple variants present for the same
+        kind."""
+        with TemporaryDirectory() as td:
+            d = Path(td)
+            self._make_gz(d / wum_filename("orbit", "RAP", 2026, 140,
+                                            gzipped=True),
+                          b"rap")
+            self._make_gz(d / wum_filename("orbit", "RTS", 2026, 140,
+                                            gzipped=True),
+                          b"rts")
+            got = resolve_wum_source(d, 2026, 140)
+            self.assertIn("RAP", got["orbit"].name)
+
+
+class StageWumProductsTest(unittest.TestCase):
+
+    def _make_gz(self, path: Path, content: bytes) -> None:
+        import gzip
+        with gzip.open(path, "wb") as fout:
+            fout.write(content)
+
+    def test_gunzips_into_target_dir(self):
+        with TemporaryDirectory() as td:
+            src_dir = Path(td) / "src"
+            tgt_dir = Path(td) / "target"
+            src_dir.mkdir()
+            gz_name = wum_filename("orbit", "RTS", 2026, 140, gzipped=True)
+            self._make_gz(src_dir / gz_name, b"orbit-payload\n")
+            n = stage_wum_products({"orbit": src_dir / gz_name}, tgt_dir)
+            self.assertEqual(n, 1)
+            staged = tgt_dir / gz_name[:-3]  # without .gz
+            self.assertTrue(staged.is_file())
+            self.assertEqual(staged.read_bytes(), b"orbit-payload\n")
+
+    def test_already_decompressed_files_copy_verbatim(self):
+        with TemporaryDirectory() as td:
+            src_dir = Path(td) / "src"
+            tgt_dir = Path(td) / "target"
+            src_dir.mkdir()
+            name = wum_filename("orbit", "RTS", 2026, 140)
+            (src_dir / name).write_text("plain payload")
+            n = stage_wum_products({"orbit": src_dir / name}, tgt_dir)
+            self.assertEqual(n, 1)
+            self.assertEqual((tgt_dir / name).read_text(), "plain payload")
+
+    def test_creates_target_dir(self):
+        with TemporaryDirectory() as td:
+            src = Path(td) / "src.gz"
+            self._make_gz(src, b"data")
+            # Note: the dummy src.gz name doesn't matter — staging
+            # writes to the .gz-stripped name.
+            tgt = Path(td) / "deeply" / "nested" / "target"
+            stage_wum_products({"orbit": src}, tgt)
+            self.assertTrue(tgt.is_dir())
+
+    def test_empty_dict_no_op(self):
+        with TemporaryDirectory() as td:
+            tgt = Path(td) / "target"
+            n = stage_wum_products({}, tgt)
+            self.assertEqual(n, 0)
+            self.assertTrue(tgt.is_dir())  # still created
+
+
+class InvokePdp3WumStagingTest(unittest.TestCase):
+    """invoke_pdp3 stages WUM products into pdp3's product/common
+    sibling dir before invoking pdp3."""
+
+    def _make_gz(self, path: Path, content: bytes = b"x") -> None:
+        import gzip
+        with gzip.open(path, "wb") as fout:
+            fout.write(content)
+
+    def _make_obs_file(self, td: Path, name: str = "MadHat-2026140.obs"):
+        p = td / name
+        p.write_text("dummy obs file\n")
+        return p
+
+    def test_wum_source_staged_to_product_common_sibling(self):
+        """WUM files go into work_dir.parent / product / common/."""
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            obs = self._make_obs_file(tdp)
+            wum_dir = tdp / "wum-cache"
+            wum_dir.mkdir()
+            orbit_gz = wum_dir / wum_filename(
+                "orbit", "RTS", 2026, 140, gzipped=True)
+            self._make_gz(orbit_gz, b"orb")
+            # work_dir is the per-attempt dir; product/common lives in
+            # the parent (shared across sys_attempts).
+            outer = tdp / "outer"
+            work = outer / "sys_GREC"
+
+            with mock.patch(
+                "peppar_fix.peppar_survey_pride.subprocess.run",
+                lambda *a, **kw: mock.Mock(returncode=0, stdout="", stderr=""),
+            ):
+                invoke_pdp3(
+                    obs, work, "GREC",
+                    pdp3_bin="/tmp/fake-pdp3",
+                    wum_source=wum_dir,
+                )
+
+            expected = outer / "product" / "common" / wum_filename(
+                "orbit", "RTS", 2026, 140)
+            self.assertTrue(expected.is_file(),
+                            f"WUM orbit not staged at {expected}")
+            self.assertEqual(expected.read_bytes(), b"orb")
+
+    def test_no_wum_source_no_product_dir(self):
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            obs = self._make_obs_file(tdp)
+            outer = tdp / "outer"
+            work = outer / "sys_GREC"
+            with mock.patch(
+                "peppar_fix.peppar_survey_pride.subprocess.run",
+                lambda *a, **kw: mock.Mock(returncode=0, stdout="", stderr=""),
+            ):
+                invoke_pdp3(
+                    obs, work, "GREC",
+                    pdp3_bin="/tmp/fake-pdp3",
+                    wum_source=None,
+                )
+            self.assertFalse((outer / "product" / "common").exists())
+
+    def test_unparseable_obs_name_skips_wum_staging(self):
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            # No YYYYDDD pattern in the name.
+            obs = self._make_obs_file(tdp, name="rinex2-style.26o")
+            wum_dir = tdp / "wum-cache"
+            wum_dir.mkdir()
+            self._make_gz(
+                wum_dir / wum_filename("orbit", "RTS", 2026, 140,
+                                       gzipped=True),
+                b"orb")
+            outer = tdp / "outer"
+            work = outer / "sys_GREC"
+            with mock.patch(
+                "peppar_fix.peppar_survey_pride.subprocess.run",
+                lambda *a, **kw: mock.Mock(returncode=0, stdout="", stderr=""),
+            ):
+                invoke_pdp3(
+                    obs, work, "GREC",
+                    pdp3_bin="/tmp/fake-pdp3",
+                    wum_source=wum_dir,
+                )
+            self.assertFalse((outer / "product" / "common").exists())
+
+    def test_brdm_and_wum_can_be_combined(self):
+        """Both --brdm-source and --wum-source plumbing in one invocation."""
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            obs = self._make_obs_file(tdp)
+            brdm = tdp / "nav.26p"
+            brdm.write_text("multi-gnss nav")
+            wum_dir = tdp / "wum-cache"
+            wum_dir.mkdir()
+            self._make_gz(
+                wum_dir / wum_filename("bias", "RTS", 2026, 140,
+                                       gzipped=True),
+                b"phase-bias")
+            outer = tdp / "outer"
+            work = outer / "sys_GREC"
+            with mock.patch(
+                "peppar_fix.peppar_survey_pride.subprocess.run",
+                lambda *a, **kw: mock.Mock(returncode=0, stdout="", stderr=""),
+            ):
+                invoke_pdp3(
+                    obs, work, "GREC",
+                    pdp3_bin="/tmp/fake-pdp3",
+                    brdm_source=brdm,
+                    wum_source=wum_dir,
+                )
+            # brdm went into work_dir (cwd)
+            self.assertTrue((work / "brdm1400.26p").is_file())
+            # WUM went into product/common sibling
+            self.assertTrue((outer / "product" / "common" / wum_filename(
+                "bias", "RTS", 2026, 140)).is_file())
+
+
+class ProcessOneObsWumPassthroughTest(unittest.TestCase):
+    """wum_source threads through process_one_obs → pdp3_runner."""
+
+    def test_wum_source_reaches_runner(self):
+        seen = []
+
+        def fake_pdp3(obs_file, work_dir, sys_str, *,
+                      brdm_source=None, wum_source=None, **kw):
+            seen.append(wum_source)
+            return PrideRunResult(
+                obs_file=obs_file, sys_attempted=sys_str,
+                returncode=1, pos_path=None, log_path=None,
+                error="stub",
+            )
+
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            wum = tdp / "wum-cache"
+            wum.mkdir()
+            process_one_obs(
+                tdp / "MadHat-2026140.obs",
+                tdp / "work",
+                sys_attempts=("GREC",),
+                pdp3_runner=fake_pdp3,
+                wum_source=wum,
+            )
+        self.assertEqual(seen, [wum])
 
 
 # ─── append → running_mean → survey.toml round-trip ─────────────── #

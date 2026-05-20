@@ -17,13 +17,14 @@ imported by that CLI and shouldn't normally be invoked directly.
 """
 from __future__ import annotations
 
+import gzip
 import logging
 import os
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -137,6 +138,180 @@ def brdm_filename(year: int, doy: int) -> str:
     return f"brdm{doy:03d}0.{year % 100:02d}p"
 
 
+# ─── WUM products (orbit / clock / bias / ERP) ───────────────────── #
+#
+# pdp3.sh's PrepareProducts builds an URL ladder (bdspride → IGN → gnsswhu
+# → bdspride WCC → gnsswhu IGS2R03FIN) for each of orbit/clock/bias/ERP.
+# In practice the gnsswhu /pub/whu/phasebias/{year}/ tree is the most
+# reliable mirror for current-day RTS variants, but pdp3's chain often
+# trips on flaky FTPS or unwritten RAP products and never reaches the
+# RTS fall-through.  Staging the products into pdp3's $product_cmn_dir
+# (= work_dir.parent / "product" / "common") under their canonical
+# names lets CopyOrDownloadProduct's USECACHE branch find them and skip
+# the download chain entirely.
+#
+# Filename conventions (per pdp3.sh URL lists at lines 2283-2285,
+# 2575-2577, 2861-2863, 2924; basename of those URLs is the canonical
+# form pdp3 looks up):
+#
+#   orbit:  WUM0MGX{VARIANT}_{YYYY}{DOY}0000_01D_05M_ORB.SP3
+#   clock:  WUM0MGX{VARIANT}_{YYYY}{DOY}0000_01D_{INT}_CLK.CLK
+#   bias:   WUM0MGX{VARIANT}_{YYYY}{DOY}0000_01D_{INT}_OSB.BIA
+#   erp:    WUM0MGX{VARIANT}_{YYYY}{DOY}0000_01D_01D_ERP.ERP
+#
+# where VARIANT ∈ {RAP, RTS, NRT, FIN}.  Sample intervals differ
+# between RAP and RTS (clock: 30S RAP vs 05S RTS; bias: 01D RAP vs
+# 05M RTS).  See _WUM_VARIANT_INTERVALS below for the per-variant
+# value pdp3 uses, mirrored from those URL lists.
+#
+# NRT (near-real-time, 2-day file) lives at
+# /pub/gps/products/mgex/<gpsweek>/WUM0MGXNRT_*_02D_*.gz — distinct
+# enough that we don't try to merge it into the staging path; operators
+# pre-fetching it should rename to the same canonical scheme.
+
+WUM_KINDS = ("orbit", "clock", "bias", "erp")
+WUM_VARIANTS = ("RAP", "RTS", "FIN")  # tried in this order when resolving
+
+# pdp3.sh's CopyOrDownloadProduct strips the URL .gz extension and uses
+# the leftover as the cached-name target.  These are the .gz suffixes
+# pdp3 expects in $product_cmn_dir (without leading directory).
+_WUM_FILENAME_TEMPLATES = {
+    "orbit": "WUM0MGX{variant}_{year}{doy:03d}0000_01D_05M_ORB.SP3",
+    # Clock has variant-dependent sample interval.  Mirrors pdp3.sh
+    # line 2487 (RAP 30S) vs line 2540 (RTS 05S).
+    "clock_RAP": "WUM0MGX{variant}_{year}{doy:03d}0000_01D_30S_CLK.CLK",
+    "clock_RTS": "WUM0MGX{variant}_{year}{doy:03d}0000_01D_05S_CLK.CLK",
+    "clock_FIN": "WUM0MGX{variant}_{year}{doy:03d}0000_01D_30S_CLK.CLK",
+    # Bias varies similarly: pdp3.sh line 2863 (RAP 01D) vs line 2924
+    # (RTS 05M).
+    "bias_RAP": "WUM0MGX{variant}_{year}{doy:03d}0000_01D_01D_OSB.BIA",
+    "bias_RTS": "WUM0MGX{variant}_{year}{doy:03d}0000_01D_05M_OSB.BIA",
+    "bias_FIN": "WUM0MGX{variant}_{year}{doy:03d}0000_01D_01D_OSB.BIA",
+    "erp": "WUM0MGX{variant}_{year}{doy:03d}0000_01D_01D_ERP.ERP",
+}
+
+# gnsswhu paths discovered 2026-05-20 (wumProductGnsswhuFallback bead):
+# the RTS variant lives under /pub/whu/phasebias/{year}/{bias|clock|orbit}/,
+# FIN lives under /pub/gps/products/mgex/{gpsweek}/.  These mirror
+# pdp3.sh's own URL templates (lines 2285, 2344, 2577, 2638, 2863, 2924)
+# but with the value set we actually observed working when pdp3's chain
+# fails through to its tail.
+_GNSSWHU_BASE = "ftp://igs.gnsswhu.cn"
+_GNSSWHU_RTS_SUBDIR_BY_KIND = {
+    "orbit": "orbit",
+    "clock": "clock",
+    "bias": "bias",
+    "erp": "orbit",  # ERP files live under orbit/ in the RTS tree
+}
+
+
+def wum_filename(kind: str, variant: str, year: int, doy: int,
+                 *, gzipped: bool = False) -> str:
+    """Canonical WUM filename for (kind, variant, year, doy).
+
+    ``kind`` ∈ ``WUM_KINDS``, ``variant`` ∈ ``WUM_VARIANTS``.
+    Returns the decompressed name by default; set ``gzipped=True``
+    for the ``.gz`` form pdp3 downloads.
+    """
+    if kind not in WUM_KINDS:
+        raise ValueError(f"unknown WUM kind: {kind}")
+    if variant not in WUM_VARIANTS:
+        raise ValueError(f"unknown WUM variant: {variant}")
+    tmpl_key = f"{kind}_{variant}" if f"{kind}_{variant}" in _WUM_FILENAME_TEMPLATES else kind
+    tmpl = _WUM_FILENAME_TEMPLATES[tmpl_key]
+    name = tmpl.format(variant=variant, year=year, doy=doy)
+    return f"{name}.gz" if gzipped else name
+
+
+def ydoy_to_gpsweek(year: int, doy: int) -> int:
+    """Convert (year, day-of-year) → GPS week number.
+
+    GPS week 0 starts 1980-01-06 (Sunday).  Used to compute the
+    /pub/gps/products/mgex/{gpsweek}/ path for FIN products.
+    """
+    d = date(year, 1, 1) + timedelta(days=doy - 1)
+    days_since_gps_epoch = (d - date(1980, 1, 6)).days
+    return days_since_gps_epoch // 7
+
+
+def gnsswhu_url(kind: str, variant: str, year: int, doy: int) -> str:
+    """gnsswhu FTP URL for a WUM product (kind, variant, year, doy).
+
+    RTS lives under /pub/whu/phasebias/{year}/{subdir}/.
+    RAP/FIN live under /pub/gps/products/mgex/{gpsweek}/.
+
+    Returns the .gz URL.  See bead wumProductGnsswhuFallback-charlie
+    for the empirically-verified paths.
+    """
+    fname = wum_filename(kind, variant, year, doy, gzipped=True)
+    if variant == "RTS":
+        sub = _GNSSWHU_RTS_SUBDIR_BY_KIND[kind]
+        return f"{_GNSSWHU_BASE}/pub/whu/phasebias/{year}/{sub}/{fname}"
+    gpsweek = ydoy_to_gpsweek(year, doy)
+    return f"{_GNSSWHU_BASE}/pub/gps/products/mgex/{gpsweek}/{fname}"
+
+
+def resolve_wum_source(wum_source: Path | str | None,
+                       year: int, doy: int) -> dict[str, Path]:
+    """Resolve a wum_source directory to {kind: filepath} for (year, doy).
+
+    Walks ``wum_source`` looking for WUM0MGX*_<YYYY><DOY>0000_*_*.gz (or
+    decompressed) files for each kind, preferring earlier variants in
+    ``WUM_VARIANTS`` (RAP > RTS > FIN).  Caller stages whatever was
+    found; missing kinds fall through to pdp3's normal download.
+
+    Returns ``{}`` when ``wum_source`` is ``None``, not a directory,
+    or contains no matching files.
+    """
+    if wum_source is None:
+        return {}
+    p = Path(wum_source).expanduser()
+    if not p.is_dir():
+        log.warning("--wum-source %s is not a directory — ignoring "
+                    "(no WUM products will be staged)", p)
+        return {}
+
+    found: dict[str, Path] = {}
+    for kind in WUM_KINDS:
+        for variant in WUM_VARIANTS:
+            cand_plain = p / wum_filename(kind, variant, year, doy)
+            cand_gz = p / wum_filename(kind, variant, year, doy, gzipped=True)
+            if cand_plain.is_file():
+                found[kind] = cand_plain
+                break
+            if cand_gz.is_file():
+                found[kind] = cand_gz
+                break
+    return found
+
+
+def stage_wum_products(files: dict[str, Path], product_cmn_dir: Path) -> int:
+    """Copy + gunzip resolved WUM files into pdp3's product/common dir.
+
+    pdp3.sh's CopyOrDownloadProduct (line 3477) looks for the
+    decompressed name first under USECACHE=YES (the default), so we
+    drop the gunzipped form there.  ``.gz`` inputs are streamed through
+    gzip; already-decompressed inputs are copied verbatim.
+
+    Returns count of files staged.
+    """
+    product_cmn_dir.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for kind, src in files.items():
+        # Always store decompressed; pdp3's USECACHE path prefers it.
+        if src.name.endswith(".gz"):
+            target = product_cmn_dir / src.name[:-3]
+            with gzip.open(src, "rb") as fin, open(target, "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+        else:
+            target = product_cmn_dir / src.name
+            if target.resolve() != src.resolve():
+                shutil.copy2(src, target)
+        log.info("staged WUM %s %s → %s", kind, src.name, target.name)
+        n += 1
+    return n
+
+
 def resolve_brdm_source(brdm_source: Path | str | None,
                         year: int, doy: int) -> Path | None:
     """Resolve ``brdm_source`` to a concrete file for (year, doy).
@@ -180,6 +355,7 @@ def invoke_pdp3(
     timeout_s: int = DEFAULT_PDP3_TIMEOUT_S,
     extra_args: Sequence[str] = (),
     brdm_source: Path | str | None = None,
+    wum_source: Path | str | None = None,
 ) -> PrideRunResult:
     """Run pdp3 once on obs_file in work_dir with the given -sys string.
 
@@ -216,20 +392,35 @@ def invoke_pdp3(
     # Dropping the operator-supplied brdm into work_dir under pdp3's
     # canonical name lets pdp3.sh:2110-2117 find it and skip the
     # download.  See prideMultiGnssBrdm-charlie / prideBadRangeDiagnostic-main.
-    if brdm_source is not None:
+    if brdm_source is not None or wum_source is not None:
         ydoy = doy_from_obs_name(obs_file)
         if ydoy is None:
-            log.warning("can't derive year/doy from %s — --brdm-source "
-                        "ignored for this obs file", obs_file.name)
+            log.warning("can't derive year/doy from %s — --brdm-source / "
+                        "--wum-source ignored for this obs file",
+                        obs_file.name)
         else:
             year, doy = ydoy
-            src = resolve_brdm_source(brdm_source, year, doy)
-            if src is not None:
-                target = work_dir / brdm_filename(year, doy)
-                if target.resolve() != src.resolve():
-                    shutil.copy2(src, target)
-                log.info("staged broadcast nav %s → %s",
-                         src, target.name)
+            if brdm_source is not None:
+                src = resolve_brdm_source(brdm_source, year, doy)
+                if src is not None:
+                    target = work_dir / brdm_filename(year, doy)
+                    if target.resolve() != src.resolve():
+                        shutil.copy2(src, target)
+                    log.info("staged broadcast nav %s → %s",
+                             src, target.name)
+            if wum_source is not None:
+                wum_files = resolve_wum_source(wum_source, year, doy)
+                if wum_files:
+                    # pdp3.sh resolves product_dir as $(rdlk ..)/product/
+                    # from its cwd (= work_dir).  So product/common is
+                    # the sibling of work_dir, shared across sys_attempts.
+                    product_cmn_dir = work_dir.parent / "product" / "common"
+                    n = stage_wum_products(wum_files, product_cmn_dir)
+                    log.info("staged %d WUM product(s) for %d/%d → %s",
+                             n, year, doy, product_cmn_dir)
+                else:
+                    log.info("no WUM products matched %d/%d in %s",
+                             year, doy, wum_source)
 
     cmd = [pdp3_bin, "-m", "S", "-sys", sys_str] + list(extra_args) + [obs_local.name]
     log.info("Running pdp3 in %s: %s", work_dir, " ".join(cmd))
@@ -306,6 +497,7 @@ def process_one_obs(
     timeout_s: int = DEFAULT_PDP3_TIMEOUT_S,
     pdp3_runner=invoke_pdp3,  # injectable for tests
     brdm_source: Path | str | None = None,
+    wum_source: Path | str | None = None,
 ) -> tuple[PrideSolution | None, PrideRunResult | None]:
     """Run pdp3 on one obs file with fallback through sys_attempts.
 
@@ -323,6 +515,7 @@ def process_one_obs(
             obs_file, attempt_dir, sys_str,
             pdp3_bin=pdp3_bin, timeout_s=timeout_s,
             brdm_source=brdm_source,
+            wum_source=wum_source,
         )
         last_result = result
         if result.pos_path is None:
@@ -397,6 +590,7 @@ def run_pride_backend(
     pdp3_runner=invoke_pdp3,
     source_label: str = "peppar-survey --pride",
     brdm_source: Path | str | None = None,
+    wum_source: Path | str | None = None,
 ) -> int:
     """Run PRIDE over each RINEX, archive solutions, write survey.toml.
 
@@ -430,6 +624,7 @@ def run_pride_backend(
             timeout_s=timeout_s,
             pdp3_runner=pdp3_runner,
             brdm_source=brdm_source,
+            wum_source=wum_source,
         )
         if sol is None:
             n_failed += 1
