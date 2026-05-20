@@ -8397,6 +8397,18 @@ def run(args):
     bootstrap_result = None  # Set by run_bootstrap, None on warm start
     try:
         if known_ecef is None:
+            # --no-antposest delegates position fully to peppar-survey
+            # (offline OPUS/PRIDE/RTKLIB).  Phase-1 bootstrap is the
+            # PPPFilter convergence path that time-only mode opts out
+            # of, so refuse to start when no seed is available rather
+            # than running a path the user said they don't want.
+            if getattr(args, 'no_antposest', False):
+                log.error(
+                    "--no-antposest requires a seed but none was found.  "
+                    "Provide --known-pos, set arp_label in the host config "
+                    "with a matching timelab/antennas.json entry, or run "
+                    "peppar-survey to produce state/positions/<uid>.survey.toml.")
+                return 1
             # Phase 1: Bootstrap
             result = run_bootstrap(args, obs_queue, corrections, stop_event,
                                    out_w=out_w, nav2_store=nav2_store)
@@ -8554,51 +8566,65 @@ def run(args):
         ape_pos_sigma_m = (pos_sigma_m
                            if pos_sigma_m is not None and pos_sigma_m > 0
                            else 10.0)
-        ape_thread = AntPosEstThread(
-            known_ecef=known_ecef,
-            corrections=corrections,
-            stop_event=stop_event,
-            ape_sm=ape_sm,
-            bootstrap_result=bootstrap_result,
-            position_callback=_position_improved,
-            nav2_store=nav2_store,
-            systems=set(args.systems.split(',')) if args.systems else None,
-            ar_elev_mask_deg=args.ar_elev_mask,
-            nl_diag_enabled=bool(getattr(args, "nl_diag", False)),
-            join_test_enabled=bool(getattr(args, "join_test", True)),
-            wl_only=bool(getattr(args, "wl_only", False)),
-            solid_tide=bool(getattr(args, "solid_tide", True)),
-            antex_parser=_ape_antex_parser,
-            receiver_antenna_type=getattr(args, "receiver_antenna", None),
-            pcv_enabled=bool(getattr(args, "pcv", True)),
-            clock_model=getattr(args, "clock_model", "random_walk"),
-            rx_tcxo_adev_1s=getattr(args, "rx_tcxo_adev_1s", None),
-            phase_windup_enabled=bool(getattr(args, "phase_windup", False)),
-            gmf_enabled=bool(getattr(args, "gmf", False)),
-            slip_rate_limit_s=float(
-                getattr(args, "slip_rate_limit_s", 0.0)),
-            ztd_tie_sigma=getattr(args, "ztd_tie_sigma", None),
-            pos_sigma_m=ape_pos_sigma_m,
-            nav2_anchor_enabled=bool(
-                getattr(args, "nav2_soft_anchor", True)),
-            nav2_anchor_max_hacc_m=float(
-                getattr(args, "nav2_anchor_max_hacc_m", 3.0)),
-            pin_position=bool(getattr(args, "pin_position", False)),
-            nav_sig_store=nav_sig_store,
-            receiver_uid=getattr(args, 'receiver_unique_id', None),
-            args=args,
-        )
-        # Phase B NAV-SIG L0 admission gate — attach store + flags to
-        # the thread so its fresh-PPPFilter path (warm-start, not
-        # bootstrap-inherited) picks them up via _build_ppp_filter.
-        # When --nav-sig-gate is off these are inert (filter constructor
-        # ignores them).
-        ape_thread._nav_sig_store = nav_sig_store
-        ape_thread._nav_sig_gate_enabled = bool(
-            getattr(args, 'nav_sig_gate', False))
-        ape_thread._nav_sig_max_age_s = float(
-            getattr(args, 'nav_sig_max_age_s', 2.0))
-        ape_thread.start()
+        # Time-only mode: skip the position filter entirely.  FixedPosFilter
+        # at pinned position still runs in steady state (time output is
+        # unaffected); NAV2 watchdog still catches gross ARP moves at the
+        # 10 m threshold.  run_steady_state's per-feature `if ape_thread
+        # is not None:` guards handle the None case — no separate code
+        # path needed.  See timeOnlyArchitecture-main + docs/time-only-
+        # architecture.md.
+        if getattr(args, 'no_antposest', False):
+            log.info(
+                "Time-only mode: skipping AntPosEstThread spawn "
+                "(--no-antposest).  FixedPosFilter at pinned position + "
+                "NAV2 move-detector + RINEX logging remain active.")
+            ape_thread = None
+        else:
+            ape_thread = AntPosEstThread(
+                known_ecef=known_ecef,
+                corrections=corrections,
+                stop_event=stop_event,
+                ape_sm=ape_sm,
+                bootstrap_result=bootstrap_result,
+                position_callback=_position_improved,
+                nav2_store=nav2_store,
+                systems=set(args.systems.split(',')) if args.systems else None,
+                ar_elev_mask_deg=args.ar_elev_mask,
+                nl_diag_enabled=bool(getattr(args, "nl_diag", False)),
+                join_test_enabled=bool(getattr(args, "join_test", True)),
+                wl_only=bool(getattr(args, "wl_only", False)),
+                solid_tide=bool(getattr(args, "solid_tide", True)),
+                antex_parser=_ape_antex_parser,
+                receiver_antenna_type=getattr(args, "receiver_antenna", None),
+                pcv_enabled=bool(getattr(args, "pcv", True)),
+                clock_model=getattr(args, "clock_model", "random_walk"),
+                rx_tcxo_adev_1s=getattr(args, "rx_tcxo_adev_1s", None),
+                phase_windup_enabled=bool(getattr(args, "phase_windup", False)),
+                gmf_enabled=bool(getattr(args, "gmf", False)),
+                slip_rate_limit_s=float(
+                    getattr(args, "slip_rate_limit_s", 0.0)),
+                ztd_tie_sigma=getattr(args, "ztd_tie_sigma", None),
+                pos_sigma_m=ape_pos_sigma_m,
+                nav2_anchor_enabled=bool(
+                    getattr(args, "nav2_soft_anchor", True)),
+                nav2_anchor_max_hacc_m=float(
+                    getattr(args, "nav2_anchor_max_hacc_m", 3.0)),
+                pin_position=bool(getattr(args, "pin_position", False)),
+                nav_sig_store=nav_sig_store,
+                receiver_uid=getattr(args, 'receiver_unique_id', None),
+                args=args,
+            )
+            # Phase B NAV-SIG L0 admission gate — attach store + flags to
+            # the thread so its fresh-PPPFilter path (warm-start, not
+            # bootstrap-inherited) picks them up via _build_ppp_filter.
+            # When --nav-sig-gate is off these are inert (filter constructor
+            # ignores them).
+            ape_thread._nav_sig_store = nav_sig_store
+            ape_thread._nav_sig_gate_enabled = bool(
+                getattr(args, 'nav_sig_gate', False))
+            ape_thread._nav_sig_max_age_s = float(
+                getattr(args, 'nav_sig_max_age_s', 2.0))
+            ape_thread.start()
 
         # Phase 2: Steady state.  On exit code 5 (catastrophic-reject
         # cascade or PHC divergence) the engine returns to the wrapper,
@@ -9005,6 +9031,22 @@ Two-phase operation:
     pos.add_argument("--wl-only", dest="wl_only_legacy",
                      action="store_true",
                      help=argparse.SUPPRESS)
+    pos.add_argument("--no-antposest",
+                     action="store_true",
+                     help="Time-only mode: skip the position filter "
+                          "(AntPosEstThread) entirely.  FixedPosFilter at "
+                          "the pinned position still runs (time output "
+                          "unaffected), NAV2 still watchdogs gross ARP "
+                          "moves at the 10 m threshold, RINEX is still "
+                          "logged for offline peppar-survey re-processing. "
+                          "Requires a seed at startup (--known-pos OR "
+                          "arp_label → antennas.json OR a "
+                          ".survey.toml/.ppp.toml state file).  Refuses to "
+                          "run Phase-1 PPPFilter bootstrap.  Implicitly "
+                          "sets --pin-position and overrides "
+                          "--position-blend-source to 'none'.  See "
+                          "docs/time-only-architecture.md and dayplan "
+                          "timeOnlyArchitecture-main.")
     pos.add_argument("--position-blend-source",
                      choices=["nav2", "antposest", "none"],
                      default="nav2",
@@ -9764,6 +9806,13 @@ Two-phase operation:
         args.port_type = "USB"
     if args.systems is None:
         args.systems = "gps,gal,bds"
+    # --no-antposest derives stricter defaults: surveyed truth is pinned
+    # (don't drift it toward NAV2 or AntPosEst), and the blend source is
+    # forced to 'none' so any downstream blend logic stays inert even if
+    # ape_thread becomes None mid-run.  See timeOnlyArchitecture-main.
+    if getattr(args, 'no_antposest', False):
+        args.pin_position = True
+        args.position_blend_source = 'none'
 
     # σ_phi / σ_pr overrides — set the module-level globals in
     # solve_ppp before any PPPFilter is constructed.  Cherry-picked
