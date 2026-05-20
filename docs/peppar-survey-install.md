@@ -152,6 +152,56 @@ When the brdm is staged successfully pdp3 logs
 `warning: no navigation message for GNSS (E)` line that's the
 signature of the GPS-only fall-through.
 
+A known working source for multi-GNSS brdm files (GAL + BDS + GLO +
+GPS, updated throughout the day from real-time streams):
+
+```
+https://igs.bkg.bund.de/root_ftp/IGS/BRDC/<year>/<doy>/BRDC00WRD_S_<year><doy>0000_01D_MN.rnx.gz
+```
+
+Available same-day, free, no authentication.
+
+### Same-day-overwrite gap (`prideBrdmSameDayClobber-charlie`)
+
+`pdp3.sh:2075` has an unconditional hourly download+merge block
+that fires when processing the **current UTC day**:
+
+```bash
+if [ $(date -u +"%Y%j") -eq "$year$doy" ]; then
+    # ... downloads hourly GPS + GLO nav, merge2brdm.py, mv -f into brdm
+```
+
+The `mv -f` overwrites any pre-staged file at `$rinex_dir/brdm${doy}0.${yy}p`.
+The existence guard at `pdp3.sh:2111` protects later branches but
+NOT this same-day block.  Result: `--brdm-source` staging is
+**silently bypassed for same-day runs**; the file pdp3 ends up
+processing has GPS+GLO only and GAL/BDS go to `DEL_BADRANGE`.
+
+Local workaround (apply once on each PRIDE host) — add the same
+existence guard:
+
+```bash
+sed -i 's|if \[ $(date -u +"%Y%j") -eq "$year$doy" \]; then|if [ $(date -u +"%Y%j") -eq "$year$doy" ] \&\& [ ! -f "$rinex_dir/$rinexnav" ]; then|' \
+    ~/.PRIDE_PPPAR_BIN/pdp3 ~/PRIDE-PPPAR/scripts/pdp3.sh
+```
+
+Save the originals first:
+
+```bash
+cp ~/.PRIDE_PPPAR_BIN/pdp3 ~/.PRIDE_PPPAR_BIN/pdp3.preBrdmPatchBackup
+cp ~/PRIDE-PPPAR/scripts/pdp3.sh ~/PRIDE-PPPAR/scripts/pdp3.sh.preBrdmPatchBackup
+```
+
+The patch is brittle — a future PRIDE-PPP-AR upgrade
+(`install.sh` rerun) will wipe it; reapply with the same sed.
+
+Alternative: only run `--pride` against **prior-day** RINEX (DOY < today
+UTC).  The same-day block doesn't fire, and pre-staged brdm is honored
+out of the box.
+
+`prideBrdmSameDayClobber-charlie` covers the durable fix (upstream
+patch to PRIDE-PPP-AR).
+
 This is the operator-managed quick path.  The longer-term fix
 (persist engine's NTRIP BCEP00BKG0 broadcast eph automatically)
 lives under the same bead family — for now, the engine's broadcast
