@@ -22,7 +22,7 @@ if _SCRIPTS_DIR not in sys.path:
 
 from peppar_fix.peppar_survey_cors import (
     CorsNtripConfig, DEFAULT_CORS_NTRIP_DURATION_S,
-    capture_cors_base_via_ntrip, ntripcli_url,
+    capture_cors_base_via_ntrip, ntrip_url,
     rtcm3_to_rinex, stream_rtcm_from_ntrip,
 )
 
@@ -59,27 +59,43 @@ class CorsNtripConfigTest(unittest.TestCase):
                             duration_s=0)
 
 
-class NtripcliUrlTest(unittest.TestCase):
+class NtripUrlTest(unittest.TestCase):
+    """str2str's NTRIP client URL scheme is ``ntrip://`` per its -h
+    table.  An earlier draft used ``ntripcli://`` and silently
+    captured zero bytes; caught by branch-main 2026-05-20 against
+    NAPERVILLE-RTCM3.1-MSM5 (0 B vs 5.7 KB in 8 s)."""
 
     def test_no_auth(self):
         cfg = CorsNtripConfig(host="peer.lab", port=2102, mount="PEPPAR")
         self.assertEqual(
-            ntripcli_url(cfg),
-            "ntripcli://peer.lab:2102/PEPPAR")
+            ntrip_url(cfg),
+            "ntrip://peer.lab:2102/PEPPAR")
 
     def test_user_only(self):
         cfg = CorsNtripConfig(host="peer", port=2102, mount="PEPPAR",
                               user="alice")
         self.assertEqual(
-            ntripcli_url(cfg),
-            "ntripcli://alice@peer:2102/PEPPAR")
+            ntrip_url(cfg),
+            "ntrip://alice@peer:2102/PEPPAR")
 
     def test_user_and_password(self):
         cfg = CorsNtripConfig(host="peer", port=2102, mount="PEPPAR",
                               user="alice", password="secret")
         self.assertEqual(
-            ntripcli_url(cfg),
-            "ntripcli://alice:secret@peer:2102/PEPPAR")
+            ntrip_url(cfg),
+            "ntrip://alice:secret@peer:2102/PEPPAR")
+
+    def test_scheme_is_not_ntripcli(self):
+        """Regression guard for the bug branch-main caught: any URL
+        we hand to str2str must start with 'ntrip://', NOT
+        'ntripcli://'.  str2str silently captures 0 bytes from the
+        latter."""
+        cfg = CorsNtripConfig(host="peer", port=2102, mount="PEPPAR")
+        url = ntrip_url(cfg)
+        self.assertTrue(url.startswith("ntrip://"),
+                        f"unexpected scheme: {url!r}")
+        self.assertFalse(url.startswith("ntripcli://"),
+                         f"ntripcli scheme regressed: {url!r}")
 
 
 # ── stream_rtcm_from_ntrip subprocess behavior ─────────────────── #
