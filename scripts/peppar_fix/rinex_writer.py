@@ -139,6 +139,36 @@ def _fmt_obs(value: float | None, lli: int = 0, ssi: int = 0) -> str:
     return f"{value:14.3f}{lli:1d}{ssi:1d}"
 
 
+def _format_approx_pos_line(x: float, y: float, z: float) -> str:
+    """Format the APPROX POSITION XYZ line.  Fixed length so the line
+    can be rewritten in place after the header has been emitted.
+    """
+    return f"{x:14.4f}{y:14.4f}{z:14.4f}{'':<18}APPROX POSITION XYZ\n"
+
+
+def _find_approx_pos_offset(p: Path) -> int | None:
+    """Scan an existing RINEX file's header for the APPROX POSITION
+    XYZ line and return its byte offset (start of line).  Returns
+    None if not found before END OF HEADER or on I/O error.
+
+    Used when reopening a partially-written daily RINEX after a
+    wrapper-respawn so set_approx_xyz() can still rewrite the seed
+    in place.
+    """
+    try:
+        with open(p, "rb") as rf:
+            offset = 0
+            for line in rf:
+                if b"APPROX POSITION XYZ" in line:
+                    return offset
+                if b"END OF HEADER" in line:
+                    return None
+                offset += len(line)
+    except OSError:
+        return None
+    return None
+
+
 def _cno_to_ssi(cno: float | None) -> int:
     """Map C/N0 (dB-Hz) to RINEX SSI 1-9.  See RINEX 3.x §5.5.
 
@@ -194,6 +224,9 @@ class RinexWriter:
         self._path: Path | None = None
         self._current_date: str | None = None  # YYYYDDD of current file
         self._header_written = False
+        self._approx_pos_offset: int | None = None  # byte offset of
+        #   APPROX POSITION XYZ line in current file; enables in-place
+        #   rewrite via set_approx_xyz() after the header is emitted.
         self._last_lock_ms: dict[tuple[str, str], int] = {}
         self._last_written_dt: datetime | None = None
         self._epoch_count = 0
@@ -212,13 +245,49 @@ class RinexWriter:
         return p, date_str
 
     def _open_for_date(self, epoch_dt: datetime) -> None:
-        """Open (or rotate to) the file for this epoch's UTC date."""
+        """Open (or rotate to) the file for this epoch's UTC date.
+
+        Append-safe: if the target already exists with non-zero size
+        (wrapper-respawn after exit-5 recovery), open r+ and seek to
+        EOF rather than truncating.  Header was emitted by the prior
+        process — don't re-write it, but locate the existing APPROX
+        POSITION XYZ line so set_approx_xyz() can update it in place.
+        """
         p, date_str = self._expand_path(epoch_dt)
         self._path = p
         self._current_date = date_str
-        self._fp = open(p, "w")
-        self._header_written = False
-        # Header rewritten with new TIME OF FIRST OBS for the new file.
+        self._approx_pos_offset = None
+        if p.exists() and p.stat().st_size > 0:
+            self._fp = open(p, "r+")
+            self._fp.seek(0, 2)  # SEEK_END
+            self._header_written = True
+            self._approx_pos_offset = _find_approx_pos_offset(p)
+            # Race fix (Main, 2026-05-19 clkPoC3 canary):
+            # set_approx_xyz() fires on the main thread at engine
+            # startup, but the writer's _fp is None until the serial
+            # thread's first write_epoch.  So when the engine resolves
+            # known_ecef and calls set_approx_xyz(), the call is a
+            # no-op — _fp is None and _header_written is False, so
+            # only self._approx_xyz is mutated.  When write_epoch
+            # later opens an EXISTING file from a prior session
+            # (whose on-disk header carries (0,0,0) from when that
+            # prior session's set_approx_xyz also fired before
+            # write_epoch), nothing rewrites the stale header.
+            # Fix: at reopen time, seek-write the in-memory seed if
+            # we have one.  Guarded on != (0,0,0) so an unresolved
+            # writer doesn't clobber a correct prior header.
+            if (self._approx_pos_offset is not None
+                    and self._approx_xyz != (0.0, 0.0, 0.0)):
+                x, y, z = self._approx_xyz
+                cur = self._fp.tell()
+                self._fp.seek(self._approx_pos_offset)
+                self._fp.write(_format_approx_pos_line(x, y, z))
+                self._fp.seek(cur)
+                self._fp.flush()
+        else:
+            self._fp = open(p, "w")
+            self._header_written = False
+        # Header (when written) carries TIME OF FIRST OBS for this file.
         # Lock-ms continuity across rollover doesn't propagate (next file's
         # first epoch will see no LLI=1 even on a real slip — acceptable
         # for daily-archive use).
@@ -252,8 +321,13 @@ class RinexWriter:
                 f"{self._rx_fw:<20}REC # / TYPE / VERS\n")
         f.write(f"{self._ant_serial:<20}{self._antenna_type:<40}"
                 f"ANT # / TYPE\n")
+        # Record where APPROX POSITION lives so set_approx_xyz() can
+        # rewrite it in place when the engine resolves known_ecef
+        # later (NAV2/PPP bootstrap paths).  Fixed-length line.
+        f.flush()
+        self._approx_pos_offset = f.tell()
         x, y, z = self._approx_xyz
-        f.write(f"{x:14.4f}{y:14.4f}{z:14.4f}{'':<18}APPROX POSITION XYZ\n")
+        f.write(_format_approx_pos_line(x, y, z))
         # Antenna delta H/E/N (we don't track these — use 0 0 0)
         f.write(f"{0.0:14.4f}{0.0:14.4f}{0.0:14.4f}{'':<18}"
                 f"ANTENNA: DELTA H/E/N\n")
@@ -378,6 +452,38 @@ class RinexWriter:
         if self._epoch_count % 60 == 0:
             self._fp.flush()
 
+    def set_approx_xyz(self, xyz: tuple[float, float, float]) -> None:
+        """Update APPROX POSITION XYZ.  Idempotent.
+
+        Use case: the engine constructs the writer at startup, before
+        known_ecef is resolved (NAV2 / PPP bootstrap path takes 30-90s
+        to converge).  The writer ships header with the best seed
+        available — arp_label → antennas.json or --known-pos — but if
+        both were absent the seed is (0,0,0) which makes PRIDE-PPP-AR
+        reject every SV as DEL_BADRANGE downstream.
+
+        Calling this after known_ecef is finalized:
+          - Before any epoch has been written: just updates the field;
+            the eventual first-epoch header write picks up the new
+            value.
+          - After the header is on disk: seek-writes the same
+            fixed-length APPROX POSITION line in place, preserving
+            all surrounding bytes.
+          - If we can't locate the offset (e.g., respawn on a header
+            we didn't author): no-op with a logged warning later.
+        """
+        xyz_t = (float(xyz[0]), float(xyz[1]), float(xyz[2]))
+        self._approx_xyz = xyz_t
+        if (self._fp is not None
+                and self._header_written
+                and self._approx_pos_offset is not None):
+            x, y, z = xyz_t
+            cur = self._fp.tell()
+            self._fp.seek(self._approx_pos_offset)
+            self._fp.write(_format_approx_pos_line(x, y, z))
+            self._fp.seek(cur)
+            self._fp.flush()
+
     def close(self) -> None:
         if self._fp:
             self._fp.flush()
@@ -436,21 +542,55 @@ def make_writer_from_args(args, log=None):
                 log.warning("RINEX writer: receiver-state lookup failed "
                             "(%s); using header defaults", e)
 
-    # Derive APPROX POSITION XYZ from --known-pos if supplied.  PRIDE
-    # doesn't validate this — it re-fits position from observations —
-    # so any sensible value works, including (0, 0, 0) on cold start.
-    approx_xyz = (0.0, 0.0, 0.0)
+    # Derive APPROX POSITION XYZ.  PRIDE-PPP-AR uses this as the
+    # first-epoch seed and rejects every SV as DEL_BADRANGE if it's
+    # (0,0,0) (seed lands ~6378 km off, PR residuals diverge).
+    # Sources tried, in priority order:
+    #   1. --known-pos          (operator-supplied LLA)
+    #   2. arp_label            (lab antenna database in antennas.json)
+    # If both miss, ship (0,0,0) and rely on the engine to call
+    # set_approx_xyz() once NAV2/PPP bootstrap resolves known_ecef.
+    approx_xyz: tuple[float, float, float] | None = None
     known_pos = getattr(args, 'known_pos', None)
     if known_pos:
         try:
             lat, lon, alt = (float(s) for s in known_pos.split(','))
             # Lazy import to keep this module's deps light.
             from solve_ppp import lla_to_ecef
-            approx_xyz = lla_to_ecef(lat, lon, alt)
+            ecef = lla_to_ecef(lat, lon, alt)
+            approx_xyz = (float(ecef[0]), float(ecef[1]), float(ecef[2]))
         except Exception as e:
             if log is not None:
                 log.warning("RINEX writer: --known-pos parse failed "
-                            "(%s); APPROX XYZ defaulting to 0,0,0", e)
+                            "(%s); trying arp_label fallback", e)
+
+    if approx_xyz is None:
+        arp_label = getattr(args, 'arp_label', None)
+        if arp_label:
+            try:
+                from peppar_fix.position_state import load_arp_from_antennas
+                state = load_arp_from_antennas(
+                    arp_label,
+                    mount_sn=0,  # unused for header derivation
+                    antennas_path=getattr(args, 'antennas_json', None),
+                )
+                if state is not None:
+                    e_m = state.ecef_m
+                    approx_xyz = (float(e_m[0]), float(e_m[1]), float(e_m[2]))
+            except Exception as e:
+                if log is not None:
+                    log.warning("RINEX writer: arp_label '%s' lookup "
+                                "failed (%s); APPROX XYZ stays (0,0,0)",
+                                arp_label, e)
+
+    if approx_xyz is None:
+        if log is not None:
+            log.warning(
+                "RINEX writer: APPROX POSITION XYZ unresolved at startup "
+                "(no --known-pos, no arp_label in antennas.json).  "
+                "PRIDE-PPP-AR downstream will reject SVs as DEL_BADRANGE "
+                "until the engine calls set_approx_xyz() with known_ecef.")
+        approx_xyz = (0.0, 0.0, 0.0)
 
     import os
     decimate_s = getattr(args, 'rinex_decimate_s', None)

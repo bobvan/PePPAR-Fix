@@ -8526,6 +8526,15 @@ def run(args):
         if stop_event.is_set():
             return 0
 
+        # Push the final known_ecef into the RINEX writer's APPROX
+        # POSITION XYZ header field.  The writer was built before
+        # bootstrap with (0,0,0) if neither --known-pos nor arp_label
+        # was set; without this update PRIDE-PPP-AR rejects every SV
+        # downstream as DEL_BADRANGE.  Idempotent when the seed was
+        # already correct.
+        if rinex_writer_obj is not None and known_ecef is not None:
+            rinex_writer_obj.set_approx_xyz(known_ecef)
+
         # Start AntPosEst background thread — keeps PPPFilter alive for
         # continuous position refinement and AR.  On cold start, reuses
         # the converged PPPFilter from bootstrap.  On warm start (position
