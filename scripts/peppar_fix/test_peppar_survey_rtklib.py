@@ -457,6 +457,43 @@ class WriteConfigTest(unittest.TestCase):
             content = cfg.read_text()
             self.assertIn("pos1-posmode       =static", content)
 
+    def test_navsys_value_is_41(self):
+        """RTKLIB navsys is a bit-flag: 1+8+32=41 for GPS+GAL+BDS.
+        Previous value 53 (= 1+4+16+32) silently dropped GAL and
+        included GLO/QZS — caught empirically 2026-05-20."""
+        for mode in ("ppp", "rtk"):
+            with TemporaryDirectory() as td:
+                cfg = write_config(Path(td), mode)
+                content = cfg.read_text()
+                self.assertIn("pos1-navsys        =41", content,
+                              f"navsys regressed for {mode}")
+                self.assertNotIn("pos1-navsys        =53", content,
+                                 f"old 53 value still present for {mode}")
+
+    def test_tidecorr_value_is_on(self):
+        """rnx2rtkp rejects tidecorr=solid; valid values are on/off."""
+        for mode in ("ppp", "rtk"):
+            with TemporaryDirectory() as td:
+                cfg = write_config(Path(td), mode)
+                content = cfg.read_text()
+                self.assertIn("pos1-tidecorr      =on", content,
+                              f"tidecorr regressed for {mode}")
+                self.assertNotIn("pos1-tidecorr      =solid", content,
+                                 f"old solid value still present for {mode}")
+
+    def test_timeform_value_is_hms(self):
+        """rnx2rtkp rejects out-timeform=ymd; valid values are tow/hms.
+        hms produces 'YYYY/MM/DD HH:MM:SS.sss' which parse_pos's
+        regex still consumes."""
+        for mode in ("ppp", "rtk"):
+            with TemporaryDirectory() as td:
+                cfg = write_config(Path(td), mode)
+                content = cfg.read_text()
+                self.assertIn("out-timeform       =hms", content,
+                              f"timeform regressed for {mode}")
+                self.assertNotIn("out-timeform       =ymd", content,
+                                 f"old ymd value still present for {mode}")
+
 
 class DatetimeToMjdTest(unittest.TestCase):
 
