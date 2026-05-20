@@ -169,6 +169,90 @@ def _find_approx_pos_offset(p: Path) -> int | None:
     return None
 
 
+def repair_partial_epochs(p: Path) -> int:
+    """Find every epoch whose time-tag NN count doesn't match the
+    obs rows actually written for that epoch, and rewrite NN in
+    place to match the row count.  Returns the number of repairs.
+
+    Why this exists (2026-05-20, prideClkPoC3BdsParseStrict-charlie):
+    When the engine is killed mid-epoch (between the time-tag write
+    and the last obs-row write), the on-disk file ends with a partial
+    epoch whose NN claims more rows than are present.  PR #42's
+    r+ append-on-respawn then writes the next epoch's time tag right
+    after the partial rows.  Downstream consumers (notably PRIDE's
+    rdrnxoi3, which reads NN obs rows past each time tag) then read
+    too many rows, consuming rows from the following epoch, and trip
+    when the next time-tag read returns an obs row instead.
+
+    Rewriting NN (rather than truncating the partial epoch) preserves
+    the partially-captured observations.  Time-tag NN is a fixed
+    3-char field at cols 32-34 of the time-tag line (per the writer's
+    format), so the rewrite preserves all surrounding bytes.
+
+    Called from ``_open_for_date`` whenever an existing daily file is
+    reopened.  Also safe to call as a one-off cleanup pass against
+    files corrupted by pre-fix respawns.
+
+    Idempotent: a file with all-consistent NN counts has no work to do
+    and returns 0.
+    """
+    # First pass: walk the file, record each time-tag's offset + NN
+    # offset + declared NN, plus the row count seen after it.
+    tag_records: list[tuple[int, int, int]] = []
+    # Each entry: (byte_offset_of_NN_field, declared_nn, rows_after)
+    last_nn_offset = None
+    last_nn = None
+    rows_after = 0
+    try:
+        with open(p, "rb") as rf:
+            offset = 0
+            for line in rf:
+                if line.startswith(b"> ") and len(line) >= 36:
+                    # Close out the previous epoch's record first.
+                    if last_nn_offset is not None:
+                        tag_records.append(
+                            (last_nn_offset, last_nn, rows_after))
+                    # Parse this tag's NN from cols 32-34.
+                    try:
+                        nn = int(line[32:35].decode().strip())
+                    except (ValueError, UnicodeDecodeError):
+                        last_nn_offset = None
+                        last_nn = None
+                        rows_after = 0
+                    else:
+                        last_nn_offset = offset + 32
+                        last_nn = nn
+                        rows_after = 0
+                elif last_nn_offset is not None and line.strip():
+                    rows_after += 1
+                offset += len(line)
+            # Close out the final epoch.
+            if last_nn_offset is not None:
+                tag_records.append((last_nn_offset, last_nn, rows_after))
+    except OSError:
+        return 0
+
+    # Second pass: for each mismatched epoch, rewrite NN to match
+    # actual row count.  Skip stranded tags (rows_after == 0) — those
+    # would write NN=0 which RINEX doesn't define as a valid count.
+    repairs = 0
+    try:
+        with open(p, "rb+") as wf:
+            for nn_offset, declared, actual in tag_records:
+                if actual == declared or actual == 0:
+                    continue
+                if actual > 999:
+                    # Field width is 3; can't represent.  Skip rather
+                    # than truncate the count.  (RINEX limits ~MAXSAT.)
+                    continue
+                wf.seek(nn_offset)
+                wf.write(f"{actual:3d}".encode())
+                repairs += 1
+    except OSError:
+        return 0
+    return repairs
+
+
 def _cno_to_ssi(cno: float | None) -> int:
     """Map C/N0 (dB-Hz) to RINEX SSI 1-9.  See RINEX 3.x §5.5.
 
@@ -258,6 +342,14 @@ class RinexWriter:
         self._current_date = date_str
         self._approx_pos_offset = None
         if p.exists() and p.stat().st_size > 0:
+            # Repair partial epoch(s) before resuming: a prior session
+            # killed mid-epoch leaves a time tag whose declared NN > the
+            # actual rows on disk.  Downstream PRIDE-PPP-AR reads the
+            # declared NN past the time tag and trips when it consumes
+            # rows from the next epoch (prideClkPoC3BdsParseStrict-
+            # charlie, 2026-05-20).  Rewriting NN to match the actual
+            # row count preserves the partial epoch's observations.
+            repair_partial_epochs(p)
             self._fp = open(p, "r+")
             self._fp.seek(0, 2)  # SEEK_END
             self._header_written = True

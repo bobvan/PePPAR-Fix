@@ -688,5 +688,129 @@ def test_respawn_set_approx_xyz_still_rewrites_existing_header(tmp_path):
         (157470.222, -4756189.544, 4232767.952))
 
 
+# ── repair_partial_epochs — recovery from kill-mid-epoch ────────── #
+#
+# Background (2026-05-20, prideClkPoC3BdsParseStrict-charlie):
+# When PR #42's r+ append-on-respawn opens a file killed mid-epoch
+# (between the time-tag write and the last obs-row write), the file
+# ends with a partial epoch whose declared NN doesn't match the
+# rows on disk.  PRIDE-PPP-AR's rdrnxoi3 reads NN obs rows past each
+# time tag and trips when it consumes rows from the next epoch.
+# Repairing rewrites NN in place to match the actual row count.
+
+
+from peppar_fix.rinex_writer import repair_partial_epochs
+
+
+def _write_synthetic_epoch(f, year, month, day, hour, minute,
+                           second, declared_nn, actual_rows):
+    """Emit a time tag with declared_nn followed by actual_rows
+    minimal obs rows.  Caller can intentionally mismatch to model
+    a killed-mid-epoch scenario."""
+    f.write(f"> {year:4d} {month:2d} {day:2d} {hour:2d} {minute:2d}"
+            f"{second:11.7f}  0{declared_nn:3d}\n")
+    for i in range(actual_rows):
+        # Single-band GPS row with stub values.  Just needs to be
+        # non-blank (so repair counts it as a real obs row).
+        f.write(f"G{i+1:02d}  21000000.000    "
+                f"110000000.000              " + " " * 100 + "\n")
+
+
+def test_repair_idempotent_on_clean_file(tmp_path):
+    """File with all epochs complete → 0 repairs."""
+    p = tmp_path / "clean.obs"
+    with open(p, "w") as f:
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 0.0, 5, 5)
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 30.0, 7, 7)
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 1, 0.0, 6, 6)
+    assert repair_partial_epochs(p) == 0
+    # A second pass is also a no-op.
+    assert repair_partial_epochs(p) == 0
+
+
+def test_repair_fixes_single_partial_epoch_at_eof(tmp_path):
+    """Last epoch declares 9 SVs but only 5 rows present.  Repair
+    rewrites NN to 5; subsequent NN reads match."""
+    p = tmp_path / "trailing-partial.obs"
+    with open(p, "w") as f:
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 0.0, 5, 5)
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 30.0, 9, 5)
+    assert repair_partial_epochs(p) == 1
+    # NN of the second time tag should now read 5.
+    with open(p) as f:
+        tags = [ln for ln in f if ln.startswith(">")]
+    assert tags[1][32:35] == "  5"
+
+
+def test_repair_fixes_multiple_internal_partial_epochs(tmp_path):
+    """Real-world scenario: respawn-without-fix produced multiple
+    internal partial epochs (clkPoC3 had 12 on 2026-05-20).  Repair
+    rewrites every mismatched NN in one pass."""
+    p = tmp_path / "multi-partial.obs"
+    with open(p, "w") as f:
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 0.0, 9, 5)   # partial
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 30.0, 7, 7)  # clean
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 1, 0.0, 12, 3)  # partial
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 1, 30.0, 6, 6)  # clean
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 2, 0.0, 8, 1)   # partial
+    assert repair_partial_epochs(p) == 3
+    with open(p) as f:
+        tags = [ln for ln in f if ln.startswith(">")]
+    declared = [int(t[32:35].strip()) for t in tags]
+    assert declared == [5, 7, 3, 6, 1]
+
+
+def test_repair_skips_stranded_tag_with_zero_rows(tmp_path):
+    """A time tag with NO rows after it (engine killed BETWEEN epochs,
+    or stranded write).  Rewriting NN to 0 is invalid RINEX, so leave
+    such tags alone.  No data is corrupted regardless; PRIDE handles
+    zero-row epochs separately."""
+    p = tmp_path / "stranded-tag.obs"
+    with open(p, "w") as f:
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 0.0, 5, 5)
+        # Time tag with no rows after
+        f.write(f"> 2026  5 20 12  0 30.0000000  0  9\n")
+    # Repair leaves the stranded tag's NN alone.
+    assert repair_partial_epochs(p) == 0
+
+
+def test_repair_handles_engine_restart_pattern_end_to_end(tmp_path):
+    """End-to-end: simulate the exact 2026-05-20 clkPoC3 scenario.
+    Session 1 writes a partial epoch; session 2's _open_for_date
+    calls repair_partial_epochs and the result is consumable by a
+    strict downstream parser."""
+    p = tmp_path / "respawn-scenario.obs"
+    # Session 1 (mocked: writes a valid epoch, then a partial epoch,
+    # then is killed mid-write).
+    with open(p, "w") as f:
+        # File starts with a stub header so repair has a valid
+        # PROLOGUE before the first epoch (matches RINEX 3.04 shape).
+        f.write("     3.04           OBSERVATION DATA    M (MIXED)           "
+                "RINEX VERSION / TYPE\n")
+        f.write(" " * 60 + "END OF HEADER\n")
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 0.0, 5, 5)
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 30.0, 9, 4)
+        # session 1 killed here
+    # Session 2 wrapper-respawn writes one more clean epoch.
+    repair_partial_epochs(p)
+    with open(p, "a") as f:
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 1, 0.0, 6, 6)
+
+    # Final file: 3 epochs, every NN matches actual row count.
+    with open(p) as f:
+        rows = f.readlines()
+    tags = []
+    for i, ln in enumerate(rows):
+        if ln.startswith("> 2026"):
+            tags.append(i)
+    # For each tag, count obs rows up to the next tag (or EOF).
+    for j, ti in enumerate(tags):
+        next_ti = tags[j+1] if j+1 < len(tags) else len(rows)
+        actual_rows = next_ti - ti - 1
+        declared = int(rows[ti][32:35].strip())
+        assert declared == actual_rows, (
+            f"epoch {j}: declared {declared}, got {actual_rows}")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
