@@ -229,6 +229,53 @@ GitHub is still the public origin and remains the long-term home of
 record.  It's just that lab hosts and gt's dev tree both push *through*
 the gt bare upstream, not directly to it.
 
+### After `gh pr merge` on GitHub — sync gt explicitly
+
+The gt mirror hook is **forward-only**: it pushes gt → GitHub when gt
+receives a push, never the other direction.  When a PR is merged via
+`gh pr merge --squash` (or any GitHub-side merge), the resulting
+commit lands on GitHub but **does not propagate to gt**.  Subsequent
+dev-box commits then end up rooted on a parent that no longer exists
+in GitHub's main history, and the hook will refuse to forward them
+("post-receive: failed to forward refs/heads/main") — leaving gt with
+local commits that never reach GitHub.
+
+**After any GitHub-side merge, sync gt before pushing more code:**
+
+```sh
+git fetch github main
+git checkout main
+git merge --ff-only github/main   # picks up the squash merge
+git push origin main              # gt now matches GitHub
+```
+
+If gt has already accumulated divergent local commits (because the
+sync was skipped), the only clean fix is reset + force-push:
+
+```sh
+git fetch github main
+git checkout main
+# Confirm content is preserved (the squash usually subsumes pre-merge work)
+git diff main github/main
+git tag pre-force-push-recovery-$(git rev-parse --short main) main
+git reset --hard github/main
+git push --force origin main      # gt aligns with GitHub
+```
+
+Then on each lab host:
+
+```sh
+ssh <host> 'cd ~/peppar-fix && git fetch && git reset --hard origin/main'
+```
+
+(plain `git pull --ff-only` fails when the lab host's local main has
+the now-orphaned commits; reset is required.)
+
+Catastrophe from skipping this: 2026-05-20 morning — dev-box had a
+standalone docs commit on gt, PR #42 + #46 merged on GitHub, lab
+hosts pulled gt's old code, canary deploy hit "unrecognized argument:
+--no-antposest", and the fix required force-pushing gt to align.
+
 ### Common lab-host failures (in order of frequency)
 
 1. **Missing Python deps**: set up the venv first:
