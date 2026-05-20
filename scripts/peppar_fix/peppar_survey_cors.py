@@ -86,12 +86,18 @@ class CorsNtripConfig:
                 f"duration_s must be > 0: {self.duration_s}")
 
 
-def ntripcli_url(cfg: CorsNtripConfig) -> str:
-    """Build str2str's ntripcli:// URL from a CorsNtripConfig.
+def ntrip_url(cfg: CorsNtripConfig) -> str:
+    """Build str2str's NTRIP-client URL from a CorsNtripConfig.
 
-    Format: ``ntripcli://[user[:password]]@host:port/mount``.  When
-    user is empty we use the bare ``host:port/mount`` form, which the
-    peer caster (no auth) accepts.
+    Format: ``ntrip://[user[:password]@]host:port/mount``.  When user
+    is empty we use the bare ``host:port/mount`` form, which the peer
+    caster (no auth) accepts.
+
+    The URL scheme is ``ntrip://`` (not ``ntripcli://``) per str2str's
+    -h table.  Earlier drafts used ``ntripcli://`` and silently
+    captured zero bytes — caught empirically 2026-05-20 by branch-main
+    against NAPERVILLE-RTCM3.1-MSM5 (0 B with ntripcli vs 5.7 KB in
+    8 s with ntrip).
     """
     auth = ""
     if cfg.user:
@@ -99,7 +105,7 @@ def ntripcli_url(cfg: CorsNtripConfig) -> str:
         if cfg.password:
             auth = f"{cfg.user}:{cfg.password}"
         auth += "@"
-    return f"ntripcli://{auth}{cfg.host}:{cfg.port}/{cfg.mount}"
+    return f"ntrip://{auth}{cfg.host}:{cfg.port}/{cfg.mount}"
 
 
 def stream_rtcm_from_ntrip(
@@ -124,7 +130,7 @@ def stream_rtcm_from_ntrip(
     if output_path.exists():
         output_path.unlink()
 
-    in_url = ntripcli_url(cfg)
+    in_url = ntrip_url(cfg)
     out_url = f"file://{output_path}"
     cmd = [str2str_bin, "-in", in_url, "-out", out_url]
     log.info("str2str: %s (duration=%ds)", " ".join(cmd), cfg.duration_s)
