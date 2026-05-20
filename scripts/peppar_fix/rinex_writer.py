@@ -262,6 +262,28 @@ class RinexWriter:
             self._fp.seek(0, 2)  # SEEK_END
             self._header_written = True
             self._approx_pos_offset = _find_approx_pos_offset(p)
+            # Race fix (Main, 2026-05-19 clkPoC3 canary):
+            # set_approx_xyz() fires on the main thread at engine
+            # startup, but the writer's _fp is None until the serial
+            # thread's first write_epoch.  So when the engine resolves
+            # known_ecef and calls set_approx_xyz(), the call is a
+            # no-op — _fp is None and _header_written is False, so
+            # only self._approx_xyz is mutated.  When write_epoch
+            # later opens an EXISTING file from a prior session
+            # (whose on-disk header carries (0,0,0) from when that
+            # prior session's set_approx_xyz also fired before
+            # write_epoch), nothing rewrites the stale header.
+            # Fix: at reopen time, seek-write the in-memory seed if
+            # we have one.  Guarded on != (0,0,0) so an unresolved
+            # writer doesn't clobber a correct prior header.
+            if (self._approx_pos_offset is not None
+                    and self._approx_xyz != (0.0, 0.0, 0.0)):
+                x, y, z = self._approx_xyz
+                cur = self._fp.tell()
+                self._fp.seek(self._approx_pos_offset)
+                self._fp.write(_format_approx_pos_line(x, y, z))
+                self._fp.seek(cur)
+                self._fp.flush()
         else:
             self._fp = open(p, "w")
             self._header_written = False

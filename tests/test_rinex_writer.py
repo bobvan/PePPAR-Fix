@@ -588,6 +588,75 @@ def test_respawn_preserves_prior_session_data(tmp_path):
     assert len(epochs) == 3
 
 
+def test_respawn_rewrites_stale_zero_header_at_reopen(tmp_path):
+    """Race fix (Main, 2026-05-19 clkPoC3 canary).
+
+    Scenario: writer constructed with a resolved arp_label seed at
+    __init__, but at engine startup set_approx_xyz() is called from
+    the main thread BEFORE the serial thread has opened the daily
+    file (write_epoch hasn't fired yet).  set_approx_xyz on a None
+    _fp is a no-op.  When write_epoch later opens an EXISTING daily
+    file (from a prior session that wrote (0,0,0) before bootstrap
+    converged), the stale on-disk header would persist without this
+    fix.
+
+    The fix: _open_for_date detects the offset of the existing
+    APPROX POSITION line and immediately seek-writes the in-memory
+    seed if non-zero, before write_epoch proceeds.
+    """
+    out = tmp_path / "stale-header.rnx"
+    # Session 1: writer started without seed → header lands at (0,0,0).
+    w1 = RinexWriter(
+        out, marker_name="UFO1", approx_xyz=(0.0, 0.0, 0.0),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    w1.write_epoch(datetime(2026, 5, 19, 14, 0, 0, tzinfo=timezone.utc),
+                   _stub_obs())
+    w1.close()
+    assert parse_header(out).approx_xyz == pytest.approx((0.0, 0.0, 0.0))
+
+    # Session 2: writer constructed WITH the arp_label-resolved seed.
+    # No explicit set_approx_xyz call — the reopen path must
+    # detect-and-rewrite from __init__'s seed alone.
+    w2 = RinexWriter(
+        out, marker_name="UFO1",
+        approx_xyz=(157470.222, -4756189.544, 4232767.952),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    w2.write_epoch(datetime(2026, 5, 19, 14, 0, 1, tzinfo=timezone.utc),
+                   _stub_obs())
+    w2.close()
+    assert parse_header(out).approx_xyz == pytest.approx(
+        (157470.222, -4756189.544, 4232767.952))
+
+
+def test_respawn_with_zero_seed_does_not_clobber_good_header(tmp_path):
+    """Guard on the race fix: a writer with self._approx_xyz=(0,0,0)
+    (unresolved seed) must NOT overwrite an existing file's correct
+    header.  Models the scenario where session 1 had arp_label and
+    session 2 is started without arp_label — session 2's stale
+    in-memory (0,0,0) should defer to the disk-resident seed."""
+    out = tmp_path / "good-header.rnx"
+    w1 = RinexWriter(
+        out, marker_name="UFO1",
+        approx_xyz=(157470.222, -4756189.544, 4232767.952),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    w1.write_epoch(datetime(2026, 5, 19, 14, 0, 0, tzinfo=timezone.utc),
+                   _stub_obs())
+    w1.close()
+
+    w2 = RinexWriter(
+        out, marker_name="UFO1", approx_xyz=(0.0, 0.0, 0.0),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    w2.write_epoch(datetime(2026, 5, 19, 14, 0, 1, tzinfo=timezone.utc),
+                   _stub_obs())
+    w2.close()
+    assert parse_header(out).approx_xyz == pytest.approx(
+        (157470.222, -4756189.544, 4232767.952))
+
+
 def test_respawn_set_approx_xyz_still_rewrites_existing_header(tmp_path):
     """On respawn, the writer relocates the APPROX POSITION offset by
     scanning the existing header, so set_approx_xyz() still works
