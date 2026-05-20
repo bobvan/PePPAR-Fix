@@ -383,7 +383,7 @@ def test_decimation_first_epoch_always_written(tmp_path):
     w.close()
     text = (tmp_path / "madhat-2026124.obs").read_text()
     assert "END OF HEADER" in text
-    assert "> 2026  5  4 14  0" in text
+    assert "> 2026 05 04 14 00" in text
 
 
 def test_decimation_header_interval(tmp_path):
@@ -398,6 +398,418 @@ def test_decimation_header_interval(tmp_path):
     assert interval_line, f"no INTERVAL line: {text[:500]}"
     # "    30.000" with INTERVAL marker
     assert "30.000" in interval_line[0]
+
+
+# ── APPROX POSITION XYZ resolution ────────────────────────────────── #
+#
+# The PRIDE-vs-engine yardstick needs APPROX POSITION XYZ within a few
+# km of truth.  At (0,0,0) PRIDE rejects every SV as DEL_BADRANGE (seed
+# lands ~6378 km off, every PR residual diverges).  See
+# rinexWriterPridePrep-main bead for the 2026-05-19 forensics.
+#
+# The writer supports three resolution paths:
+#   1. --known-pos          → make_writer_from_args parses immediately
+#   2. arp_label            → antennas.json lookup at construction
+#   3. set_approx_xyz()     → engine call after NAV2/PPP bootstrap
+#                             (covers cold-start path)
+
+
+def test_make_writer_uses_arp_label_when_no_known_pos(tmp_path):
+    """arp_label in args + antennas_json override → APPROX XYZ from
+    antennas.json entry.  This is the lab path: every host runs with
+    arp_label = "ufo1" or similar, no --known-pos.  Was returning
+    (0,0,0) before the rinexWriterPridePrep-main fix."""
+    import json
+    antennas = tmp_path / "antennas.json"
+    antennas.write_text(json.dumps({
+        "ufo1": {
+            "ecef_m": [157470.222, -4756189.544, 4232767.952],
+            "sigma_m": 0.009,
+            "method": "OPUS-Static",
+            "updated": "2026-05-19",
+        }
+    }))
+    out = tmp_path / "lab.rnx"
+    args = Namespace(
+        rinex_out=str(out),
+        arp_label="ufo1",
+        antennas_json=str(antennas),
+    )
+    w = make_writer_from_args(args)
+    assert w is not None
+    assert w._approx_xyz == pytest.approx(
+        (157470.222, -4756189.544, 4232767.952))
+    w.close()
+
+
+def test_make_writer_known_pos_wins_over_arp_label(tmp_path):
+    """When both --known-pos and arp_label are set, --known-pos wins
+    (operator override beats the lab database)."""
+    import json
+    antennas = tmp_path / "antennas.json"
+    antennas.write_text(json.dumps({
+        "ufo1": {
+            "ecef_m": [1.0, 2.0, 3.0],  # sentinel; should NOT be picked
+            "sigma_m": 0.009,
+        }
+    }))
+    out = tmp_path / "both.rnx"
+    args = Namespace(
+        rinex_out=str(out),
+        known_pos="40.0,-90.0,200.0",
+        arp_label="ufo1",
+        antennas_json=str(antennas),
+    )
+    w = make_writer_from_args(args)
+    assert w is not None
+    # Should be the lla_to_ecef of 40, -90, 200, not the sentinel
+    x, _, _ = w._approx_xyz
+    assert abs(x) < 100  # lon=-90 puts x≈0; sentinel x=1.0 would too,
+    # but lon/alt path produces y≈-4.89e6 not 2.0
+    assert w._approx_xyz[1] < -4_800_000
+    w.close()
+
+
+def test_make_writer_arp_label_unknown_falls_back_to_zero(tmp_path):
+    """arp_label not in antennas.json → warn + (0,0,0)."""
+    import json
+    antennas = tmp_path / "antennas.json"
+    antennas.write_text(json.dumps({"ufo1": {
+        "ecef_m": [1.0, 2.0, 3.0], "sigma_m": 0.009}}))
+    out = tmp_path / "missing-label.rnx"
+    args = Namespace(
+        rinex_out=str(out),
+        arp_label="not-a-real-label",
+        antennas_json=str(antennas),
+    )
+    w = make_writer_from_args(args)
+    assert w is not None
+    assert w._approx_xyz == (0.0, 0.0, 0.0)
+    w.close()
+
+
+def test_set_approx_xyz_before_first_epoch(tmp_path):
+    """set_approx_xyz() called before any write_epoch → header on
+    first epoch carries the updated seed.  Covers the bootstrap path
+    where the engine resolves known_ecef via NAV2/PPP after writer
+    construction but before the first observation lands."""
+    w = RinexWriter(
+        tmp_path / "boot.rnx",
+        marker_name="UFO1",
+        approx_xyz=(0.0, 0.0, 0.0),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    w.set_approx_xyz((157470.222, -4756189.544, 4232767.952))
+    epoch = datetime(2026, 5, 19, 14, 0, 0, tzinfo=timezone.utc)
+    w.write_epoch(epoch, _stub_obs())
+    w.close()
+    hdr = parse_header(tmp_path / "boot.rnx")
+    assert hdr.approx_xyz == pytest.approx(
+        (157470.222, -4756189.544, 4232767.952))
+
+
+def test_set_approx_xyz_after_header_written_rewrites_in_place(tmp_path):
+    """set_approx_xyz() called after the header is on disk → seek-write
+    rewrites the APPROX POSITION XYZ line in place; subsequent epochs
+    write at EOF normally.  Header is fixed-length so the rewrite
+    preserves all surrounding bytes.  Covers the PPP-bootstrap path
+    where the engine converges to known_ecef ~30-90s after first epoch."""
+    out = tmp_path / "deferred.rnx"
+    w = RinexWriter(
+        out,
+        marker_name="UFO1",
+        approx_xyz=(0.0, 0.0, 0.0),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    # First epoch → header written with (0,0,0)
+    w.write_epoch(datetime(2026, 5, 19, 14, 0, 0, tzinfo=timezone.utc),
+                  _stub_obs())
+    # Now engine resolves known_ecef and pushes it in
+    w.set_approx_xyz((157470.222, -4756189.544, 4232767.952))
+    # More epochs after the rewrite
+    w.write_epoch(datetime(2026, 5, 19, 14, 0, 1, tzinfo=timezone.utc),
+                  _stub_obs())
+    w.close()
+    hdr = parse_header(out)
+    assert hdr.approx_xyz == pytest.approx(
+        (157470.222, -4756189.544, 4232767.952))
+    # Both epochs still readable — the seek didn't corrupt the file
+    epochs = list(parse_epochs(out))
+    assert len(epochs) == 2
+
+
+# ── Append-on-respawn (wrapper exit-5 recovery) ───────────────────── #
+#
+# Before the 2026-05-19 fix, _open_for_date opened with 'w' which
+# truncated the day's RINEX every time the wrapper respawned the
+# engine after a catastrophic-reject cascade.  Lost ~1 hr MadHat +
+# ~1.5 hr clkPoC3 RINEX on 2026-05-19 from exactly this.  The fix:
+# open r+ when the file already exists, skip the duplicate header,
+# continue appending epochs.
+
+
+def test_respawn_preserves_prior_session_data(tmp_path):
+    """Two writer instances against the same path: epochs from both
+    sessions land in the file, only one header total.  Models the
+    wrapper-respawn (exit 5) recovery path."""
+    out = tmp_path / "respawn.rnx"
+    # Session 1
+    w1 = RinexWriter(
+        out, marker_name="UFO1",
+        approx_xyz=(157470.222, -4756189.544, 4232767.952),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    w1.write_epoch(datetime(2026, 5, 19, 14, 0, 0, tzinfo=timezone.utc),
+                   _stub_obs())
+    w1.write_epoch(datetime(2026, 5, 19, 14, 0, 1, tzinfo=timezone.utc),
+                   _stub_obs())
+    w1.close()
+    # Session 2 (engine respawn) — same path
+    w2 = RinexWriter(
+        out, marker_name="UFO1",
+        approx_xyz=(157470.222, -4756189.544, 4232767.952),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    w2.write_epoch(datetime(2026, 5, 19, 14, 0, 2, tzinfo=timezone.utc),
+                   _stub_obs())
+    w2.close()
+
+    text = out.read_text()
+    # Exactly one header (one END OF HEADER, one RINEX VERSION line)
+    assert text.count("END OF HEADER") == 1
+    assert text.count("RINEX VERSION / TYPE") == 1
+    # All three epochs present
+    epoch_lines = [ln for ln in text.splitlines() if ln.startswith("> ")]
+    assert len(epoch_lines) == 3, (
+        f"expected 3 epochs across two sessions, got {len(epoch_lines)}: "
+        f"{epoch_lines}")
+    # File still parses as a valid RINEX
+    epochs = list(parse_epochs(out))
+    assert len(epochs) == 3
+
+
+def test_respawn_rewrites_stale_zero_header_at_reopen(tmp_path):
+    """Race fix (Main, 2026-05-19 clkPoC3 canary).
+
+    Scenario: writer constructed with a resolved arp_label seed at
+    __init__, but at engine startup set_approx_xyz() is called from
+    the main thread BEFORE the serial thread has opened the daily
+    file (write_epoch hasn't fired yet).  set_approx_xyz on a None
+    _fp is a no-op.  When write_epoch later opens an EXISTING daily
+    file (from a prior session that wrote (0,0,0) before bootstrap
+    converged), the stale on-disk header would persist without this
+    fix.
+
+    The fix: _open_for_date detects the offset of the existing
+    APPROX POSITION line and immediately seek-writes the in-memory
+    seed if non-zero, before write_epoch proceeds.
+    """
+    out = tmp_path / "stale-header.rnx"
+    # Session 1: writer started without seed → header lands at (0,0,0).
+    w1 = RinexWriter(
+        out, marker_name="UFO1", approx_xyz=(0.0, 0.0, 0.0),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    w1.write_epoch(datetime(2026, 5, 19, 14, 0, 0, tzinfo=timezone.utc),
+                   _stub_obs())
+    w1.close()
+    assert parse_header(out).approx_xyz == pytest.approx((0.0, 0.0, 0.0))
+
+    # Session 2: writer constructed WITH the arp_label-resolved seed.
+    # No explicit set_approx_xyz call — the reopen path must
+    # detect-and-rewrite from __init__'s seed alone.
+    w2 = RinexWriter(
+        out, marker_name="UFO1",
+        approx_xyz=(157470.222, -4756189.544, 4232767.952),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    w2.write_epoch(datetime(2026, 5, 19, 14, 0, 1, tzinfo=timezone.utc),
+                   _stub_obs())
+    w2.close()
+    assert parse_header(out).approx_xyz == pytest.approx(
+        (157470.222, -4756189.544, 4232767.952))
+
+
+def test_respawn_with_zero_seed_does_not_clobber_good_header(tmp_path):
+    """Guard on the race fix: a writer with self._approx_xyz=(0,0,0)
+    (unresolved seed) must NOT overwrite an existing file's correct
+    header.  Models the scenario where session 1 had arp_label and
+    session 2 is started without arp_label — session 2's stale
+    in-memory (0,0,0) should defer to the disk-resident seed."""
+    out = tmp_path / "good-header.rnx"
+    w1 = RinexWriter(
+        out, marker_name="UFO1",
+        approx_xyz=(157470.222, -4756189.544, 4232767.952),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    w1.write_epoch(datetime(2026, 5, 19, 14, 0, 0, tzinfo=timezone.utc),
+                   _stub_obs())
+    w1.close()
+
+    w2 = RinexWriter(
+        out, marker_name="UFO1", approx_xyz=(0.0, 0.0, 0.0),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    w2.write_epoch(datetime(2026, 5, 19, 14, 0, 1, tzinfo=timezone.utc),
+                   _stub_obs())
+    w2.close()
+    assert parse_header(out).approx_xyz == pytest.approx(
+        (157470.222, -4756189.544, 4232767.952))
+
+
+def test_respawn_set_approx_xyz_still_rewrites_existing_header(tmp_path):
+    """On respawn, the writer relocates the APPROX POSITION offset by
+    scanning the existing header, so set_approx_xyz() still works
+    against a file authored by a prior process.  This is the scenario
+    where the prior engine wrote (0,0,0) (cold-bootstrap, no seed)
+    and the new engine has known_ecef ready at startup — the rewrite
+    fixes the header for downstream PRIDE."""
+    out = tmp_path / "respawn-fix-header.rnx"
+    # Session 1: cold-bootstrap, no seed, header lands at (0,0,0).
+    w1 = RinexWriter(
+        out, marker_name="UFO1", approx_xyz=(0.0, 0.0, 0.0),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    w1.write_epoch(datetime(2026, 5, 19, 14, 0, 0, tzinfo=timezone.utc),
+                   _stub_obs())
+    w1.close()
+    # Session 2: known_ecef now resolved — push it in.
+    w2 = RinexWriter(
+        out, marker_name="UFO1", approx_xyz=(0.0, 0.0, 0.0),
+        antenna_type="SFESPK6618H     NONE",
+    )
+    # Trigger _open_for_date by writing one epoch (the writer is lazy)
+    w2.write_epoch(datetime(2026, 5, 19, 14, 0, 1, tzinfo=timezone.utc),
+                   _stub_obs())
+    w2.set_approx_xyz((157470.222, -4756189.544, 4232767.952))
+    w2.close()
+    hdr = parse_header(out)
+    assert hdr.approx_xyz == pytest.approx(
+        (157470.222, -4756189.544, 4232767.952))
+
+
+# ── repair_partial_epochs — recovery from kill-mid-epoch ────────── #
+#
+# Background (2026-05-20, prideClkPoC3BdsParseStrict-charlie):
+# When PR #42's r+ append-on-respawn opens a file killed mid-epoch
+# (between the time-tag write and the last obs-row write), the file
+# ends with a partial epoch whose declared NN doesn't match the
+# rows on disk.  PRIDE-PPP-AR's rdrnxoi3 reads NN obs rows past each
+# time tag and trips when it consumes rows from the next epoch.
+# Repairing rewrites NN in place to match the actual row count.
+
+
+from peppar_fix.rinex_writer import repair_partial_epochs
+
+
+def _write_synthetic_epoch(f, year, month, day, hour, minute,
+                           second, declared_nn, actual_rows):
+    """Emit a time tag with declared_nn followed by actual_rows
+    minimal obs rows.  Caller can intentionally mismatch to model
+    a killed-mid-epoch scenario."""
+    f.write(f"> {year:4d} {month:2d} {day:2d} {hour:2d} {minute:2d}"
+            f"{second:11.7f}  0{declared_nn:3d}\n")
+    for i in range(actual_rows):
+        # Single-band GPS row with stub values.  Just needs to be
+        # non-blank (so repair counts it as a real obs row).
+        f.write(f"G{i+1:02d}  21000000.000    "
+                f"110000000.000              " + " " * 100 + "\n")
+
+
+def test_repair_idempotent_on_clean_file(tmp_path):
+    """File with all epochs complete → 0 repairs."""
+    p = tmp_path / "clean.obs"
+    with open(p, "w") as f:
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 0.0, 5, 5)
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 30.0, 7, 7)
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 1, 0.0, 6, 6)
+    assert repair_partial_epochs(p) == 0
+    # A second pass is also a no-op.
+    assert repair_partial_epochs(p) == 0
+
+
+def test_repair_fixes_single_partial_epoch_at_eof(tmp_path):
+    """Last epoch declares 9 SVs but only 5 rows present.  Repair
+    rewrites NN to 5; subsequent NN reads match."""
+    p = tmp_path / "trailing-partial.obs"
+    with open(p, "w") as f:
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 0.0, 5, 5)
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 30.0, 9, 5)
+    assert repair_partial_epochs(p) == 1
+    # NN of the second time tag should now read 5.
+    with open(p) as f:
+        tags = [ln for ln in f if ln.startswith(">")]
+    assert tags[1][32:35] == "  5"
+
+
+def test_repair_fixes_multiple_internal_partial_epochs(tmp_path):
+    """Real-world scenario: respawn-without-fix produced multiple
+    internal partial epochs (clkPoC3 had 12 on 2026-05-20).  Repair
+    rewrites every mismatched NN in one pass."""
+    p = tmp_path / "multi-partial.obs"
+    with open(p, "w") as f:
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 0.0, 9, 5)   # partial
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 30.0, 7, 7)  # clean
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 1, 0.0, 12, 3)  # partial
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 1, 30.0, 6, 6)  # clean
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 2, 0.0, 8, 1)   # partial
+    assert repair_partial_epochs(p) == 3
+    with open(p) as f:
+        tags = [ln for ln in f if ln.startswith(">")]
+    declared = [int(t[32:35].strip()) for t in tags]
+    assert declared == [5, 7, 3, 6, 1]
+
+
+def test_repair_skips_stranded_tag_with_zero_rows(tmp_path):
+    """A time tag with NO rows after it (engine killed BETWEEN epochs,
+    or stranded write).  Rewriting NN to 0 is invalid RINEX, so leave
+    such tags alone.  No data is corrupted regardless; PRIDE handles
+    zero-row epochs separately."""
+    p = tmp_path / "stranded-tag.obs"
+    with open(p, "w") as f:
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 0.0, 5, 5)
+        # Time tag with no rows after
+        f.write(f"> 2026  5 20 12  0 30.0000000  0  9\n")
+    # Repair leaves the stranded tag's NN alone.
+    assert repair_partial_epochs(p) == 0
+
+
+def test_repair_handles_engine_restart_pattern_end_to_end(tmp_path):
+    """End-to-end: simulate the exact 2026-05-20 clkPoC3 scenario.
+    Session 1 writes a partial epoch; session 2's _open_for_date
+    calls repair_partial_epochs and the result is consumable by a
+    strict downstream parser."""
+    p = tmp_path / "respawn-scenario.obs"
+    # Session 1 (mocked: writes a valid epoch, then a partial epoch,
+    # then is killed mid-write).
+    with open(p, "w") as f:
+        # File starts with a stub header so repair has a valid
+        # PROLOGUE before the first epoch (matches RINEX 3.04 shape).
+        f.write("     3.04           OBSERVATION DATA    M (MIXED)           "
+                "RINEX VERSION / TYPE\n")
+        f.write(" " * 60 + "END OF HEADER\n")
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 0.0, 5, 5)
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 0, 30.0, 9, 4)
+        # session 1 killed here
+    # Session 2 wrapper-respawn writes one more clean epoch.
+    repair_partial_epochs(p)
+    with open(p, "a") as f:
+        _write_synthetic_epoch(f, 2026, 5, 20, 12, 1, 0.0, 6, 6)
+
+    # Final file: 3 epochs, every NN matches actual row count.
+    with open(p) as f:
+        rows = f.readlines()
+    tags = []
+    for i, ln in enumerate(rows):
+        if ln.startswith("> 2026"):
+            tags.append(i)
+    # For each tag, count obs rows up to the next tag (or EOF).
+    for j, ti in enumerate(tags):
+        next_ti = tags[j+1] if j+1 < len(tags) else len(rows)
+        actual_rows = next_ti - ti - 1
+        declared = int(rows[ti][32:35].strip())
+        assert declared == actual_rows, (
+            f"epoch {j}: declared {declared}, got {actual_rows}")
 
 
 if __name__ == "__main__":

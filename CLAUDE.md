@@ -229,6 +229,53 @@ GitHub is still the public origin and remains the long-term home of
 record.  It's just that lab hosts and gt's dev tree both push *through*
 the gt bare upstream, not directly to it.
 
+### After `gh pr merge` on GitHub — sync gt explicitly
+
+The gt mirror hook is **forward-only**: it pushes gt → GitHub when gt
+receives a push, never the other direction.  When a PR is merged via
+`gh pr merge --squash` (or any GitHub-side merge), the resulting
+commit lands on GitHub but **does not propagate to gt**.  Subsequent
+dev-box commits then end up rooted on a parent that no longer exists
+in GitHub's main history, and the hook will refuse to forward them
+("post-receive: failed to forward refs/heads/main") — leaving gt with
+local commits that never reach GitHub.
+
+**After any GitHub-side merge, sync gt before pushing more code:**
+
+```sh
+git fetch github main
+git checkout main
+git merge --ff-only github/main   # picks up the squash merge
+git push origin main              # gt now matches GitHub
+```
+
+If gt has already accumulated divergent local commits (because the
+sync was skipped), the only clean fix is reset + force-push:
+
+```sh
+git fetch github main
+git checkout main
+# Confirm content is preserved (the squash usually subsumes pre-merge work)
+git diff main github/main
+git tag pre-force-push-recovery-$(git rev-parse --short main) main
+git reset --hard github/main
+git push --force origin main      # gt aligns with GitHub
+```
+
+Then on each lab host:
+
+```sh
+ssh <host> 'cd ~/peppar-fix && git fetch && git reset --hard origin/main'
+```
+
+(plain `git pull --ff-only` fails when the lab host's local main has
+the now-orphaned commits; reset is required.)
+
+Catastrophe from skipping this: 2026-05-20 morning — dev-box had a
+standalone docs commit on gt, PR #42 + #46 merged on GitHub, lab
+hosts pulled gt's old code, canary deploy hit "unrecognized argument:
+--no-antposest", and the fix required force-pushing gt to align.
+
 ### Common lab-host failures (in order of frequency)
 
 1. **Missing Python deps**: set up the venv first:
@@ -252,6 +299,23 @@ wrapper in scripts/peppar-fix. That's over 500 lines of code that should be test
 possible. Always prefer testing using the wrapper as a user would, but it's ok to
 run components individually for diagnosis or troubleshooting.
 
+## Recommended operational mode: `--no-antposest` (time-only)
+
+For time-mission deployments, **the recommended way to run the engine
+is `--no-antposest`**.  See [`docs/time-only-architecture.md`](docs/time-only-architecture.md).
+TL;DR: peppar-survey delivers the ARP offline; the engine skips
+its own position filter entirely; FixedPosFilter runs at the pinned
+ARP and drives PHC discipline; NAV2 watchdogs gross ARP moves at
+10 m.  Empirically validated 2026-05-20 on PiFace canary — TICC chA
+TDEV at τ = 1000 s matched the default-mode baseline within 1 ps
+(0.73 ns vs 0.72 ns).  All four lab hosts switched to `--no-antposest`
+2026-05-20.
+
+The default engine behavior is preserved (Phase 1 PPPFilter
+bootstrap + AntPosEst runtime refinement) for backward compatibility
+and for moving-platform / real-time positioning use cases where the
+position filter is the point.
+
 ## Optional component: peppar-survey
 
 `peppar-survey` is the optional companion to `peppar-fix` that writes
@@ -259,6 +323,11 @@ authoritative ARP estimates to `state/positions/<uid>.survey.toml`
 from external observation backends (currently `--pride` only).  Native
 deps are tracked separately from `peppar-fix`'s `pyproject.toml`
 because PRIDE-PPP-AR is Fortran, not pip-installable.
+
+In the recommended `--no-antposest` mode, peppar-survey is
+**load-bearing** for ARP acquisition — the engine refuses to start
+without a seed (`--known-pos` OR `arp_label → antennas.json` OR a
+`.survey.toml` / `.ppp.toml` state file).
 
 Full install procedure: [`docs/peppar-survey-install.md`](docs/peppar-survey-install.md).
 TL;DR: `bash scripts/install_peppar_survey.sh` on each lab host.

@@ -196,6 +196,19 @@ def invoke_pdp3(
     if obs_local.resolve() != obs_file.resolve():
         shutil.copy2(obs_file, obs_local)
 
+    # Repair any partial-epoch corruption in the work-dir copy before
+    # pdp3 runs.  Files captured by the engine BEFORE the writer's
+    # repair-on-reopen fix can contain time tags whose declared NN
+    # exceeds the actual rows that followed (engine killed mid-epoch).
+    # PRIDE's rdrnxoi3 trips on these.  Repair rewrites NN in place to
+    # match actual row count; data preserved, original file untouched
+    # (we only modify the work_dir copy).  Idempotent.
+    from peppar_fix.rinex_writer import repair_partial_epochs
+    n_repaired = repair_partial_epochs(obs_local)
+    if n_repaired:
+        log.info("Repaired %d partial epoch(s) in %s before pdp3",
+                 n_repaired, obs_local.name)
+
     # Stage a pre-fetched multi-GNSS broadcast nav file when given.
     # pdp3.sh's IGS-MGEX download chain (gnsswhu/IGN/DLR) sometimes
     # falls through to GPS-only nav; without GAL/BDS ephemeris pdp3's
