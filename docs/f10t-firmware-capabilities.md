@@ -59,28 +59,12 @@ default):
 | NAV-PVT   | (not directly observed) | Engine doesn't consume; not tracked |
 | NAV-SAT   | (not directly observed) | Engine doesn't consume; not tracked |
 
-## NAK semantics — three categories
+## NAK semantics
 
-1. **Idempotent NAK**: receiver rejects the key but the underlying
-   feature is already in the desired state.  Observed for
-   `CFG_NAV2_OUT_ENABLED=1` on F10T (NAV2-PVT messages flow despite
-   the NAK).  Likely persisted as enabled in BBR/Flash from earlier
-   config or factory default.  **Workaround**: check before set, or
-   accept the NAK and move on.
-
-2. **Rate-cap NAK**: receiver rejects a specific rate value
-   (decimation factor) but accepts the key at other rates.
-   Observed for `CFG_MSGOUT_UBX_NAV_TIMEGPS_UART1=5`; the message
-   continues to flow at the receiver's default rate.  **Workaround**:
-   retry at rate=1 for the next post-config burst revision.
-
-3. **Hardware NAK**: receiver rejects the key because the underlying
-   hardware doesn't exist.  Observed for all `_USB`-suffixed keys on
-   F10T.  **No workaround**: use the correct port suffix.
-
-The no-bundle CFG-VALSET policy (`docs/receiver-signals.md`) lets us
-distinguish these categories at the wire.  Bundled VALSETs would NAK
-the entire burst on any one of them, losing the diagnostic.
+The "NAK (idempotent)" / "NAK (rate cap)" / `_USB` hardware-NAK
+patterns called out in the matrices above are the three categories
+documented in [`docs/cfg-valset-nak-taxonomy.md`](cfg-valset-nak-taxonomy.md).
+F10T contributes the canonical example of each.
 
 ## Signal capability matrix
 
