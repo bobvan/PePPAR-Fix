@@ -584,17 +584,24 @@ def process_one_obs(
     mode: str = "ppp",
     cors_station: str | None = None,
     cors_rinex_path: Path | None = None,
+    cors_ntrip=None,  # peppar_survey_cors.CorsNtripConfig | None
     nav_file: Path | None = None,
     rnx2rtkp_bin: str = DEFAULT_RNX2RTKP,
     timeout_s: int = DEFAULT_RNX2RTKP_TIMEOUT_S,
     rnx2rtkp_runner=invoke_rnx2rtkp,
     cors_fetcher=fetch_cors_rinex,
+    cors_ntrip_capturer=None,  # injectable for tests
 ) -> tuple[RtklibSolution | None, RtklibRunResult | None]:
     """Run rnx2rtkp on one obs file and aggregate into a solution.
 
-    For mode="rtk", a CORS base RINEX is required.  Either pass
-    ``cors_rinex_path`` directly OR pass ``cors_station`` (NOAA CORS
-    station code) and the helper will fetch via fetch_cors_rinex.
+    For mode="rtk", a CORS base RINEX is required, supplied via
+    exactly one of:
+      - ``cors_rinex_path``: explicit path to a pre-staged base
+      - ``cors_station``: NOAA CORS station code; fetched by
+        ``cors_fetcher``
+      - ``cors_ntrip``: ``CorsNtripConfig`` for a live-NTRIP capture
+        from a peer peppar-fix caster; streamed by
+        ``cors_ntrip_capturer``
     """
     last_result: RtklibRunResult | None = None
     base_obs: Path | None = None
@@ -619,11 +626,28 @@ def process_one_obs(
                     error=f"CORS fetch failed for station={cors_station} "
                           f"year={year} doy={doy}",
                 )
+        elif cors_ntrip is not None:
+            # Lazy import: avoid pulling peppar_survey_cors (and the
+            # subprocess machinery it imports) into the static-CORS
+            # paths that don't need it.
+            if cors_ntrip_capturer is None:
+                from peppar_fix.peppar_survey_cors import (
+                    capture_cors_base_via_ntrip as cors_ntrip_capturer
+                )
+            base_obs = cors_ntrip_capturer(cors_ntrip, work_dir)
+            if base_obs is None:
+                return None, RtklibRunResult(
+                    obs_file=obs_file, mode=mode, returncode=-1,
+                    pos_path=None,
+                    error=f"live NTRIP capture failed for "
+                          f"{cors_ntrip.host}:{cors_ntrip.port}/"
+                          f"{cors_ntrip.mount}",
+                )
         else:
             return None, RtklibRunResult(
                 obs_file=obs_file, mode=mode, returncode=-1, pos_path=None,
-                error="rtk mode requires --cors-station or "
-                      "--cors-rinex-path",
+                error="rtk mode requires --cors-station, "
+                      "--cors-rinex-path, or --cors-ntrip-*",
             )
 
     result = rnx2rtkp_runner(
@@ -711,9 +735,11 @@ def run_rtklib_backend(
     min_n_obs: int = DEFAULT_MIN_N_OBS,
     rnx2rtkp_bin: str = DEFAULT_RNX2RTKP,
     timeout_s: int = DEFAULT_RNX2RTKP_TIMEOUT_S,
+    cors_ntrip=None,
     dry_run: bool = False,
     rnx2rtkp_runner=invoke_rnx2rtkp,
     cors_fetcher=fetch_cors_rinex,
+    cors_ntrip_capturer=None,
     source_label: str | None = None,
 ) -> int:
     """Run rnx2rtkp over each obs file, archive each solution to
@@ -739,9 +765,14 @@ def run_rtklib_backend(
     work_dir = Path(work_dir)
     history_path = default_history_path(receiver_uid, history_dir)
     if source_label is None:
-        source_label = (f"peppar-survey --rtklib"
-                        + (f" --cors-station {cors_station}"
-                           if mode == "rtk" and cors_station else ""))
+        if mode == "rtk" and cors_ntrip is not None:
+            source_label = (
+                f"peppar-survey --rtklib --cors-ntrip "
+                f"{cors_ntrip.host}:{cors_ntrip.port}/{cors_ntrip.mount}")
+        elif mode == "rtk" and cors_station:
+            source_label = f"peppar-survey --rtklib --cors-station {cors_station}"
+        else:
+            source_label = "peppar-survey --rtklib"
 
     n_solved = 0
     n_quality_ok = 0
@@ -753,11 +784,13 @@ def run_rtklib_backend(
             mode=mode,
             cors_station=cors_station,
             cors_rinex_path=cors_rinex_path,
+            cors_ntrip=cors_ntrip,
             nav_file=nav_file,
             rnx2rtkp_bin=rnx2rtkp_bin,
             timeout_s=timeout_s,
             rnx2rtkp_runner=rnx2rtkp_runner,
             cors_fetcher=cors_fetcher,
+            cors_ntrip_capturer=cors_ntrip_capturer,
         )
         if sol is None:
             n_failed += 1
