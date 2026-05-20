@@ -174,6 +174,17 @@ def main(argv: list[str] | None = None) -> int:
              "File: used as-is for every obs file.  Directory: looks "
              "up brdmDDD0.YYp matching each obs file's year/doy.",
     )
+    pride.add_argument(
+        "--wum-source", default=None,
+        help="Directory of pre-fetched WUM products (orbit / clock / "
+             "phase-bias / ERP) for pdp3.  Files matching each obs "
+             "file's year/doy are gunzipped into pdp3's product/common "
+             "dir before each run, so pdp3's USECACHE path picks them "
+             "up and the flaky bdspride→IGN→gnsswhu→bdspride→gnsswhu "
+             "download ladder never has to fire.  Codified gnsswhu "
+             "fallback paths live in scripts/fetch_wum_products.sh; "
+             "see wumProductGnsswhuFallback-charlie for the discovery.",
+    )
 
     args = ap.parse_args(argv)
 
@@ -239,6 +250,7 @@ def _run_pride(args) -> int:
         min_n_obs=(args.min_n_obs if args.min_n_obs is not None
                    else DEFAULT_MIN_N_OBS),
         brdm_source=args.brdm_source,
+        wum_source=args.wum_source,
         dry_run=args.dry_run,
     )
 
