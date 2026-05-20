@@ -251,6 +251,9 @@ class ReceiverDriver:
     # 3.01 reports native cycles (empty set is correct for F10T); F9T's
     # TIM 2.25 quirk is captured in F9TDriver.
     bds_l1_ref_cycles = frozenset()
+    # CFG_MSGOUT_UBX_NAV_TIMEGPS rate.  F9T accepts 5 (every 5th epoch).
+    # F10T NAKs anything > 1 (rate-cap quirk; messages flow at 1 anyway).
+    nav_timegps_rate = 5
 
     def signal_name(self, gnss_id, sig_id):
         return self.signal_names.get((gnss_id, sig_id))
@@ -347,6 +350,7 @@ class F10TDriver(ReceiverDriver):
     supports_timing_mode = False
     supports_l5_health_override = False
     signal_names = F10T_SIGNAL_NAMES
+    nav_timegps_rate = 1  # F10T rate-caps NAV-TIMEGPS at 1
     if_pairs = (
         ('GPS', 'GPS-L1CA', 'GPS-L5Q', 'G'),
         ('GAL', 'GAL-E1C', 'GAL-E5aQ', 'E'),
@@ -906,14 +910,18 @@ def configure_rate_ms(ser, ubr, meas_ms):
     return not nak
 
 
-def configure_messages(ser, ubr, port_id, sfrbx_rate=1):
+def configure_messages(ser, ubr, port_id, sfrbx_rate=1, driver=None):
     """Enable required UBX messages on the specified port.
 
     Args:
         sfrbx_rate: SFRBX output decimation (0=disabled, 1=every epoch).
                     When 0, PVT and NAV-SAT are also disabled to minimize
                     I2C bandwidth on E810 (15-byte AQ limit, ~1.6 kB/s).
+        driver: ReceiverDriver instance; supplies per-receiver decimations
+                (currently `nav_timegps_rate`).  None falls back to the
+                base-class defaults.
     """
+    nav_timegps_rate = (driver or ReceiverDriver()).nav_timegps_rate
     pname = PORT_SUFFIX.get(port_id, f"port{port_id}")
     messages = {
         f"CFG_MSGOUT_UBX_RXM_RAWX_{pname}": 1,
@@ -953,11 +961,12 @@ def configure_messages(ser, ubr, port_id, sfrbx_rate=1):
     #   NAV-CLOCK: receiver's clock-bias / drift / accuracy (~24 B/epoch).
     #              1 Hz for chip-slip vs command-envelope diagnostics.
     #   NAV-TIMEGPS: GPS time solution + valid flags (~24 B/epoch).
-    #                5-epoch decimation — state is slowly varying.
+    #                Decimation per driver.nav_timegps_rate (F9T accepts 5;
+    #                F10T rate-caps at 1).
     if sfrbx_rate > 0:
         messages[f"CFG_MSGOUT_UBX_NAV_SIG_{pname}"] = 1
         messages[f"CFG_MSGOUT_UBX_NAV_CLOCK_{pname}"] = 1
-        messages[f"CFG_MSGOUT_UBX_NAV_TIMEGPS_{pname}"] = 5
+        messages[f"CFG_MSGOUT_UBX_NAV_TIMEGPS_{pname}"] = nav_timegps_rate
     else:
         messages[f"CFG_MSGOUT_UBX_NAV_SIG_{pname}"] = 0
         messages[f"CFG_MSGOUT_UBX_NAV_CLOCK_{pname}"] = 0
@@ -1163,7 +1172,7 @@ def full_configure(port, baud=9600, port_type="USB", rate_hz=1,
     ser, ubr = reopen_after_reset(port, wait_s=10)
 
     configure_rate(ser, ubr, rate_hz)
-    configure_messages(ser, ubr, port_id)
+    configure_messages(ser, ubr, port_id, driver=driver)
     configure_nmea_off(ser, ubr, port_id)
     configure_tmode(ser, ubr, survey_dur_s, survey_acc_m)
 
@@ -1385,7 +1394,8 @@ def ensure_receiver_ready(port, baud, port_type="USB", systems=None,
             ser.close()
             ser, ubr = reopen_after_reset(port, wait_s=10)
         configure_rate_ms(ser, ubr, measurement_rate_ms)
-        configure_messages(ser, ubr, pid, sfrbx_rate=sfrbx_rate)
+        configure_messages(ser, ubr, pid, sfrbx_rate=sfrbx_rate,
+                           driver=forced_driver)
         configure_nmea_off(ser, ubr, pid)
         ser.close()
         # Verify
@@ -1485,7 +1495,7 @@ def ensure_receiver_ready(port, baud, port_type="USB", systems=None,
 
     # Set measurement rate and enable required messages on the correct port
     configure_rate_ms(ser, ubr, measurement_rate_ms)
-    configure_messages(ser, ubr, pid, sfrbx_rate=sfrbx_rate)
+    configure_messages(ser, ubr, pid, sfrbx_rate=sfrbx_rate, driver=driver)
     configure_nmea_off(ser, ubr, pid)
     ser.close()
 
