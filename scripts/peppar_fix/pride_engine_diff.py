@@ -295,10 +295,18 @@ def match_engine_to_pride(samples: list[EngineSample],
         pride_ecef = (nearest.x, nearest.y, nearest.z)
         delta = ecef_dist(engine_ecef, pride_ecef)
 
-        # Events in the ±window_s window around this sample
-        window_events = [
+        # Events in the ±window_s window around this sample.
+        # Dedupe with multiplicity so a 200-slip burst renders as
+        # "SLIP×200" instead of 200 separate tokens — keeps the CSV
+        # column readable.
+        from collections import Counter
+        counts = Counter(
             e.label for e in events
             if abs(e.wall_dt.timestamp() - s_unix) <= window_s
+        )
+        window_events = [
+            f"{label}×{n}" if n > 1 else label
+            for label, n in sorted(counts.items())
         ]
 
         out.append(DiffRecord(
