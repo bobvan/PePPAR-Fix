@@ -49,6 +49,17 @@ ACK = accepted, NAK = rejected by firmware.
 | BeiDou B2 (B2I) | CFG_SIGNAL_BDS_B2_ENA | (not tested) | **ACK** | (not tested) | **ACK** |
 | BeiDou B2a | CFG_SIGNAL_BDS_B2A_ENA | (not tested) | **NAK** | (not tested) | **NAK** |
 
+## NAK semantics
+
+Most NAKs in the matrix above are **hardware NAKs** (category 3
+in [`docs/cfg-valset-nak-taxonomy.md`](cfg-valset-nak-taxonomy.md))
+— the RF front-end that the signal would talk to isn't present
+on the module.  `vpManager_07` (MON-HW3 bit 7) is the canonical
+software-visible discriminator for the L5-capable vs L2-only
+F9T physical variants that share `MOD=ZED-F9T, FWVER=TIM 2.20,
+PROTVER=29.20`.  See the taxonomy doc for the idempotent and
+rate-cap categories observed on sibling F10T hardware.
+
 ## Key findings
 
 ### Neither receiver supports GLONASS
