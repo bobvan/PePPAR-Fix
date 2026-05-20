@@ -409,8 +409,8 @@ class RinexWriter:
 
         sec = epoch_dt.second + epoch_dt.microsecond * 1e-6
         f.write(f"> {epoch_dt.year:4d} "
-                f"{epoch_dt.month:2d} {epoch_dt.day:2d} "
-                f"{epoch_dt.hour:2d} {epoch_dt.minute:2d}"
+                f"{epoch_dt.month:02d} {epoch_dt.day:02d} "
+                f"{epoch_dt.hour:02d} {epoch_dt.minute:02d}"
                 f"{sec:11.7f}  0{n:3d}\n")
 
         for sv in sorted(usable_svs):

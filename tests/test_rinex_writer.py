@@ -383,7 +383,7 @@ def test_decimation_first_epoch_always_written(tmp_path):
     w.close()
     text = (tmp_path / "madhat-2026124.obs").read_text()
     assert "END OF HEADER" in text
-    assert "> 2026  5  4 14  0" in text
+    assert "> 2026 05 04 14 00" in text
 
 
 def test_decimation_header_interval(tmp_path):
