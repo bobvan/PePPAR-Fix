@@ -1497,8 +1497,16 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                             cp_f1 -= pb_f1 / wl_f1  # meters → cycles
                         if pb_f2 is not None:
                             cp_f2 -= pb_f2 / wl_f2
-                        ar_phase_bias_ok = (pb_f1 is not None
-                                            and pb_f2 is not None)
+                        # DIAGNOSTIC PATCH (diag-allow-no-pb-position):
+                        # Treat "both PBs missing" as broadcast-only intent
+                        # (admit obs, no AR).  "One present, one missing"
+                        # is still rejected (biased IF combination).  Both
+                        # present is the original AR-eligible case.
+                        if pb_f1 is None and pb_f2 is None:
+                            ar_phase_bias_ok = True
+                        else:
+                            ar_phase_bias_ok = (pb_f1 is not None
+                                                and pb_f2 is not None)
                         if phase_bias_stepped:
                             log.info(
                                 "[PB_STEP] %s phase-bias segment boundary "
