@@ -1416,8 +1416,14 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                     # a biased IF ambiguity — the short-term promoter in
                     # ppp_ar.py uses this flag to exclude such SVs from
                     # integer-fix candidacy (they still contribute PR for
-                    # geometry).  Defaults False when ssr is absent.
-                    ar_phase_bias_ok = False
+                    # geometry).
+                    #
+                    # DIAGNOSTIC PATCH (diag-allow-no-pb-position): default
+                    # True when SSR is absent or PB lookup is skipped, so
+                    # broadcast-only / --no-ssr / --no-ssr-phase-bias runs
+                    # produce AntPosEst output for the position-bias hunt.
+                    # Revert this default to False after the diagnosis.
+                    ar_phase_bias_ok = True
                     phase_bias_stepped = False
                     if ssr is not None and rinex_f1 and rinex_f2:
                         # Phase biases are indexed by code signal identifier
