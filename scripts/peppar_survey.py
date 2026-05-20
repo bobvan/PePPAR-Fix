@@ -163,6 +163,17 @@ def main(argv: list[str] | None = None) -> int:
              "clears this 2-10x).  Lower (e.g. 100) when validating "
              "against short engine-fragment captures.",
     )
+    pride.add_argument(
+        "--brdm-source", default=None,
+        help="Path to a pre-fetched multi-GNSS broadcast nav file "
+             "(or a directory containing brdmDDD0.YYp files).  "
+             "Staged into pdp3's work_dir before each run so pdp3 "
+             "skips its own IGS-MGEX download.  Workaround for the "
+             "GPS-only-brdm fall-through that produces DEL_BADRANGE "
+             "on every GAL/BDS SV (see docs / prideMultiGnssBrdm).  "
+             "File: used as-is for every obs file.  Directory: looks "
+             "up brdmDDD0.YYp matching each obs file's year/doy.",
+    )
 
     args = ap.parse_args(argv)
 
@@ -227,6 +238,7 @@ def _run_pride(args) -> int:
                     else DEFAULT_MAX_SIG0_M),
         min_n_obs=(args.min_n_obs if args.min_n_obs is not None
                    else DEFAULT_MIN_N_OBS),
+        brdm_source=args.brdm_source,
         dry_run=args.dry_run,
     )
 

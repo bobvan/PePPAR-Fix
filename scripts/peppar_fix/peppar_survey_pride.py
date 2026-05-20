@@ -124,6 +124,53 @@ def expected_log_name(year: int, doy: int, site: str) -> str:
     return f"log_{year:04d}{doy:03d}_{site}"
 
 
+def brdm_filename(year: int, doy: int) -> str:
+    """pdp3.sh's canonical broadcast-nav name for a given day.
+
+    pdp3.sh:1578 builds this as ``brdm${doy_s}0.${ymd_s:2:2}p``.  If
+    a file by this name is already present in pdp3's rinex_dir, the
+    download chain (pdp3.sh:2110-2167) skips and uses the local copy
+    directly — which is the integration point ``--brdm-source`` uses
+    to feed a multi-GNSS broadcast nav from outside PRIDE's normal
+    IGS download path.
+    """
+    return f"brdm{doy:03d}0.{year % 100:02d}p"
+
+
+def resolve_brdm_source(brdm_source: Path | str | None,
+                        year: int, doy: int) -> Path | None:
+    """Resolve ``brdm_source`` to a concrete file for (year, doy).
+
+    Accepts file-or-directory paths:
+      - ``None``: returns ``None`` (caller falls back to pdp3's
+        normal download behavior).
+      - File path: returned as-is — operator's responsibility to pass
+        a file matching the obs day.
+      - Directory path: looks up ``brdm{doy:03d}0.{yy:02d}p`` inside.
+        Returns ``None`` (with a warning) when the per-day file isn't
+        present.
+
+    Made a top-level helper rather than inlined into ``invoke_pdp3``
+    so tests can exercise the path resolution independently of the
+    pdp3 subprocess.
+    """
+    if brdm_source is None:
+        return None
+    p = Path(brdm_source).expanduser()
+    if p.is_file():
+        return p
+    if p.is_dir():
+        candidate = p / brdm_filename(year, doy)
+        if candidate.is_file():
+            return candidate
+        log.warning("--brdm-source dir %s has no %s — falling through to "
+                    "pdp3's normal download", p, brdm_filename(year, doy))
+        return None
+    log.warning("--brdm-source %s is neither file nor directory — "
+                "falling through to pdp3's normal download", p)
+    return None
+
+
 def invoke_pdp3(
     obs_file: Path,
     work_dir: Path,
@@ -132,6 +179,7 @@ def invoke_pdp3(
     pdp3_bin: str = DEFAULT_PDP3,
     timeout_s: int = DEFAULT_PDP3_TIMEOUT_S,
     extra_args: Sequence[str] = (),
+    brdm_source: Path | str | None = None,
 ) -> PrideRunResult:
     """Run pdp3 once on obs_file in work_dir with the given -sys string.
 
@@ -147,6 +195,28 @@ def invoke_pdp3(
     obs_local = work_dir / obs_file.name
     if obs_local.resolve() != obs_file.resolve():
         shutil.copy2(obs_file, obs_local)
+
+    # Stage a pre-fetched multi-GNSS broadcast nav file when given.
+    # pdp3.sh's IGS-MGEX download chain (gnsswhu/IGN/DLR) sometimes
+    # falls through to GPS-only nav; without GAL/BDS ephemeris pdp3's
+    # elevation() returns dist=-1 for every E**/C** SV → DEL_BADRANGE.
+    # Dropping the operator-supplied brdm into work_dir under pdp3's
+    # canonical name lets pdp3.sh:2110-2117 find it and skip the
+    # download.  See prideMultiGnssBrdm-charlie / prideBadRangeDiagnostic-main.
+    if brdm_source is not None:
+        ydoy = doy_from_obs_name(obs_file)
+        if ydoy is None:
+            log.warning("can't derive year/doy from %s — --brdm-source "
+                        "ignored for this obs file", obs_file.name)
+        else:
+            year, doy = ydoy
+            src = resolve_brdm_source(brdm_source, year, doy)
+            if src is not None:
+                target = work_dir / brdm_filename(year, doy)
+                if target.resolve() != src.resolve():
+                    shutil.copy2(src, target)
+                log.info("staged broadcast nav %s → %s",
+                         src, target.name)
 
     cmd = [pdp3_bin, "-m", "S", "-sys", sys_str] + list(extra_args) + [obs_local.name]
     log.info("Running pdp3 in %s: %s", work_dir, " ".join(cmd))
@@ -222,6 +292,7 @@ def process_one_obs(
     pdp3_bin: str = DEFAULT_PDP3,
     timeout_s: int = DEFAULT_PDP3_TIMEOUT_S,
     pdp3_runner=invoke_pdp3,  # injectable for tests
+    brdm_source: Path | str | None = None,
 ) -> tuple[PrideSolution | None, PrideRunResult | None]:
     """Run pdp3 on one obs file with fallback through sys_attempts.
 
@@ -238,6 +309,7 @@ def process_one_obs(
         result = pdp3_runner(
             obs_file, attempt_dir, sys_str,
             pdp3_bin=pdp3_bin, timeout_s=timeout_s,
+            brdm_source=brdm_source,
         )
         last_result = result
         if result.pos_path is None:
@@ -311,6 +383,7 @@ def run_pride_backend(
     dry_run: bool = False,
     pdp3_runner=invoke_pdp3,
     source_label: str = "peppar-survey --pride",
+    brdm_source: Path | str | None = None,
 ) -> int:
     """Run PRIDE over each RINEX, archive solutions, write survey.toml.
 
@@ -343,6 +416,7 @@ def run_pride_backend(
             pdp3_bin=pdp3_bin,
             timeout_s=timeout_s,
             pdp3_runner=pdp3_runner,
+            brdm_source=brdm_source,
         )
         if sol is None:
             n_failed += 1
