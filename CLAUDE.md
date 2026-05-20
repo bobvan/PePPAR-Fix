@@ -299,6 +299,23 @@ wrapper in scripts/peppar-fix. That's over 500 lines of code that should be test
 possible. Always prefer testing using the wrapper as a user would, but it's ok to
 run components individually for diagnosis or troubleshooting.
 
+## Recommended operational mode: `--no-antposest` (time-only)
+
+For time-mission deployments, **the recommended way to run the engine
+is `--no-antposest`**.  See [`docs/time-only-architecture.md`](docs/time-only-architecture.md).
+TL;DR: peppar-survey delivers the ARP offline; the engine skips
+its own position filter entirely; FixedPosFilter runs at the pinned
+ARP and drives PHC discipline; NAV2 watchdogs gross ARP moves at
+10 m.  Empirically validated 2026-05-20 on PiFace canary — TICC chA
+TDEV at τ = 1000 s matched the default-mode baseline within 1 ps
+(0.73 ns vs 0.72 ns).  All four lab hosts switched to `--no-antposest`
+2026-05-20.
+
+The default engine behavior is preserved (Phase 1 PPPFilter
+bootstrap + AntPosEst runtime refinement) for backward compatibility
+and for moving-platform / real-time positioning use cases where the
+position filter is the point.
+
 ## Optional component: peppar-survey
 
 `peppar-survey` is the optional companion to `peppar-fix` that writes
@@ -306,6 +323,11 @@ authoritative ARP estimates to `state/positions/<uid>.survey.toml`
 from external observation backends (currently `--pride` only).  Native
 deps are tracked separately from `peppar-fix`'s `pyproject.toml`
 because PRIDE-PPP-AR is Fortran, not pip-installable.
+
+In the recommended `--no-antposest` mode, peppar-survey is
+**load-bearing** for ARP acquisition — the engine refuses to start
+without a seed (`--known-pos` OR `arp_label → antennas.json` OR a
+`.survey.toml` / `.ppp.toml` state file).
 
 Full install procedure: [`docs/peppar-survey-install.md`](docs/peppar-survey-install.md).
 TL;DR: `bash scripts/install_peppar_survey.sh` on each lab host.

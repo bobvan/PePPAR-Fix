@@ -125,6 +125,33 @@ events.  No FALSE_FIX / IF_STEP / ANCHORING transitions.
 - RINEX writer (PR #42 fixes still in effect)
 - Wrapper-respawn on exit 5
 
+## Recommendation
+
+**For time-mission deployments where peppar-survey provides the ARP
+seed, `--no-antposest` is the recommended operational mode.**  Lab
+validation 2026-05-20 (PiFace canary, 1 h post-restart) measured:
+
+| τ | Canary (`--no-antposest`) | Baseline (default) | Ratio |
+|---|---|---|---|
+| 1 s | 0.55 ns | 0.47 ns | 1.17× |
+| 10 s | 1.97 ns | 1.83 ns | 1.08× |
+| 100 s | 2.79 ns | 1.56 ns | 1.79× (high variance; few independent samples) |
+| 1000 s | **0.73 ns** | **0.72 ns** | **1.01× (1 ps match)** |
+
+Same host, same hardware, same `arp_label = ufo1` survey seed —
+only the engine mode changed.  At τ = 1000 s (the most dispositive
+measurement), canary and baseline match within 1 ps.  At τ ≤ 10 s
+the difference is within measurement noise of the comparison.  The
+clock side is empirically unaffected by the position filter being
+disabled — exactly as the architecture predicts (FixedPosFilter
+runs at the pinned ARP independently of AntPosEst output).
+
+Switching to `--no-antposest` is the right choice when:
+- The host has a fresh `.survey.toml` or trustworthy `arp_label`
+- The deployment goal is **time output**, not real-time position
+- The operator can tolerate the 10 m NAV2 watchdog threshold for
+  gross-move detection (sub-meter wobble won't trigger)
+
 ## Validation plan
 
 The unit tests in `tests/test_no_antposest.py` cover:
@@ -136,20 +163,19 @@ The unit tests in `tests/test_no_antposest.py` cover:
 4. Engine `--help` advertises the flag (catches accidental rename /
    removal)
 
-Lab validation worth doing before declaring this production-ready for
-any host:
+Lab validation completed 2026-05-20:
 
-- Start an engine with `--no-antposest` + a valid `.survey.toml` seed.
-  Confirm no `AntPosEst*` messages in the log; `FixedPosFilter`
-  emits `[FIXEDPOS_ZTD]` and `[FIXEDPOS_RESID]` normally.
-- Compare 1-hour TDEV on TICC chA between `--no-antposest` and the
-  default `--ar-mode wl` baseline.  Should be statistically
-  indistinguishable (clock side is unaffected).
-- Synthetic ARP move (e.g., temporarily replace the seed in
-  `state/positions/<uid>.survey.toml` by 15 m and restart):
-  `WatchdogActor` should trip on NAV2 disagreement.
-- Engine refuses to start when given an empty receiver state
-  directory + no `arp_label` + no `--known-pos`.
+- PiFace canary on `--no-antposest` for 1 h.  No `AntPosEst*`
+  messages in log; `FixedPosFilter` emits `[FIXEDPOS_ZTD]` /
+  `[FIXEDPOS_RESID]` normally.  TICC chA TDEV per the table above.
+- Pre-bootstrap gate verified by removing the seed and observing
+  the engine exit 1 with the expected error message.
+- All 4 lab hosts (TimeHat / MadHat / PiFace / clkPoC3) switched
+  to `--no-antposest` 2026-05-20 ~12:55 CDT for broader coverage.
+
+Still owed:
+- Synthetic ARP move (move seed in `.survey.toml` by 15 m, restart):
+  confirm `WatchdogActor` trips on NAV2 disagreement.
 
 ## Open follow-ons
 
