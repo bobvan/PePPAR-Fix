@@ -1246,6 +1246,16 @@ class FixedPosFilter:
         self.last_n_td = 0
         self.last_resid_pr = np.array([])
         self.last_resid_td = np.array([])
+        # Per-row labels parallel to last_resid_pr / last_resid_td, so
+        # downstream loggers can emit (sv, sys, elev, residual) without
+        # re-running the H/z construction.  Populated at the same sites
+        # that save the residual arrays.  See --per-sv-resid-log.
+        self.last_pr_svs: list[str] = []
+        self.last_pr_sys: list[str] = []
+        self.last_pr_elev: list[float] = []
+        self.last_td_svs: list[str] = []
+        self.last_td_sys: list[str] = []
+        self.last_td_elev: list[float] = []
         # Catastrophic residual gate state (I-202649).  History records
         # accepted-epoch median |PR residual|; rejected epochs do NOT
         # update history so the baseline stays clean across bursts.
@@ -1348,6 +1358,15 @@ class FixedPosFilter:
         #   [SV1_PR, SV1_TD?, SV2_PR, SV2_TD?, …]
         # so post_resid[:n_pr] does NOT yield the PR rows alone.
         pr_idx, td_idx = [], []
+        # Parallel label arrays so post-fit per-SV residuals can be
+        # emitted without re-walking observations.  Populated next to
+        # pr_idx.append / td_idx.append in the construction loop below.
+        pr_svs: list[str] = []
+        pr_sys: list[str] = []
+        pr_elev: list[float] = []
+        td_svs: list[str] = []
+        td_sys: list[str] = []
+        td_elev: list[float] = []
         n_pr = 0
         n_td = 0
         current_geo = {}
@@ -1449,6 +1468,9 @@ class FixedPosFilter:
             if isb_idx is not None:
                 h_pr[isb_idx] = 1.0
             pr_idx.append(len(H_rows))
+            pr_svs.append(sv)
+            pr_sys.append(sys_name)
+            pr_elev.append(float(elev))
             H_rows.append(h_pr)
             z_rows.append(dz_pr)
             R_diag.append((SIGMA_P_IF / w) ** 2)
@@ -1473,6 +1495,9 @@ class FixedPosFilter:
                 h_td[self.IDX_ZTD] = m_wet  # ZTD change maps through wet MF
                 # ISB cancels in time difference (constant bias)
                 td_idx.append(len(H_rows))
+                td_svs.append(sv)
+                td_sys.append(sys_name)
+                td_elev.append(float(elev))
                 H_rows.append(h_td)
                 z_rows.append(dz_td)
                 sigma_td = 0.3 / max(0.2, elev_factor)
@@ -1486,6 +1511,12 @@ class FixedPosFilter:
             self.last_n_td = 0
             self.last_resid_pr = np.array([])
             self.last_resid_td = np.array([])
+            self.last_pr_svs = []
+            self.last_pr_sys = []
+            self.last_pr_elev = []
+            self.last_td_svs = []
+            self.last_td_sys = []
+            self.last_td_elev = []
             return 0, np.array([]), 0
 
         H = np.array(H_rows)
@@ -1526,6 +1557,12 @@ class FixedPosFilter:
                 self.last_resid_pr = z[pr_idx].copy()
                 self.last_resid_td = (z[td_idx].copy() if td_idx
                                       else np.array([]))
+                self.last_pr_svs = list(pr_svs)
+                self.last_pr_sys = list(pr_sys)
+                self.last_pr_elev = list(pr_elev)
+                self.last_td_svs = list(td_svs)
+                self.last_td_sys = list(td_sys)
+                self.last_td_elev = list(td_elev)
                 # Don't update prev_geo / prev_clock — corrupted obs as
                 # a TD-CP baseline would poison the next epoch.  Don't
                 # update _pr_median_history either — sustained bursts
@@ -1554,6 +1591,12 @@ class FixedPosFilter:
                                   else np.array([]))
             self.last_resid_td = (z[td_idx].copy() if td_idx
                                   else np.array([]))
+            self.last_pr_svs = list(pr_svs)
+            self.last_pr_sys = list(pr_sys)
+            self.last_pr_elev = list(pr_elev)
+            self.last_td_svs = list(td_svs)
+            self.last_td_sys = list(td_sys)
+            self.last_td_elev = list(td_elev)
             return n_pr, z, n_td
 
         self.x = self.x + K @ z
@@ -1580,6 +1623,12 @@ class FixedPosFilter:
                               else np.array([]))
         self.last_resid_td = (post_resid[td_idx].copy() if td_idx
                               else np.array([]))
+        self.last_pr_svs = list(pr_svs)
+        self.last_pr_sys = list(pr_sys)
+        self.last_pr_elev = list(pr_elev)
+        self.last_td_svs = list(td_svs)
+        self.last_td_sys = list(td_sys)
+        self.last_td_elev = list(td_elev)
 
         return n_pr + n_td, post_resid, n_td
 

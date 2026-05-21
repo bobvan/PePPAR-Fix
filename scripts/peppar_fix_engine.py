@@ -4370,6 +4370,35 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             except OSError as e:
                 log.error("Failed to open arm_state_log %s: %s",
                           args.arm_state_log, e)
+        # --per-sv-resid-log: per-epoch per-SV post-fit residuals.
+        # One row per (epoch, SV) that contributed observations.  Lets
+        # downstream analysis ask "is dt_rx noise filter-side or
+        # observation-side?" by computing per-SV TDEV(τ) and comparing
+        # against Arm 1 dt_rx TDEV.  See perSvResidLog dayplan item.
+        if getattr(args, 'per_sv_resid_log', None):
+            try:
+                _needs_header = (not os.path.exists(args.per_sv_resid_log)
+                                 or os.path.getsize(args.per_sv_resid_log) == 0)
+                _psv_f = open(args.per_sv_resid_log, 'a', newline='')
+                _psv_csv = csv.writer(_psv_f)
+                if _needs_header:
+                    _psv_csv.writerow([
+                        'host_timestamp', 'host_monotonic', 'epoch_unix',
+                        'sv', 'sys', 'elev_deg',
+                        'n_pr_epoch', 'n_td_epoch',
+                        'resid_pr_m', 'resid_td_m',
+                    ])
+                    _psv_f.flush()
+                _psv_w = StridedWriter(
+                    _psv_csv,
+                    stride=getattr(args, "per_sv_resid_log_stride", 1))
+                servo_ctx['per_sv_resid_log_writer'] = _psv_w
+                servo_ctx['per_sv_resid_log_file'] = _psv_f
+                log.info("per-SV residual CSV log: %s (stride=%d)",
+                         args.per_sv_resid_log, _psv_w.stride)
+            except OSError as e:
+                log.error("Failed to open per_sv_resid_log %s: %s",
+                          args.per_sv_resid_log, e)
 
     prev_t = None
     n_epochs = 0
@@ -4976,6 +5005,51 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     if _dtrx_f is not None:
                         _dtrx_f.flush()
                 except (OSError, ValueError):
+                    pass
+
+            # Per-SV post-fit residuals (perSvResidLog).  One row per
+            # SV that contributed to this epoch's filter update.  Lets
+            # downstream analysis decompose dt_rx noise across SVs:
+            # per-SV TDEV vs Arm 1 TDEV says whether the noise is
+            # observation-level (per-SV ≈ dt_rx) or filter-side
+            # (per-SV ≪ dt_rx).
+            _psv_w = (servo_ctx.get('per_sv_resid_log_writer')
+                      if servo_ctx else None)
+            _psv_f = (servo_ctx.get('per_sv_resid_log_file')
+                      if servo_ctx else None)
+            if _psv_w is not None:
+                try:
+                    _pr_svs = getattr(filt, 'last_pr_svs', []) or []
+                    _pr_sys = getattr(filt, 'last_pr_sys', []) or []
+                    _pr_elev = getattr(filt, 'last_pr_elev', []) or []
+                    _resid_pr = getattr(filt, 'last_resid_pr', None)
+                    _td_svs = getattr(filt, 'last_td_svs', []) or []
+                    _resid_td = getattr(filt, 'last_resid_td', None)
+                    _td_map = {}
+                    if _resid_td is not None and len(_resid_td) == len(_td_svs):
+                        _td_map = dict(zip(_td_svs, _resid_td))
+                    _ts_iso = datetime.now(tz=timezone.utc).isoformat()
+                    _mono = f"{time.monotonic():.9f}"
+                    _epoch_unix = f"{gps_time.timestamp():.6f}"
+                    _n_pr_ep = len(_pr_svs)
+                    _n_td_ep = len(_td_svs)
+                    if (_resid_pr is not None
+                            and len(_resid_pr) == _n_pr_ep):
+                        for i in range(_n_pr_ep):
+                            _sv = _pr_svs[i]
+                            _rtd = _td_map.get(_sv)
+                            _rtd_s = (f"{float(_rtd):.6f}"
+                                      if _rtd is not None else 'nan')
+                            _psv_w.writerow([
+                                _ts_iso, _mono, _epoch_unix,
+                                _sv, _pr_sys[i], f"{_pr_elev[i]:.2f}",
+                                _n_pr_ep, _n_td_ep,
+                                f"{float(_resid_pr[i]):.6f}",
+                                _rtd_s,
+                            ])
+                    if _psv_f is not None:
+                        _psv_f.flush()
+                except (OSError, ValueError, IndexError):
                     pass
 
             # Periodic ZTD soft-tie from refreshed METAR — bounds the
@@ -9857,6 +9931,23 @@ Two-phase operation:
                       help="Decimation stride for --arm-state-log.  1 = "
                            "every servo update (scheduler-driven, "
                            "default).  0 coerced to 1.")
+    ticc.add_argument("--per-sv-resid-log", default=None,
+                      help="Optional per-SV post-fit residual CSV log "
+                           "path.  One row per (epoch, SV) that "
+                           "contributed observations to the filter "
+                           "update.  Fields: host_timestamp, "
+                           "host_monotonic, epoch_unix, sv, sys, "
+                           "elev_deg, n_pr_epoch, n_td_epoch, "
+                           "resid_pr_m, resid_td_m (NaN when no TD "
+                           "row).  Lets downstream analysis ask "
+                           "whether dt_rx noise is observation-level "
+                           "(per-SV TDEV ≈ Arm 1 TDEV) or filter-side "
+                           "(per-SV TDEV ≪ Arm 1).  See perSvResidLog.")
+    ticc.add_argument("--per-sv-resid-log-stride", type=int, default=1,
+                      help="Decimation stride for --per-sv-resid-log.  "
+                           "1 = every epoch's SVs (default).  Each "
+                           "epoch emits N rows (one per contributing "
+                           "SV), so stride=N skips entire epochs.")
     ticc.add_argument("--ticc-baud", type=int, default=115200,
                       help="TICC baud rate (default: 115200)")
     ticc.add_argument("--ticc-phc-channel", choices=["chA", "chB"], default="chA",
