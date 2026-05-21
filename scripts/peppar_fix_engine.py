@@ -4137,10 +4137,18 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             log.warning("Failed to load R-calibration %s: %s — "
                         "falling back to defaults",
                         r_cal_path, e)
+    q_clk_step_arg = getattr(args, 'q_clk_step', None)
+    q_clk_rate_step_arg = getattr(args, 'q_clk_rate_step', None)
+    if q_clk_step_arg is not None or q_clk_rate_step_arg is not None:
+        log.info("Q tuning: q_clk_step=%s q_clk_rate_step=%s",
+                 q_clk_step_arg if q_clk_step_arg is not None else 'default',
+                 q_clk_rate_step_arg if q_clk_rate_step_arg is not None else 'default')
     filt = FixedPosFilter(known_ecef,
                           init_ztd_m=init_ztd_m,
                           init_ztd_sigma_m=init_ztd_sigma_m,
-                          r_calibration=r_cal_obj)
+                          r_calibration=r_cal_obj,
+                          q_clk_step=q_clk_step_arg,
+                          q_clk_rate_step=q_clk_rate_step_arg)
     filt.prev_clock = 0.0
 
     # σ_pin: time filter's uncertainty about its pinned ARP, used by
@@ -9066,6 +9074,8 @@ def _apply_host_config(args):
         "rinex_out":        ("rinex_out",        str),
         "rinex_decimate_s": ("rinex_decimate_s", float),
         "r_calibration":    ("r_calibration",    str),
+        "q_clk_step":       ("q_clk_step",       float),
+        "q_clk_rate_step":  ("q_clk_rate_step",  float),
     }
 
     for toml_key, (dest, conv) in _MAP.items():
@@ -10068,6 +10078,16 @@ Two-phase operation:
                            "binned per-(sys,elev) σ_pr and σ_td.  When "
                            "omitted, defaults match the legacy formulas "
                            "(no behavior change).  See rMatrixTuning.")
+    ticc.add_argument("--q-clk-step", type=float, default=None,
+                      help="Process noise on x[CLK] per predict (m²/s).  "
+                           "Models F9T rx-TCXO white-FM noise growth "
+                           "between epochs.  Default 0.01 = legacy.  "
+                           "Same value across all F9T hosts (same chip). "
+                           "Lower → filter weights observations more.  "
+                           "See qClockTuning Phase A.")
+    ticc.add_argument("--q-clk-rate-step", type=float, default=None,
+                      help="Process noise on x[CLK_RATE] per predict "
+                           "(m²/s³).  Default 0.01 = legacy.")
     ticc.add_argument("--ticc-baud", type=int, default=115200,
                       help="TICC baud rate (default: 115200)")
     ticc.add_argument("--ticc-phc-channel", choices=["chA", "chB"], default="chA",

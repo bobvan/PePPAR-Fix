@@ -1210,8 +1210,15 @@ class FixedPosFilter:
     CATASTROPHIC_REJECT_LIMIT = 30
 
 
+    # Process-noise defaults — tunable via constructor kwargs / engine
+    # --q-clk-step / --q-clk-rate-step.  These represent the F9T rx-
+    # TCXO white-FM noise model.  Same chip across all F9T hosts, so
+    # this Q is not host-dependent.  See qClockTuning dayplan item.
+    Q_CLK_DEFAULT = 0.01       # m²/s — clock-phase white noise
+    Q_CLK_RATE_DEFAULT = 0.01  # m²/s³ — clock-rate white noise
+
     def __init__(self, pos_ecef, init_ztd_m=0.0, init_ztd_sigma_m=0.5,
-                 r_calibration=None):
+                 r_calibration=None, q_clk_step=None, q_clk_rate_step=None):
         """Fixed-position PPP filter.
 
         Args:
@@ -1233,10 +1240,24 @@ class FixedPosFilter:
                 σ_pr and σ_td values.  When None, defaults match the
                 legacy SIGMA_P_IF / sigma_td formulas (no behavior
                 change).  See peppar_fix.r_calibration and rMatrixTuning.
+            q_clk_step: process noise added to Q[CLK,CLK] per predict
+                in m²/s.  Default 0.01 matches legacy behavior.  This
+                value models the F9T rx-TCXO white-FM noise growth
+                between epochs.  Same physical chip on all F9T hosts
+                so this is not a per-host knob — empirical tuning is
+                expected to produce a single value used everywhere.
+                See qClockTuning Phase A.
+            q_clk_rate_step: process noise added to Q[CLK_RATE,CLK_RATE]
+                per predict in m²/s³.  Default 0.01 matches legacy.
         """
         # Lazy import to avoid cycle (r_calibration → solve_ppp)
         from peppar_fix.r_calibration import RCalibration
         self.r_cal = r_calibration if r_calibration is not None else RCalibration()
+        self.q_clk_step = (float(q_clk_step) if q_clk_step is not None
+                           else self.Q_CLK_DEFAULT)
+        self.q_clk_rate_step = (float(q_clk_rate_step)
+                                if q_clk_rate_step is not None
+                                else self.Q_CLK_RATE_DEFAULT)
         self.pos = np.array(pos_ecef)
         self.x = np.zeros(self.N_STATES)     # [clock, clock_rate, dZTD, isb_gal, isb_bds] in meters
         self.x[self.IDX_ZTD] = float(init_ztd_m)
@@ -1298,10 +1319,12 @@ class FixedPosFilter:
         F = np.eye(self.N_STATES)
         F[0, 1] = dt
         self.P = F @ self.P @ F.T
-        # Process noise: TCXO model + ZTD drift + small ISB walk
+        # Process noise: TCXO model + ZTD drift + small ISB walk.
+        # Q_clk / Q_clk_rate values come from constructor kwargs (default
+        # 0.01 each — F9T rx-TCXO white-FM model).  See qClockTuning.
         Q = np.zeros((self.N_STATES, self.N_STATES))
-        Q[0, 0] = 0.01 * dt      # phase noise (m²/s)
-        Q[1, 1] = 0.01 * dt      # frequency noise (m²/s³)
+        Q[0, 0] = self.q_clk_step * dt        # phase noise (m²/s)
+        Q[1, 1] = self.q_clk_rate_step * dt   # frequency noise (m²/s³)
         # q = σ_hr / √3600 = 0.05 / 60 ≈ 8.33e-4 m/√s yields 5 cm/hr RMS.
         Q[self.IDX_ZTD, self.IDX_ZTD] = (8.33e-4)**2 * dt  # 5 cm/hour RMS (IGS standard)
         Q[self.IDX_ISB_GAL, self.IDX_ISB_GAL] = 1e-6 * dt  # GAL ISB random walk
