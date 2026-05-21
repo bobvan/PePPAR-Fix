@@ -421,6 +421,81 @@ class ProcessOneObsTest(unittest.TestCase):
         self.assertIsNone(sol)
         self.assertIn("CORS fetch failed", last.error)
 
+    def test_rtk_with_cors_ntrip_calls_capturer(self):
+        """When cors_ntrip is set, the live-NTRIP capturer is invoked
+        and its result is fed to rnx2rtkp as the base RINEX."""
+        from peppar_fix.peppar_survey_cors import CorsNtripConfig
+
+        captured = {}
+
+        def fake_capturer(cfg, work_dir):
+            captured["host"] = cfg.host
+            captured["port"] = cfg.port
+            captured["mount"] = cfg.mount
+            base = work_dir / "captured-base.obs"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            base.write_text("captured base stub")
+            return base
+
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            obs = tdp / "host-2026140.obs"
+            obs.write_text("stub")
+            rows = [
+                (2026, 5, 20, 14, 0, 0.0 + i, 40.0, -90.0, 200.0, 6, 12)
+                for i in range(60)
+            ]
+            cfg = CorsNtripConfig(host="peer.lab", port=2102, mount="PEPPAR")
+            sol, last = process_one_obs(
+                obs, tdp / "work", mode="rtk",
+                cors_ntrip=cfg,
+                rnx2rtkp_runner=self._make_runner_returning_pos(rows),
+                cors_ntrip_capturer=fake_capturer,
+            )
+        self.assertIsNotNone(sol)
+        self.assertEqual(sol.mode, "rtklib_cors")
+        self.assertEqual(captured["host"], "peer.lab")
+        self.assertEqual(captured["port"], 2102)
+        self.assertEqual(captured["mount"], "PEPPAR")
+        # cors_base label propagates from the captured filename
+        self.assertEqual(sol.cors_base, "captured-base.obs")
+
+    def test_rtk_cors_ntrip_capture_failure(self):
+        from peppar_fix.peppar_survey_cors import CorsNtripConfig
+
+        def fake_capturer(cfg, work_dir):
+            return None  # str2str or convbin failure
+
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            obs = tdp / "host-2026140.obs"
+            obs.write_text("stub")
+            cfg = CorsNtripConfig(host="peer.lab", port=2102, mount="PEPPAR")
+            sol, last = process_one_obs(
+                obs, tdp / "work", mode="rtk",
+                cors_ntrip=cfg,
+                rnx2rtkp_runner=lambda *a, **kw: None,
+                cors_ntrip_capturer=fake_capturer,
+            )
+        self.assertIsNone(sol)
+        self.assertIn("live NTRIP capture failed", last.error)
+        self.assertIn("peer.lab:2102/PEPPAR", last.error)
+
+    def test_rtk_error_message_lists_all_three_sources(self):
+        """Without any cors source, the error mentions all three."""
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            obs = tdp / "host-2026140.obs"
+            obs.write_text("stub")
+            sol, last = process_one_obs(
+                obs, tdp / "work", mode="rtk",
+                rnx2rtkp_runner=self._make_runner_returning_pos([]),
+            )
+        self.assertIsNone(sol)
+        self.assertIn("--cors-station", last.error)
+        self.assertIn("--cors-rinex-path", last.error)
+        self.assertIn("--cors-ntrip", last.error)
+
     def test_no_quality_epochs_returns_none_solution(self):
         with TemporaryDirectory() as td:
             tdp = Path(td)

@@ -222,6 +222,32 @@ def main(argv: list[str] | None = None) -> int:
              "rnx2rtkp.  If unset, rnx2rtkp tries to find one in "
              "work_dir.",
     )
+    rtklib.add_argument(
+        "--cors-ntrip-host", default=None,
+        help="Hostname or IP of a peer peppar-fix's NTRIP caster "
+             "(scripts/ntrip_caster.py).  When set with --rtklib, "
+             "streams RTCM 3.3 MSM4 + 1005 from the peer for "
+             "--cors-ntrip-duration seconds and uses the converted "
+             "RINEX as the RTK base.  Mutually exclusive with "
+             "--cors-station and --cors-rinex-path.  Requires str2str "
+             "+ convbin alongside rnx2rtkp.",
+    )
+    rtklib.add_argument(
+        "--cors-ntrip-port", type=int, default=2102,
+        help="Peer caster port.  Default 2102 (matches "
+             "scripts/ntrip_caster.py).",
+    )
+    rtklib.add_argument(
+        "--cors-ntrip-mount", default="PEPPAR",
+        help="Peer caster mountpoint.  Default 'PEPPAR' (matches "
+             "scripts/ntrip_caster.py's MOUNTPOINT constant).",
+    )
+    rtklib.add_argument(
+        "--cors-ntrip-duration", type=int, default=None,
+        help="Seconds of RTCM to capture from the peer.  Default 300 "
+             "(5 min).  Must overlap the rover RINEX time range or "
+             "rnx2rtkp will have no co-temporal epochs to solve.",
+    )
 
     args = ap.parse_args(argv)
 
@@ -314,10 +340,36 @@ def _run_rtklib(args) -> int:
     work_dir = Path(args.rtklib_work_dir or os.path.join(
         tempfile.gettempdir(), "peppar-survey-rtklib"))
 
-    # Mode: rtk if any --cors-* is set; otherwise ppp-static
-    use_rtk = bool(args.cors_station or args.cors_rinex_path)
+    # Exactly one of (--cors-station, --cors-rinex-path, --cors-ntrip-host)
+    # may be set.  More than one is ambiguous; none → PPP-static mode.
+    cors_sources = [
+        ("--cors-station", args.cors_station),
+        ("--cors-rinex-path", args.cors_rinex_path),
+        ("--cors-ntrip-host", args.cors_ntrip_host),
+    ]
+    selected = [name for name, val in cors_sources if val]
+    if len(selected) > 1:
+        log.error("--rtklib accepts at most one of %s — got %s",
+                  ", ".join(n for n, _ in cors_sources),
+                  ", ".join(selected))
+        return 2
+    use_rtk = bool(selected)
     mode = "rtk" if use_rtk else "ppp"
     nav_file = Path(args.rtklib_nav) if args.rtklib_nav else None
+
+    cors_ntrip = None
+    if args.cors_ntrip_host:
+        from peppar_fix.peppar_survey_cors import (
+            CorsNtripConfig, DEFAULT_CORS_NTRIP_DURATION_S,
+        )
+        cors_ntrip = CorsNtripConfig(
+            host=args.cors_ntrip_host,
+            port=args.cors_ntrip_port,
+            mount=args.cors_ntrip_mount,
+            duration_s=(args.cors_ntrip_duration
+                        if args.cors_ntrip_duration is not None
+                        else DEFAULT_CORS_NTRIP_DURATION_S),
+        )
 
     return run_rtklib_backend(
         obs_files=obs_files,
@@ -327,6 +379,7 @@ def _run_rtklib(args) -> int:
         cors_station=args.cors_station,
         cors_rinex_path=(Path(args.cors_rinex_path)
                          if args.cors_rinex_path else None),
+        cors_ntrip=cors_ntrip,
         nav_file=nav_file,
         positions_dir=args.positions_dir,
         history_dir=args.history_dir,
