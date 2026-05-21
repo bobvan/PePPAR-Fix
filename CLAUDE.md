@@ -276,6 +276,36 @@ standalone docs commit on gt, PR #42 + #46 merged on GitHub, lab
 hosts pulled gt's old code, canary deploy hit "unrecognized argument:
 --no-antposest", and the fix required force-pushing gt to align.
 
+### Squash-merging a stacked PR's base auto-closes the dependent PR
+
+When PR B's base is PR A's branch (typical stacked-PR setup), and PR
+A is merged with `gh pr merge --squash --delete-branch`, GitHub
+deletes PR A's branch and PR B **auto-closes** because its base ref
+no longer exists.  `gh pr reopen` fails with "Could not open the
+pull request" — there's no way to revive the original PR number.
+
+Recovery — rebase the dependent branch onto main and open a new PR:
+
+```sh
+# Locally — drop the commits that PR A already squashed in
+git checkout -b rebase-prB github/charlie/featureB
+git rebase --onto main <old-tip-of-PR-A> rebase-prB
+./bin/test                                    # confirm clean
+git push --force-with-lease github HEAD:charlie/featureB
+git checkout main
+git branch -D rebase-prB
+
+# Open a fresh PR with base=main
+gh pr create --base main --head charlie/featureB \
+    --title "..." --body "Reopen of #N (auto-closed when its base \
+    branch was deleted on PR A merge).  Rebased onto main."
+```
+
+The original PR number is dead; the replacement gets a new number.
+Cross-link them in the new PR body so the review history is
+discoverable.  Caught 2026-05-20 when PR #50 (charlie/surveyCorsConsumer,
+stacked on PR #48) auto-closed and reopened as PR #51.
+
 ### Common lab-host failures (in order of frequency)
 
 1. **Missing Python deps**: set up the venv first:
