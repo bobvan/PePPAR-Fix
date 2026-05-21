@@ -4316,6 +4316,61 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
         if dfe_sm is not None:
             servo_ctx["dfe_sm"] = dfe_sm
 
+        # ── --dt-rx-log + --arm-state-log: per-epoch software-arm CSVs ──
+        # (logStrideFlags-main)
+        # dt_rx_log: one row per PPP epoch (Arm 1's native rate, 1 Hz)
+        # arm_state_log: one row per servo.update() (scheduler rate)
+        # Open here so they share the servo_ctx lifetime; stride
+        # gating handled by StridedWriter at construction.
+        from peppar_fix.strided_writer import StridedWriter
+        if getattr(args, 'dt_rx_log', None):
+            try:
+                _needs_header = (not os.path.exists(args.dt_rx_log)
+                                 or os.path.getsize(args.dt_rx_log) == 0)
+                _dtrx_f = open(args.dt_rx_log, 'a', newline='')
+                _dtrx_csv = csv.writer(_dtrx_f)
+                if _needs_header:
+                    _dtrx_csv.writerow([
+                        'host_timestamp', 'host_monotonic', 'gpst_iTOW',
+                        'dt_rx_ns', 'dt_rx_sigma_ns', 'n_used',
+                        'ztd_mm', 'ztd_sigma_mm',
+                    ])
+                    _dtrx_f.flush()
+                _dtrx_w = StridedWriter(
+                    _dtrx_csv, stride=getattr(args, "dt_rx_log_stride", 1))
+                servo_ctx['dt_rx_log_writer'] = _dtrx_w
+                servo_ctx['dt_rx_log_file'] = _dtrx_f
+                log.info("dt_rx CSV log: %s (stride=%d)",
+                         args.dt_rx_log, _dtrx_w.stride)
+            except OSError as e:
+                log.error("Failed to open dt_rx_log %s: %s",
+                          args.dt_rx_log, e)
+        if getattr(args, 'arm_state_log', None):
+            try:
+                _needs_header = (not os.path.exists(args.arm_state_log)
+                                 or os.path.getsize(args.arm_state_log) == 0)
+                _arm_f = open(args.arm_state_log, 'a', newline='')
+                _arm_csv = csv.writer(_arm_f)
+                if _needs_header:
+                    _arm_csv.writerow([
+                        'host_timestamp', 'host_monotonic',
+                        'x0_phi_rx_ns', 'x1_f_rx_ppb',
+                        'x2_phi_do_ns', 'x3_f_do_ppb',
+                        'P00', 'P11', 'P22', 'P33',
+                        'arm1_used', 'arm2_used', 'arm3_used', 'arm4_used',
+                        'dt_actual_s',
+                    ])
+                    _arm_f.flush()
+                _arm_w = StridedWriter(
+                    _arm_csv, stride=getattr(args, "arm_state_log_stride", 1))
+                servo_ctx['arm_state_log_writer'] = _arm_w
+                servo_ctx['arm_state_log_file'] = _arm_f
+                log.info("arm-state CSV log: %s (stride=%d)",
+                         args.arm_state_log, _arm_w.stride)
+            except OSError as e:
+                log.error("Failed to open arm_state_log %s: %s",
+                          args.arm_state_log, e)
+
     prev_t = None
     n_epochs = 0
     n_epochs_total = 0  # counts all observation epochs, even when gate stalls
@@ -4895,6 +4950,33 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     dztd_m * 1000.0, dztd_sigma_m * 1000.0,
                     dt_rx_ns, dt_rx_sigma,
                 )
+
+            # Per-epoch dt_rx CSV log (Arm 1 time-domain output at 1 Hz
+            # native rate, decoupled from the 30-epoch [FIXEDPOS_ZTD]
+            # log decimation).  Enables sub-30s τ TDEV/ADEV vs TICC
+            # chB.  See logStrideFlags-main.
+            _dtrx_w = ctx.get('dt_rx_log_writer')
+            _dtrx_f = ctx.get('dt_rx_log_file')
+            if _dtrx_w is not None:
+                try:
+                    # gpst_iTOW: try to lift from latest NAV-CLOCK if
+                    # available; otherwise emit empty.
+                    _itow = ctx.get('last_nav_clock_iTOW', '')
+                    _n_used = int(getattr(filt, 'last_n_pr', 0))
+                    _dtrx_w.writerow([
+                        datetime.now(tz=timezone.utc).isoformat(),
+                        f"{time.monotonic():.9f}",
+                        _itow,
+                        f"{dt_rx_ns:.6f}",
+                        f"{dt_rx_sigma:.6f}",
+                        _n_used,
+                        f"{dztd_m * 1000.0:.3f}",
+                        f"{dztd_sigma_m * 1000.0:.3f}",
+                    ])
+                    if _dtrx_f is not None:
+                        _dtrx_f.flush()
+                except (OSError, ValueError):
+                    pass
 
             # Periodic ZTD soft-tie from refreshed METAR — bounds the
             # rate of ZTD-state drift driven by per-SV systematic-bias
@@ -6554,12 +6636,18 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                 or os.path.getsize(args.ticc_log) == 0
             )
             ticc_log_f = open(args.ticc_log, 'a', newline='')
-            ticc_log_w = csv.writer(ticc_log_f)
+            _ticc_csv = csv.writer(ticc_log_f)
             if _ticc_log_needs_header:
-                ticc_log_w.writerow([
+                # Header row writes through StridedWriter at counter=0,
+                # which always emits regardless of stride.  Done before
+                # the wrap so we can flush immediately.
+                _ticc_csv.writerow([
                     'host_timestamp', 'host_monotonic', 'ref_sec', 'ref_ps', 'channel'
                 ])
                 ticc_log_f.flush()
+            from peppar_fix.strided_writer import StridedWriter
+            ticc_log_w = StridedWriter(
+                _ticc_csv, stride=getattr(args, "ticc_log_stride", 1))
 
         qerr_ticc_tracker = QErrTimescaleTracker()
 
@@ -7536,6 +7624,30 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             ticc_diff_ns=ticc_diff_ns,
             ticc_sigma_ns=ticc_sigma_ns,
         )
+        # ── --arm-state-log: post-update DOFreqEst state vector ─────
+        _arm_w = ctx.get('arm_state_log_writer')
+        _arm_f = ctx.get('arm_state_log_file')
+        if _arm_w is not None:
+            try:
+                _x = servo.x
+                _P = servo.P
+                _arm_w.writerow([
+                    datetime.now(tz=timezone.utc).isoformat(),
+                    f"{time.monotonic():.9f}",
+                    f"{_x[0]:.6f}", f"{_x[1]:.6f}",
+                    f"{_x[2]:.6f}", f"{_x[3]:.6f}",
+                    f"{_P[0,0]:.6e}", f"{_P[1,1]:.6e}",
+                    f"{_P[2,2]:.6e}", f"{_P[3,3]:.6e}",
+                    1 if dt_rx_ns is not None else 0,
+                    1 if qerr_freq_ppb is not None else 0,
+                    1 if extint_phase_ns is not None else 0,
+                    1 if ticc_diff_ns is not None else 0,
+                    f"{dt_actual:.6f}",
+                ])
+                if _arm_f is not None:
+                    _arm_f.flush()
+            except (OSError, ValueError, AttributeError):
+                pass
         max_track_ppb = min(
             ctx['caps']['max_adj'],
             args.track_max_ppb if args.track_max_ppb is not None else ctx['caps']['max_adj'],
@@ -8015,14 +8127,18 @@ def run(args):
                     or os.path.getsize(args.qerr_log) == 0
                 )
                 qerr_log_f = open(args.qerr_log, 'a', newline='')
-                qerr_log_writer = csv.writer(qerr_log_f)
+                _qerr_csv = csv.writer(qerr_log_f)
                 if _qerr_log_needs_header:
-                    qerr_log_writer.writerow([
+                    _qerr_csv.writerow([
                         'host_timestamp', 'host_monotonic', 'qerr_ns',
                         'tow_ms', 'qerr_invalid',
                     ])
                     qerr_log_f.flush()
-                log.info("qErr CSV log: %s", args.qerr_log)
+                from peppar_fix.strided_writer import StridedWriter
+                qerr_log_writer = StridedWriter(
+                    _qerr_csv, stride=getattr(args, "qerr_log_stride", 1))
+                log.info("qErr CSV log: %s (stride=%d)",
+                         args.qerr_log, qerr_log_writer.stride)
             except OSError as e:
                 log.error("Failed to open qerr_log %s: %s", args.qerr_log, e)
                 qerr_log_writer = None
@@ -8101,15 +8217,19 @@ def run(args):
                     or os.path.getsize(args.extint_log) == 0
                 )
                 extint_log_f = open(args.extint_log, 'a', newline='')
-                _ext_log_writer = csv.writer(extint_log_f)
+                _ext_csv = csv.writer(extint_log_f)
                 if _extint_log_needs_header:
-                    _ext_log_writer.writerow([
+                    _ext_csv.writerow([
                         'host_timestamp', 'host_monotonic',
                         'wn', 'tow_ms', 'tow_sub_ms_ns',
                         'acc_est_ns', 'phase_residual_ns', 'count', 'flags',
                     ])
                     extint_log_f.flush()
-                log.info("TIM-TM2 CSV log: %s", args.extint_log)
+                from peppar_fix.strided_writer import StridedWriter
+                _ext_log_writer = StridedWriter(
+                    _ext_csv, stride=getattr(args, "extint_log_stride", 1))
+                log.info("TIM-TM2 CSV log: %s (stride=%d)",
+                         args.extint_log, _ext_log_writer.stride)
             except OSError as e:
                 log.error("Failed to open extint_log %s: %s", args.extint_log, e)
                 _ext_log_writer = None
@@ -9639,6 +9759,11 @@ Two-phase operation:
                            "ref_ps/channel.  Pair with --qerr-log to do "
                            "post-hoc qErr correction by index-matching on "
                            "CLOCK_MONOTONIC.")
+    ticc.add_argument("--ticc-log-stride", type=int, default=1,
+                      help="Decimation stride for --ticc-log.  1 = every "
+                           "TICC line (~1 Hz, default); 30 = every 30th "
+                           "(~30 s); 0 coerced to 1.  See "
+                           "logStrideFlags-main.")
     ticc.add_argument("--noise-buffer-csv", default=None,
                       help="Optional per-epoch noise-buffer CSV export "
                            "(I-162848 Step 1).  Each row records "
@@ -9685,6 +9810,9 @@ Two-phase operation:
                            "of servo state; lets post-processing redo the "
                            "qErr ↔ TICC chB matching the engine does in "
                            "real time, without sawtooth dewrap heuristics.")
+    ticc.add_argument("--qerr-log-stride", type=int, default=1,
+                      help="Decimation stride for --qerr-log.  1 = every "
+                           "TIM-TP message (~1 Hz, default).  0 coerced to 1.")
     ticc.add_argument("--extint-log", default=None,
                       help="Optional raw TIM-TM2 CSV log path for the "
                            "gnss-phase-experiment.  Each row captures "
@@ -9697,6 +9825,38 @@ Two-phase operation:
                            "their static offset + dynamic noise — the "
                            "ablation matrix from "
                            "docs/dofreq-est-measurement-ladder.md.")
+    ticc.add_argument("--extint-log-stride", type=int, default=1,
+                      help="Decimation stride for --extint-log.  1 = every "
+                           "TIM-TM2 message (default).  0 coerced to 1.")
+    ticc.add_argument("--dt-rx-log", default=None,
+                      help="Optional raw dt_rx CSV log path.  One row per "
+                           "PPP epoch capturing FixedPosFilter's "
+                           "(host_timestamp, host_monotonic, gpst_iTOW, "
+                           "dt_rx_ns, dt_rx_sigma_ns, n_used, ztd_mm, "
+                           "ztd_sigma_mm).  This is the engine-side time-"
+                           "scale view of the rx_tcxo clock — the time-"
+                           "domain output of Arm 1 (PPP carrier phase) — "
+                           "at native 1 Hz rate, decoupled from "
+                           "[FIXEDPOS_ZTD] log decimation.  Pair with "
+                           "--ticc-log for sub-30s τ TDEV/ADEV comparison "
+                           "of software-arm-vs-hardware-floor stability.")
+    ticc.add_argument("--dt-rx-log-stride", type=int, default=1,
+                      help="Decimation stride for --dt-rx-log.  1 = every "
+                           "PPP epoch (~1 Hz, default).  0 coerced to 1.")
+    ticc.add_argument("--arm-state-log", default=None,
+                      help="Optional four-arm Kalman state CSV log path.  "
+                           "One row per servo.update() call capturing "
+                           "DOFreqEst's (host_timestamp, host_monotonic, "
+                           "x0_phi_rx_ns, x1_f_rx_ppb, x2_phi_do_ns, "
+                           "x3_f_do_ppb, P00, P11, P22, P33, arm1_used, "
+                           "arm2_used, arm3_used, arm4_used, dt_actual_s).  "
+                           "Lets post-processing reconstruct the four-arm "
+                           "fusion trajectory + per-epoch arm availability "
+                           "for ablation analysis.")
+    ticc.add_argument("--arm-state-log-stride", type=int, default=1,
+                      help="Decimation stride for --arm-state-log.  1 = "
+                           "every servo update (scheduler-driven, "
+                           "default).  0 coerced to 1.")
     ticc.add_argument("--ticc-baud", type=int, default=115200,
                       help="TICC baud rate (default: 115200)")
     ticc.add_argument("--ticc-phc-channel", choices=["chA", "chB"], default="chA",
