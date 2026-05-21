@@ -7462,13 +7462,15 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         if mode_gain_floor is not None:
             gain_scale = max(gain_scale, mode_gain_floor)
 
-        # gnss-phase-experiment: four-arm Kalman fusion in DOFreqEst.
-        # See docs/dofreq-est-measurement-ladder.md.  Each arm gated on
+        # Four-arm Kalman fusion in DOFreqEst.  See
+        # docs/dofreq-est-measurement-ladder.md.  Each arm gated on
         # availability inside servo.update; predict step always runs.
+        # Per-arm ablation via --no-qerr-arm / --no-ticc / etc.
         #
-        # Wired today: Arm 1 (PPP), Arm 3 (TIM-TM2 → x[2]),
-        #              Arm 4 (TICC chA-chB → couple x[0], x[2]).
-        # Pending:    Arm 2 (qErr-as-frequency).
+        #   Arm 1 (PPP, dt_rx_ns)             → observes x[0] (rx_tcxo phase)
+        #   Arm 2 (qErr-as-frequency)         → observes x[1] (rx_tcxo freq)
+        #   Arm 3 (TIM-TM2, extint_phase_ns)  → observes x[2] (DO phase)
+        #   Arm 4 (TICC chA-chB)              → couples x[0] + x[2]
         extint_phase_ns = None
         extint_sigma_ns = None
         _ext = ctx.get('extint_store')
