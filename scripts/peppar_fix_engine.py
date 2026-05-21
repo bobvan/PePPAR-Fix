@@ -4955,13 +4955,13 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             # native rate, decoupled from the 30-epoch [FIXEDPOS_ZTD]
             # log decimation).  Enables sub-30s τ TDEV/ADEV vs TICC
             # chB.  See logStrideFlags-main.
-            _dtrx_w = ctx.get('dt_rx_log_writer')
-            _dtrx_f = ctx.get('dt_rx_log_file')
+            _dtrx_w = servo_ctx.get('dt_rx_log_writer') if servo_ctx else None
+            _dtrx_f = servo_ctx.get('dt_rx_log_file') if servo_ctx else None
             if _dtrx_w is not None:
                 try:
                     # gpst_iTOW: try to lift from latest NAV-CLOCK if
                     # available; otherwise emit empty.
-                    _itow = ctx.get('last_nav_clock_iTOW', '')
+                    _itow = servo_ctx.get('last_nav_clock_iTOW', '')
                     _n_used = int(getattr(filt, 'last_n_pr', 0))
                     _dtrx_w.writerow([
                         datetime.now(tz=timezone.utc).isoformat(),
