@@ -1210,7 +1210,8 @@ class FixedPosFilter:
     CATASTROPHIC_REJECT_LIMIT = 30
 
 
-    def __init__(self, pos_ecef, init_ztd_m=0.0, init_ztd_sigma_m=0.5):
+    def __init__(self, pos_ecef, init_ztd_m=0.0, init_ztd_sigma_m=0.5,
+                 r_calibration=None):
         """Fixed-position PPP filter.
 
         Args:
@@ -1228,7 +1229,14 @@ class FixedPosFilter:
                 m = legacy wide prior).  With METAR source: ~0.05 m
                 tightens the prior so the filter cannot drift ZTD past
                 physical envelope while clock state catches up.
+            r_calibration: optional RCalibration giving per-(sys,elev)
+                σ_pr and σ_td values.  When None, defaults match the
+                legacy SIGMA_P_IF / sigma_td formulas (no behavior
+                change).  See peppar_fix.r_calibration and rMatrixTuning.
         """
+        # Lazy import to avoid cycle (r_calibration → solve_ppp)
+        from peppar_fix.r_calibration import RCalibration
+        self.r_cal = r_calibration if r_calibration is not None else RCalibration()
         self.pos = np.array(pos_ecef)
         self.x = np.zeros(self.N_STATES)     # [clock, clock_rate, dZTD, isb_gal, isb_bds] in meters
         self.x[self.IDX_ZTD] = float(init_ztd_m)
@@ -1494,7 +1502,11 @@ class FixedPosFilter:
             pr_elev.append(float(elev))
             H_rows.append(h_pr)
             z_rows.append(dz_pr)
-            R_diag.append((SIGMA_P_IF / w) ** 2)
+            # σ_pr from r_calibration (elev-binned, per-system); cno_factor
+            # applies separately as per-SV signal-quality weight.  Default
+            # path matches legacy SIGMA_P_IF/w exactly.
+            sigma_pr_base = self.r_cal.sigma_pr_m(sys_name, elev)
+            R_diag.append((sigma_pr_base / cno_factor) ** 2)
             n_pr += 1
 
             # --- Time-differenced carrier phase ---
@@ -1521,8 +1533,10 @@ class FixedPosFilter:
                 td_elev.append(float(elev))
                 H_rows.append(h_td)
                 z_rows.append(dz_td)
-                sigma_td = 0.3 / max(0.2, elev_factor)
-                R_diag.append((sigma_td / w) ** 2)
+                # σ_td from r_calibration (elev-binned, per-system); cno_factor
+                # applies separately.  Default matches legacy 0.3/elev_factor.
+                sigma_td_base = self.r_cal.sigma_td_m(sys_name, elev)
+                R_diag.append((sigma_td_base / cno_factor) ** 2)
                 n_td += 1
 
         if n_pr < 1:

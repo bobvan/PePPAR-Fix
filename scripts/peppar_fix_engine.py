@@ -40,6 +40,7 @@ import threading
 import time
 import tomllib
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import numpy as np
 
@@ -4122,9 +4123,24 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     # (observed 2026-05-04: ZTD walked +32mm → -4494mm in 30 epochs).
     # The first-epoch median-PR seed inside FixedPosFilter.update()
     # places x[CLK] near truth before the Kalman gain attacks ZTD.
+    # Optional R-calibration: per-host (sys, elev) σ_pr / σ_td model.
+    # When --r-calibration is not set, FixedPosFilter uses defaults that
+    # exactly match the legacy SIGMA_P_IF / sigma_td formulas.
+    r_cal_obj = None
+    r_cal_path = getattr(args, 'r_calibration', None)
+    if r_cal_path:
+        from peppar_fix.r_calibration import RCalibration
+        try:
+            r_cal_obj = RCalibration.from_toml(Path(r_cal_path))
+            log.info("R-calibration loaded: %s", r_cal_path)
+        except (OSError, ValueError, KeyError) as e:
+            log.warning("Failed to load R-calibration %s: %s — "
+                        "falling back to defaults",
+                        r_cal_path, e)
     filt = FixedPosFilter(known_ecef,
                           init_ztd_m=init_ztd_m,
-                          init_ztd_sigma_m=init_ztd_sigma_m)
+                          init_ztd_sigma_m=init_ztd_sigma_m,
+                          r_calibration=r_cal_obj)
     filt.prev_clock = 0.0
 
     # σ_pin: time filter's uncertainty about its pinned ARP, used by
@@ -9035,6 +9051,7 @@ def _apply_host_config(args):
         "antennas_json":    ("antennas_json",    str),
         "rinex_out":        ("rinex_out",        str),
         "rinex_decimate_s": ("rinex_decimate_s", float),
+        "r_calibration":    ("r_calibration",    str),
     }
 
     for toml_key, (dest, conv) in _MAP.items():
@@ -10029,6 +10046,14 @@ Two-phase operation:
     ticc.add_argument("--filter-state-log-stride", type=int, default=1,
                       help="Decimation stride for --filter-state-log.  "
                            "1 = every epoch (default).  0 coerced to 1.")
+    ticc.add_argument("--r-calibration", default=None,
+                      help="Path to a per-host R-calibration TOML "
+                           "(produced by scripts/peppar_fix/fit_r_"
+                           "calibration.py).  Replaces the global "
+                           "SIGMA_P_IF / sigma_td defaults with elev-"
+                           "binned per-(sys,elev) σ_pr and σ_td.  When "
+                           "omitted, defaults match the legacy formulas "
+                           "(no behavior change).  See rMatrixTuning.")
     ticc.add_argument("--ticc-baud", type=int, default=115200,
                       help="TICC baud rate (default: 115200)")
     ticc.add_argument("--ticc-phc-channel", choices=["chA", "chB"], default="chA",
