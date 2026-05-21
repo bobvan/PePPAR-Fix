@@ -117,6 +117,15 @@ def main(argv: list[str] | None = None) -> int:
              "--rinex-glob and pdp3 installed (PEPPAR_PDP3_BIN env var "
              "or default ~/.PRIDE_PPPAR_BIN/pdp3).",
     )
+    backends.add_argument(
+        "--rtklib", action="store_true",
+        help="Use RTKLIB rnx2rtkp over captured RINEX (PPP-static "
+             "by default).  Practical alternative to --pride for "
+             "F9T L1+L5 hardware where WUM phase biases don't cover "
+             "GPS L5.  Add --cors-station for RTK-static against a "
+             "NOAA CORS base.  Requires rnx2rtkp on PATH or via "
+             "PEPPAR_RNX2RTKP_BIN.",
+    )
     pride = ap.add_argument_group("--pride options")
     pride.add_argument(
         "--rinex-glob", default=None,
@@ -186,6 +195,34 @@ def main(argv: list[str] | None = None) -> int:
              "see wumProductGnsswhuFallback-charlie for the discovery.",
     )
 
+    rtklib = ap.add_argument_group("--rtklib options")
+    rtklib.add_argument(
+        "--rtklib-work-dir", default=None,
+        help="Scratch directory for rnx2rtkp (per-day subdirs created "
+             "inside).  Default: $TMPDIR/peppar-survey-rtklib/.",
+    )
+    rtklib.add_argument(
+        "--cors-station", default=None,
+        help="NOAA CORS station code (4-char, e.g. 'dsp1').  When set "
+             "with --rtklib, runs RTK-static against the station's "
+             "daily RINEX 3 base file fetched from "
+             "geodesy.noaa.gov/corsdata.  Omit for PPP-static mode "
+             "(no base, no fetch).",
+    )
+    rtklib.add_argument(
+        "--cors-rinex-path", default=None,
+        help="Explicit path to a CORS base RINEX file (skip the NOAA "
+             "fetch).  Useful when an internal base / pre-fetched "
+             "file is available or when the operator wants to point "
+             "at a non-NOAA source.",
+    )
+    rtklib.add_argument(
+        "--rtklib-nav", default=None,
+        help="Path to a broadcast-nav RINEX file (.<yy>p) to pass to "
+             "rnx2rtkp.  If unset, rnx2rtkp tries to find one in "
+             "work_dir.",
+    )
+
     args = ap.parse_args(argv)
 
     logging.basicConfig(
@@ -206,10 +243,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.pride:
         return _run_pride(args)
+    if args.rtklib:
+        return _run_rtklib(args)
 
     log.error(
-        "No backend selected.  Pass one of: --pride, --opus, --cors, "
-        "--rtklib.  Only --pride is implemented today."
+        "No backend selected.  Pass one of: --pride, --rtklib, "
+        "--opus, --cors.  --pride and --rtklib are implemented today."
     )
     return 2
 
@@ -251,6 +290,52 @@ def _run_pride(args) -> int:
                    else DEFAULT_MIN_N_OBS),
         brdm_source=args.brdm_source,
         wum_source=args.wum_source,
+        dry_run=args.dry_run,
+    )
+
+
+def _run_rtklib(args) -> int:
+    """Dispatch to the RTKLIB rnx2rtkp backend."""
+    import tempfile
+    from glob import glob
+    from pathlib import Path
+
+    from peppar_fix.arp_history import DEFAULT_MAX_SIG0_M, DEFAULT_MIN_N_OBS
+    from peppar_fix.peppar_survey_rtklib import run_rtklib_backend
+
+    if not args.rinex_glob:
+        log.error("--rtklib requires --rinex-glob "
+                  "(e.g. 'data/rinex/MadHat-*.obs')")
+        return 2
+    obs_files = [Path(p) for p in sorted(glob(args.rinex_glob))]
+    if not obs_files:
+        log.error("--rinex-glob %r matched no files", args.rinex_glob)
+        return 1
+    work_dir = Path(args.rtklib_work_dir or os.path.join(
+        tempfile.gettempdir(), "peppar-survey-rtklib"))
+
+    # Mode: rtk if any --cors-* is set; otherwise ppp-static
+    use_rtk = bool(args.cors_station or args.cors_rinex_path)
+    mode = "rtk" if use_rtk else "ppp"
+    nav_file = Path(args.rtklib_nav) if args.rtklib_nav else None
+
+    return run_rtklib_backend(
+        obs_files=obs_files,
+        work_dir=work_dir,
+        receiver_uid=args.receiver_uid,
+        mode=mode,
+        cors_station=args.cors_station,
+        cors_rinex_path=(Path(args.cors_rinex_path)
+                         if args.cors_rinex_path else None),
+        nav_file=nav_file,
+        positions_dir=args.positions_dir,
+        history_dir=args.history_dir,
+        mount_sn=args.mount_sn,
+        n_days=args.n_days,
+        max_sig0_m=(args.max_sig0_m if args.max_sig0_m is not None
+                    else DEFAULT_MAX_SIG0_M),
+        min_n_obs=(args.min_n_obs if args.min_n_obs is not None
+                   else DEFAULT_MIN_N_OBS),
         dry_run=args.dry_run,
     )
 
