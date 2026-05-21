@@ -1254,6 +1254,12 @@ class FixedPosFilter:
         self.last_n_td = 0
         self.last_resid_pr = np.array([])
         self.last_resid_td = np.array([])
+        # Pre-fit innovations (z, obs - H @ x_predicted) parallel to
+        # the post-fit residuals.  Use these to size R via innovation-
+        # std (correct) instead of post-fit residual MAD (under-sizes
+        # R → overconfidence).  See innovationBasedRFit dayplan item.
+        self.last_innov_pr = np.array([])
+        self.last_innov_td = np.array([])
         # Per-row labels parallel to last_resid_pr / last_resid_td, so
         # downstream loggers can emit (sv, sys, elev, residual) without
         # re-running the H/z construction.  Populated at the same sites
@@ -1546,6 +1552,8 @@ class FixedPosFilter:
             self.last_n_td = 0
             self.last_resid_pr = np.array([])
             self.last_resid_td = np.array([])
+            self.last_innov_pr = np.array([])
+            self.last_innov_td = np.array([])
             self.last_pr_svs = []
             self.last_pr_sys = []
             self.last_pr_elev = []
@@ -1587,11 +1595,16 @@ class FixedPosFilter:
                     self._consecutive_catastrophic_rejects,
                 )
                 # Preserve pre-fit residuals for downstream visibility.
+                # In the catastrophic-reject path z IS the pre-fit
+                # innovation (no Kalman update happened), so last_resid
+                # == last_innov here by construction.
                 self.last_n_pr = n_pr
                 self.last_n_td = n_td
                 self.last_resid_pr = z[pr_idx].copy()
                 self.last_resid_td = (z[td_idx].copy() if td_idx
                                       else np.array([]))
+                self.last_innov_pr = self.last_resid_pr.copy()
+                self.last_innov_td = self.last_resid_td.copy()
                 self.last_pr_svs = list(pr_svs)
                 self.last_pr_sys = list(pr_sys)
                 self.last_pr_elev = list(pr_elev)
@@ -1624,12 +1637,16 @@ class FixedPosFilter:
             # the per-row index lists tracked during construction.
             # Cannot use z[:n_pr] / z[n_pr:n_pr+n_td] — rows are
             # interleaved per-SV.
+            # In the LinAlgError path no Kalman update happened, so z
+            # IS the innovation by construction.  Same array, same data.
             self.last_n_pr = n_pr
             self.last_n_td = n_td
             self.last_resid_pr = (z[pr_idx].copy() if pr_idx
                                   else np.array([]))
             self.last_resid_td = (z[td_idx].copy() if td_idx
                                   else np.array([]))
+            self.last_innov_pr = self.last_resid_pr.copy()
+            self.last_innov_td = self.last_resid_td.copy()
             self.last_pr_svs = list(pr_svs)
             self.last_pr_sys = list(pr_sys)
             self.last_pr_elev = list(pr_elev)
@@ -1682,6 +1699,13 @@ class FixedPosFilter:
         self.last_resid_pr = (post_resid[pr_idx].copy() if pr_idx
                               else np.array([]))
         self.last_resid_td = (post_resid[td_idx].copy() if td_idx
+                              else np.array([]))
+        # Pre-fit innovations from the original z vector (before
+        # Kalman update transformed it via post_resid = z - H @ K @ z).
+        # This is the correct quantity to size R against.
+        self.last_innov_pr = (z[pr_idx].copy() if pr_idx
+                              else np.array([]))
+        self.last_innov_td = (z[td_idx].copy() if td_idx
                               else np.array([]))
         self.last_pr_svs = list(pr_svs)
         self.last_pr_sys = list(pr_sys)

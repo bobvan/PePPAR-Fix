@@ -28,9 +28,12 @@ import numpy as np
 _DEFAULT_BIN_EDGES = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 90.0)
 
 
-def _mad_sigma(arr: np.ndarray) -> float:
-    """MAD × 1.4826 (consistent estimator of σ for Gaussian data,
-    robust to ~50% outliers)."""
+def _robust_sigma(arr: np.ndarray) -> float:
+    """Robust σ estimator: MAD × 1.4826, consistent for Gaussian data,
+    immune to ~50% outliers.  Used on both post-fit residuals and pre-
+    fit innovations — outlier rejection matters either way (e.g. cycle
+    slips, SV-specific phase-bias errors).
+    """
     if len(arr) < 4:
         return 0.0
     m = np.median(arr)
@@ -39,8 +42,17 @@ def _mad_sigma(arr: np.ndarray) -> float:
 
 def fit_from_csv(path: Path, start_iso: str | None = None,
                  min_samples: int = 100,
-                 bin_edges: tuple[float, ...] = _DEFAULT_BIN_EDGES):
+                 bin_edges: tuple[float, ...] = _DEFAULT_BIN_EDGES,
+                 use_innovation: bool = True):
     """Bin (sys, elev) residuals from per-SV CSV; return per-system table.
+
+    Args:
+        use_innovation: when True (default), fit from pre-fit innovations
+            (innov_pr_m / innov_td_m columns).  This is the correct sizing
+            of R — post-fit residuals systematically underestimate sigma
+            because the filter already absorbed part of the noise.  Falls
+            back to resid_*_m if the innov_* columns are missing (e.g.
+            CSVs written before innovationBasedRFit).
 
     Returns: {sys: {'edges': edges, 'sigma_pr_m': [...], 'sigma_td_m': [...]}}
     """
@@ -48,15 +60,23 @@ def fit_from_csv(path: Path, start_iso: str | None = None,
                   if start_iso else 0.0)
     rows: list[tuple[str, float, float, float]] = []
     with open(path) as f:
-        for r in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        # Decide which column to read for PR and TD based on whether
+        # innovation columns are present in the header.
+        fields = reader.fieldnames or []
+        pr_col = ('innov_pr_m' if (use_innovation and 'innov_pr_m' in fields)
+                  else 'resid_pr_m')
+        td_col = ('innov_td_m' if (use_innovation and 'innov_td_m' in fields)
+                  else 'resid_td_m')
+        for r in reader:
             try:
                 eu = float(r['epoch_unix'])
                 if eu < start_unix:
                     continue
                 sys_ = r['sys']
                 elev = float(r['elev_deg'])
-                pr = float(r['resid_pr_m'])
-                td_s = r.get('resid_td_m', 'nan').strip()
+                pr = float(r[pr_col])
+                td_s = r.get(td_col, 'nan').strip()
                 try:
                     td = float(td_s)
                 except ValueError:
@@ -82,12 +102,12 @@ def fit_from_csv(path: Path, start_iso: str | None = None,
                 if not math.isnan(td):
                     td_vals.append(td)
             if len(pr_vals) >= min_samples:
-                sigma_pr_m.append(round(_mad_sigma(np.asarray(pr_vals)), 4))
+                sigma_pr_m.append(round(_robust_sigma(np.asarray(pr_vals)), 4))
                 any_bin = True
             else:
                 sigma_pr_m.append(0.0)  # 0 → fall back to default in lookup
             if len(td_vals) >= min_samples:
-                sigma_td_m.append(round(_mad_sigma(np.asarray(td_vals)), 4))
+                sigma_td_m.append(round(_robust_sigma(np.asarray(td_vals)), 4))
             else:
                 sigma_td_m.append(0.0)
         if any_bin:
@@ -137,13 +157,28 @@ def main():
                          "back to default formula")
     ap.add_argument("--td-floor", type=float, default=0.003,
                     help="Minimum σ_td allowed (m)")
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("--use-innovation", dest="use_innovation",
+                     action="store_true",
+                     help="Fit from pre-fit innovations (innov_pr_m / "
+                          "innov_td_m).  Default when those columns "
+                          "exist in the CSV.")
+    src.add_argument("--use-residual", dest="use_innovation",
+                     action="store_false",
+                     help="Force fit from post-fit residuals (resid_pr_m "
+                          "/ resid_td_m).  Use only for back-compat "
+                          "comparisons; under-sizes R, leads to filter "
+                          "overconfidence.")
+    ap.set_defaults(use_innovation=True)
     args = ap.parse_args()
 
     fits = fit_from_csv(args.input, start_iso=args.start,
-                        min_samples=args.min_samples)
+                        min_samples=args.min_samples,
+                        use_innovation=args.use_innovation)
     note = (f"source: {args.input.name}\n"
             f"start:  {args.start or 'all rows'}\n"
-            f"min_samples_per_bin: {args.min_samples}")
+            f"min_samples_per_bin: {args.min_samples}\n"
+            f"sigma_source: {'innovation (pre-fit)' if args.use_innovation else 'residual (post-fit)'}")
     toml = render_toml(fits, pr_floor_m=args.pr_floor,
                        td_floor_m=args.td_floor, source_note=note)
     args.output.write_text(toml)

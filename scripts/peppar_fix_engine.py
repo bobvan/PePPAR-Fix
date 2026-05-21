@@ -4403,6 +4403,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                         'sv', 'sys', 'elev_deg',
                         'n_pr_epoch', 'n_td_epoch',
                         'resid_pr_m', 'resid_td_m',
+                        'innov_pr_m', 'innov_td_m',
                     ])
                     _psv_f.flush()
                 _psv_w = StridedWriter(
@@ -5105,11 +5106,16 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     _pr_sys = getattr(filt, 'last_pr_sys', []) or []
                     _pr_elev = getattr(filt, 'last_pr_elev', []) or []
                     _resid_pr = getattr(filt, 'last_resid_pr', None)
+                    _innov_pr = getattr(filt, 'last_innov_pr', None)
                     _td_svs = getattr(filt, 'last_td_svs', []) or []
                     _resid_td = getattr(filt, 'last_resid_td', None)
+                    _innov_td = getattr(filt, 'last_innov_td', None)
                     _td_map = {}
                     if _resid_td is not None and len(_resid_td) == len(_td_svs):
                         _td_map = dict(zip(_td_svs, _resid_td))
+                    _td_innov_map = {}
+                    if _innov_td is not None and len(_innov_td) == len(_td_svs):
+                        _td_innov_map = dict(zip(_td_svs, _innov_td))
                     _ts_iso = datetime.now(tz=timezone.utc).isoformat()
                     _mono = f"{time.monotonic():.9f}"
                     _epoch_unix = f"{gps_time.timestamp():.6f}"
@@ -5122,12 +5128,20 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                             _rtd = _td_map.get(_sv)
                             _rtd_s = (f"{float(_rtd):.6f}"
                                       if _rtd is not None else 'nan')
+                            _itd = _td_innov_map.get(_sv)
+                            _itd_s = (f"{float(_itd):.6f}"
+                                      if _itd is not None else 'nan')
+                            _ipr_s = 'nan'
+                            if (_innov_pr is not None
+                                    and len(_innov_pr) == _n_pr_ep):
+                                _ipr_s = f"{float(_innov_pr[i]):.6f}"
                             _psv_w.writerow([
                                 _ts_iso, _mono, _epoch_unix,
                                 _sv, _pr_sys[i], f"{_pr_elev[i]:.2f}",
                                 _n_pr_ep, _n_td_ep,
                                 f"{float(_resid_pr[i]):.6f}",
                                 _rtd_s,
+                                _ipr_s, _itd_s,
                             ])
                     if _psv_f is not None:
                         _psv_f.flush()
