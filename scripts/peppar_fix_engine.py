@@ -4399,6 +4399,38 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             except OSError as e:
                 log.error("Failed to open per_sv_resid_log %s: %s",
                           args.per_sv_resid_log, e)
+        # --filter-state-log: per-epoch FixedPosFilter internals.
+        # Captures Q-injection (predict) vs measurement-update (K@z)
+        # contributions to the clock state, and clock cross-covariance
+        # with ZTD + ISB.  Lets us tell whether dt_rx noise is process-
+        # noise-bound, PR-dominated, or ZTD-leaky.  See filterStateLog.
+        if getattr(args, 'filter_state_log', None):
+            try:
+                _needs_header = (not os.path.exists(args.filter_state_log)
+                                 or os.path.getsize(args.filter_state_log) == 0)
+                _fs_f = open(args.filter_state_log, 'a', newline='')
+                _fs_csv = csv.writer(_fs_f)
+                if _needs_header:
+                    _fs_csv.writerow([
+                        'host_timestamp', 'host_monotonic', 'epoch_unix',
+                        'clk_pre_m', 'clk_post_m',
+                        'P_clk_clk_pre', 'P_clk_clk_post',
+                        'Q_clk_step', 'Q_ztd_step', 'Q_isb_gal_step',
+                        'Kz_clk_pr_m', 'Kz_clk_td_m',
+                        'P_clk_ztd', 'P_clk_isb_gal',
+                        'n_pr', 'n_td',
+                    ])
+                    _fs_f.flush()
+                _fs_w = StridedWriter(
+                    _fs_csv,
+                    stride=getattr(args, "filter_state_log_stride", 1))
+                servo_ctx['filter_state_log_writer'] = _fs_w
+                servo_ctx['filter_state_log_file'] = _fs_f
+                log.info("filter-state CSV log: %s (stride=%d)",
+                         args.filter_state_log, _fs_w.stride)
+            except OSError as e:
+                log.error("Failed to open filter_state_log %s: %s",
+                          args.filter_state_log, e)
 
     prev_t = None
     n_epochs = 0
@@ -5013,6 +5045,40 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             # per-SV TDEV vs Arm 1 TDEV says whether the noise is
             # observation-level (per-SV ≈ dt_rx) or filter-side
             # (per-SV ≪ dt_rx).
+            # Filter-state diagnostics (filterStateLog).  One row per
+            # epoch capturing FixedPosFilter internals.  Emitted before
+            # the per-SV log so they share the same epoch_unix string
+            # when both flags are passed together.
+            _fs_w = (servo_ctx.get('filter_state_log_writer')
+                     if servo_ctx else None)
+            _fs_f = (servo_ctx.get('filter_state_log_file')
+                     if servo_ctx else None)
+            if _fs_w is not None:
+                try:
+                    _n_pr_ep = int(getattr(filt, 'last_n_pr', 0))
+                    _n_td_ep = int(getattr(filt, 'last_n_td', 0))
+                    _fs_w.writerow([
+                        datetime.now(tz=timezone.utc).isoformat(),
+                        f"{time.monotonic():.9f}",
+                        f"{gps_time.timestamp():.6f}",
+                        f"{float(getattr(filt, 'last_clk_pre', 0.0)):.6f}",
+                        f"{float(getattr(filt, 'last_clk_post', 0.0)):.6f}",
+                        f"{float(getattr(filt, 'last_p_clk_clk_pre', 0.0)):.9e}",
+                        f"{float(getattr(filt, 'last_p_clk_clk_post', 0.0)):.9e}",
+                        f"{float(getattr(filt, 'last_q_clk_step', 0.0)):.9e}",
+                        f"{float(getattr(filt, 'last_q_ztd_step', 0.0)):.9e}",
+                        f"{float(getattr(filt, 'last_q_isb_gal_step', 0.0)):.9e}",
+                        f"{float(getattr(filt, 'last_kz_clk_pr', 0.0)):.9e}",
+                        f"{float(getattr(filt, 'last_kz_clk_td', 0.0)):.9e}",
+                        f"{float(getattr(filt, 'last_p_clk_ztd', 0.0)):.9e}",
+                        f"{float(getattr(filt, 'last_p_clk_isb_gal', 0.0)):.9e}",
+                        _n_pr_ep, _n_td_ep,
+                    ])
+                    if _fs_f is not None:
+                        _fs_f.flush()
+                except (OSError, ValueError):
+                    pass
+
             _psv_w = (servo_ctx.get('per_sv_resid_log_writer')
                       if servo_ctx else None)
             _psv_f = (servo_ctx.get('per_sv_resid_log_file')
@@ -9948,6 +10014,21 @@ Two-phase operation:
                            "1 = every epoch's SVs (default).  Each "
                            "epoch emits N rows (one per contributing "
                            "SV), so stride=N skips entire epochs.")
+    ticc.add_argument("--filter-state-log", default=None,
+                      help="Optional per-epoch FixedPosFilter internals "
+                           "CSV.  Fields: host_timestamp, host_monotonic, "
+                           "epoch_unix, clk_pre_m, clk_post_m, "
+                           "P_clk_clk_pre, P_clk_clk_post, Q_clk_step, "
+                           "Q_ztd_step, Q_isb_gal_step, Kz_clk_pr_m, "
+                           "Kz_clk_td_m, P_clk_ztd, P_clk_isb_gal, "
+                           "n_pr, n_td.  Lets us localize where dt_rx "
+                           "noise enters: Q_clk_step vs (Kz_clk_pr + "
+                           "Kz_clk_td) tells process-noise-bound vs "
+                           "measurement-bound; P_clk_ztd shows ZTD-"
+                           "clock cross-coupling.  See filterStateLog.")
+    ticc.add_argument("--filter-state-log-stride", type=int, default=1,
+                      help="Decimation stride for --filter-state-log.  "
+                           "1 = every epoch (default).  0 coerced to 1.")
     ticc.add_argument("--ticc-baud", type=int, default=115200,
                       help="TICC baud rate (default: 115200)")
     ticc.add_argument("--ticc-phc-channel", choices=["chA", "chB"], default="chA",

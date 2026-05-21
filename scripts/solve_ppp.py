@@ -1256,6 +1256,20 @@ class FixedPosFilter:
         self.last_td_svs: list[str] = []
         self.last_td_sys: list[str] = []
         self.last_td_elev: list[float] = []
+        # Filter-state diagnostics (--filter-state-log).  These let us
+        # tell whether dt_rx noise is process-noise-bound (Q dominates
+        # measurement update), PR-dominated, or ZTD-leaky.
+        self.last_q_clk_step = 0.0
+        self.last_q_ztd_step = 0.0
+        self.last_q_isb_gal_step = 0.0
+        self.last_clk_pre = 0.0
+        self.last_clk_post = 0.0
+        self.last_p_clk_clk_pre = 0.0
+        self.last_p_clk_clk_post = 0.0
+        self.last_kz_clk_pr = 0.0
+        self.last_kz_clk_td = 0.0
+        self.last_p_clk_ztd = 0.0
+        self.last_p_clk_isb_gal = 0.0
         # Catastrophic residual gate state (I-202649).  History records
         # accepted-epoch median |PR residual|; rejected epochs do NOT
         # update history so the baseline stays clean across bursts.
@@ -1279,6 +1293,13 @@ class FixedPosFilter:
         Q[self.IDX_ISB_GAL, self.IDX_ISB_GAL] = 1e-6 * dt  # GAL ISB random walk
         Q[self.IDX_ISB_BDS, self.IDX_ISB_BDS] = 1e-6 * dt  # BDS ISB random walk
         self.P += Q
+        # Stash this epoch's Q-injection magnitude on each tracked state
+        # so the filter-state log can plot it alongside the measurement
+        # update.  See --filter-state-log.
+        self.last_q_clk_step = float(Q[self.IDX_CLK, self.IDX_CLK])
+        self.last_q_ztd_step = float(Q[self.IDX_ZTD, self.IDX_ZTD])
+        self.last_q_isb_gal_step = float(
+            Q[self.IDX_ISB_GAL, self.IDX_ISB_GAL])
 
     def apply_ztd_tie(self, sigma_m: float, target_m: float = 0.0) -> None:
         """Soft prior on the residual ZTD state (rank-1 Kalman update,
@@ -1576,6 +1597,10 @@ class FixedPosFilter:
         self._consecutive_catastrophic_rejects = 0
 
         S = H @ self.P @ H.T + R
+        # Snapshot clock + clock variance before update — filter-state
+        # diagnostic uses these to compute K_z_clk and P delta.
+        _clk_pre = float(self.x[self.IDX_CLK])
+        _p_clk_clk_pre = float(self.P[self.IDX_CLK, self.IDX_CLK])
         try:
             K = self.P @ H.T @ np.linalg.inv(S)
         except np.linalg.LinAlgError:
@@ -1599,10 +1624,31 @@ class FixedPosFilter:
             self.last_td_elev = list(td_elev)
             return n_pr, z, n_td
 
+        # Per-row clock update contribution, split PR vs TD.  K[CLK, i]
+        # is the gain from row i into the clock state; row i's
+        # contribution to Δx[CLK] is K[CLK, i] * z[i].
+        kz_clk_pr = float(np.sum(K[self.IDX_CLK, pr_idx] * z[pr_idx])
+                          if pr_idx else 0.0)
+        kz_clk_td = float(np.sum(K[self.IDX_CLK, td_idx] * z[td_idx])
+                          if td_idx else 0.0)
+
         self.x = self.x + K @ z
         I_KH = np.eye(self.N_STATES) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
         self.P = 0.5 * (self.P + self.P.T)
+
+        # Filter-state log post-update snapshot.
+        self.last_clk_pre = _clk_pre
+        self.last_clk_post = float(self.x[self.IDX_CLK])
+        self.last_p_clk_clk_pre = _p_clk_clk_pre
+        self.last_p_clk_clk_post = float(
+            self.P[self.IDX_CLK, self.IDX_CLK])
+        self.last_kz_clk_pr = kz_clk_pr
+        self.last_kz_clk_td = kz_clk_td
+        self.last_p_clk_ztd = float(
+            self.P[self.IDX_CLK, self.IDX_ZTD])
+        self.last_p_clk_isb_gal = float(
+            self.P[self.IDX_CLK, self.IDX_ISB_GAL])
 
         post_resid = z - H @ (K @ z)
 
