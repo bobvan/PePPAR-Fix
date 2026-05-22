@@ -6709,6 +6709,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         converge_threshold_ns=args.scheduler_converge_threshold_ns,
         settle_window=args.scheduler_settle_window,
         unconverge_factor=args.scheduler_unconverge_factor,
+        phase_error_budget_ns=args.phase_error_budget_ns,
     )
 
     qerr_alignment = {
@@ -7149,6 +7150,7 @@ def _enter_obs_holdover(ctx, args, reason_code, detail):
         converge_threshold_ns=args.scheduler_converge_threshold_ns,
         settle_window=args.scheduler_settle_window,
         unconverge_factor=args.scheduler_unconverge_factor,
+        phase_error_budget_ns=args.phase_error_budget_ns,
     )
     ctx['phase'] = 'tracking'
     ctx['tracking_large_error_count'] = 0
@@ -7298,12 +7300,11 @@ def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
         ctx['adjfine_ppb'] = freq_ppb
         ctx['gain_scale'] = gain_scale
 
-        # Drift estimate now lives inside compute_adaptive_interval(),
-        # which reads the scheduler's error-history (input side).  The
-        # legacy update_drift_rate(adjfine_ppb) call was removed
-        # (schedulerInputSideDriftRate) — it created a circular
-        # dependency where servo output → drift_rate → faster updates
-        # → bigger output changes.
+        # Output-side actuation history → physical-drift estimator
+        # inside compute_adaptive_interval().  Long-window slope of
+        # adjfine = |open-loop DO drift rate|; combined with input-
+        # side σ_obs to choose τ.  See schedulerCombinedDriftEstimator.
+        scheduler.record_actuation(time.monotonic(), freq_ppb)
         scheduler.compute_adaptive_interval()
 
         if n_epochs % 10 == 0:
@@ -7847,9 +7848,11 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             _dfe.update_metrics(adj_ppb=adjfine_ppb, err_ns=avg_error,
                                 interval=scheduler.interval)
 
-        # Adaptive interval is now driven by the input-side error
-        # history inside compute_adaptive_interval() — no longer takes
-        # the servo's adjfine output as the drift signal (closed loop).
+        # Output-side actuation history feeds physical-drift estimator
+        # inside compute_adaptive_interval().  Long-window slope of
+        # adjfine = |D_physical|; τ = √(2·budget/D).  See
+        # schedulerCombinedDriftEstimator.
+        scheduler.record_actuation(time.monotonic(), adjfine_ppb)
         scheduler.compute_adaptive_interval()
 
         if n_epochs % 10 == 0:
@@ -9772,6 +9775,14 @@ Two-phase operation:
                        help="Minimum discipline interval (default: 1)")
     servo.add_argument("--scheduler-converge-threshold-ns", type=float, default=100.0,
                        help="Scheduler settled threshold in ns (default: 100)")
+    servo.add_argument("--phase-error-budget-ns", type=float, default=1.0,
+                       help="Hard cap (ns) on tolerable instantaneous "
+                            "phase error.  When |err| exceeds this the "
+                            "scheduler force-corrects regardless of "
+                            "interval.  Also drives the adaptive "
+                            "interval upper bound: τ = √(2·budget/"
+                            "D_physical).  Default 1.0 ns.  See "
+                            "schedulerCombinedDriftEstimator.")
     servo.add_argument("--scheduler-settle-window", type=int, default=10,
                        help="Consecutive corrections required to declare settled (default: 10)")
     servo.add_argument("--scheduler-unconverge-factor", type=float, default=5.0,

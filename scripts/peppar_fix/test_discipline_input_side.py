@@ -87,8 +87,13 @@ class InputSideEstimatorTest(unittest.TestCase):
         # σ within 20% (estimator vs true)
         self.assertAlmostEqual(s.sigma_obs_ns, true_sigma, delta=0.15)
 
-    def test_quiet_input_grows_tau(self):
-        """Pure white noise around zero → drift_rate ≈ 0 → tau = max_interval."""
+    def test_quiet_actuation_grows_tau(self):
+        """Constant adjfine (D_physical ≈ 0) → tau = max_interval.
+
+        Updated for schedulerCombinedDriftEstimator: τ is driven by
+        the output-side actuation slope now, so quietness is measured
+        from adjfine being flat, not from error history.
+        """
         s = DisciplineScheduler(base_interval=1, adaptive=True,
                                  max_interval=60, min_interval=1)
         rng = np.random.default_rng(7)
@@ -96,32 +101,37 @@ class InputSideEstimatorTest(unittest.TestCase):
         for t in range(n):
             s.accumulate(float(rng.normal(0, 0.1)), 1.0, 'TEST',
                           t_monotonic=float(t))
+            # Flat adjfine: DO holding stable, no physical drift.
+            s.record_actuation(float(t), 100.0)
             if s.n_accumulated >= 5:
                 s.flush()
         tau = s.compute_adaptive_interval()
-        # With sub-noise drift, drift_rate < 1e-6 path triggers, tau=max.
-        # Even if it doesn't quite hit < 1e-6 in this seed, tau should be
-        # heavily skewed toward max_interval given the favorable σ/drift ratio.
-        self.assertGreaterEqual(tau, 30,
-            f"quiet input should give large tau; got {tau} "
-            f"(drift={s.drift_rate_ns_per_s:.3e}, sigma={s.sigma_obs_ns:.3e})")
+        # Flat adjfine → D_physical < 1e-9 path triggers, tau=max.
+        self.assertEqual(tau, 60,
+            f"flat adjfine should give tau=max_interval; got {tau} "
+            f"(D_physical={s.d_physical_ppb_per_s:.3e})")
 
-    def test_drifting_input_shrinks_tau(self):
-        """Fast drift → short tau."""
+    def test_drifting_actuation_shrinks_tau(self):
+        """Fast adjfine drift → short tau.
+
+        Adjfine ramping at 1 ppb/s implies D_physical = 1 ppb/s.
+        With budget=1ns: τ = √(2·1/1) = √2 ≈ 1.4 → 1.
+        """
         s = DisciplineScheduler(base_interval=1, adaptive=True,
-                                 max_interval=60, min_interval=1)
-        # Drift of 100 ns/s with low noise.  Tau should be small.
+                                 max_interval=60, min_interval=1,
+                                 phase_error_budget_ns=1.0)
         rng = np.random.default_rng(11)
         n = 100
         for t in range(n):
-            e = 100.0 * t + rng.normal(0, 0.5)
-            s.accumulate(e, 1.0, 'TEST', t_monotonic=float(t))
+            s.accumulate(0.0, 1.0, 'TEST', t_monotonic=float(t))
+            # adjfine ramps at 1 ppb/s — substantial physical drift.
+            s.record_actuation(float(t), 100.0 + 1.0 * t)
             if s.n_accumulated >= 5:
                 s.flush()
         tau = s.compute_adaptive_interval()
-        self.assertLessEqual(tau, 5,
-            f"fast-drift input should give small tau; got {tau} "
-            f"(drift={s.drift_rate_ns_per_s:.3f}, sigma={s.sigma_obs_ns:.3f})")
+        self.assertLessEqual(tau, 3,
+            f"fast-drifting adjfine should give small tau; got {tau} "
+            f"(D_physical={s.d_physical_ppb_per_s:.3f} ppb/s)")
 
 
 class LegacyApiTest(unittest.TestCase):
@@ -165,9 +175,65 @@ class IntervalBoundsTest(unittest.TestCase):
         # we set max=10 to verify the cap is honored.
         for t in range(_MIN_FIT_SAMPLES + 10):
             s.accumulate(0.0, 1.0, 'TEST', t_monotonic=float(t))
+            s.record_actuation(float(t), 100.0)  # constant adjfine
             if s.n_accumulated >= 5:
                 s.flush()
         self.assertEqual(s.compute_adaptive_interval(), 10)
+
+    def test_phase_error_budget_force_corrects(self):
+        """When the last buffered error exceeds T_budget,
+        should_correct() returns True immediately."""
+        s = DisciplineScheduler(base_interval=10, adaptive=False,
+                                 phase_error_budget_ns=1.0)
+        s._converging = False  # bypass convergence latch for the test
+        # Below budget: shouldn't fire until interval reached.
+        s.accumulate(0.5, 1.0, 'TEST', t_monotonic=0.0)
+        self.assertFalse(s.should_correct())
+        # Above budget: fire immediately.
+        s.accumulate(1.5, 1.0, 'TEST', t_monotonic=1.0)
+        self.assertTrue(s.should_correct())
+
+    def test_phase_error_budget_negative_value_also_fires(self):
+        """Budget check is on |error|, not signed."""
+        s = DisciplineScheduler(base_interval=10, adaptive=False,
+                                 phase_error_budget_ns=1.0)
+        s._converging = False
+        s.accumulate(-2.0, 1.0, 'TEST', t_monotonic=0.0)
+        self.assertTrue(s.should_correct())
+
+    def test_budget_tau_formula(self):
+        """τ = √(2·T_budget/D_physical) — direct math check.
+
+        Set T_budget=2 ns, ramp adjfine at 0.5 ppb/s.
+        τ = √(2·2/0.5) = √8 ≈ 2.83 → 3.
+        """
+        s = DisciplineScheduler(base_interval=1, adaptive=True,
+                                 min_interval=1, max_interval=60,
+                                 phase_error_budget_ns=2.0)
+        for t in range(60):
+            s.accumulate(0.0, 1.0, 'TEST', t_monotonic=float(t))
+            s.record_actuation(float(t), 100.0 + 0.5 * t)
+            if s.n_accumulated >= 5:
+                s.flush()
+        tau = s.compute_adaptive_interval()
+        self.assertEqual(tau, 3,
+            f"expected τ=3 from √(2·2/0.5); got {tau} "
+            f"(D_physical={s.d_physical_ppb_per_s:.3f} ppb/s)")
+
+    def test_d_physical_recovers_slope(self):
+        """D_physical estimator recovers the ramp rate."""
+        s = DisciplineScheduler(adaptive=True)
+        for t in range(80):
+            s.record_actuation(float(t), 50.0 + 0.123 * t)
+        s.compute_adaptive_interval()  # triggers _update_d_physical
+        self.assertAlmostEqual(s.d_physical_ppb_per_s, 0.123, places=4)
+
+    def test_d_physical_bootstrap_returns_base(self):
+        """Until adjfine_history has _MIN_FIT_SAMPLES, fall back to base."""
+        s = DisciplineScheduler(base_interval=7, adaptive=True)
+        for t in range(_MIN_FIT_SAMPLES - 5):
+            s.record_actuation(float(t), 50.0 + t)  # fast ramp
+        self.assertEqual(s.compute_adaptive_interval(), 7)
 
     def test_adaptive_off_returns_base(self):
         s = DisciplineScheduler(base_interval=4, adaptive=False)
