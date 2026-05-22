@@ -7298,8 +7298,13 @@ def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
         ctx['adjfine_ppb'] = freq_ppb
         ctx['gain_scale'] = gain_scale
 
-        scheduler.update_drift_rate(time.monotonic(), freq_ppb)
-        scheduler.compute_adaptive_interval(avg_confidence)
+        # Drift estimate now lives inside compute_adaptive_interval(),
+        # which reads the scheduler's error-history (input side).  The
+        # legacy update_drift_rate(adjfine_ppb) call was removed
+        # (schedulerInputSideDriftRate) — it created a circular
+        # dependency where servo output → drift_rate → faster updates
+        # → bigger output changes.
+        scheduler.compute_adaptive_interval()
 
         if n_epochs % 10 == 0:
             log.info("  [%d] CM_TDC: err=%+.1fns (avg %d) freq=%+.1fppb "
@@ -7842,8 +7847,10 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             _dfe.update_metrics(adj_ppb=adjfine_ppb, err_ns=avg_error,
                                 interval=scheduler.interval)
 
-        scheduler.update_drift_rate(time.monotonic(), adjfine_ppb)
-        scheduler.compute_adaptive_interval(avg_confidence)
+        # Adaptive interval is now driven by the input-side error
+        # history inside compute_adaptive_interval() — no longer takes
+        # the servo's adjfine output as the drift signal (closed loop).
+        scheduler.compute_adaptive_interval()
 
         if n_epochs % 10 == 0:
             log.info(f"  [{n_epochs}] EKF: "
