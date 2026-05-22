@@ -9076,6 +9076,7 @@ def _apply_host_config(args):
         "r_calibration":    ("r_calibration",    str),
         "q_clk_step":       ("q_clk_step",       float),
         "q_clk_rate_step":  ("q_clk_rate_step",  float),
+        "perout_period_ns": ("perout_period_ns", int),
     }
 
     for toml_key, (dest, conv) in _MAP.items():
@@ -9883,6 +9884,21 @@ Two-phase operation:
                       help="SDP pin for PPS OUT (PEROUT), -1 = none")
     boot.add_argument("--pps-out-channel", type=int, default=0,
                       help="PEROUT channel for PPS OUT (default: 0)")
+    boot.add_argument("--perout-period-ns", type=int, default=None,
+                      help="PEROUT period in nanoseconds.  Default 1 Hz "
+                           "(1_000_000_000).  On i226 boards that fire PEROUT "
+                           "at BOTH half-period boundaries (a per-board bug — "
+                           "MadHat's TimeHAT v5 specimen, and an ocxo "
+                           "specimen, both confirmed 2026-05-17), set this to "
+                           "2_000_000_000.  At period=2s the buggy hardware's "
+                           "half-period firing puts the spurious edge on the "
+                           "next 1s boundary instead of at 500ms, so net "
+                           "output is 1 PPS at correct phase.  See "
+                           "docs/i226-perout-500ms-bug.md.  Default is None "
+                           "(not 1_000_000_000) so per-host TOML configs can "
+                           "override via _apply_host_config — that helper only "
+                           "applies a TOML value when the argparse default is "
+                           "still None.")
     boot.add_argument("--phc-step-threshold-ns", type=int, default=10000,
                       help="Skip phase step if error already within this (default: 10000)")
     boot.add_argument("--phc-settime-lag-ns", type=int, default=0,

@@ -292,6 +292,14 @@ def main():
                     metavar="CH",
                     help="With --enable-perout-pin: PEROUT channel "
                          "(default: 0)")
+    ap.add_argument("--perout-period-ns", type=int, default=1_000_000_000,
+                    metavar="NS",
+                    help="With --enable-perout-pin: PEROUT period.  "
+                         "Default 1 Hz (1_000_000_000).  Set "
+                         "2_000_000_000 on i226 boards that fire PEROUT "
+                         "at BOTH half-period boundaries (MadHat's "
+                         "TimeHAT v5 specimen — see "
+                         "docs/i226-perout-500ms-bug.md).")
     ap.add_argument("--no-perout-verify", action="store_true",
                     help="With --enable-perout-pin: skip TICC phase "
                          "verification + retry-on-misalignment.  Use "
@@ -336,6 +344,7 @@ def main():
             ptp,
             pin_index=args.enable_perout_pin,
             channel=args.enable_perout_channel,
+            period_ns=args.perout_period_ns,
             program_pin=True,
             ptp_dev_path=args.phc,
             verify_via_ticc_port=(None if args.no_perout_verify
