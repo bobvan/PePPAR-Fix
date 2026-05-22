@@ -135,6 +135,7 @@ def _enable_pps_out(ptp, args):
         ptp,
         pin_index=args.pps_out_pin,
         channel=args.pps_out_channel,
+        period_ns=getattr(args, 'perout_period_ns', 1_000_000_000),
         program_pin=getattr(args, 'program_pin', True),
         ptp_dev_path=getattr(args, 'ptp_dev', None),
         verify_via_ticc_port=getattr(args, 'ticc_port', None),

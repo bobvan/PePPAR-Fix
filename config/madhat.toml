@@ -146,6 +146,26 @@ arp_label = "ufo1"
 # TICC #2: chA = PEROUT (i226 PPS OUT), chB = GNSS PPS.
 ticc_port = "/dev/ticc2"
 
+# PEROUT period override for MadHat's both-halves-firing i226.
+#
+# MadHat's TimeHAT v5 specimen emits PEROUT pulses at BOTH halves of
+# every period — once at start, once at start + period/2 — regardless
+# of start_nsec.  At the default period=1_000_000_000 ns this means
+# one pulse at the second boundary (correct) plus one at +500 ms
+# (wrong, 500 ms off).  The TICC bootstrap check sometimes catches
+# the right pulse and declares "phase verified" by coincidence,
+# leaving peppar-fix to discipline against an output that's actually
+# emitting at 2 Hz with a 500-ms ambiguity.
+#
+# Workaround: set period=2_000_000_000 ns.  The hardware still fires
+# both halves, but now they land at the second boundary AND at the
+# next second boundary — both correctly phased.  Net output rate is
+# 1 PPS at correct phase.  Verified 2026-05-17 (Bravo's finding,
+# memory project_madhat_perout_both_halves_2026_05_17.md).  TimeHat
+# and most other i226 boards do not need this and should leave the
+# field at its default 1_000_000_000.
+perout_period_ns = 2_000_000_000
+
 
 # RINEX archival for I-013307 daily PRIDE pipeline.
 # Path templates {date} (UTC YYYYDDD) and {host}; {date} triggers
