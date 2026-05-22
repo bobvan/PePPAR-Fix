@@ -1216,9 +1216,14 @@ class FixedPosFilter:
     # this Q is not host-dependent.  See qClockTuning dayplan item.
     Q_CLK_DEFAULT = 0.01       # m²/s — clock-phase white noise
     Q_CLK_RATE_DEFAULT = 0.01  # m²/s³ — clock-rate white noise
+    # ZTD random-walk noise: σ_hr/√3600 = 5cm/hr → (8.33e-4 m/√s)².
+    # IGS-standard for tropo-mission filters.  For PinnedPos clock-
+    # mission use cases we can run tighter — see fixedPosFilterNoiseLocate.
+    Q_ZTD_DEFAULT = (8.33e-4) ** 2  # m²/s ≈ 6.94e-7
 
     def __init__(self, pos_ecef, init_ztd_m=0.0, init_ztd_sigma_m=0.5,
-                 r_calibration=None, q_clk_step=None, q_clk_rate_step=None):
+                 r_calibration=None, q_clk_step=None, q_clk_rate_step=None,
+                 q_ztd_step=None):
         """Fixed-position PPP filter.
 
         Args:
@@ -1249,6 +1254,14 @@ class FixedPosFilter:
                 See qClockTuning Phase A.
             q_clk_rate_step: process noise added to Q[CLK_RATE,CLK_RATE]
                 per predict in m²/s³.  Default 0.01 matches legacy.
+            q_ztd_step: process noise added to Q[ZTD,ZTD] per predict
+                in m²/s.  Default (8.33e-4)² = 6.94e-7 m²/s matches
+                IGS-standard 5 cm/hr ZTD random walk.  For pinned-
+                position clock-mission use, tightening this (e.g.
+                100× smaller) reduces ZTD-CLK cross-coupling — see
+                fixedPosFilterNoiseLocate finding that
+                |P[CLK,ZTD]|/|P[CLK,CLK]| ≈ 0.5, meaning ZTD walk
+                leaks ~50% into the clock estimate.
         """
         # Lazy import to avoid cycle (r_calibration → solve_ppp)
         from peppar_fix.r_calibration import RCalibration
@@ -1258,6 +1271,8 @@ class FixedPosFilter:
         self.q_clk_rate_step = (float(q_clk_rate_step)
                                 if q_clk_rate_step is not None
                                 else self.Q_CLK_RATE_DEFAULT)
+        self.q_ztd_step = (float(q_ztd_step) if q_ztd_step is not None
+                            else self.Q_ZTD_DEFAULT)
         self.pos = np.array(pos_ecef)
         self.x = np.zeros(self.N_STATES)     # [clock, clock_rate, dZTD, isb_gal, isb_bds] in meters
         self.x[self.IDX_ZTD] = float(init_ztd_m)
@@ -1325,8 +1340,11 @@ class FixedPosFilter:
         Q = np.zeros((self.N_STATES, self.N_STATES))
         Q[0, 0] = self.q_clk_step * dt        # phase noise (m²/s)
         Q[1, 1] = self.q_clk_rate_step * dt   # frequency noise (m²/s³)
-        # q = σ_hr / √3600 = 0.05 / 60 ≈ 8.33e-4 m/√s yields 5 cm/hr RMS.
-        Q[self.IDX_ZTD, self.IDX_ZTD] = (8.33e-4)**2 * dt  # 5 cm/hour RMS (IGS standard)
+        # q = σ_hr / √3600 = 0.05 / 60 ≈ 8.33e-4 m/√s yields 5 cm/hr RMS
+        # at the default.  Configurable via q_ztd_step constructor kwarg
+        # / --q-ztd-step CLI for ZTD-CLK coupling experiments
+        # (fixedPosFilterNoiseLocate).
+        Q[self.IDX_ZTD, self.IDX_ZTD] = self.q_ztd_step * dt
         Q[self.IDX_ISB_GAL, self.IDX_ISB_GAL] = 1e-6 * dt  # GAL ISB random walk
         Q[self.IDX_ISB_BDS, self.IDX_ISB_BDS] = 1e-6 * dt  # BDS ISB random walk
         self.P += Q

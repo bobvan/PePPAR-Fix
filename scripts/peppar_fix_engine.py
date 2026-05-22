@@ -4139,16 +4139,20 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                         r_cal_path, e)
     q_clk_step_arg = getattr(args, 'q_clk_step', None)
     q_clk_rate_step_arg = getattr(args, 'q_clk_rate_step', None)
-    if q_clk_step_arg is not None or q_clk_rate_step_arg is not None:
-        log.info("Q tuning: q_clk_step=%s q_clk_rate_step=%s",
+    q_ztd_step_arg = getattr(args, 'q_ztd_step', None)
+    if (q_clk_step_arg is not None or q_clk_rate_step_arg is not None
+            or q_ztd_step_arg is not None):
+        log.info("Q tuning: q_clk_step=%s q_clk_rate_step=%s q_ztd_step=%s",
                  q_clk_step_arg if q_clk_step_arg is not None else 'default',
-                 q_clk_rate_step_arg if q_clk_rate_step_arg is not None else 'default')
+                 q_clk_rate_step_arg if q_clk_rate_step_arg is not None else 'default',
+                 q_ztd_step_arg if q_ztd_step_arg is not None else 'default')
     filt = FixedPosFilter(known_ecef,
                           init_ztd_m=init_ztd_m,
                           init_ztd_sigma_m=init_ztd_sigma_m,
                           r_calibration=r_cal_obj,
                           q_clk_step=q_clk_step_arg,
-                          q_clk_rate_step=q_clk_rate_step_arg)
+                          q_clk_rate_step=q_clk_rate_step_arg,
+                          q_ztd_step=q_ztd_step_arg)
     filt.prev_clock = 0.0
 
     # σ_pin: time filter's uncertainty about its pinned ARP, used by
@@ -9086,6 +9090,7 @@ def _apply_host_config(args):
         "r_calibration":    ("r_calibration",    str),
         "q_clk_step":       ("q_clk_step",       float),
         "q_clk_rate_step":  ("q_clk_rate_step",  float),
+        "q_ztd_step":       ("q_ztd_step",       float),
         "perout_period_ns": ("perout_period_ns", int),
     }
 
@@ -10122,6 +10127,13 @@ Two-phase operation:
     ticc.add_argument("--q-clk-rate-step", type=float, default=None,
                       help="Process noise on x[CLK_RATE] per predict "
                            "(m²/s³).  Default 0.01 = legacy.")
+    ticc.add_argument("--q-ztd-step", type=float, default=None,
+                      help="Process noise on x[ZTD] per predict (m²/s).  "
+                           "Default 6.94e-7 = (8.33e-4)² matches 5 cm/hr "
+                           "ZTD random walk (IGS standard).  Tighten "
+                           "for pinned-position clock-mission use — the "
+                           "fixedPosFilterNoiseLocate finding showed "
+                           "ZTD walk leaks ~50% into clock estimate.")
     ticc.add_argument("--ticc-baud", type=int, default=115200,
                       help="TICC baud rate (default: 115200)")
     ticc.add_argument("--ticc-phc-channel", choices=["chA", "chB"], default="chA",
