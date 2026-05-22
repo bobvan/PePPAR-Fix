@@ -648,25 +648,103 @@ def discover_receivers(ports=None, baud_rates=None):
     return results
 
 
+# Known UBX class+id byte pairs for the messages we wait on.  Extended
+# as new callers appear.  The pair is used to validate that an incoming
+# ACK frame's 2-byte payload actually identifies the message we just
+# sent — without this, an ACK for some other UBX-CFG-* sent
+# concurrently (or a stale ACK still in the buffer from an earlier
+# timeout) could be mis-attributed.
+_UBX_CLSID_BY_NAME = {
+    ("CFG", "VALSET"): (0x06, 0x8A),
+    ("CFG", "VALDEL"): (0x06, 0x8C),
+    ("CFG", "VALGET"): (0x06, 0x8B),
+    ("CFG", "RST"):    (0x06, 0x04),
+    ("CFG", "CFG"):    (0x06, 0x09),
+}
+
+
+def _ubx_fletcher16(data: bytes) -> tuple[int, int]:
+    """UBX's Fletcher-16 checksum.  Returns (CK_A, CK_B)."""
+    a = 0
+    b = 0
+    for byte in data:
+        a = (a + byte) & 0xFF
+        b = (b + a) & 0xFF
+    return a, b
+
+
+def _parse_ubx_ack_frame(buf: bytes, start: int) -> tuple[str | None, int, int, int]:
+    """Try to parse a UBX-ACK-ACK or UBX-ACK-NAK frame at ``buf[start:]``.
+
+    Validates: 2-byte sync, ACK class (0x05), ACK/NAK id (0x01/0x00),
+    length=2, and Fletcher-16 checksum.
+
+    Returns ``(kind, payload_cls, payload_id, next_pos)`` where:
+      - ``kind`` is ``"ACK"`` for ACK-ACK, ``"NAK"`` for ACK-NAK, or
+        ``None`` if the bytes at ``start`` don't form a valid ACK frame
+      - ``payload_cls`` / ``payload_id`` are the 2 payload bytes (the
+        class+id of the message being ACK'd)
+      - ``next_pos`` is where the caller should resume scanning: one
+        past the end of the validated frame on success, ``start + 1``
+        on validation failure (skip past sync1 and keep looking), or
+        ``start`` on "not enough bytes yet" (caller should wait for
+        more data without consuming the buffer prefix)
+    """
+    # Need 10 bytes for a complete ACK frame.
+    if start + 10 > len(buf):
+        return None, 0, 0, start
+    if buf[start] != 0xB5 or buf[start + 1] != 0x62:
+        return None, 0, 0, start + 1
+    if buf[start + 2] != 0x05:
+        return None, 0, 0, start + 1
+    ubx_id = buf[start + 3]
+    if ubx_id not in (0x00, 0x01):
+        return None, 0, 0, start + 1
+    if buf[start + 4] != 0x02 or buf[start + 5] != 0x00:
+        return None, 0, 0, start + 1
+    expected_a, expected_b = _ubx_fletcher16(buf[start + 2:start + 8])
+    if expected_a != buf[start + 8] or expected_b != buf[start + 9]:
+        return None, 0, 0, start + 1
+    kind = "ACK" if ubx_id == 0x01 else "NAK"
+    return kind, buf[start + 6], buf[start + 7], start + 10
+
+
 def wait_ack(ubr, cls_name="CFG", msg_name="VALSET", timeout=3.0):
-    """Wait for UBX-ACK-ACK or UBX-ACK-NAK.
+    """Wait for UBX-ACK-ACK or UBX-ACK-NAK that ACKs the message we sent.
+
+    Validates the incoming ACK frame against three things:
+
+    1. Full UBX framing: sync bytes, class=ACK (0x05), id in {0x00, 0x01},
+       length=2, **and Fletcher-16 checksum**.  A 4-byte pattern match
+       without checksum validation can theoretically match arbitrary
+       payload bytes in observation messages; the checksum reduces the
+       false-positive probability by another factor of 65536.
+    2. **Payload class/id**: the ACK's 2-byte payload carries the
+       class+id of the message being ACK'd.  We validate it matches
+       the ``(cls_name, msg_name)`` we passed.  Without this, an ACK
+       for an unrelated UBX-CFG-* sent concurrently (or a stale ACK
+       still in the buffer from a previous wait that timed out) could
+       be mis-attributed to the current send.
+    3. ACK/NAK distinction returned as True/False.
 
     Reads raw bytes from the underlying stream to avoid the cost of
     full pyubx2 deserialization on every observation message while
     waiting for a 10-byte ACK.  Falls back to pyubx2 parsing if the
     stream doesn't expose a raw read interface.
     """
+    expected_payload = _UBX_CLSID_BY_NAME.get((cls_name, msg_name))
+    if expected_payload is None:
+        # Unknown class/msg pair — log loudly so this surfaces in CI,
+        # but accept any well-framed ACK so callers aren't blocked.
+        log.warning("wait_ack: no payload-validation mapping for %s-%s; "
+                    "accepting any well-framed ACK", cls_name, msg_name)
+
     stream = getattr(ubr, '_stream', None)
     raw_read = getattr(stream, 'read_raw', None) if stream else None
     if raw_read is None:
-        # Fallback: use pyubx2 (slower but always works)
-        return _wait_ack_parsed(ubr, cls_name, msg_name, timeout)
+        return _wait_ack_parsed(ubr, cls_name, msg_name, timeout,
+                                expected_payload)
 
-    # Scan raw bytes for ACK-ACK (b5 62 05 01) or ACK-NAK (b5 62 05 00).
-    # This bypasses pyubx2 deserialization — just a byte pattern search.
-    # os.read() on the blocking fd does the waiting; no polling or sleeping.
-    ACK_ACK = b'\xb5\x62\x05\x01'
-    ACK_NAK = b'\xb5\x62\x05\x00'
     buf = b''
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -677,19 +755,50 @@ def wait_ack(ubr, cls_name="CFG", msg_name="VALSET", timeout=3.0):
         if not chunk:
             continue
         buf += chunk
-        # Keep buffer bounded — we only need to find a 10-byte ACK
+        # Keep buffer bounded — cap at 4096 with a 1024-byte tail kept
+        # to preserve any partial ACK frame that straddles the trim.
         if len(buf) > 4096:
-            buf = buf[-256:]
-        if ACK_ACK in buf:
-            return True
-        if ACK_NAK in buf:
+            buf = buf[-1024:]
+
+        pos = 0
+        while True:
+            idx = buf.find(b'\xb5', pos)
+            if idx < 0:
+                # No more sync candidates; drop scanned bytes from buf,
+                # keep a small tail in case a sync appears next chunk.
+                buf = buf[-32:]
+                break
+            kind, p_cls, p_id, next_pos = _parse_ubx_ack_frame(buf, idx)
+            if kind is None and next_pos == idx:
+                # Not enough bytes for a full frame yet; keep tail.
+                buf = buf[idx:]
+                break
+            if kind is None:
+                pos = next_pos
+                continue
+            # Validated ACK frame.
+            if expected_payload is not None and (p_cls, p_id) != expected_payload:
+                log.debug("wait_ack: ignoring ACK-%s for unrelated "
+                          "cls=0x%02x id=0x%02x (waiting for %s-%s)",
+                          kind, p_cls, p_id, cls_name, msg_name)
+                pos = next_pos
+                continue
+            if kind == "ACK":
+                return True
             log.warning("NAK received for %s-%s", cls_name, msg_name)
             return False
     return False
 
 
-def _wait_ack_parsed(ubr, cls_name, msg_name, timeout):
-    """Fallback ACK wait using full pyubx2 parsing."""
+def _wait_ack_parsed(ubr, cls_name, msg_name, timeout,
+                     expected_payload=None):
+    """Fallback ACK wait using full pyubx2 parsing.
+
+    pyubx2 already validates UBX framing + Fletcher-16 checksum on
+    parse, so the only extra check here is the ACK's payload
+    class/id matching the ``expected_payload = (cls_byte, id_byte)``
+    tuple we passed (corresponding to ``cls_name``/``msg_name``).
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -698,11 +807,22 @@ def _wait_ack_parsed(ubr, cls_name, msg_name, timeout):
             continue
         if parsed is None:
             continue
+        if parsed.identity not in ("ACK-ACK", "ACK-NAK"):
+            continue
+        if expected_payload is not None:
+            # pyubx2 names the ACK payload fields clsID and msgID.
+            ack_cls = getattr(parsed, "clsID", None)
+            ack_id = getattr(parsed, "msgID", None)
+            if (ack_cls, ack_id) != expected_payload:
+                log.debug("wait_ack: ignoring %s for unrelated "
+                          "cls=%s id=%s (waiting for %s-%s)",
+                          parsed.identity, ack_cls, ack_id,
+                          cls_name, msg_name)
+                continue
         if parsed.identity == "ACK-ACK":
             return True
-        if parsed.identity == "ACK-NAK":
-            log.warning("NAK received for %s-%s", cls_name, msg_name)
-            return False
+        log.warning("NAK received for %s-%s", cls_name, msg_name)
+        return False
     return False
 
 
