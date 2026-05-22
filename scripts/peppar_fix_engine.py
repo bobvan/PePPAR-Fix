@@ -9884,7 +9884,7 @@ Two-phase operation:
                       help="SDP pin for PPS OUT (PEROUT), -1 = none")
     boot.add_argument("--pps-out-channel", type=int, default=0,
                       help="PEROUT channel for PPS OUT (default: 0)")
-    boot.add_argument("--perout-period-ns", type=int, default=1_000_000_000,
+    boot.add_argument("--perout-period-ns", type=int, default=None,
                       help="PEROUT period in nanoseconds.  Default 1 Hz "
                            "(1_000_000_000).  On i226 boards that fire PEROUT "
                            "at BOTH half-period boundaries (a per-board bug — "
@@ -9894,7 +9894,11 @@ Two-phase operation:
                            "half-period firing puts the spurious edge on the "
                            "next 1s boundary instead of at 500ms, so net "
                            "output is 1 PPS at correct phase.  See "
-                           "docs/i226-perout-500ms-bug.md.")
+                           "docs/i226-perout-500ms-bug.md.  Default is None "
+                           "(not 1_000_000_000) so per-host TOML configs can "
+                           "override via _apply_host_config — that helper only "
+                           "applies a TOML value when the argparse default is "
+                           "still None.")
     boot.add_argument("--phc-step-threshold-ns", type=int, default=10000,
                       help="Skip phase step if error already within this (default: 10000)")
     boot.add_argument("--phc-settime-lag-ns", type=int, default=0,

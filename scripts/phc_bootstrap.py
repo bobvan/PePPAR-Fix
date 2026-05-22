@@ -131,11 +131,16 @@ def _enable_pps_out(ptp, args):
     if args.pps_out_pin < 0:
         return
     from peppar_fix.perout_setup import setup_perout
+    # period_ns: argparse default is None so that _apply_host_config can
+    # honor the per-host TOML value (it only overrides when the argparse
+    # default is None).  Fall back to 1 Hz when neither CLI nor TOML sets
+    # it.
+    period_ns = getattr(args, 'perout_period_ns', None) or 1_000_000_000
     setup_perout(
         ptp,
         pin_index=args.pps_out_pin,
         channel=args.pps_out_channel,
-        period_ns=getattr(args, 'perout_period_ns', 1_000_000_000),
+        period_ns=period_ns,
         program_pin=getattr(args, 'program_pin', True),
         ptp_dev_path=getattr(args, 'ptp_dev', None),
         verify_via_ticc_port=getattr(args, 'ticc_port', None),

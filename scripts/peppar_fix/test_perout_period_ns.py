@@ -43,12 +43,39 @@ class SetupPeroutPassesPeriodTest(unittest.TestCase):
         return captured
 
     def test_default_period_is_1_second(self):
-        kw = self._run_enable()
+        # Argparse default is None so _apply_host_config can override.
+        # _enable_pps_out must fall back to 1 Hz when nothing's set.
+        kw = self._run_enable({"perout_period_ns": None})
         self.assertEqual(kw.get("period_ns"), 1_000_000_000)
 
     def test_period_doubling_overrides_default(self):
         kw = self._run_enable({"perout_period_ns": 2_000_000_000})
         self.assertEqual(kw.get("period_ns"), 2_000_000_000)
+
+    def test_argparse_default_is_none_so_toml_overrides_can_apply(self):
+        """The actual lab-validated bug: argparse default for
+        --perout-period-ns must be None, NOT 1_000_000_000.  Otherwise
+        _apply_host_config in peppar_fix_engine sees a non-None value
+        already on args and SKIPS the TOML override, silently leaving
+        MadHat at the buggy 1 Hz period.  Empirically caught
+        2026-05-22 when the engine bootstrap landed at chA=2.40 Hz
+        on MadHat despite madhat.toml saying 2_000_000_000."""
+        import os, ast
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        engine = os.path.join(here, "peppar_fix_engine.py")
+        # Crude but robust: find the literal "--perout-period-ns" in the
+        # source and walk forward to the default kwarg.
+        with open(engine) as f:
+            src = f.read()
+        idx = src.find('"--perout-period-ns"')
+        self.assertGreater(idx, 0, "--perout-period-ns flag not found")
+        snippet = src[idx:idx + 400]
+        # Require default=None in the same add_argument call.  If a
+        # future edit puts an int default back, this test fires.
+        self.assertIn("default=None", snippet,
+                      "--perout-period-ns must use default=None so "
+                      "_apply_host_config can override from per-host TOML; "
+                      "found instead:\n" + snippet[:200])
 
     def test_pin_disabled_skips_setup_entirely(self):
         from types import SimpleNamespace
