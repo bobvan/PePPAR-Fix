@@ -10156,7 +10156,7 @@ Two-phase operation:
                            "ZTD random walk (IGS standard).  Tighten "
                            "for pinned-position clock-mission use — the "
                            "fixedPosFilterNoiseLocate finding showed "
-                           "ZTD walk leaks ~50% into clock estimate.")
+                           "ZTD walk leaks ~50%% into clock estimate.")
     ticc.add_argument("--ticc-baud", type=int, default=115200,
                       help="TICC baud rate (default: 115200)")
     ticc.add_argument("--ticc-phc-channel", choices=["chA", "chB"], default="chA",
