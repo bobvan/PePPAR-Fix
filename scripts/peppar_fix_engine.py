@@ -9067,7 +9067,12 @@ def run(args):
         # known_ecef changes (via _apply_survey_refresh or the
         # existing NAV2 / AntPosEst blend paths).
         _arp_box = [known_ecef]
-        _survey_path = _survey_path_helper(uid, args.positions_dir)
+        # _survey_path_helper accepts positions_dir=None and falls back
+        # to the canonical state/positions/ location.  args doesn't
+        # currently define --positions-dir as a CLI flag, so getattr
+        # with default None matches the helper's contract.
+        _survey_path = _survey_path_helper(
+            uid, getattr(args, 'positions_dir', None))
         def _on_survey_slew(_refresh, _delta):
             _survey_refresh_queue.put(("slew", _refresh, _delta))
         def _on_survey_step(_refresh, _delta):
