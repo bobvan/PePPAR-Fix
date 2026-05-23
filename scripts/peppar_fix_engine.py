@@ -7803,9 +7803,21 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                 # by 1000x).  Tunable via --qerr-freq-sigma-floor for
                 # experimentation.
                 qerr_freq_sigma_ppb = max(_sigma, args.qerr_freq_sigma_floor)
+        # --no-ppp-arm: gate Arm 1 (PPP dt_rx → x[0] rx_tcxo phase) at
+        # the DOFreqEst input layer.  Distinct from --no-ppp which
+        # affects PPS+PPP correction at an earlier source-mux layer.
+        # Used by fixedPosFilterNoiseLocate's TICC-only ablation to
+        # answer: "Does FixedPosFilter actually contribute usable info
+        # to chA, or is Arm 4 (TICC+qErr) doing all the work?"
+        if getattr(args, 'no_ppp_arm', False):
+            dt_rx_ns_arg = None
+            dt_rx_sigma_arg = None
+        else:
+            dt_rx_ns_arg = dt_rx_ns
+            dt_rx_sigma_arg = dt_rx_sigma
         adjfine_ppb = -servo.update(
             dt=dt_actual,
-            dt_rx_ns=dt_rx_ns, dt_rx_sigma_ns=dt_rx_sigma,
+            dt_rx_ns=dt_rx_ns_arg, dt_rx_sigma_ns=dt_rx_sigma_arg,
             qerr_freq_ppb=qerr_freq_ppb, qerr_freq_sigma_ppb=qerr_freq_sigma_ppb,
             extint_phase_ns=extint_phase_ns,
             extint_sigma_ns=extint_sigma_ns,
@@ -9834,6 +9846,17 @@ Two-phase operation:
     servo.add_argument("--no-ppp", action="store_true",
                        help="Disable PPP carrier-phase correction "
                             "(PPS+qErr only, no PPS+PPP source)")
+    servo.add_argument("--no-ppp-arm", action="store_true",
+                       help="Disable DOFreqEst Arm 1 (PPP dt_rx → "
+                            "x[0] = rx_tcxo phase).  When set, dt_rx_ns "
+                            "is passed as None to servo.update(); the "
+                            "Kalman runs without Arm 1.  Pairs with "
+                            "--no-qerr-arm / --no-extint / --no-ticc "
+                            "for full per-arm ablation including the "
+                            "TICC-only configuration that --no-ppp "
+                            "alone does NOT achieve (--no-ppp gates a "
+                            "different source-mux layer).  See "
+                            "fixedPosFilterNoiseLocate.")
     servo.add_argument("--no-carrier", action="store_true",
                        help="Disable PPP Carrier Phase servo drive "
                             "(Carrier source disabled, PPS+PPP still available)")
