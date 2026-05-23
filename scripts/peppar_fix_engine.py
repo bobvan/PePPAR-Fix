@@ -4467,6 +4467,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                         'x2_phi_do_ns', 'x3_f_do_ppb',
                         'P00', 'P11', 'P22', 'P33',
                         'arm1_used', 'arm2_used', 'arm3_used', 'arm4_used',
+                        'arm5_used', 'tdcp_freq_ppb',
                         'dt_actual_s',
                     ])
                     _arm_f.flush()
@@ -8009,6 +8010,8 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                     1 if qerr_freq_ppb is not None else 0,
                     1 if extint_phase_ns is not None else 0,
                     1 if ticc_diff_ns is not None else 0,
+                    1 if tdcp_freq_ppb is not None else 0,
+                    f"{tdcp_freq_ppb:.6f}" if tdcp_freq_ppb is not None else "",
                     f"{dt_actual:.6f}",
                 ])
                 if _arm_f is not None:
@@ -10340,13 +10343,14 @@ Two-phase operation:
                       help="Decimation stride for --dt-rx-log.  1 = every "
                            "PPP epoch (~1 Hz, default).  0 coerced to 1.")
     ticc.add_argument("--arm-state-log", default=None,
-                      help="Optional four-arm Kalman state CSV log path.  "
+                      help="Optional five-arm Kalman state CSV log path.  "
                            "One row per servo.update() call capturing "
                            "DOFreqEst's (host_timestamp, host_monotonic, "
                            "x0_phi_rx_ns, x1_f_rx_ppb, x2_phi_do_ns, "
                            "x3_f_do_ppb, P00, P11, P22, P33, arm1_used, "
-                           "arm2_used, arm3_used, arm4_used, dt_actual_s).  "
-                           "Lets post-processing reconstruct the four-arm "
+                           "arm2_used, arm3_used, arm4_used, arm5_used, "
+                           "tdcp_freq_ppb, dt_actual_s).  "
+                           "Lets post-processing reconstruct the five-arm "
                            "fusion trajectory + per-epoch arm availability "
                            "for ablation analysis.")
     ticc.add_argument("--arm-state-log-stride", type=int, default=1,
