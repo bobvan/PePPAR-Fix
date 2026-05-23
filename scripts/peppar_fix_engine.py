@@ -4048,12 +4048,68 @@ class AntPosEstThread(threading.Thread):
 # ── Phase 2: Steady state ────────────────────────────────────────────── #
 
 
+def _apply_survey_refresh(event, known_ecef, sigma_pin_m, filt):
+    """Apply one survey-refresh event drained from the watcher queue.
+
+    Event shape (from survey_state_watcher.on_slew / on_step):
+      ("slew" | "step", SurveyRefresh, delta_3d_m: float)
+
+    Returns ``(new_known_ecef, new_sigma_pin_m, exit_code_or_None)``:
+      - On STEP: exit_code = 5 (wrapper respawn picks up the new
+        survey.toml on restart).  known_ecef and sigma_pin_m
+        unchanged — they'll be re-seeded from the file at startup.
+      - On SLEW: invoke bayesian_arp_blend; if accepted, update
+        known_ecef + sigma_pin_m + filt.pos and return them.  If the
+        3σ outlier gate rejects, leave state unchanged.  exit_code
+        is None in both SLEW outcomes.
+
+    Pure-enough to test in isolation: takes filt (mutable),
+    known_ecef, sigma_pin_m, and the event.  No globals.
+    """
+    kind, refresh, delta = event
+    if kind == "step":
+        log.warning(
+            "[SURVEY_REFRESHED] STEP — Δ=%.3fm σ_new=%.3fm "
+            "(mount_sn=%d).  Returning exit code 5 for wrapper "
+            "respawn; restarted engine will seed from the new "
+            "survey.toml.",
+            delta, refresh.new_sigma_m, refresh.new_mount_sn)
+        return known_ecef, sigma_pin_m, 5
+    if kind != "slew":
+        log.warning("[SURVEY_REFRESHED] unknown event kind %r — ignoring",
+                    kind)
+        return known_ecef, sigma_pin_m, None
+    blend = bayesian_arp_blend(
+        known_ecef, sigma_pin_m,
+        np.asarray(refresh.new_ecef, dtype=float),
+        refresh.new_sigma_m,
+    )
+    if blend.action == "applied":
+        log.info(
+            "[SURVEY_REFRESHED] SLEW applied: Δ=%.3fm α=%.3f "
+            "step=%.1fmm σ_pin %.3f→%.3f m (σ_src=%.3fm)",
+            blend.delta_3d_m, blend.alpha_eff,
+            blend.step_3d_m * 1000,
+            sigma_pin_m, blend.sigma_pin_new_m,
+            refresh.new_sigma_m)
+        filt.pos = np.array(blend.arp_new)
+        return blend.arp_new, blend.sigma_pin_new_m, None
+    log.warning(
+        "[SURVEY_REFRESHED] SLEW rejected by 3σ outlier gate: "
+        "Δ=%.3fm > gate=%.3fm (σ_pin=%.3f σ_src=%.3f) — "
+        "keeping current ARP",
+        blend.delta_3d_m, blend.gate_3sigma_m,
+        sigma_pin_m, refresh.new_sigma_m)
+    return known_ecef, sigma_pin_m, None
+
+
 def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                      stop_event, qerr_store=None, out_w=None, nav2_store=None,
                      ape_sm=None, dfe_sm=None, ape_thread=None,
                      ar_position=None, ar_pos_lock=None,
                      extint_store=None,
-                     pos_sigma_m=None, pos_source=None):
+                     pos_sigma_m=None, pos_source=None,
+                     survey_refresh_queue=None, arp_box=None):
     """Run FixedPosFilter for clock estimation with optional servo.
 
     This is the steady-state phase: position is known, we estimate clock
@@ -4766,6 +4822,28 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 skip_stats["too_few_meas"] += 1
                 continue
 
+            # Drain any pending survey-refresh events from the
+            # watcher thread before doing the normal NAV2/AntPosEst
+            # blend below.  STEP events return 5 to trigger a wrapper
+            # respawn; SLEW events update known_ecef / sigma_pin_m /
+            # filt.pos via bayesian_arp_blend (same 3σ outlier gate
+            # the live-source blends use).  See PR #57 +
+            # survey_state_watcher.
+            if survey_refresh_queue is not None:
+                import queue as _queue_mod
+                try:
+                    while True:
+                        event = survey_refresh_queue.get_nowait()
+                        (known_ecef, sigma_pin_m,
+                         exit_code) = _apply_survey_refresh(
+                            event, known_ecef, sigma_pin_m, filt)
+                        if arp_box is not None:
+                            arp_box[0] = known_ecef
+                        if exit_code is not None:
+                            return exit_code
+                except _queue_mod.Empty:
+                    pass
+
             # Blend a refined position estimate into FixedPosFilter's ARP.
             #
             # --ar-mode wl (production default):
@@ -4839,6 +4917,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                             known_ecef = blend.arp_new
                             filt.pos = np.array(known_ecef)
                             sigma_pin_m = blend.sigma_pin_new_m
+                            if arp_box is not None:
+                                arp_box[0] = known_ecef
                             consecutive_blend_rejects = 0
                             if (n_epochs % 100 == 0
                                     and blend.delta_3d_m > 0.01):
@@ -4900,6 +4980,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                         step = alpha * delta
                         known_ecef += step
                         filt.pos = np.array(known_ecef)
+                        if arp_box is not None:
+                            arp_box[0] = known_ecef
                         step_mm = float(np.linalg.norm(step)) * 1000
                         if n_epochs % 100 == 0 and delta_3d > 0.01:
                             log.info("Position blend: Δ=%.2fm step=%.1fmm "
@@ -8949,6 +9031,42 @@ def run(args):
                 getattr(args, 'nav_sig_max_age_s', 2.0))
             ape_thread.start()
 
+        # Spawn the survey-refresh watcher.  It polls
+        # state/positions/<uid>.survey.toml for mtime changes; on a
+        # refresh it queues a slew or step event keyed on |Δ_3d| vs
+        # the current in-memory ARP.  The main loop in
+        # run_steady_state drains the queue at the existing blend
+        # call site.  See scripts/peppar_fix/survey_state_watcher.py
+        # for the detector + scope rationale.
+        import queue as _queue_mod
+        from peppar_fix import survey_state_watcher as _sw
+        from peppar_fix.position_state import (
+            _survey_path as _survey_path_helper,
+        )
+        _survey_refresh_queue = _queue_mod.Queue()
+        # Mutable container the watcher thread reads to get the
+        # engine's current ARP; main loop updates it whenever
+        # known_ecef changes (via _apply_survey_refresh or the
+        # existing NAV2 / AntPosEst blend paths).
+        _arp_box = [known_ecef]
+        _survey_path = _survey_path_helper(uid, args.positions_dir)
+        def _on_survey_slew(_refresh, _delta):
+            _survey_refresh_queue.put(("slew", _refresh, _delta))
+        def _on_survey_step(_refresh, _delta):
+            _survey_refresh_queue.put(("step", _refresh, _delta))
+        _survey_watcher_thread = threading.Thread(
+            target=_sw.watch_loop,
+            args=(_survey_path, lambda: _arp_box[0],
+                  _on_survey_slew, _on_survey_step),
+            kwargs=dict(stop_fn=stop_event.is_set),
+            daemon=True,
+            name="survey-watcher",
+        )
+        _survey_watcher_thread.start()
+        log.info("survey-watcher started on %s (poll %.0fs, slew Δ < %.2fm)",
+                 _survey_path, _sw.DEFAULT_POLL_INTERVAL_S,
+                 _sw.DEFAULT_SLEW_THRESHOLD_M)
+
         # Phase 2: Steady state.  On exit code 5 (catastrophic-reject
         # cascade or PHC divergence) the engine returns to the wrapper,
         # which relaunches a fresh process — that path correctly
@@ -8978,6 +9096,8 @@ def run(args):
             extint_store=extint_store,
             pos_sigma_m=pos_sigma_m,
             pos_source=pos_source,
+            survey_refresh_queue=_survey_refresh_queue,
+            arp_box=_arp_box,
         )
         # run_steady_state returns an int exit code on error
         # (e.g. 5 for catastrophic-reject cascade) or a gate_stats
