@@ -8622,6 +8622,12 @@ def run(args):
     if rinex_writer_obj is not None:
         log.info(f"RINEX OBS writer: {args.rinex_out}")
         serial_kwargs['rinex_writer'] = rinex_writer_obj
+    # Optional raw UBX byte-stream capture (--ubx-out).  Append-binary so
+    # an engine restart appends to the same file rather than truncating.
+    if getattr(args, 'ubx_out', None):
+        ubx_log_file = open(args.ubx_out, 'ab')
+        log.info(f"Raw UBX capture → {args.ubx_out}")
+        serial_kwargs['ubx_log_file'] = ubx_log_file
     t_serial = threading.Thread(
         target=serial_reader,
         args=(args.serial, args.baud, obs_queue, stop_event, beph, systems, ssr),
@@ -10315,6 +10321,16 @@ Two-phase operation:
                           "rate; only the writer skips epochs).  Standard "
                           "PRIDE / RTKLIB input rate is 30 s.  Default: no "
                           "decimation — every engine epoch written.")
+    out.add_argument("--ubx-out", default=None,
+                     help="Optional path to write the raw UBX byte stream "
+                          "from the F9T (pre-parse, append-binary) for "
+                          "offline replay through UBX-aware tools "
+                          "(prototypes/tdcp_proto.py, "
+                          "tools/log_observations.py-style readers).  "
+                          "Captures every UBX frame the engine sees, "
+                          "including ones pyubx2 can't decode.  ~2 KB/s "
+                          "= ~170 MB/day at 1 Hz — sized for an "
+                          "overnight on the lab SSDs.")
     out.add_argument("--duration", type=int, default=None,
                      help="Run duration in seconds (0 = unlimited)")
     out.add_argument("--gate-stats", help="Optional JSON output for strict sink gate statistics")
