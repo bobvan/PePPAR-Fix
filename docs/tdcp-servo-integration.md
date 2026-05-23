@@ -30,57 +30,111 @@ Existing arms (after 2026-05-22 overnight tuning):
   z_ticc    :  observes  −x[0]·∂qerr/∂x − x[2]      σ ~ 60 ps
 
 New arm (this doc):
-  z_tdcp    :  observes  x[1]                       σ ~ 0.015 ppb
+  z_tdcp    :  observes  x[1]                       σ ~ 0.026 ppb
 ```
 
 ## Why this slots in cleanly as Arm 5
 
 The prototype's measured TDEV(1s) ≈ 15 ps is the σ of the
-ensemble-derived **phase** signal at τ = 1 s.  Converting:
+ensemble-derived **phase** at τ = 1 s.  To use it as Arm 5's
+R-matrix entry we need σ_y, the fractional-frequency noise.  For
+white-FM-dominated noise (the regime TDCP measures on F9T data):
 
-  σ_x1 = TDEV(1s) / τ = 15e-12 s / 1 s = **1.5e-11 = 0.015 ppb**.
+  TDEV(τ) ≈ σ_y · √(τ / 3)   ⇒   σ_y = TDEV(τ) · √(3 / τ)
 
-That's the measurement-noise floor of TDCP's observation of `x[1]`.
-qErr today sits at "sub-ppb" — call it 0.3 ppb effective σ after the
-time-averaging window.  So z_tdcp is ~20× more precise than z_qerr
-**on the same state**.
+  At τ = 1 s:  σ_y = 15e-12 · √3 ≈ **2.6e-11 ≈ 0.026 ppb**
+
+(An earlier draft used the MDEV/τ ratio of 0.015 ppb, missing the
+√3 noise-model factor.  Fixed; the headline survives at a
+12–15× ratio against qErr.)
+
+qErr today sits at "sub-ppb" — call it 0.3 ppb effective σ after
+the time-averaging window.  So z_tdcp is **~12× more precise than
+z_qerr on the same state**.
 
 When two arms observe the same state with different R values, the
 Kalman fusion gives an optimal-weighted estimate.  K-gain for the
 sharper arm dominates.  No design choice required at integration
-time — the math sorts it out.  This is exactly the competition Bob
-asked for, and we can read the scoreboard directly:
+time — the math sorts it out.  This is exactly the competition
+Bob asked for, and we can read the scoreboard directly:
 
-  * Log K_5[1] vs K_2[1] per epoch.  Ratio ≫ 1 means TDCP carries it.
-  * Run `--no-arm-5` to ablate and re-measure chA TDEV.
+  * Log K_5[1] vs K_2[1] per epoch.  Ratio ≫ 1 ⇒ TDCP carries it.
+  * Run `--no-tdcp-arm` to ablate and re-measure chA TDEV.
   * Differential analysis: does adding Arm 5 change chA TDEV(τ)?
     By how much?  At which τ?  That's the answer.
 
+(For the per-SV-σ-from-MAD path — 4.2 mm = 14 ps per SV, ensemble
+σ = 14 / √16 = 3.5 ps — that's the *estimator's* noise floor, well
+below the 15 ps the prototype actually observed.  The 15 ps is real
+rx-TCXO motion on top.  The right number to feed R is therefore
+the observed TDEV converted via the formula above, not the
+estimator floor.)
+
 ## What TDCP is NOT measuring (Charlie's reframe)
 
-**15 ps is the F9T rx-TCXO's own motion as seen through carrier
-phase.**  It is **not** a disciplined-DO output target.  In the
-CLAUDE.md "two oscillators bound the result" framing, this is the
-**RX TCXO measurement-chain ceiling** — the second of the two
-limits, the one that bounds how cleanly we can characterize GPS
-time from the receiver's perspective.
+**The 15 ps frequency-observation σ_x1 and the 79 ps chA TDEV are
+different physical quantities.**  15 ps is TDCP's measurement
+noise on `x[1]` (rx-TCXO frequency, expressed as the equivalent
+τ = 1 s phase deviation).  79 ps is the phase TDEV of the
+disciplined DO output as measured on TICC chA.  The latter is what
+downstream users see; the former is what TDCP improves as an
+observation of one of the model's internal states.
 
-The disciplined OCXO output (chA TDEV via TICC) sits *below* 15 ps
-on PiFace + clkPoC3 today (79–84 ps was the 2026-05-22 night result,
-and OCXO freerun is ~85 ps).  Wait — 79 ps is *less* than 15 ps?
-No: 79 ps is the **DO PPS** measured through TICC; 15 ps is the
-**rx-TCXO frequency observation noise** at 1 s.  Different units and
-different physical signals.  Future readers should not anchor chA
-expectations to "15 ps".
+In the CLAUDE.md "two oscillators bound the result" framing, the
+15 ps is the **RX TCXO measurement-chain ceiling** — the second of
+the two limits, the one bounding how cleanly we can observe GPS
+time from the receiver's perspective.  It is **not** a
+disciplined-DO output target.  Future readers should not anchor
+chA expectations to "15 ps".
 
 What TDCP buys us is **cleaner observation of x[1]**.  Whether
-that translates to chA improvement depends on whether x[1] is on the
-critical path for chA.  Today (after main's overnight) x[2] (DO
-phase via TICC) carries the chA discipline directly.  TDCP enters
-through x[1] which influences x[3] (DO frequency) through the
-prediction model, and x[3] sets adjfine.  So TDCP's improvement
-propagates to chA through one prediction step.  Validation
-measures the size of that propagation.
+that translates to chA improvement depends on whether x[1] is on
+the critical path for chA today.  After main's 2026-05-22 finding,
+chA discipline is carried by Arm 4 (TICC chA-chB + qErr) which
+observes a function of `x[0]` and `x[2]`.  TDCP enters through
+`x[1]` — see the next section for the propagation path.
+
+## How an x[1] observation reaches x[3] / adjfine
+
+The DOFreqEst predict step couples states over time:
+
+```
+x[0]_{k+1} = x[0]_k + x[1]_k · Δt + w_phase     (rx-TCXO phase ← integrates freq)
+x[1]_{k+1} = x[1]_k             + w_freq        (rx-TCXO freq, RW with Q_clk_rate)
+x[2]_{k+1} = x[2]_k + x[3]_k · Δt + w_do_phase  (DO phase ← integrates DO freq)
+x[3]_{k+1} = x[3]_k             + w_do_freq     (DO freq, RW with Q_do_rate)
+```
+
+The measurement model of Arm 4 (TICC chA-chB + qErr) couples
+`x[0]` and `x[2]` in a single innovation: `z_ticc ≈ −x[0]·∂qerr/∂x
+− x[2]`.  Adjfine reads `x[3]`.
+
+The chain by which Arm 5's tightening of `x[1]` propagates to
+`x[3]`:
+
+1. **Predict step**: tighter posterior on `x[1]` ⇒ tighter
+   predicted `x[0]` at the next step (because `x[0]_{k+1}` depends
+   on `x[1]_k`).
+2. **Arm 4 update**: the next z_ticc arrives.  Its innovation is
+   processed against the (now tighter) prior in `x[0]`.  The
+   Kalman gain `K_4 = P H^T (HPH^T + R_ticc)^{-1}` reads the
+   off-diagonal `P[3, 2]` and `P[3, 0]` covariances — tighter
+   `x[0]` prior implies the actual TICC innovation is attributed
+   more cleanly to `x[2]` and (through `P[3, 2]`) to `x[3]`.
+3. **Adjfine**: LQR reads the updated `x[3]`.
+
+Two-step indirect path, gated on Q's process-noise injection
+between epochs.  The expected size of the improvement at chA is
+not large in magnitude on top of today's TICC-only floor (79 ps);
+the value is in (a) headroom for better-than-OCXO DOs, (b)
+robustness when TICC degrades and Arm 4 has to lean harder on
+priors, and (c) cleaner `x[1]` for downstream consumers (e.g.,
+the slow-loop / drift-trim path).
+
+Phase B validation measures the size of (a)+(b) in practice.  If
+it turns out chA TDEV is indistinguishable from TICC-only at all
+τ we care about — Arm 5 still earns its keep through (c) and as
+free instrumentation of the rx-TCXO behavior.
 
 ## Architecture choice — three options considered
 
@@ -97,7 +151,7 @@ Pros:
 - Natural fallback: TDCP arm degrades (sky-loss, slip storm) →
   Kalman down-weights it via innovation-based R-rcal → smoothly
   reverts to qErr.
-- Each arm independently gateable: `--no-arm-5` (and `--no-qerr-arm`
+- Each arm independently gateable: `--no-tdcp-arm` (and `--no-qerr-arm`
   / `--no-extint` / `--no-ticc` already exist) lets ablation match
   main's 2026-05-22 methodology one-for-one.
 
@@ -206,8 +260,14 @@ write-side wiring lands:
 - 1-hour live capture on TimeHat + PiFace (both have TICC + good
   antenna access), `--ubx-out` enabled.
 - Run Phase A estimator offline against both captures.  TDEV(1s)
-  must be ≤ 25 ps on each host (1.5× headroom over the prototype's
-  15 ps).
+  must be ≤ 25 ps on each host.  Headroom rationale: the prototype
+  hit 15 ps on one TimeHat capture from a single day; cross-host
+  rx-TCXO variation across F9T units + multipath / ionosphere /
+  time-of-day differences can plausibly add a few ps; 25 ps
+  (~1.67× the prototype) is a generous bar that still keeps us
+  well under qErr's 0.3 ppb on the same state.  If both hosts
+  land within ~5 ps of the prototype, tighten the bar in
+  Phase B's validation.
 - Cross-host pair-excursion: PiFace ↔ TimeHat differential
   rx_TCXO frequency must agree to ≤ 1 ns at 95% over 1 hour.
   This is the moonshot's per-pair short-tau bound and is the
@@ -217,18 +277,60 @@ If either bound fails, debug Phase A before Phase B.
 
 ### Phase B — actuator wiring (Arm 5 of DOFreqEst)
 
-- Add z_tdcp arm to `do_freq_est.py`.  Initial R sized
-  conservatively at σ = 0.05 ppb (3× the prototype floor).
+- Add z_tdcp arm to `do_freq_est.py`.  Initial R sized at
+  σ = 0.13 ppb (~5× the prototype floor σ_y ≈ 0.026 ppb).
+  Conservative starting value lets innov-rcal tighten from there
+  with low risk of contaminating `x[1]` before adaptation kicks
+  in.  Cost of "too loose" is slower adaptation; cost of "too
+  tight" is contamination — asymmetric.
 - `--servo-input tdcp` opt-in.  When set, Arm 5 is enabled; when
   unset, the engine behaves exactly as today.
-- `--no-arm-5` kill switch (parallel to `--no-qerr-arm`).
+- `--no-tdcp-arm` kill switch (parallel to `--no-qerr-arm`).
 - L2 innovation gate.
-- Validation: chA TDEV(τ) regression on PiFace.  Must not degrade
-  the 79 ps freerun-floor result from 2026-05-22.
-- A/B: 30-min runs with and without Arm 5 enabled, plot TDEV(τ).
-  Expected outcome: small improvement at sub-1 s τ where x[1]
-  precision propagates to x[3]; no change at τ ≫ servo time
-  constant.
+
+#### Phase B default-config recommendation
+
+Main raised this explicitly in PR #59: with Arm 5 added, what are
+the *other* arms during the Phase B opt-in window?  Three options:
+
+  (a) **All 5 arms enabled** (additive Arm 5 on top of today's
+      Arm 1+2+3+4).  Maximum K-gain-scoreboard signal between
+      Arm 2 (qErr) and Arm 5 (TDCP); but Arm 1 is the proven
+      noise source from 2026-05-22, and adding Arm 5 on top of a
+      contaminated baseline confounds the validation.
+  (b) **Match yesterday's TICC-only operational config + Arm 5**:
+      `--no-ppp-arm --no-qerr-arm --no-extint` + new Arm 5.
+      Cleanest A/B against the proven-good 79 ps freerun-floor
+      baseline.  But Arm 5 is the *only* x[1] observation in this
+      config — we lose the Arm-2-vs-Arm-5 competition.
+  (c) **TICC-only + Arm 2 (qErr) + Arm 5**: keep Arm 2 enabled
+      so we get the Arm-2-vs-Arm-5 K-gain comparison, drop the
+      proven-noise Arm 1 and the no-value-add Arm 3.  This is
+      the cleanest "competition" config and the cleanest A/B
+      against TICC-only.
+
+**Recommendation: (c)**.  Phase B default startup:
+
+  `--no-ppp-arm --no-extint --servo-input tdcp`
+
+This keeps Arm 4 (TICC) as the proven primary discipline path,
+keeps Arm 2 (qErr) so it can compete with Arm 5 on `x[1]`, and
+drops Arm 1 (proven contaminator) + Arm 3 (no chA value-add per
+2026-05-22 ablation).  Validation A/B: this config vs today's
+`--no-ppp-arm --no-qerr-arm --no-extint` (TICC-only).  Difference
+isolates Arm 5's contribution.
+
+#### Phase B validation
+
+- chA TDEV(τ) regression on PiFace.  Must not degrade the 79 ps
+  freerun-floor result from 2026-05-22.
+- A/B: 30-min runs with and without `--servo-input tdcp`, plot
+  TDEV(τ).  Predicted improvement is modest at chA (the
+  propagation path through `x[1] → x[3]` is two-step; main
+  effect is headroom + robustness, not a big chA TDEV delta at
+  the OCXO floor we already hit).
+- K-gain log: `K_5[1]` vs `K_2[1]` per epoch confirms Arm 5
+  carries the `x[1]` competition.
 
 ### Phase C — production polish
 
@@ -243,10 +345,11 @@ If either bound fails, debug Phase A before Phase B.
 
 - **Calibration bias in TDCP**.  If TDCP carries a constant
   frequency bias (e.g., from a wrong wavelength constant or sat
-  ephemeris drift), it would push x[1] by that bias.  Arm 5
+  ephemeris drift), it would push `x[1]` by that bias.  Arm 5
   innovation-based R-rcal catches this within a few minutes
-  (`projet/.../r_calibration` infrastructure already exists);
-  worst case the user runs `--no-arm-5` to revert.
+  (`scripts/peppar_fix/r_calibration.py` +
+  `scripts/peppar_fix/fit_r_calibration.py` infrastructure already
+  exists); worst case the user runs `--no-tdcp-arm` to revert.
 
 - **Slip storm**.  If L1+L2 both miss a co-slip, the actuator gets
   a frequency punch.  L3 (rate limit) caps the worst-case damage
@@ -254,18 +357,27 @@ If either bound fails, debug Phase A before Phase B.
   next-epoch when L1's GF/IF detectors catch up.
 
 - **All-SV dropout**.  Arm 5 produces no measurement; DOFreqEst
-  predicts forward on x[1] using the existing process model.
-  Same coast behavior as today minus one observation.  qErr arm
-  (Arm 2) keeps pulling.
+  predicts forward on `x[1]` using the existing random-walk
+  process model (`Q_clk_rate` injects per-epoch process noise so
+  `P[1,1]` grows unboundedly during a sustained outage).  As
+  `P[1,1]` grows, `K_2[1]` (qErr's gain on `x[1]`) auto-increases
+  to fill the gap — smooth fallback to qErr-only behavior for
+  `x[1]`, no special handling required.  Same coast behavior as
+  today on the other states.
 
-- **Hard rollback**.  `--no-arm-5` reverts to today's exact
+- **Hard rollback**.  `--no-tdcp-arm` reverts to today's exact
   behavior.  Adding the flag is part of Phase B; verify it works
   via integration test.
 
 ## Open questions for review
 
-1. **R-matrix sizing**.  Plan: start at 3× prototype floor
-   (0.05 ppb) and innov-rcal from there.  Concerns?
+1. **R-matrix sizing**.  Plan: start at **5× prototype σ_y floor**
+   (0.13 ppb starting σ; up from the original 3×/0.05 ppb after
+   charlie's review note that "too tight before innov-rcal kicks
+   in" has asymmetric cost vs "too loose").  Innov-rcal tightens
+   from there.  Open: is 5× enough headroom for cross-host F9T
+   variation, or should it be 10× (0.26 ppb starting σ)?  Will
+   measure host-to-host variation in the validation gate.
 2. **Default opt-in vs opt-out**.  Charlie + main both say
    opt-in.  Agreed; flip after 1 week of all-host clean runs.
 3. **Cross-host calibration**.  Different F9T units may have
