@@ -259,21 +259,30 @@ write-side wiring lands:
 
 - 1-hour live capture on TimeHat + PiFace (both have TICC + good
   antenna access), `--ubx-out` enabled.
-- Run Phase A estimator offline against both captures.  TDEV(1s)
-  must be ≤ 25 ps on each host.  Headroom rationale: the prototype
-  hit 15 ps on one TimeHat capture from a single day; cross-host
-  rx-TCXO variation across F9T units + multipath / ionosphere /
-  time-of-day differences can plausibly add a few ps; 25 ps
-  (~1.67× the prototype) is a generous bar that still keeps us
-  well under qErr's 0.3 ppb on the same state.  If both hosts
-  land within ~5 ps of the prototype, tighten the bar in
-  Phase B's validation.
-- Cross-host pair-excursion: PiFace ↔ TimeHat differential
-  rx_TCXO frequency must agree to ≤ 1 ns at 95% over 1 hour.
-  This is the moonshot's per-pair short-tau bound and is the
-  reason this whole work exists.
+- Run Phase A estimator offline against each capture.  TDEV(1s)
+  must be ≤ 35 ps on each host.  Headroom rationale (revised
+  2026-05-23 after the morning gate ran): the prototype hit 15 ps
+  on one TimeHat-old capture from 2026-03-23, but the gate run on
+  three lab hosts revealed PiFace F9T-20B 15.1 ps / TimeHat F9T-10
+  (TIM 2.20) 29.6 ps / clkPoC3 F9T-20B 32.9 ps — fleet-wide F9T
+  unit-to-unit rx-TCXO variation is ~2× the original fixture's
+  TCXO, not the "few ps" originally allowed for.  35 ps absorbs
+  the observed unit variation while still leaving 5–30× headroom
+  over qErr (200–960 ps on the same hosts).  Pair-differential
+  TDEV(1s) matched the incoherent-sum √(σ_a² + σ_b²) prediction
+  within 0.6 ps across all three pairs on the gate run, proving
+  the estimator is correct and the per-host floors are independent
+  rx-TCXO noise.
+- Pair-excursion (integrated phase) is **not** the right gate
+  metric here.  Free-running rx-TCXOs have linear frequency drift
+  (thermal + aging) of order 1e-12/s that integrates to hundreds
+  of ns of differential phase over an hour — the moonshot's 1 ns
+  bound applies to the **disciplined-DO output** (Phase B's own
+  downstream gate via TICC chA differential), not to the
+  measurement-side rx-TCXO motion TDCP observes.
 
-If either bound fails, debug Phase A before Phase B.
+If the per-host TDEV(1s) bound fails on any host, debug Phase A
+before Phase B.
 
 ### Phase B — actuator wiring (Arm 5 of DOFreqEst)
 

@@ -4211,16 +4211,30 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                           q_ztd_step=q_ztd_step_arg)
     filt.prev_clock = 0.0
 
-    # Optional read-only TDCP estimator (--print-tdcp).  Runs alongside
-    # the FixedPosFilter, observing the same per-epoch obs dicts, but
-    # does not steer the servo.  Phase A scaffold for the architecture
-    # in docs/tdcp-servo-integration.md; Phase B wires the output into
-    # DOFreqEst as Arm 5.
+    # TDCP estimator — runs alongside the FixedPosFilter on the same
+    # per-epoch obs dicts.  Active when --print-tdcp is on (Phase A
+    # diagnostic) OR when Arm 5 is selected (Phase B servo input).
+    # See docs/tdcp-servo-integration.md.
+    tdcp_arm5_active = (getattr(args, 'servo_input', 'default') == 'tdcp'
+                        and not getattr(args, 'no_tdcp_arm', False))
     tdcp_est = None
-    if getattr(args, 'print_tdcp', False):
+    tdcp_gate = None
+    if getattr(args, 'print_tdcp', False) or tdcp_arm5_active:
         from peppar_fix.tdcp_estimator import TdcpEstimator
         tdcp_est = TdcpEstimator(beph, known_ecef)
-        log.info("TDCP estimator running read-only (--print-tdcp)")
+        if tdcp_arm5_active:
+            from peppar_fix.tdcp_innov_gate import TdcpInnovGate
+            tdcp_gate = TdcpInnovGate(
+                window=int(getattr(args, 'tdcp_gate_window', 30)),
+                n_sigma=float(getattr(args, 'tdcp_gate_nsigma', 5.0)),
+            )
+            log.info("TDCP estimator active: Arm 5 servo input "
+                     "(σ=%.3f ppb, L2 gate window=%d N=%.1f)",
+                     float(getattr(args, 'tdcp_sigma_ppb', 0.13)),
+                     int(getattr(args, 'tdcp_gate_window', 30)),
+                     float(getattr(args, 'tdcp_gate_nsigma', 5.0)))
+        else:
+            log.info("TDCP estimator running read-only (--print-tdcp)")
 
     # σ_pin: time filter's uncertainty about its pinned ARP, used by
     # the σ-weighted Bayesian position-blend (I-125649 Stage 2/3).
@@ -4753,10 +4767,12 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             skip_stats["obs_dropped_expired"] += dropped_obs
             gps_time, observations = obs_event
 
-            # Read-only TDCP estimate (--print-tdcp).  Runs before the
-            # FixedPosFilter update so the [TDCP] line lines up with
-            # the same gps_time/obs the filter is about to see.  Does
-            # not steer the servo — Phase A scaffold only.
+            # TDCP estimate (--print-tdcp diagnostic OR Arm 5 servo
+            # input).  Runs before the FixedPosFilter update so the
+            # [TDCP] line lines up with the same gps_time/obs the
+            # filter is about to see.  When Arm 5 is active, gate-
+            # approved observations are stashed in servo_ctx for the
+            # next servo.update() call to consume.
             if tdcp_est is not None:
                 tdcp_r = tdcp_est.update(observations, gps_time)
                 log.info(
@@ -4764,6 +4780,24 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     tdcp_r.n_used, tdcp_r.n_total, tdcp_r.c_dt_rx_m,
                     tdcp_r.df_f, tdcp_r.mad_r_m, tdcp_r.dt_s,
                 )
+                if tdcp_arm5_active and servo_ctx is not None \
+                        and not math.isnan(tdcp_r.df_f):
+                    # df_f is dimensionless (Δdt_rx / Δt); ppb = 1e9.
+                    tdcp_freq_ppb = float(tdcp_r.df_f) * 1e9
+                    g = tdcp_gate.evaluate(tdcp_freq_ppb)
+                    if g.accepted:
+                        servo_ctx['tdcp_latest'] = (
+                            tdcp_freq_ppb,
+                            servo_ctx['tdcp_sigma_ppb'],
+                            time.monotonic(),
+                        )
+                    else:
+                        log.warning(
+                            "[TDCP] L2 gate rejected obs: freq=%.4f ppb "
+                            "median=%.4f σ=%.4f dev=%.1fσ — "
+                            "likely multi-SV co-slip; arm 5 skipped this epoch",
+                            tdcp_freq_ppb, g.median, g.sigma, g.deviation,
+                        )
 
             # After a PHC step, the filter's clock state is stale.
             # Reset dt_rx to near-zero so the servo doesn't over-correct.
@@ -7166,6 +7200,15 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             'exited': 0,
             'reasons': {},
         },
+        # Arm 5 (TDCP): latest gate-approved freq observation, ready to
+        # consume at next servo.update().  Set by the TDCP per-epoch
+        # hook; cleared by the servo loop after consumption.  None when
+        # Arm 5 is off or no fresh observation is available.
+        'tdcp_latest': None,
+        # Arm 5 supporting refs (None when Arm 5 off):
+        'tdcp_est': None,
+        'tdcp_gate': None,
+        'tdcp_sigma_ppb': float(getattr(args, 'tdcp_sigma_ppb', 0.13)),
     }
 
     # ── Optional noise-buffer CSV (I-162848 Step 1) ───────────────── #
@@ -7920,10 +7963,29 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         else:
             dt_rx_ns_arg = dt_rx_ns
             dt_rx_sigma_arg = dt_rx_sigma
+        # ── Arm 5: TDCP ensemble frequency (consume + clear) ────────
+        # Latest gate-approved observation is stashed by the obs loop
+        # at observation rate (1 Hz typically).  Consume at most once
+        # per servo epoch; clear so a stale observation isn't reused
+        # if the next servo epoch beats the next obs.  Staleness cap
+        # at 2 × dt_actual: anything older than two servo intervals
+        # is too stale to inform the current x[1] update.
+        tdcp_freq_ppb = None
+        tdcp_freq_sigma_ppb = None
+        if not getattr(args, 'no_tdcp_arm', False):
+            _td = ctx.get('tdcp_latest')
+            if _td is not None:
+                _td_freq, _td_sigma, _td_mono = _td
+                if (now_mono - _td_mono) <= max(2.0 * dt_actual, 2.0):
+                    tdcp_freq_ppb = _td_freq
+                    tdcp_freq_sigma_ppb = _td_sigma
+                ctx['tdcp_latest'] = None  # consume-and-clear
         adjfine_ppb = -servo.update(
             dt=dt_actual,
             dt_rx_ns=dt_rx_ns_arg, dt_rx_sigma_ns=dt_rx_sigma_arg,
             qerr_freq_ppb=qerr_freq_ppb, qerr_freq_sigma_ppb=qerr_freq_sigma_ppb,
+            tdcp_freq_ppb=tdcp_freq_ppb,
+            tdcp_freq_sigma_ppb=tdcp_freq_sigma_ppb,
             extint_phase_ns=extint_phase_ns,
             extint_sigma_ns=extint_sigma_ns,
             ticc_diff_ns=ticc_diff_ns,
@@ -10045,6 +10107,43 @@ Two-phase operation:
                             "fed to the servo.  Used for ablation runs "
                             "comparing TIM-TM2-only against TICC+TIM-TM2 "
                             "performance.")
+    servo.add_argument("--servo-input", choices=("default", "tdcp"),
+                       default="default",
+                       help="Servo-input mode.  'default' = today's 4-arm "
+                            "DOFreqEst (PPP/qErr/EXTINT/TICC).  'tdcp' = "
+                            "enable Arm 5 (TDCP ensemble fractional-"
+                            "frequency observation of x[1] from carrier-"
+                            "phase deltas).  Arm 5 has σ ~0.026 ppb vs "
+                            "qErr's ~0.3 ppb on the same state, so the "
+                            "Kalman fusion lets it dominate x[1] when "
+                            "both arms are present.  Phase B of "
+                            "docs/tdcp-servo-integration.md; opt-in.")
+    servo.add_argument("--no-tdcp-arm", action="store_true",
+                       help="Kill switch for DOFreqEst Arm 5 (TDCP).  "
+                            "Overrides --servo-input tdcp.  Reverts to "
+                            "today's exact behavior — useful for hard "
+                            "rollback during validation if Arm 5 misbehaves.")
+    servo.add_argument("--tdcp-sigma-ppb", type=float, default=0.13,
+                       help="Initial 1-σ for the Arm 5 observation, in "
+                            "ppb.  Default 0.13 = 5× the prototype σ_y "
+                            "floor (0.026 ppb).  Innovation-based R-rcal "
+                            "tightens from here.  Per Phase B design: "
+                            "starting too loose is cheaper than too tight "
+                            "(asymmetric cost — too-tight contaminates "
+                            "x[1] before adaptation kicks in).")
+    servo.add_argument("--tdcp-gate-window", type=int, default=30,
+                       help="L2 ensemble-innovation gate sliding-window "
+                            "length in epochs.  Larger = more stable "
+                            "statistics but slower adaptation to genuine "
+                            "rx-TCXO drift.  Default 30 = ~30 s at 1 Hz.")
+    servo.add_argument("--tdcp-gate-nsigma", type=float, default=5.0,
+                       help="L2 gate rejection threshold in MAD-σ.  "
+                            "Observations farther than this many σ from "
+                            "the running median are rejected.  Default "
+                            "5σ — far enough above intrinsic TDCP noise "
+                            "(σ ~0.026 ppb) to never trip spuriously, "
+                            "close enough that a co-slip frequency punch "
+                            "(≥ 0.1 ppb) is caught.")
     servo.add_argument("--do-char-file", default="data/do_characterization.json",
                        help="Path to DO characterization JSON (read at startup)")
     servo.add_argument("--do-label", default=None,

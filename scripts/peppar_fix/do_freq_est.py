@@ -179,18 +179,21 @@ class DOFreqEst:
                dt=1.0,
                dt_rx_ns=None, dt_rx_sigma_ns=None,
                qerr_freq_ppb=None, qerr_freq_sigma_ppb=None,
+               tdcp_freq_ppb=None, tdcp_freq_sigma_ppb=None,
                extint_phase_ns=None, extint_sigma_ns=None,
                ticc_diff_ns=None, ticc_sigma_ns=None):
-        """Process one epoch with up to four conditional measurement arms.
+        """Process one epoch with up to five conditional measurement arms.
 
-        Per docs/dofreq-est-measurement-ladder.md.  All arms are
-        keyword-only.  Each arm is gated on its own availability;
-        the predict step always runs.  Order: PPP → qErr → EXTINT
-        → TICC, chosen so the linear arms run before the nonlinear
-        TICC update at the most recent state estimate.
+        Per docs/dofreq-est-measurement-ladder.md and
+        docs/tdcp-servo-integration.md.  All arms are keyword-only.
+        Each arm is gated on its own availability; the predict step
+        always runs.  Order: PPP → qErr → TDCP → EXTINT → TICC,
+        chosen so the linear arms run before the nonlinear TICC
+        update at the most recent state estimate.
 
         Arm 1 (PPP)     observes  x[0] = rx TCXO phase from GPS
         Arm 2 (qErr)    observes  x[1] = rx TCXO frequency from GPS rate
+        Arm 5 (TDCP)    observes  x[1] = rx TCXO frequency, cleaner signal
         Arm 3 (EXTINT)  observes  x[2] = DO phase from GPS
         Arm 4 (TICC)    observes  -x[2] - qerr(x[0])  (nonlinear coupling)
 
@@ -203,6 +206,15 @@ class DOFreqEst:
                 direct rx-TCXO-frequency observation.  No FIFO edge
                 matching required (this arm is on time-averaged
                 qErr, not per-edge correction).
+            tdcp_freq_ppb, tdcp_freq_sigma_ppb:
+                Arm 5 — TDCP ensemble fractional-frequency offset
+                (rx TCXO − GPS) in ppb, derived from carrier-phase
+                deltas across SVs by `peppar_fix.tdcp_estimator`.
+                Observes the same state as Arm 2 (x[1]) but with a
+                much lower noise floor (TDEV(1s) ~15-35 ps =
+                σ_y ~0.026 ppb vs qErr's ~0.3 ppb).  The Kalman
+                filter does optimal-weighted fusion automatically;
+                Arm 5 dominates x[1] when both are present.
             extint_phase_ns, extint_sigma_ns:
                 Arm 3 — DO PPS phase from GPS time, from TIM-TM2
                 (DO PPS wired to F9T EXTINT).  Sigma typically
@@ -280,6 +292,20 @@ class DOFreqEst:
                 z=qerr_freq_ppb,
                 H=np.array([[0.0, 1.0, 0.0, 0.0]]),
                 R=qerr_freq_sigma_ppb ** 2,
+            )
+
+        # ── Arm 5: TDCP ensemble freq (linear, observes x[1]) ──
+        # Same observation state as Arm 2 (rx TCXO frequency), but
+        # σ ~0.026 ppb vs qErr's ~0.3 ppb.  Order after Arm 2 so the
+        # cleaner observation runs against the qErr-tightened P[1,1].
+        # Sequential linear updates on the same H are order-invariant
+        # in exact arithmetic; this order is purely for readability.
+        if tdcp_freq_ppb is not None and tdcp_freq_sigma_ppb is not None:
+            x_pred, P_pred = self._kalman_linear_update(
+                x_pred, P_pred,
+                z=tdcp_freq_ppb,
+                H=np.array([[0.0, 1.0, 0.0, 0.0]]),
+                R=tdcp_freq_sigma_ppb ** 2,
             )
 
         # ── Arm 3: EXTINT (linear, observes x[2]) ──
