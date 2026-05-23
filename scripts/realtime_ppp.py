@@ -1044,7 +1044,8 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                    ssr=None, qerr_store=None, config_queue=None, driver=None,
                    raw_callback=None, nav2_store=None, rinex_writer=None,
                    extint_store=None, nav_sig_store=None,
-                   nav_clock_store=None, nav_time_gps_store=None):
+                   nav_clock_store=None, nav_time_gps_store=None,
+                   ubx_log_file=None):
     """Read UBX messages from a GNSS device.
 
     Puts (timestamp, observations_list) tuples onto obs_queue for each
@@ -1078,6 +1079,11 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
         raw_callback: optional callable(parsed_msg) called with each
              RXM-RAWX message for raw observation access (e.g. NTRIP caster).
         extint_store: TimTm2Store instance for DOFreqEst Arm 3 ingest.
+        ubx_log_file: optional open file handle (binary, append) — every
+             raw UBX message from the receiver is tee'd here for offline
+             replay (e.g. through the TDCP estimator in prototypes/).
+             Pre-parse capture: bytes are written before pyubx2 tries to
+             parse, so even malformed frames land in the log.
     """
     try:
         from pyubx2 import UBXReader
@@ -1146,6 +1152,12 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
 
         try:
             raw, parsed = ubr.read()
+            if ubx_log_file is not None and raw:
+                try:
+                    ubx_log_file.write(raw)
+                except (OSError, ValueError):
+                    log.warning("--ubx-out write failed; disabling capture")
+                    ubx_log_file = None
             if parsed is None:
                 continue
             delay_injector.maybe_inject_delay(source_name)
