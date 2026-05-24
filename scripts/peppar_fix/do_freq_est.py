@@ -151,6 +151,27 @@ class DOFreqEst:
         self.innov_monitor = InnovControlMonitor()
         self.last_innov = 0.0
         self.last_S = 0.0
+        # Per-arm innovation logging — populated each epoch by the
+        # arms that fire.  Reset to None at the top of update().  The
+        # arm-state CSV log reads these to emit innov_{name} + s_{name}
+        # columns alongside the existing arm_{name}_used flag.
+        #
+        # Names match the arm-naming convention used in the CSV columns
+        # and docstrings (see "six conditional measurement arms" below):
+        #   ppp     — Arm 1, PPP dt_rx → x[0]
+        #   qerr    — Arm 2, qErr slope → x[1]
+        #   tdcp    — Arm 5, TDCP ensemble freq → x[1]
+        #   extint  — Arm 3, F9T TIM-TM2 → x[2]
+        #   pseudo  — Arm 6, holdover-integrated synthetic x[2]
+        #   ticc    — Arm 4, TICC chA-chB (nonlinear coupling)
+        self.last_arm_innov: dict[str, float | None] = {
+            'ppp': None, 'qerr': None, 'tdcp': None,
+            'extint': None, 'pseudo': None, 'ticc': None,
+        }
+        self.last_arm_S: dict[str, float | None] = {
+            'ppp': None, 'qerr': None, 'tdcp': None,
+            'extint': None, 'pseudo': None, 'ticc': None,
+        }
         # rx TCXO state must be initialized at construction from bootstrap
         # dt_rx to avoid a mid-run measurement model transition that
         # causes divergence.  If dt_rx wasn't available at construction,
@@ -195,21 +216,26 @@ class DOFreqEst:
                qerr_freq_ppb=None, qerr_freq_sigma_ppb=None,
                tdcp_freq_ppb=None, tdcp_freq_sigma_ppb=None,
                extint_phase_ns=None, extint_sigma_ns=None,
-               ticc_diff_ns=None, ticc_sigma_ns=None):
-        """Process one epoch with up to five conditional measurement arms.
+               ticc_diff_ns=None, ticc_sigma_ns=None,
+               pseudo_phase_ns=None, pseudo_phase_sigma_ns=None):
+        """Process one epoch with up to six conditional measurement arms.
 
         Per docs/dofreq-est-measurement-ladder.md and
         docs/tdcp-servo-integration.md.  All arms are keyword-only.
         Each arm is gated on its own availability; the predict step
-        always runs.  Order: PPP → qErr → TDCP → EXTINT → TICC,
-        chosen so the linear arms run before the nonlinear TICC
-        update at the most recent state estimate.
+        always runs.  Order: PPP → qErr → TDCP → EXTINT → (pseudo) →
+        TICC, chosen so the linear arms run before the nonlinear TICC
+        update at the most recent state estimate.  Arm numbers are
+        kept stable across history; names are the preferred reference
+        going forward (see CSV column naming `arm_<name>_used`).
 
-        Arm 1 (PPP)     observes  x[0] = rx TCXO phase from GPS
-        Arm 2 (qErr)    observes  x[1] = rx TCXO frequency from GPS rate
-        Arm 5 (TDCP)    observes  x[1] = rx TCXO frequency, cleaner signal
-        Arm 3 (EXTINT)  observes  x[2] = DO phase from GPS
-        Arm 4 (TICC)    observes  -x[2] - qerr(x[0])  (nonlinear coupling)
+        Arm PPP    (1) observes  x[0] = rx TCXO phase from GPS
+        Arm qErr   (2) observes  x[1] = rx TCXO frequency from GPS rate
+        Arm TDCP   (5) observes  x[1] = rx TCXO frequency, cleaner signal
+        Arm EXTINT (3) observes  x[2] = DO phase from GPS
+        Arm pseudo (6) observes  x[2] = DO phase, synthetic from TDCP-
+                                 integrated phase during holdover
+        Arm TICC   (4) observes  -x[2] - qerr(x[0])  (nonlinear coupling)
 
         Args:
             dt: seconds since last correction.
@@ -268,6 +294,13 @@ class DOFreqEst:
                 self.P[2, 2] = 10.0 ** 2
                 self._need_phc_seed = False
 
+        # Reset per-epoch innovation log.  Arms that fire below will
+        # populate their entries; arms that don't fire stay None.  The
+        # CSV writer emits empty fields for None entries.
+        for _k in self.last_arm_innov:
+            self.last_arm_innov[_k] = None
+            self.last_arm_S[_k] = None
+
         # ── Adaptive Q: boost during pull-in ──
         do_phase_abs = abs(self.x[2])
         if do_phase_abs > 50.0:
@@ -294,6 +327,7 @@ class DOFreqEst:
                 z=dt_rx_ns,
                 H=self.H_ppp,
                 R=dt_rx_sigma_ns ** 2,
+                arm_name='ppp',
             )
 
         # ── Arm 2: qErr-as-frequency (linear, observes x[1]) ──
@@ -306,6 +340,7 @@ class DOFreqEst:
                 z=qerr_freq_ppb,
                 H=np.array([[0.0, 1.0, 0.0, 0.0]]),
                 R=qerr_freq_sigma_ppb ** 2,
+                arm_name='qerr',
             )
 
         # ── Arm 5: TDCP ensemble freq (linear, observes x[1]) ──
@@ -320,6 +355,7 @@ class DOFreqEst:
                 z=tdcp_freq_ppb,
                 H=np.array([[0.0, 1.0, 0.0, 0.0]]),
                 R=tdcp_freq_sigma_ppb ** 2,
+                arm_name='tdcp',
             )
 
         # ── Arm 3: EXTINT (linear, observes x[2]) ──
@@ -331,6 +367,20 @@ class DOFreqEst:
                 z=extint_phase_ns,
                 H=np.array([[0.0, 0.0, 1.0, 0.0]]),
                 R=extint_sigma_ns ** 2,
+                arm_name='extint',
+            )
+
+        # ── Arm 6: holdover pseudo-obs (linear, observes x[2]) ──
+        # Synthetic DO phase from TDCP-integrated rx_TCXO phase + frozen
+        # DO-vs-rx_TCXO offset.  Same H as Arm 3; wider σ that grows
+        # with holdover duration.  Only present during HOLDOVER/REACQUIRED.
+        if pseudo_phase_ns is not None and pseudo_phase_sigma_ns is not None:
+            x_pred, P_pred = self._kalman_linear_update(
+                x_pred, P_pred,
+                z=pseudo_phase_ns,
+                H=np.array([[0.0, 0.0, 1.0, 0.0]]),
+                R=pseudo_phase_sigma_ns ** 2,
+                arm_name='pseudo',
             )
 
         # ── Arm 4: TICC (nonlinear, couples x[0] and x[2]) ──
@@ -372,8 +422,19 @@ class DOFreqEst:
             h_pred = self._h_ticc(x_pred)
             H_ticc = self._H_ticc(x_pred)
             S = (H_ticc @ P_pred @ H_ticc.T + R_ticc).item()
-            K = (P_pred @ H_ticc.T) / S
             innov_ticc = ticc_diff_ns - h_pred
+
+            # Record innov + S BEFORE the state update.  See note on
+            # _kalman_linear_update — recording before any downstream
+            # gate skips the update means rejected innovations still
+            # appear in the log, which is essential for post-mortems
+            # on chi-squared-gate trips (ekfInnovationGate-bravo).
+            self.last_innov = innov_ticc
+            self.last_S = S
+            self.last_arm_innov['ticc'] = innov_ticc
+            self.last_arm_S['ticc'] = S
+
+            K = (P_pred @ H_ticc.T) / S
             x_pred = x_pred + K.flatten() * innov_ticc
             P_pred = P_pred - np.outer(K.flatten(), K.flatten()) * S
 
@@ -381,8 +442,6 @@ class DOFreqEst:
             # that closes the loop on x[2] (DO phase), so its innov is
             # what carries plant-model error.
             self.innov_monitor.observe(self._last_u, innov_ticc, S)
-            self.last_innov = innov_ticc
-            self.last_S = S
 
         self.x = x_pred
         self.P = P_pred
@@ -411,14 +470,26 @@ class DOFreqEst:
         self.freq = adjfine
         return self.freq
 
-    def _kalman_linear_update(self, x_pred, P_pred, *, z, H, R):
+    def _kalman_linear_update(self, x_pred, P_pred, *, z, H, R,
+                              arm_name=None):
         """One linear Kalman measurement update.
 
-        Sequential update helper for arms 1/2/3 (the linear arms).
-        H is (1×4), z and R are scalars.  Returns updated (x, P).
+        Sequential update helper for the linear arms (PPP, qErr, TDCP,
+        EXTINT, pseudo).  H is (1×4), z and R are scalars.  Returns
+        updated (x, P).
+
+        When `arm_name` is provided, the innovation and predicted
+        measurement variance are recorded to `self.last_arm_innov[name]`
+        and `self.last_arm_S[name]` BEFORE the state update is applied.
+        Recording before any downstream gate decides to skip the update
+        means rejected innovations still appear in the per-epoch log,
+        which is essential for post-mortems on chi-squared-gate trips.
         """
         innov = z - (H @ x_pred).item()
         S = (H @ P_pred @ H.T + R).item()
+        if arm_name is not None:
+            self.last_arm_innov[arm_name] = innov
+            self.last_arm_S[arm_name] = S
         K = (P_pred @ H.T) / S
         x_new = x_pred + K.flatten() * innov
         P_new = P_pred - np.outer(K.flatten(), K.flatten()) * S

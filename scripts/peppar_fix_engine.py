@@ -4461,14 +4461,29 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 _arm_f = open(args.arm_state_log, 'a', newline='')
                 _arm_csv = csv.writer(_arm_f)
                 if _needs_header:
+                    # Schema v2 (2026-05-24, armInnovationLogging-main):
+                    # arm columns renamed from arm{N}_used to
+                    # arm_{name}_used (legacy logs are still readable
+                    # column-by-position up to arm_ticc_used).  New
+                    # `innov_{name}` + `s_{name}` columns are
+                    # post-mortem aids — for arms that didn't fire
+                    # this epoch, the fields are empty (no fabricated
+                    # zero).  See dayplan I-074410-bravo.
                     _arm_csv.writerow([
                         'host_timestamp', 'host_monotonic',
                         'x0_phi_rx_ns', 'x1_f_rx_ppb',
                         'x2_phi_do_ns', 'x3_f_do_ppb',
                         'P00', 'P11', 'P22', 'P33',
-                        'arm1_used', 'arm2_used', 'arm3_used', 'arm4_used',
-                        'arm5_used', 'tdcp_freq_ppb',
+                        'arm_ppp_used', 'arm_qerr_used',
+                        'arm_extint_used', 'arm_ticc_used',
+                        'arm_tdcp_used', 'tdcp_freq_ppb',
                         'dt_actual_s',
+                        'innov_ppp',    's_ppp',
+                        'innov_qerr',   's_qerr',
+                        'innov_tdcp',   's_tdcp',
+                        'innov_extint', 's_extint',
+                        'innov_pseudo', 's_pseudo',
+                        'innov_ticc',   's_ticc',
                     ])
                     _arm_f.flush()
                 _arm_w = StridedWriter(
@@ -8003,6 +8018,13 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             try:
                 _x = servo.x
                 _P = servo.P
+                _innov = getattr(servo, 'last_arm_innov', None) or {}
+                _S_dict = getattr(servo, 'last_arm_S', None) or {}
+
+                def _fmt(v: float | None, fmt: str = '.6e') -> str:
+                    """Empty string when arm didn't fire; formatted float otherwise."""
+                    return format(v, fmt) if v is not None else ''
+
                 _arm_w.writerow([
                     datetime.now(tz=timezone.utc).isoformat(),
                     f"{time.monotonic():.9f}",
@@ -8017,6 +8039,12 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                     1 if tdcp_freq_ppb is not None else 0,
                     f"{tdcp_freq_ppb:.6f}" if tdcp_freq_ppb is not None else "",
                     f"{dt_actual:.6f}",
+                    _fmt(_innov.get('ppp')),    _fmt(_S_dict.get('ppp')),
+                    _fmt(_innov.get('qerr')),   _fmt(_S_dict.get('qerr')),
+                    _fmt(_innov.get('tdcp')),   _fmt(_S_dict.get('tdcp')),
+                    _fmt(_innov.get('extint')), _fmt(_S_dict.get('extint')),
+                    _fmt(_innov.get('pseudo')), _fmt(_S_dict.get('pseudo')),
+                    _fmt(_innov.get('ticc')),   _fmt(_S_dict.get('ticc')),
                 ])
                 if _arm_f is not None:
                     _arm_f.flush()
@@ -10358,16 +10386,23 @@ Two-phase operation:
                       help="Decimation stride for --dt-rx-log.  1 = every "
                            "PPP epoch (~1 Hz, default).  0 coerced to 1.")
     ticc.add_argument("--arm-state-log", default=None,
-                      help="Optional five-arm Kalman state CSV log path.  "
+                      help="Optional six-arm Kalman state CSV log path.  "
                            "One row per servo.update() call capturing "
-                           "DOFreqEst's (host_timestamp, host_monotonic, "
-                           "x0_phi_rx_ns, x1_f_rx_ppb, x2_phi_do_ns, "
-                           "x3_f_do_ppb, P00, P11, P22, P33, arm1_used, "
-                           "arm2_used, arm3_used, arm4_used, arm5_used, "
-                           "tdcp_freq_ppb, dt_actual_s).  "
-                           "Lets post-processing reconstruct the five-arm "
-                           "fusion trajectory + per-epoch arm availability "
-                           "for ablation analysis.")
+                           "DOFreqEst's state vector (x0_phi_rx_ns, "
+                           "x1_f_rx_ppb, x2_phi_do_ns, x3_f_do_ppb), "
+                           "diagonal covariance (P00, P11, P22, P33), "
+                           "per-arm fired-this-epoch flags "
+                           "(arm_{ppp,qerr,extint,ticc,tdcp,pseudo}_used), "
+                           "the TDCP frequency observation, the actual "
+                           "epoch dt, and per-arm Kalman innovation + "
+                           "predicted measurement variance "
+                           "(innov_{name}, s_{name}) for every arm that "
+                           "fired (empty if the arm did not fire).  Lets "
+                           "post-processing reconstruct the fusion "
+                           "trajectory, per-epoch arm availability, and "
+                           "the |innov|/√S of each arm — the latter "
+                           "essential for finding which arm caused a "
+                           "state excursion in post-mortems.")
     ticc.add_argument("--arm-state-log-stride", type=int, default=1,
                       help="Decimation stride for --arm-state-log.  1 = "
                            "every servo update (scheduler-driven, "
