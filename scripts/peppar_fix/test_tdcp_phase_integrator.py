@@ -125,6 +125,12 @@ class TestTdcpPhaseIntegratorPseudoObs(unittest.TestCase):
         pseudo = integ.pseudo_obs(offset_ns=-5.0)
         self.assertAlmostEqual(pseudo, 95.0)
 
+    def test_pseudo_obs_none_when_offset_is_none(self):
+        integ = TdcpPhaseIntegrator()
+        integ.seed(x0_phi_rx_ns=50.0, mono_s=0.0)
+        integ.integrate(df_f=1e-9, mono_s=1.0)
+        self.assertIsNone(integ.pseudo_obs(offset_ns=None))
+
 
 class TestTdcpPhaseIntegratorReset(unittest.TestCase):
 

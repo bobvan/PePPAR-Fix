@@ -290,6 +290,17 @@ class TestHoldoverActorFullCycle(unittest.TestCase):
 
 class TestHoldoverActorEdgeCases(unittest.TestCase):
 
+    def test_fresh_actor_arms_absent_no_offset_stays_tracking(self):
+        """Engine-restart-during-HOLDOVER scenario (Charlie #4):
+        fresh actor, arms still down, no offset available → must stay
+        in TRACKING (no holdover without anchor)."""
+        actor = HoldoverActor(t_enter_s=5.0)
+        for i in range(20):
+            t = actor.tick(hw_arm_healthy=False, mono_s=float(i),
+                           offset_ns=None, offset_ready=False)
+            self.assertIsNone(t)
+        self.assertEqual(actor.mode, HoldoverMode.TRACKING)
+
     def test_last_transition_stored(self):
         actor = HoldoverActor(t_enter_s=3.0)
         self.assertIsNone(actor.last_transition)

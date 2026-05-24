@@ -65,17 +65,18 @@ class TdcpPhaseIntegrator:
         self._n_integrated += 1
         return True
 
-    def pseudo_obs(self, offset_ns: float) -> float | None:
+    def pseudo_obs(self, offset_ns: float | None) -> float | None:
         """Compute x[2]_pseudo = integrated_phase + frozen_offset.
 
         Args:
             offset_ns: the DoVsRxTcxoOffset.last_offset_ns frozen at
-                HOLDOVER entry.
+                HOLDOVER entry.  None if offset was never captured.
 
         Returns:
-            x[2]_pseudo in nanoseconds, or None if not seeded or gap.
+            x[2]_pseudo in nanoseconds, or None if not seeded, gap,
+            or offset_ns is None.
         """
-        if self._phase_ns is None or self._gap_detected:
+        if self._phase_ns is None or self._gap_detected or offset_ns is None:
             return None
         return self._phase_ns + offset_ns
 

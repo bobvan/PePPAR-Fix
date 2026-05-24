@@ -27,10 +27,10 @@ class HoldoverTransition(NamedTuple):
     sigma_ns: float
 
 
-# σ thresholds for PTP clockClass (from Phase D spec).
-SIGMA_CLOCKCLASS_6 = 0.354   # ns — within moonshot per-clock budget
-SIGMA_CLOCKCLASS_7 = 1.0     # ns — within excursion bound
-SIGMA_CLOCKCLASS_52 = 10.0   # ns — degraded holdover
+# Upper-bound σ for each PTP clockClass (from Phase D spec).
+SIGMA_MAX_CC6 = 0.354   # ns — max σ for clockClass 6 (locked)
+SIGMA_MAX_CC7 = 1.0     # ns — max σ for clockClass 7 (holdover)
+SIGMA_MAX_CC52 = 10.0   # ns — max σ for clockClass 52 (degraded)
 
 
 class HoldoverActor:
@@ -47,16 +47,16 @@ class HoldoverActor:
         t_enter_s: float = 5.0,
         t_blend_s: float = 30.0,
         sigma_blend_done_ns2: float = 1.0,
-        sigma_clockclass_7_ns: float = SIGMA_CLOCKCLASS_6,
-        sigma_clockclass_52_ns: float = SIGMA_CLOCKCLASS_7,
-        sigma_freerun_ns: float = SIGMA_CLOCKCLASS_52,
+        sigma_max_cc6_ns: float = SIGMA_MAX_CC6,
+        sigma_max_cc7_ns: float = SIGMA_MAX_CC7,
+        sigma_max_cc52_ns: float = SIGMA_MAX_CC52,
     ):
         self._t_enter_s = t_enter_s
         self._t_blend_s = t_blend_s
         self._sigma_blend_done_ns2 = sigma_blend_done_ns2
-        self._sigma_cc7 = sigma_clockclass_7_ns
-        self._sigma_cc52 = sigma_clockclass_52_ns
-        self._sigma_freerun = sigma_freerun_ns
+        self._sigma_max_cc6 = sigma_max_cc6_ns
+        self._sigma_max_cc7 = sigma_max_cc7_ns
+        self._sigma_max_cc52 = sigma_max_cc52_ns
 
         self._mode = HoldoverMode.TRACKING
         self._arms_absent_since: float | None = None
@@ -86,11 +86,11 @@ class HoldoverActor:
         if self._mode == HoldoverMode.TRACKING:
             return 6
         s = self._last_sigma_ns
-        if s <= self._sigma_cc7:
+        if s <= self._sigma_max_cc6:
             return 6
-        if s <= self._sigma_cc52:
+        if s <= self._sigma_max_cc7:
             return 7
-        if s <= self._sigma_freerun:
+        if s <= self._sigma_max_cc52:
             return 52
         return 248
 
