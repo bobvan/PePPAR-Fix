@@ -1,6 +1,8 @@
 # TDCP holdover anchor — Phase D design
 
-Status: draft for review (bravo, 2026-05-23).  No code in flight.
+Status: v2 — revised per charlie + main reviews (bravo, 2026-05-23).
+Open questions resolved; σ-growth analysis added; holdover_max_s
+replaced with σ-threshold transitions.  No code in flight.
 
 ## Motivation
 
@@ -43,16 +45,37 @@ long-term phase anchor *during holdover* — i.e., when Arms 3 and
 
 ## Goals + non-goals
 
+**Framing**: we will do well for short holdover.  We will fail for
+infinite holdover.  The job is to know *how well we're doing* as
+holdover progresses, so we can signal our confidence downstream:
+
+- PTP `clockClass` transitions at defined σ thresholds
+- Future hardware: mute DO PPS OUT when confidence is gone
+
+We do NOT promise a fixed holdover budget ("X hours").  We report
+σ(t) honestly and let downstream consumers decide their tolerance.
+
 **In scope**:
 
-- Extended holdover budget: from ~60 s today to **hours**, for the
-  failure modes where TDCP is still alive.
+- Extended holdover from ~60 s today to **minutes on OCXO-class,
+  degrading gracefully** — for failure modes where TDCP is alive.
+- Honest σ(t) reporting: the engine must know and expose how its
+  holdover phase uncertainty grows with time (see σ-growth analysis
+  below).
+- PTP clockClass transition thresholds tied to σ(t) — today
+  HOLDOVER → clockClass 7 immediately; Phase D makes that
+  transition σ-aware, and adds a later transition to clockClass 52
+  (FREERUN) when σ crosses a harder threshold.
 - Smooth holdover entry / exit (no servo punch on either boundary).
 - Self-rcal: the calibration that lets us propagate DO phase
   during holdover updates *continuously* while Arms 3/4 are healthy,
   so it's fresh when holdover begins.
 - L1+L2+L3 protection extends naturally — same slip-defense layers
   protect the TDCP path during holdover as during normal operation.
+- **Future**: DO PPS OUT muting when σ exceeds the excursion bound
+  (requires hardware gate on PPS OUT, not available on current lab
+  hosts).  Phase D builds the σ-tracking infrastructure; threshold
+  policy is separate.
 
 **Out of scope**:
 
@@ -171,9 +194,9 @@ x[2]_pseudo = TdcpPhaseIntegrator.phase + DoVsRxTcxoOffset.last_offset
 
 This pseudo-observation enters as a synthetic "Arm 6" (or as a
 re-purposed Arm 3 with widened σ — implementation detail).  σ
-grows with holdover duration; eventually σ exceeds the moonshot
-per-clock budget and the engine should transition to a noisier
-fallback (or alarm).
+grows with holdover duration per the analysis below; the engine
+reports σ(t) continuously and ties downstream signals (PTP
+clockClass, future PPS muting) to threshold crossings.
 
 ### REACQUIRED → TRACKING blend
 
@@ -214,6 +237,166 @@ is well-defined.  Drift sources on this offset:
 The EMA's τ ~ 60 s smooths out epoch-to-epoch noise.  This is the
 calibration that gets *frozen* at HOLDOVER entry.
 
+## Holdover σ growth analysis
+
+We will do well for short holdover.  We will fail for infinite
+holdover.  This section makes explicit *where the crossover is*
+for each DO class, so we don't oversell.
+
+### Error sources during holdover
+
+Three independent contributions to `σ(x[2]_pseudo)`:
+
+**S1 — TDCP integrated phase noise (random walk).**  TDCP gives
+per-epoch frequency estimates with noise σ_y.  Integrating
+frequency to maintain rx_TCXO phase accumulates as:
+
+```
+σ_tdcp(T) = σ_y × √T     [ns, with σ_y in ppb, T in seconds]
+```
+
+From the 2026-05-23 validation gate:
+
+| Host | σ_y (ppb) | σ_tdcp(60 s) | σ_tdcp(300 s) | σ_tdcp(3600 s) |
+|---|---|---|---|---|
+| PiFace (F9T-20B) | 0.026 | 0.20 ns | 0.45 ns | 1.56 ns |
+| TimeHat (F9T-10) | 0.051 | 0.40 ns | 0.88 ns | 3.08 ns |
+| clkPoC3 (F9T-20B) | 0.057 | 0.44 ns | 0.99 ns | 3.43 ns |
+| MadHat (F10T) | 0.065 | 0.50 ns | 1.12 ns | 3.90 ns |
+
+This is the *minimum* contribution — TDCP integration noise alone,
+even if the frozen offset were perfect.
+
+**S2 — Frozen offset uncertainty at holdover entry.**  The EMA
+captures `offset = x[2] − x[0]` with noise dependent on EMA τ and
+Arm 3/4 observation noise:
+
+```
+σ_offset ≈ √P[2,2] at holdover entry    [typically 0.1-1 ns]
+```
+
+This is constant (doesn't grow with T) — it's the initial condition
+uncertainty.  Negligible relative to S1 beyond ~30 s.
+
+**S3 — Differential DO-vs-rx_TCXO frequency drift (systematic).**
+The frozen offset assumes the DO and rx_TCXO maintain the same
+frequency relationship they had at holdover entry.  They don't:
+
+- The DO runs at fixed adjfine.  Its actual frequency drifts from
+  temperature changes and aging.
+- The rx_TCXO drifts independently (different crystal, different
+  thermal mass, different tempco).
+- TDCP tracks the rx_TCXO's motion (that's what Arm 5 measures)
+  but is blind to the DO's drift.
+
+This produces a *systematic* phase error that grows linearly (or
+worse, if temperature is changing):
+
+```
+Δx[2]_drift(T) = δf_differential × T    [ns, with δf in ppb]
+```
+
+where `δf_differential` is the unmeasured differential frequency
+walk between DO and rx_TCXO during holdover.
+
+Bounding δf_differential is the hard part:
+- OCXO in a stable thermal environment: δf ≈ 0.01-0.05 ppb/min
+  (dominated by rx_TCXO tempco; OCXO tempco is 10-100× lower)
+- OCXO during a thermal transient: δf ≈ 0.1-1 ppb/min
+- TCXO-class DO: δf ≈ 0.5-5 ppb/min (both crystals responding
+  to temperature with comparable magnitude but different time
+  constants)
+
+### Combined σ(t) — OCXO-class hosts (PiFace, clkPoC3)
+
+Conservative case (δf_differential = 0.05 ppb/min = 0.83 ppt/s,
+thermally quiet lab):
+
+| T (holdover) | S1 (TDCP noise) | S3 (drift) | Combined σ | vs 354 ps budget | vs 1 ns bound |
+|---|---|---|---|---|---|
+| 30 s | 0.14 ns | 0.03 ns | **0.14 ns** | within | within |
+| 60 s | 0.20 ns | 0.05 ns | **0.21 ns** | within | within |
+| 2 min | 0.28 ns | 0.10 ns | **0.30 ns** | within | within |
+| 5 min | 0.45 ns | 0.25 ns | **0.51 ns** | **EXCEEDS** | within |
+| 10 min | 0.64 ns | 0.50 ns | **0.81 ns** | exceeds | within |
+| 30 min | 1.10 ns | 1.50 ns | **1.86 ns** | exceeds | **EXCEEDS** |
+| 1 hr | 1.56 ns | 3.00 ns | **3.38 ns** | exceeds | exceeds |
+
+Aggressive case (δf_differential = 0.2 ppb/min, thermal transient):
+
+| T | S1 | S3 | Combined σ | vs 354 ps | vs 1 ns |
+|---|---|---|---|---|---|
+| 60 s | 0.20 ns | 0.20 ns | **0.28 ns** | within | within |
+| 2 min | 0.28 ns | 0.40 ns | **0.49 ns** | **EXCEEDS** | within |
+| 5 min | 0.45 ns | 1.00 ns | **1.10 ns** | exceeds | **EXCEEDS** |
+| 10 min | 0.64 ns | 2.00 ns | **2.10 ns** | exceeds | exceeds |
+
+**Headline**: on an OCXO-class host in a quiet lab, TDCP holdover
+stays within the moonshot per-clock budget (354 ps) for ~2-5 minutes
+and within the shared-antenna excursion bound (1 ns) for ~10-30
+minutes.  These ranges compress during thermal transients.
+
+Charlie's estimate of "5-15 minutes before exceeding 354 ps" is
+confirmed — the dominant term beyond ~2 min is S3 (differential
+drift), not S1 (TDCP noise).
+
+### Combined σ(t) — TCXO-class hosts (TimeHat, MadHat)
+
+For TCXO-class DOs, both the DO and rx_TCXO have comparable tempco
+(~1e-9), so δf_differential can be larger (0.5-5 ppb/min) and S1
+is also noisier.  Budget for the 354 ps moonshot bound is already
+unachievable for TCXO hosts (per CLAUDE.md), so holdover buys little.
+Best-effort only; might extend the 60 s open-loop to ~2-3 minutes.
+
+### PTP clockClass and PPS muting thresholds
+
+The σ(t) analysis gives us three natural transition points:
+
+| σ threshold | PTP clockClass | PPS action | Meaning |
+|---|---|---|---|
+| σ ≤ 354 ps | 6 (locked, high accuracy) | PPS OUT active | within moonshot per-clock budget |
+| 354 ps < σ ≤ 1 ns | 7 (holdover) | PPS OUT active | degraded but within excursion bound |
+| 1 ns < σ ≤ 10 ns | 52 (holdover, degraded) | PPS OUT active (future: consider muting) | useful for loose-tolerance consumers |
+| σ > 10 ns | 248 (FREERUN) | **PPS OUT muted** (future hardware) | no better than uncorrected |
+
+Phase D v1 implements σ(t) tracking and log reporting.  Phase D v2
+wires it to PTP clockClass transitions via `ptp4l-supervision.md`.
+PPS muting requires hardware support (GPIO gate on PPS OUT, not
+present on current lab hosts).  The threshold policy will be tuned
+from live holdover cable-pull experiments.
+
+The old `holdover_max_s = 7200` hard cap is replaced by σ-threshold
+transitions — there is no fixed timeout.  The engine stays in
+HOLDOVER as long as TDCP is alive, reporting σ honestly; downstream
+consumers decide their tolerance.
+
+### Prerequisite: TDCP bias measurement during TRACKING
+
+(Charlie's concern #2, accepted.)
+
+In TRACKING, any sustained TDCP bias is masked by Arms 3/4 — the
+Kalman fusion weights them appropriately and the bias stays buried.
+In HOLDOVER, the TDCP path becomes load-bearing: a sustained bias
+of 0.01 ppb integrates to 36 ns over 1 hour.
+
+Before Phase D code lands, we need an empirical measurement:
+compare Arm 5's TDCP-derived x[1] against Arm 4's TICC-derived x[1]
+over a 4+ hour TRACKING window on each host, and extract the mean
+bias and its temporal structure.  Sources of bias include:
+
+- Residual ionospheric delay in undifferenced carrier phase
+- Ephemeris errors that don't fully cancel under time-differencing
+- Satellite geometry-dependent systematic residuals
+
+If the bias is ≤ 0.001 ppb (integrates to 3.6 ns over 1 hr), it's
+below S3 and doesn't change the analysis.  If it's larger, it
+becomes a floor on σ(x[2]_pseudo) during HOLDOVER.
+
+The measurement uses existing infrastructure: `--arm-state-log`
+records per-epoch arm contributions to x[1]; a simple offline
+script computes mean(Arm5_x1 − Arm4_x1) over the capture.  No
+new code required, just lab time.
+
 ## Interaction with existing systems
 
 - **Temperature memory** (`project_temp_freq_holdover.md`): the
@@ -222,8 +405,11 @@ calibration that gets *frozen* at HOLDOVER entry.
   pairs and predict the offset during HOLDOVER if temperature is
   changing.  Out of scope for Phase D v1.
 - **clockClass reporting**: today HOLDOVER → ptp4l clockClass 7
-  (via `ptp4l-supervision.md`).  Phase D's HOLDOVER preserves this
-  but lengthens the duration before clockClass falls to FREERUN.
+  (via `ptp4l-supervision.md`).  Phase D replaces the
+  fixed-timeout clockClass cascade with σ-threshold transitions
+  (see "PTP clockClass and PPS muting thresholds" above).  The
+  engine reports current σ(t) in its UDS interface; the ptp4l
+  supervision layer maps σ to clockClass.
 - **PHC step / re-bootstrap (exit code 5)**: orthogonal — the
   `HoldoverActor` resets at engine restart.  Capture continuity
   across restart requires persisting `DoVsRxTcxoOffset.last_offset`
@@ -237,16 +423,22 @@ Following the same pattern as Phases B and C:
   return).  Verify (1) `x[2]` continuity at HOLDOVER entry,
   (2) drift rate during HOLDOVER matches the crystal-drift model,
   (3) no `x[2]` step at REACQUIRED entry, (4) blend converges in
-  T_blend.
-- **Integration**: deliberately pull the DO PPS cable on a TimeHat
-  or PiFace test host while the engine is running.  Verify the
-  engine remains within budget for ~10 minutes and recovers cleanly
-  when the cable is reconnected.  Compare against the same scenario
-  with Phase D off (today's behavior) — should hit ~60 s before
-  divergence.
-- **Long-duration**: 1-hour cable-pull, verify the disciplined-DO
-  output stays within the moonshot per-clock budget (354 ps RMS
-  at all τ from 0.1 s to 1000 s).
+  T_blend, (5) σ(t) reporting grows at the predicted rate.
+- **σ characterization**: 4+ hour TRACKING capture on PiFace and
+  clkPoC3 with `--arm-state-log`, measuring TDCP-vs-Arm4 bias
+  (Phase D prerequisite).  Extract δf_differential empirically
+  rather than relying on the estimates above.
+- **Integration**: deliberately pull the DO PPS cable on PiFace
+  while the engine is running.  Verify the engine reports σ(t)
+  accurately and stays within budget for the duration predicted by
+  the σ-growth table.  Compare against Phase D off (today's
+  behavior) — should hit ~60 s before divergence.
+  Expected: TDCP holdover extends useful operation to ~5 min
+  (within 354 ps budget) to ~30 min (within 1 ns) on OCXO-class
+  in a quiet lab.  Do NOT claim "hours" without validating S3
+  empirically.
+- **Threshold validation**: verify PTP clockClass transitions
+  fire at the correct σ crossings during the cable-pull test.
 
 Required hardware: any single host with Arms 3 or 4 (PiFace,
 TimeHat, clkPoC3).  Two hosts for cross-host pair-excursion check
@@ -261,36 +453,37 @@ during HOLDOVER (the real moonshot test for this design).
 | `max_dt_s` | 1.5 s | Integrator gap-protection (drop diff if exceeded) |
 | `T_blend` | 30 s | REACQUIRED → TRACKING blend |
 | `σ_blend_done` | 1 ns² | REACQUIRED exit condition |
-| `holdover_max_s` | 7200 s | Hard cap; beyond this, drop to clockClass FREERUN |
+| `σ_clockclass_7` | 354 ps | σ(t) above this → clockClass 7 (holdover) |
+| `σ_clockclass_52` | 1 ns | σ(t) above this → clockClass 52 (holdover, degraded) |
+| `σ_freerun` | 10 ns | σ(t) above this → clockClass 248 (FREERUN) |
+| `σ_pps_mute` | 10 ns | σ(t) above this → mute PPS OUT (future hardware) |
 
 All exposed as engine CLI flags so we can iterate without code
-changes.
+changes.  The previous `holdover_max_s = 7200` hard cap is removed;
+σ-based transitions handle quality degradation continuously.
 
-## Open questions for reviewers
+## Resolved design questions
 
-1. **Single Arm 5 σ for both TRACKING and HOLDOVER, or separate?**
-   - During TRACKING, Arm 5 mostly tightens `x[1]`.
-   - During HOLDOVER, the integrated phase is the load-bearing
-     metric.  Conservative σ during HOLDOVER (say 2× TRACKING)
-     biases toward keeping the predict-step's process noise visible.
-2. **Where does the `HoldoverActor` live?**
-   - Inside `do_freq_est.py` keeps it close to the EKF/LQR but
-     bloats that file.
-   - Sibling file is cleaner but the wiring at the engine layer
-     becomes more complex.
-   - Lean: sibling file `scripts/peppar_fix/holdover_actor.py`.
-3. **Should we persist `DoVsRxTcxoOffset.last_offset` to disk?**
-   - Lets HOLDOVER survive engine restart.  Useful for crash
-     recovery + scheduled reboots.
-   - Adds a state file + cache-coherency concerns.
-   - Lean: v1 in-memory only; v2 add disk persistence after
-     measurement experience.
-4. **Phase D as one PR or stack?**
-   - One PR: easier to review the whole design.  Big diff.
-   - Stack: `DoVsRxTcxoOffset` → `TdcpPhaseIntegrator` →
-     `HoldoverActor` → engine wiring.  4 small PRs in dependency
-     order.
-   - Lean: stack.  Aligns with Phases A/B/C precedent.
+(Closed by main + charlie reviews, 2026-05-23.)
+
+1. **Single Arm 5 σ for both TRACKING and HOLDOVER.**
+   Charlie's argument: let the integrator's process noise model
+   carry the uncertainty growth, not a manually-widened R.  If
+   Arm 5 is genuinely noisier during HOLDOVER, measure it.
+   Main concurred with separate-σ but the σ-growth analysis above
+   makes the point moot — `σ(x[2]_pseudo)` already grows via S1+S3
+   regardless of Arm 5's R.  **Decision: single σ.**
+
+2. **`HoldoverActor` in a sibling file**
+   (`scripts/peppar_fix/holdover_actor.py`).  Both reviewers agreed.
+
+3. **`DoVsRxTcxoOffset` v1 in-memory only.**  Disk persistence
+   deferred to v2 after we know whether engine-restart-during-
+   HOLDOVER is a real operational need.  Both reviewers agreed.
+
+4. **4-PR stack**: `DoVsRxTcxoOffset` → `TdcpPhaseIntegrator` →
+   `HoldoverActor` → engine wiring.  Matches A/B/C precedent.
+   Both reviewers agreed.
 
 ## Cross-references
 

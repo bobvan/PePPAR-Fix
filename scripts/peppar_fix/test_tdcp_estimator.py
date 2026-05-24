@@ -346,8 +346,9 @@ class TdcpEstimatorEdgeCases(unittest.TestCase):
     def test_phi1_raw_cyc_preferred_over_phi1_cyc(self):
         """SSR phase-bias steps drop integer cycles into `phi1_cyc`
         without changing the underlying carrier phase — a 1-cycle L1
-        step = 0.19 m = ~2.1 ppb single-epoch frequency punch =
-        16σ on default --tdcp-sigma-ppb.  The estimator must read
+        step = 0.19 m / c / 1 s = 0.635 ppb single-epoch frequency
+        punch = 4.9σ on default --tdcp-sigma-ppb (63σ on L2 gate
+        σ_floor).  The estimator must read
         `phi1_raw_cyc` (the receiver's uncorrected carrier phase) when
         available so the SSR PB stream doesn't propagate into Arm 5.
 
@@ -378,7 +379,7 @@ class TdcpEstimatorEdgeCases(unittest.TestCase):
         r = est.update(obs1, _ts(1))
         # If the fix is in place: TDCP residual ≈ 0 (no real motion).
         # If we had been reading phi1_cyc directly: residual = 1 cycle =
-        # 0.190 m → df_f ≈ 6.3e-10 (2.1 ppb).
+        # 0.190 m / c / 1 s → df_f ≈ 6.3e-10 (0.635 ppb).
         self.assertEqual(r.n_used, 1)
         self.assertLess(
             abs(r.df_f), 1e-11,

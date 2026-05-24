@@ -172,7 +172,8 @@ def test_l3_caps_punch_that_leaks_through():
     servo.P = np.diag([1.0, 1.0, 100.0, 1.0])
     servo.x = np.array([0.0, 0.0, 0.0, -50.0])
     servo._last_u = 50.0
-    # A 2.1 ppb Arm 5 freq punch (1-cycle SSR PB step equivalent).
+    # A 2.1 ppb Arm 5 freq punch (well above 1-cycle SSR PB step
+    # = 0.635 ppb; tests that L3 clamps at large magnitude).
     servo.update(dt=1.0, tdcp_freq_ppb=2.1, tdcp_freq_sigma_ppb=0.026)
     # The LQR's u change should be ≤ max_step_ppb = 10 ppb.
     assert abs(servo._last_u - 50.0) <= 10.0 + 1e-6
