@@ -45,10 +45,9 @@ class HoldoverState:
 def init_holdover(args) -> HoldoverState | None:
     """Create Phase D holdover objects from CLI args.
 
-    Returns None if holdover is not enabled (no servo or no TDCP).
+    Returns None if holdover is not enabled (no TDCP servo input).
+    Works on any actuator type (PHC, DAC+OCXO, ClockMatrix).
     """
-    if not getattr(args, 'servo', None):
-        return None
     if getattr(args, 'servo_input', 'default') != 'tdcp':
         return None
     if getattr(args, 'no_tdcp_arm', False):

@@ -52,9 +52,11 @@ class TestInitHoldover(unittest.TestCase):
         self.assertIsNotNone(state.integrator)
         self.assertIsNotNone(state.actor)
 
-    def test_returns_none_without_servo(self):
+    def test_works_without_phc_servo(self):
+        """DAC+OCXO hosts have servo=None but holdover still works."""
         args = _mock_args(servo=None)
-        self.assertIsNone(init_holdover(args))
+        state = init_holdover(args)
+        self.assertIsNotNone(state)
 
     def test_returns_none_with_default_servo_input(self):
         args = _mock_args(servo_input='default')
