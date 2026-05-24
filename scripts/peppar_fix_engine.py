@@ -6826,6 +6826,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             log.warning("Could not derive DO process noise from "
                         "characterization: %s", e)
 
+    _max_step = getattr(args, 'max_adjfine_step_ppb', None)
     servo = DOFreqEst(
         sigma_ticc_ns=sigma_ticc,
         sigma_do_phase_ns=sigma_do_phase_ns_eff,
@@ -6836,6 +6837,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         initial_freq=current_adj,
         initial_dt_rx_ns=bootstrap_dt_rx_ns,
         base_freq=bootstrap_base_freq,
+        max_step_ppb=_max_step if _max_step and _max_step > 0 else None,
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
              "sigma_do=[%.4f ns, %.4f ppb], "
@@ -7205,10 +7207,12 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         # consume at next servo.update().  Set by the TDCP per-epoch
         # hook; cleared by the servo loop after consumption.  None when
         # Arm 5 is off or no fresh observation is available.
+        # (The TdcpEstimator + TdcpInnovGate instances themselves live
+        # as locals in run_steady_state — they're not in ctx because
+        # the obs-loop hook that populates `tdcp_latest` holds direct
+        # refs.  Removed dead ctx['tdcp_est']/['tdcp_gate'] slots per
+        # charlie's PR #61 review item 2.)
         'tdcp_latest': None,
-        # Arm 5 supporting refs (None when Arm 5 off):
-        'tdcp_est': None,
-        'tdcp_gate': None,
         'tdcp_sigma_ppb': float(getattr(args, 'tdcp_sigma_ppb', 0.13)),
     }
 
@@ -10147,6 +10151,17 @@ Two-phase operation:
                             "(σ ~0.026 ppb) to never trip spuriously, "
                             "close enough that a co-slip frequency punch "
                             "(≥ 0.1 ppb) is caught.")
+    servo.add_argument("--max-adjfine-step-ppb", type=float, default=None,
+                       help="L3 actuator rate limit (DOFreqEst).  Cap the "
+                            "per-epoch change in PHC adjfine to this value "
+                            "in ppb.  Belt-and-suspenders defense against "
+                            "Arm 5 / Arm 4 / Arm 3 outliers that defeat "
+                            "L1+L2 — independent of which arm produces the "
+                            "punch.  Suggested 10-50 ppb on OCXO-class "
+                            "hosts (well above legitimate convergence "
+                            "rates and well below the 600+ ppb worst-case "
+                            "co-slip punch).  Default: None (no limit; "
+                            "today's behavior preserved).")
     servo.add_argument("--do-char-file", default="data/do_characterization.json",
                        help="Path to DO characterization JSON (read at startup)")
     servo.add_argument("--do-label", default=None,

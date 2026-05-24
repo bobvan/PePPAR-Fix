@@ -166,7 +166,16 @@ class TdcpEstimator:
 
         for obs in observations:
             sv = obs.get("sv")
-            phi_cyc = obs.get("phi1_cyc")
+            # Prefer the raw carrier-phase (`phi1_raw_cyc`) when available
+            # so the TDCP diff isn't punched by integer-cycle steps from
+            # SSR phase-bias updates.  A 1-cycle PB step on L1 = 0.190 m
+            # / c / 1 s = 0.635 ppb frequency punch = 4.9σ on default
+            # --tdcp-sigma-ppb=0.13 (63σ on L2 gate σ_floor).  The `phi1_cyc` field
+            # is post-PB-correction; `phi1_raw_cyc` is what the receiver
+            # measured.  Mirrors cycle_slip.py:286.
+            phi_cyc = obs.get("phi1_raw_cyc")
+            if phi_cyc is None:
+                phi_cyc = obs.get("phi1_cyc")
             wl = obs.get("wl_f1")
             if sv is None or phi_cyc is None or wl is None or phi_cyc == 0:
                 continue

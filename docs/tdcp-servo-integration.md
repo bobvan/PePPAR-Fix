@@ -212,19 +212,46 @@ Three layered defenses, all required:
   `scripts/peppar_fix/cycle_slip.py` infrastructure.
 - IF (ionosphere-free) phase jump check, same source.
 
-**L2 — per-epoch ensemble innovation gate (in `do_freq_est.py`)**
-- Reject the whole epoch's Arm 5 measurement if
-  `|z_tdcp − Hx̂| > N × σ_innov`.
-- Catches multi-SV co-slips because L1 is per-SV but L2 treats the
-  whole epoch as suspect when the ensemble disagrees with the
-  filter's prior.
-- Conservatively N = 4 (white-noise excess is rare at N > 3).
+**L2 — per-epoch ensemble-MAD gate on the TDCP observation
+(in `tdcp_innov_gate.py`)**
+- Sliding-window MAD-based anomaly check on the raw TDCP
+  `df_f` *observation*, not the Kalman innovation `(z − Hx̂)`.
+- Reject if `|z − running_median| > N × max(1.4826·MAD, σ_floor)`.
+- Default `window=30 s`, `n_sigma=5`, `sigma_floor_ppb=0.01`.
+- Decoupled from filter state by design (Phase B v2 revision):
+  - A Kalman-innovation gate would compare against the filter's
+    prior `Hx̂`.  If the filter belief is itself contaminated
+    (e.g., upstream slip not yet detected, or a prior bad-arm
+    update), the Kalman gate accepts the new bad observation as
+    "consistent with the prior" — failing exactly when we need
+    it most.
+  - The observation-domain gate uses a robust running median of
+    recent observations as its reference.  A single outlier
+    moves the median negligibly; sustained drift moves the
+    median over `window`-many epochs (adaptive); a transient
+    spike is rejected without polluting future statistics.
+- Trade-off vs Kalman: a legitimate rapid shift in `x[1]` (e.g.,
+  thermal step) is rejected for ~window epochs until the median
+  catches up.  Acceptable because (a) real rx-TCXO steps are rare
+  and (b) holding the prior x[1] for 30 s is cheaper than a
+  multi-σ punch leaking through.
 
-**L3 — actuator rate limit (in the LQR controller)**
-- Cap the per-epoch adjfine delta independent of what DOFreqEst
-  asks for.  Belt-and-suspenders.
-- Already partially in place; verify it remains enforced when
-  Arm 5 is the dominant innovation source.
+**L3 — actuator rate limit (in `do_freq_est.py`)**
+- Cap the per-epoch adjfine delta via the `max_step_ppb`
+  constructor parameter on `DOFreqEst`.  Engine flag
+  `--max-adjfine-step-ppb`.  None = disabled (preserves
+  pre-Phase-C behavior exactly).
+- Applies AFTER the existing `±max_ppb` absolute clamp.
+- Belt-and-suspenders defense against ANY arm that produces a
+  punch — not Arm-5 specific.  E.g., an outlier TICC sample
+  through Arm 4 or an EXTINT spike through Arm 3 also get
+  capped here.
+- Engaged from the second servo epoch onward (first epoch's
+  adjfine is unconstrained because there's no prior to clamp
+  against).
+- Suggested 10-50 ppb on OCXO-class hosts.  Well above
+  legitimate convergence rates (~0.01-0.1 ppb/s) and well
+  below the worst-case multi-cycle co-slip punch (~600 ppb).
 
 The day0419h sunrise event is a good fault-injection fixture for
 all three layers.  See `prototypes/tdcp-findings-2026-05-22.md`.

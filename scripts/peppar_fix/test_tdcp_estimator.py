@@ -343,6 +343,62 @@ class TdcpEstimatorEdgeCases(unittest.TestCase):
         self.assertEqual(r.n_total, 0)
         self.assertEqual(r.n_used, 0)
 
+    def test_phi1_raw_cyc_preferred_over_phi1_cyc(self):
+        """SSR phase-bias steps drop integer cycles into `phi1_cyc`
+        without changing the underlying carrier phase — a 1-cycle L1
+        step = 0.19 m / c / 1 s = 0.635 ppb single-epoch frequency
+        punch = 4.9σ on default --tdcp-sigma-ppb (63σ on L2 gate
+        σ_floor).  The estimator must read
+        `phi1_raw_cyc` (the receiver's uncorrected carrier phase) when
+        available so the SSR PB stream doesn't propagate into Arm 5.
+
+        Mirrors `cycle_slip.py:286` fallback pattern.
+        """
+        eph = _MockEph({"G01": _stationary_sat([20e6, 0, 0])})
+        est = TdcpEstimator(eph, _LAB_ECEF)
+        wl = 0.190293673
+        baseline = 1000.0  # cycles
+
+        # Epoch 0: phi1_cyc=phi1_raw_cyc=baseline (no PB yet).
+        obs0 = [{
+            "sv": "G01",
+            "phi1_cyc": baseline, "phi1_raw_cyc": baseline,
+            "wl_f1": wl, "cno": 45.0, "lock_duration_ms": 10_000, "lli": 0,
+        }]
+        _ = est.update(obs0, _ts(0))
+
+        # Epoch 1: phi1_cyc has a 1-cycle SSR PB step.  phi1_raw_cyc
+        # tracks the actual physics (no step — same as epoch 0 +
+        # whatever small motion).  TDCP must follow phi1_raw_cyc.
+        obs1 = [{
+            "sv": "G01",
+            "phi1_cyc": baseline + 1.0,     # PB step (1 full cycle)
+            "phi1_raw_cyc": baseline,        # truth, unchanged
+            "wl_f1": wl, "cno": 45.0, "lock_duration_ms": 10_000, "lli": 0,
+        }]
+        r = est.update(obs1, _ts(1))
+        # If the fix is in place: TDCP residual ≈ 0 (no real motion).
+        # If we had been reading phi1_cyc directly: residual = 1 cycle =
+        # 0.190 m / c / 1 s → df_f ≈ 6.3e-10 (0.635 ppb).
+        self.assertEqual(r.n_used, 1)
+        self.assertLess(
+            abs(r.df_f), 1e-11,
+            "TDCP must not pick up SSR PB step (phi1_raw_cyc fallback)",
+        )
+
+    def test_phi1_cyc_used_when_phi1_raw_cyc_absent(self):
+        """Backward compatibility: if the receiver-reader doesn't emit
+        `phi1_raw_cyc` (older code path), TdcpEstimator must still work
+        with `phi1_cyc` alone — same as before this fallback landed.
+        """
+        eph = _MockEph({"G01": _stationary_sat([20e6, 0, 0])})
+        est = TdcpEstimator(eph, _LAB_ECEF)
+        # _epoch_obs only emits phi1_cyc; no phi1_raw_cyc key.
+        _ = est.update(_epoch_obs(["G01"]), _ts(0))
+        r = est.update(_epoch_obs(["G01"]), _ts(1))
+        self.assertEqual(r.n_used, 1)
+        self.assertTrue(math.isfinite(r.df_f))
+
 
 if __name__ == "__main__":
     unittest.main()
