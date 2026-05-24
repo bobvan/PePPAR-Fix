@@ -4211,6 +4211,17 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                           q_ztd_step=q_ztd_step_arg)
     filt.prev_clock = 0.0
 
+    # Optional read-only TDCP estimator (--print-tdcp).  Runs alongside
+    # the FixedPosFilter, observing the same per-epoch obs dicts, but
+    # does not steer the servo.  Phase A scaffold for the architecture
+    # in docs/tdcp-servo-integration.md; Phase B wires the output into
+    # DOFreqEst as Arm 5.
+    tdcp_est = None
+    if getattr(args, 'print_tdcp', False):
+        from peppar_fix.tdcp_estimator import TdcpEstimator
+        tdcp_est = TdcpEstimator(beph, known_ecef)
+        log.info("TDCP estimator running read-only (--print-tdcp)")
+
     # σ_pin: time filter's uncertainty about its pinned ARP, used by
     # the σ-weighted Bayesian position-blend (I-125649 Stage 2/3).
     # Initial value comes from how the engine learned this position
@@ -4741,6 +4752,18 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 log.info(f"  [{n_epochs}] Dropped {dropped_obs} expired observation epochs")
             skip_stats["obs_dropped_expired"] += dropped_obs
             gps_time, observations = obs_event
+
+            # Read-only TDCP estimate (--print-tdcp).  Runs before the
+            # FixedPosFilter update so the [TDCP] line lines up with
+            # the same gps_time/obs the filter is about to see.  Does
+            # not steer the servo — Phase A scaffold only.
+            if tdcp_est is not None:
+                tdcp_r = tdcp_est.update(observations, gps_time)
+                log.info(
+                    "[TDCP] n_sv=%d/%d c_dt_rx=%.4fm df_f=%.3e mad_m=%.4f dt_s=%.2f",
+                    tdcp_r.n_used, tdcp_r.n_total, tdcp_r.c_dt_rx_m,
+                    tdcp_r.df_f, tdcp_r.mad_r_m, tdcp_r.dt_s,
+                )
 
             # After a PHC step, the filter's clock state is stale.
             # Reset dt_rx to near-zero so the servo doesn't over-correct.
@@ -10309,6 +10332,12 @@ Two-phase operation:
     # Output
     out = ap.add_argument_group("Output")
     out.add_argument("--out", help="Solution CSV output file")
+    out.add_argument("--print-tdcp", action="store_true",
+                     help="Run a read-only TDCP frequency-error "
+                          "estimator alongside the steady-state filter "
+                          "and emit a [TDCP] log line per epoch.  No "
+                          "servo impact; off by default.  Phase A scaffold "
+                          "for docs/tdcp-servo-integration.md.")
     out.add_argument("--rinex-out", default=None,
                      help="Optional path to write a RINEX 3.04 OBS file "
                           "of the observations the engine processed.  "
