@@ -216,7 +216,8 @@ class DOFreqEst:
                qerr_freq_ppb=None, qerr_freq_sigma_ppb=None,
                tdcp_freq_ppb=None, tdcp_freq_sigma_ppb=None,
                extint_phase_ns=None, extint_sigma_ns=None,
-               ticc_diff_ns=None, ticc_sigma_ns=None):
+               ticc_diff_ns=None, ticc_sigma_ns=None,
+               pseudo_phase_ns=None, pseudo_phase_sigma_ns=None):
         """Process one epoch with up to six conditional measurement arms.
 
         Per docs/dofreq-est-measurement-ladder.md and
@@ -367,6 +368,19 @@ class DOFreqEst:
                 H=np.array([[0.0, 0.0, 1.0, 0.0]]),
                 R=extint_sigma_ns ** 2,
                 arm_name='extint',
+            )
+
+        # ── Arm 6: holdover pseudo-obs (linear, observes x[2]) ──
+        # Synthetic DO phase from TDCP-integrated rx_TCXO phase + frozen
+        # DO-vs-rx_TCXO offset.  Same H as Arm 3; wider σ that grows
+        # with holdover duration.  Only present during HOLDOVER/REACQUIRED.
+        if pseudo_phase_ns is not None and pseudo_phase_sigma_ns is not None:
+            x_pred, P_pred = self._kalman_linear_update(
+                x_pred, P_pred,
+                z=pseudo_phase_ns,
+                H=np.array([[0.0, 0.0, 1.0, 0.0]]),
+                R=pseudo_phase_sigma_ns ** 2,
+                arm_name='pseudo',
             )
 
         # ── Arm 4: TICC (nonlinear, couples x[0] and x[2]) ──
