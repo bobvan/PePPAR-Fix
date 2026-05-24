@@ -39,10 +39,15 @@ This couples the rx TCXO and DO states in the measurement — the key
 insight that makes 4-state fusion work where 2-state failed.
 """
 
+import logging
 import math
 import numpy as np
 
 from peppar_fix.innov_control_monitor import InnovControlMonitor
+
+log = logging.getLogger(__name__)
+
+_CHI2_GATE_THRESHOLD = 100.0  # 10σ; |innov|/√S > 10 skips Arm 4 update
 
 
 def _qerr(phi_tcxo_ns, tick_ns=8.0):
@@ -145,6 +150,8 @@ class DOFreqEst:
         # At startup, bootstrap set adjfine = initial_freq, so
         # the last applied u = initial_freq.
         self._last_u = initial_freq
+
+        self._state_corrupted = False
 
         # Innov-vs-control consistency monitor (TICC arm, where u enters
         # the prediction).  See peppar_fix/innov_control_monitor.py.
@@ -434,17 +441,34 @@ class DOFreqEst:
             self.last_arm_innov['ticc'] = innov_ticc
             self.last_arm_S['ticc'] = S
 
-            K = (P_pred @ H_ticc.T) / S
-            x_pred = x_pred + K.flatten() * innov_ticc
-            P_pred = P_pred - np.outer(K.flatten(), K.flatten()) * S
-
-            # Feed the innov-vs-control monitor.  TICC arm is the one
-            # that closes the loop on x[2] (DO phase), so its innov is
-            # what carries plant-model error.
-            self.innov_monitor.observe(self._last_u, innov_ticc, S)
+            _chi2 = innov_ticc ** 2 / S if S > 0 else 0.0
+            if _chi2 > _CHI2_GATE_THRESHOLD:
+                log.warning(
+                    "[EKF] Arm 4 chi² gate: |innov|=%.1f ns, √S=%.1f ns, "
+                    "χ²=%.0f > %.0f — update skipped",
+                    abs(innov_ticc), math.sqrt(S), _chi2,
+                    _CHI2_GATE_THRESHOLD,
+                )
+            else:
+                K = (P_pred @ H_ticc.T) / S
+                x_pred = x_pred + K.flatten() * innov_ticc
+                P_pred = P_pred - np.outer(K.flatten(), K.flatten()) * S
+                self.innov_monitor.observe(self._last_u, innov_ticc, S)
 
         self.x = x_pred
         self.P = P_pred
+
+        # State-sanity guard (I-074400 defense #2): detect state
+        # corruption that the chi-squared gate didn't catch (e.g.,
+        # corruption through a non-TICC path or accumulated drift).
+        _X_BOUNDS = (1e8, 1e4, 1e8, 1e6)  # ns, ppb, ns, ppb
+        for _i, (_xi, _bound) in enumerate(zip(self.x, _X_BOUNDS)):
+            if abs(_xi) > _bound:
+                log.error(
+                    "[EKF] state-sanity: |x[%d]|=%.1f > %.0f — "
+                    "state corrupted", _i, abs(_xi), _bound)
+                self._state_corrupted = True
+                break
 
         # ── LQR control ──
         # Only L[2] (φ_phc) and L[3] (f_phc) are nonzero.

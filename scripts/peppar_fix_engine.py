@@ -66,6 +66,8 @@ from peppar_fix.if_step_monitor import IfStepMonitor
 from peppar_fix.setting_sv_drop_monitor import SettingSvDropMonitor
 from peppar_fix.fix_set_integrity_monitor import FixSetIntegrityMonitor
 from peppar_fix.wl_drift_monitor import WlDriftMonitor
+from peppar_fix.holdover_wiring import init_holdover, tick_holdover, add_holdover_args
+from peppar_fix.holdover_actor import HoldoverMode
 from peppar_fix.gf_step_monitor import GfStepMonitor, gf_phase_m
 from peppar_fix.second_opinion_pos_monitor import (
     SecondOpinionPosMonitor,
@@ -7229,6 +7231,8 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         # charlie's PR #61 review item 2.)
         'tdcp_latest': None,
         'tdcp_sigma_ppb': float(getattr(args, 'tdcp_sigma_ppb', 0.13)),
+        'holdover_state': init_holdover(args),
+        'holdover_log_counter': 0,
     }
 
     # ── Optional noise-buffer CSV (I-162848 Step 1) ───────────────── #
@@ -8000,6 +8004,36 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                     tdcp_freq_ppb = _td_freq
                     tdcp_freq_sigma_ppb = _td_sigma
                 ctx['tdcp_latest'] = None  # consume-and-clear
+        # ── Phase D holdover tick (pre-update: produces pseudo-obs) ──
+        _pseudo_phase_ns = None
+        _pseudo_phase_sigma_ns = None
+        _ho = ctx.get('holdover_state')
+        if _ho is not None:
+            _hw_healthy = (extint_phase_ns is not None or
+                           ticc_diff_ns is not None)
+            _ho_result = tick_holdover(
+                _ho, servo, tdcp_freq_ppb,
+                ctx['tdcp_sigma_ppb'], now_mono, _hw_healthy,
+            )
+            _pseudo_phase_ns = _ho_result.pseudo_obs_ns
+            _pseudo_phase_sigma_ns = _ho_result.pseudo_obs_sigma_ns
+            _ho_cc = _ho_result.clock_class
+            _cc_map = {6: "locked", 7: "holdover", 52: "initialized", 248: "freerun"}
+            _cc_state = _cc_map.get(_ho_cc)
+            if _cc_state and _ho_result.mode != HoldoverMode.TRACKING:
+                _set_clock_class(ctx, _cc_state)
+            if _ho_result.mode == HoldoverMode.HOLDOVER:
+                ctx['holdover_log_counter'] += 1
+                if ctx['holdover_log_counter'] % 10 == 0:
+                    log.info(
+                        "[HOLDOVER] σ=%.3f ns cc=%d T=%.0f s",
+                        _ho_result.holdover_sigma_ns,
+                        _ho_cc,
+                        now_mono - _ho.holdover_entry_mono
+                        if _ho.holdover_entry_mono is not None else 0.0,
+                    )
+            else:
+                ctx['holdover_log_counter'] = 0
         adjfine_ppb = -servo.update(
             dt=dt_actual,
             dt_rx_ns=dt_rx_ns_arg, dt_rx_sigma_ns=dt_rx_sigma_arg,
@@ -8010,6 +8044,8 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             extint_sigma_ns=extint_sigma_ns,
             ticc_diff_ns=ticc_diff_ns,
             ticc_sigma_ns=ticc_sigma_ns,
+            pseudo_phase_ns=_pseudo_phase_ns,
+            pseudo_phase_sigma_ns=_pseudo_phase_sigma_ns,
         )
         # ── --arm-state-log: post-update DOFreqEst state vector ─────
         _arm_w = ctx.get('arm_state_log_writer')
@@ -10190,6 +10226,7 @@ Two-phase operation:
                             "rates and well below the 600+ ppb worst-case "
                             "co-slip punch).  Default: None (no limit; "
                             "today's behavior preserved).")
+    add_holdover_args(servo)
     servo.add_argument("--do-char-file", default="data/do_characterization.json",
                        help="Path to DO characterization JSON (read at startup)")
     servo.add_argument("--do-label", default=None,
