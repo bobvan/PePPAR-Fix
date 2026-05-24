@@ -255,7 +255,9 @@ frequency to maintain rx_TCXO phase accumulates as:
 σ_tdcp(T) = σ_y × √T     [ns, with σ_y in ppb, T in seconds]
 ```
 
-From the 2026-05-23 validation gate:
+From the 2026-05-23 validation gate (PiFace/TimeHat/clkPoC3 from
+the Phase A morning gate; MadHat from Main's separate 1.02 h
+F10T offline replay at 09:27 CDT):
 
 | Host | σ_y (ppb) | σ_tdcp(60 s) | σ_tdcp(300 s) | σ_tdcp(3600 s) |
 |---|---|---|---|---|
@@ -263,6 +265,16 @@ From the 2026-05-23 validation gate:
 | TimeHat (F9T-10) | 0.051 | 0.40 ns | 0.88 ns | 3.08 ns |
 | clkPoC3 (F9T-20B) | 0.057 | 0.44 ns | 0.99 ns | 3.43 ns |
 | MadHat (F10T) | 0.065 | 0.50 ns | 1.12 ns | 3.90 ns |
+
+**Caveat**: `σ_y × √T` assumes white-FM noise, which matches the
+prototype's short-τ TDEV slope.  At longer τ the prototype showed
+TDEV ∝ τ^1.6 (from 15 ps at 1 s to 2.3 ns at 30 s — steeper than
+the τ^0.5 white-FM prediction of 82 ps at 30 s).  This implies a
+flicker-FM or RW-FM component that grows faster than √T.  S1 is
+therefore a **lower bound** on TDCP integrated noise at long T;
+actual could be 20-50% higher at T > 300 s.  This doesn't change
+the 354 ps crossover (S3 dominates there anyway) but means the
+1-hour S1 column is optimistic by up to 50%.
 
 This is the *minimum* contribution — TDCP integration noise alone,
 even if the frozen offset were perfect.
