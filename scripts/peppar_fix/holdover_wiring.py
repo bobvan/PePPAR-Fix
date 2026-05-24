@@ -21,7 +21,14 @@ from peppar_fix.tdcp_phase_integrator import TdcpPhaseIntegrator
 
 log = logging.getLogger(__name__)
 
+# Engine uses this exit code when HOLDOVER is required but no hardware
+# anchor is available at startup (e.g., engine restarted mid-HOLDOVER).
+# Wired into peppar_fix_engine.py in the engine-integration commit.
 EXIT_NO_ANCHOR = 7
+
+# Prevents Kalman over-trust when offset σ is sub-100 ps right after
+# HOLDOVER entry (EMA hasn't had time to inflate yet).
+MIN_PSEUDO_OBS_SIGMA_NS = 0.1
 
 
 class HoldoverState:
@@ -32,6 +39,7 @@ class HoldoverState:
         self.integrator: TdcpPhaseIntegrator = integrator
         self.actor: HoldoverActor = actor
         self.holdover_entry_mono: float | None = None
+        self.gap_logged: bool = False
 
 
 def init_holdover(args) -> HoldoverState | None:
@@ -146,6 +154,7 @@ def tick_holdover(
         elif transition.curr == HoldoverMode.TRACKING:
             integrator.reset()
             state.holdover_entry_mono = None
+            state.gap_logged = False
 
     # During HOLDOVER or REACQUIRED: integrate TDCP and produce pseudo-obs.
     pseudo_obs_ns = None
@@ -153,21 +162,20 @@ def tick_holdover(
 
     if actor.wants_pseudo_obs:
         if tdcp_freq is not None:
-            ok = integrator.integrate(df_f=tdcp_freq, mono_s=mono_s)
-            if not ok and not integrator.gap_detected:
-                pass
-            elif integrator.gap_detected:
+            integrator.integrate(df_f=tdcp_freq, mono_s=mono_s)
+            if integrator.gap_detected and not state.gap_logged:
                 log.warning(
                     "[HOLDOVER] TDCP gap — Arm 6 muted until REACQUIRE "
                     "(gap at %.1f s into holdover)",
                     holdover_dur,
                 )
+                state.gap_logged = True
 
         frozen = actor.frozen_offset_ns
         pseudo = integrator.pseudo_obs(offset_ns=frozen)
         if pseudo is not None:
             pseudo_obs_ns = pseudo
-            pseudo_obs_sigma_ns = max(holdover_sigma, 0.1)
+            pseudo_obs_sigma_ns = max(holdover_sigma, MIN_PSEUDO_OBS_SIGMA_NS)
 
     return TickResult(
         pseudo_obs_ns=pseudo_obs_ns,
@@ -200,11 +208,17 @@ def _log_transition(transition, holdover_dur, actor):
             actor.clock_class(),
         )
     elif transition.curr == HoldoverMode.TRACKING:
-        log.info(
-            "[STATE] holdover: REACQUIRED → TRACKING "
-            "(P[2,2]=%.3e, blend complete)",
-            transition.sigma_ns ** 2 if transition.sigma_ns > 0 else 0.0,
-        )
+        if transition.sigma_ns > 0:
+            log.warning(
+                "[STATE] holdover: REACQUIRED → TRACKING via T_blend timeout "
+                "(P[2,2]=%.3e — blend did not converge to σ_blend_done)",
+                transition.sigma_ns ** 2,
+            )
+        else:
+            log.info(
+                "[STATE] holdover: REACQUIRED → TRACKING "
+                "(P[2,2] converged, blend complete)",
+            )
 
 
 def add_holdover_args(servo_group):
