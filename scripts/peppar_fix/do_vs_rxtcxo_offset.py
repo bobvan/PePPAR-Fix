@@ -95,6 +95,9 @@ class DoVsRxTcxoOffset:
                           tdcp_sigma_y_ppb: float = 0.026) -> float:
         """Predicted σ(x[2]_pseudo) after holdover_duration_s seconds.
 
+        tdcp_sigma_y_ppb default is PiFace F9T-20B's value.  Per-host:
+        TimeHat F9T-10 ~0.051, clkPoC3 F9T-20B ~0.057, MadHat F10T ~0.065.
+
         Combines:
           S1: TDCP integrated phase noise = σ_y × √T
           S2: frozen offset initial uncertainty = last_offset_sigma_ns

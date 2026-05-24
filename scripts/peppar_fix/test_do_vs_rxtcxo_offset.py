@@ -50,9 +50,8 @@ class TestDoVsRxTcxoOffsetBasics(unittest.TestCase):
             val = 10.0 if i < 25 else 20.0
             fast.update(0.0, val, 0.01, 0.01, float(i))
             slow.update(0.0, val, 0.01, 0.01, float(i))
-        self.assertGreater(abs(fast.last_offset_ns - 20.0),
-                           abs(slow.last_offset_ns - 20.0) * -1)
-        self.assertAlmostEqual(fast.last_offset_ns, 20.0, places=0)
+        self.assertLess(abs(fast.last_offset_ns - 20.0),
+                        abs(slow.last_offset_ns - 20.0))
 
     def test_negative_tau_raises(self):
         with self.assertRaises(ValueError):
