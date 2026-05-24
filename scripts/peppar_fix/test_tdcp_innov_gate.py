@@ -39,6 +39,29 @@ def test_post_warmup_rejects_co_slip_punch():
     assert r.deviation > 5.0
 
 
+def test_marginal_at_threshold_with_sigma_floor():
+    """At intrinsic TDCP σ=0.026 ppb, buffer MAD will land near
+    σ_floor (0.01 ppb default).  n_sigma=5 then sets the boundary at
+    ~0.05 ppb deviation — observations BELOW that pass, ABOVE reject.
+    Tests the marginal regime around the threshold (Charlie's review).
+    """
+    # Buffer of clean noise around 0, σ_floor will dominate (MAD-σ
+    # below floor).
+    g = TdcpInnovGate(window=30, n_sigma=5.0, sigma_floor_ppb=0.01)
+    import random
+    random.seed(7)
+    for _ in range(30):
+        g.evaluate(random.gauss(0.0, 0.005))  # very quiet, MAD near 0
+
+    # Well below 5×σ_floor = 0.05: accept.
+    r_low = g.evaluate(0.04)
+    assert r_low.accepted is True, f"0.04 ppb dev should pass; {r_low}"
+
+    # Well above 5×σ_floor: reject.
+    r_high = g.evaluate(0.20)
+    assert r_high.accepted is False, f"0.20 ppb dev should reject; {r_high}"
+
+
 def test_buffer_always_buffers_for_adaptive_drift():
     """A sustained shift eventually re-anchors the gate."""
     g = TdcpInnovGate(window=5, n_sigma=5.0)

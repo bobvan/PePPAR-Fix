@@ -129,3 +129,125 @@ def test_arm5_after_reset_starts_clean():
 
     f.reset(current_freq=0.0)
     assert f.x[1] == 0.0
+
+
+# ── L3 — actuator rate limit tests ─────────────────────────────────── #
+
+def _l3_baseline(max_step_ppb=10.0):
+    """DOFreqEst seeded so we can exercise the L3 clamp deterministically."""
+    f = DOFreqEst(
+        sigma_ticc_ns=0.060,
+        sigma_do_phase_ns=0.92, sigma_do_freq_ppb=0.01,
+        sigma_tcxo_phase_ns=2.0, sigma_tcxo_freq_ppb=0.1,
+        initial_dt_rx_ns=0.0, base_freq=0.0,
+        max_step_ppb=max_step_ppb,
+    )
+    # Force-tighten P to avoid runaway corrections from huge initial
+    # uncertainty; keep x[3] at -50 ppb so LQR commands a non-zero
+    # baseline adjfine of +50 ppb.
+    f.P = np.diag([1.0, 1.0, 100.0, 1.0])
+    f.x = np.array([0.0, 0.0, 0.0, -50.0])
+    # Set _last_u to where LQR would naturally land with this state.
+    # u = -L·x = -(0·0 + 0·0 + (-0.05)·0 + 1.0·(-50)) = 50.
+    f._last_u = 50.0
+    return f
+
+
+def test_l3_rate_limit_clamps_large_positive_step():
+    """A large punch on x[2] (e.g., outlier EXTINT) should be clamped."""
+    f = _l3_baseline(max_step_ppb=10.0)
+    # Inject an EXTINT obs at 200 ns — would normally produce a much
+    # larger adjfine jump than 10 ppb in one epoch.
+    f.update(dt=1.0, extint_phase_ns=200.0, extint_sigma_ns=5.0)
+    # New u should be at most 50 + 10 = 60 ppb (rate-limited).
+    assert f._last_u <= 60.0 + 1e-6, f"L3 failed to clamp: u={f._last_u}"
+    # And the actual change must be ≤ max_step_ppb in magnitude.
+    assert abs(f._last_u - 50.0) <= 10.0 + 1e-6
+
+
+def test_l3_rate_limit_clamps_large_negative_step():
+    f = _l3_baseline(max_step_ppb=10.0)
+    f.update(dt=1.0, extint_phase_ns=-200.0, extint_sigma_ns=5.0)
+    assert f._last_u >= 40.0 - 1e-6
+    assert abs(f._last_u - 50.0) <= 10.0 + 1e-6
+
+
+def test_l3_does_not_clamp_small_legitimate_steps():
+    """A 0.1 ppb correction (well below max_step_ppb) must pass through."""
+    f = _l3_baseline(max_step_ppb=10.0)
+    f.update(dt=1.0, qerr_freq_ppb=49.9, qerr_freq_sigma_ppb=0.05)
+    # Without clamping the response should land between 49.9 and 50.
+    # With clamping at 10 ppb step, since the desired step is well
+    # under 10 ppb, no clamp engages — same result.
+    expected_unclamped = f._last_u  # whatever Kalman computed
+    # Re-run with no L3 active.
+    f2 = _l3_baseline(max_step_ppb=None)
+    f2.update(dt=1.0, qerr_freq_ppb=49.9, qerr_freq_sigma_ppb=0.05)
+    assert abs(expected_unclamped - f2._last_u) < 1e-9
+
+
+def test_arm2_arm5_order_invariance():
+    """Sequential Kalman updates on the same H are order-invariant
+    in exact arithmetic.  Whether we call qErr-then-TDCP or
+    TDCP-then-qErr, the posterior must match to machine ε.
+
+    Charlie's PR #61 review item 5 — defense against future refactors
+    that change Arm ordering inadvertently.
+    """
+    def run(order):
+        f = _baseline()
+        kwargs_qerr = {"qerr_freq_ppb": 0.5, "qerr_freq_sigma_ppb": 0.30}
+        kwargs_tdcp = {"tdcp_freq_ppb": 0.5, "tdcp_freq_sigma_ppb": 0.026}
+        if order == "qerr_first":
+            # Today's update() calls qerr before tdcp by construction;
+            # nothing to swap manually since both pass keyword args.
+            f.update(dt=1.0, **kwargs_qerr, **kwargs_tdcp)
+        else:
+            # The implementation order is fixed in update() — Arm 2
+            # before Arm 5.  This branch is a structural cross-check:
+            # if a future refactor reorders Arm 5 BEFORE Arm 2, the
+            # posterior must still match.  We simulate by calling
+            # _kalman_linear_update directly in the opposite order.
+            import numpy as np
+            x_pred = f.F @ f.x + f.B * f._last_u
+            P_pred = f.F @ f.P @ f.F.T + f.Q * 1.0
+            x_new, P_new = f._kalman_linear_update(
+                x_pred, P_pred,
+                z=kwargs_tdcp["tdcp_freq_ppb"],
+                H=np.array([[0.0, 1.0, 0.0, 0.0]]),
+                R=kwargs_tdcp["tdcp_freq_sigma_ppb"] ** 2,
+            )
+            x_new, P_new = f._kalman_linear_update(
+                x_new, P_new,
+                z=kwargs_qerr["qerr_freq_ppb"],
+                H=np.array([[0.0, 1.0, 0.0, 0.0]]),
+                R=kwargs_qerr["qerr_freq_sigma_ppb"] ** 2,
+            )
+            f.x = x_new
+            f.P = P_new
+        return f.x.copy(), f.P.copy()
+
+    x1, p1 = run("qerr_first")
+    x2, p2 = run("tdcp_first")
+    np.testing.assert_allclose(x1, x2, atol=1e-12)
+    np.testing.assert_allclose(p1, p2, atol=1e-12)
+
+
+def test_l3_disabled_when_max_step_ppb_none():
+    """max_step_ppb=None preserves pre-Phase-C behavior exactly."""
+    f1 = _l3_baseline(max_step_ppb=None)
+    f1.update(dt=1.0, extint_phase_ns=200.0, extint_sigma_ns=5.0)
+
+    f2 = DOFreqEst(
+        sigma_ticc_ns=0.060,
+        sigma_do_phase_ns=0.92, sigma_do_freq_ppb=0.01,
+        sigma_tcxo_phase_ns=2.0, sigma_tcxo_freq_ppb=0.1,
+        initial_dt_rx_ns=0.0, base_freq=0.0,
+    )  # no max_step_ppb param at all
+    f2.P = np.diag([1.0, 1.0, 100.0, 1.0])
+    f2.x = np.array([0.0, 0.0, 0.0, -50.0])
+    f2._last_u = 50.0
+    f2.update(dt=1.0, extint_phase_ns=200.0, extint_sigma_ns=5.0)
+
+    np.testing.assert_allclose(f1.x, f2.x, atol=1e-12)
+    assert f1._last_u == f2._last_u

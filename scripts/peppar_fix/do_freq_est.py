@@ -62,8 +62,22 @@ class DOFreqEst:
                  sigma_tcxo_phase_ns=2.0, sigma_tcxo_freq_ppb=0.1,
                  tick_ns=8.0,
                  max_ppb=62_500_000.0, initial_freq=0.0,
-                 initial_dt_rx_ns=None, base_freq=None):
+                 initial_dt_rx_ns=None, base_freq=None,
+                 max_step_ppb=None):
         self.max_ppb = max_ppb
+        # L3 of the TDCP slip-protection stack: per-epoch actuator
+        # rate limit.  None = disabled (today's behavior preserved).
+        # When set, |adjfine_new - adjfine_prev| is clamped to this
+        # value, providing belt-and-suspenders defense against any
+        # arm — Arm 5 co-slip that defeats L1+L2, Arm 4 TICC outlier
+        # punch, Arm 3 EXTINT outlier punch, or filter divergence.
+        # The cost of "too low" is slower legitimate convergence
+        # (multi-epoch pull on a real step); cost of "too high" is
+        # less defense against catastrophic single-epoch errors.
+        # Engaged only after the first adjfine has been computed —
+        # the very first epoch's adjfine is unconstrained because
+        # there's no prior to rate-limit against.
+        self.max_step_ppb = max_step_ppb
         self.tick_ns = tick_ns
         self.dt = 1.0
 
@@ -380,6 +394,18 @@ class DOFreqEst:
         adjfine = -u
 
         adjfine = max(-self.max_ppb, min(self.max_ppb, adjfine))
+
+        # L3: per-epoch rate limit on the actual applied adjfine.
+        # The engine applies u (after double-negation of -u return);
+        # self._last_u stores the previous u.  So clamp |u_new - u_prev|.
+        # max_step_ppb is None → behavior unchanged from pre-Phase-C.
+        if self.max_step_ppb is not None:
+            u_prev = self._last_u
+            if u > u_prev + self.max_step_ppb:
+                u = u_prev + self.max_step_ppb
+            elif u < u_prev - self.max_step_ppb:
+                u = u_prev - self.max_step_ppb
+            adjfine = -u
 
         self._last_u = u
         self.freq = adjfine
