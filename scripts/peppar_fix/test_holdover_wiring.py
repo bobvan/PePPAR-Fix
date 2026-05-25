@@ -165,7 +165,8 @@ class TestTickHoldoverFullCycle(unittest.TestCase):
         r = tick_holdover(state, servo, 1e-9, 0.026, t + 5.0, False)
         self.assertEqual(r.clock_class, 6)
 
-    def test_gap_in_holdover_mutes_pseudo_obs(self):
+    def test_gap_in_holdover_reseeds_and_recovers(self):
+        """Fix A: gap re-seeds integrator instead of permanent mute."""
         args = _mock_args(holdover_t_enter_s=3.0, holdover_max_gap_s=1.5)
         state = init_holdover(args)
         servo = _mock_servo(x0=0.0, x2=5.0)
@@ -179,9 +180,33 @@ class TestTickHoldoverFullCycle(unittest.TestCase):
         r = tick_holdover(state, servo, 1e-9, 0.026, t + 4.0, False)
         self.assertIsNotNone(r.pseudo_obs_ns)
 
-        # Gap (3 s > 1.5 s max from t+4 to t+7).
+        # Gap (3 s > 1.5 s max from t+4 to t+7) → re-seed.
         r = tick_holdover(state, servo, 1e-9, 0.026, t + 7.0, False)
-        self.assertIsNone(r.pseudo_obs_ns)
+        # Integrator was re-seeded at t+7; pseudo_obs available
+        # at the NEXT epoch after re-seed (need one integrate).
+        r = tick_holdover(state, servo, 1e-9, 0.026, t + 8.0, False)
+        self.assertIsNotNone(r.pseudo_obs_ns,
+                             "Arm 6 should recover after gap re-seed")
+
+    def test_cross_covariance_zeroed_during_holdover(self):
+        """Fix E: P[0,2]/P[2,0] zeroed to prevent Arm 6 pulling x[0]."""
+        args = _mock_args(holdover_t_enter_s=3.0)
+        state = init_holdover(args)
+        servo = _mock_servo(x0=1000.0, x2=5.0)
+        # Set nonzero cross-covariance.
+        servo.P[0, 2] = 50.0
+        servo.P[2, 0] = 50.0
+        t = self._warm_up_tracking(state, servo)
+
+        # Enter holdover.
+        for i in range(4):
+            tick_holdover(state, servo, 1e-9, 0.026, t + i, False)
+        self.assertEqual(state.actor.mode, HoldoverMode.HOLDOVER)
+
+        # During holdover, P[0,2] should be zeroed.
+        tick_holdover(state, servo, 1e-9, 0.026, t + 4.0, False)
+        self.assertAlmostEqual(servo.P[0, 2], 0.0)
+        self.assertAlmostEqual(servo.P[2, 0], 0.0)
 
     def test_holdover_duration_from_wall_clock_not_integrator(self):
         """Charlie's review: use mono from tick, not integrator."""
