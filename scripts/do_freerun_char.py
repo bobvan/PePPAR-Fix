@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Free-run + phase-noise characterization of a DO via TICC chA−chB.
+"""Free-run + phase-noise characterization of a DO via TICC chA (vs Rb).
 
 Parks the DAC at a fixed code (default: code yielding ~0 ppb offset
 from the existing dac_slope_cal.py output, if present in the JSON;
-else mid-scale 32768), then captures TICC chA−chB for a configured
-duration.  Computes:
+else mid-scale 32768), then captures TICC chA timestamps for a
+configured duration.  The TICC's chA timestamp is referenced to the
+TICC's internal Rb-disciplined timebase (sub-100 ps TDEV(1s) per the
+lab's Rb characterization), so chA alone (detrended) measures the
+DO's freerun noise vs the Rb — what you want for an apples-to-apples
+oscillator comparison.
+
+Per CLAUDE.md `### TICC stability metric: use chA alone, not chA-chB`.
+
+Computes:
 
   - RMS of phase residual (ns)
   - PSD curve at standard offset frequencies (0.005–0.5 Hz from 1 Hz
@@ -78,16 +86,29 @@ def classify_noise_type(slope: float) -> str:
     return "random_walk_FM"
 
 
-def collect_phase_series(ticc_port: str, duration_s: float):
-    """Listen to TICC; pair chA/chB by ref_sec; return list of
-    (ref_sec, chA_minus_chB_ns).
+def collect_chA_series(ticc_port: str, duration_s: float):
+    """Listen to TICC; collect all chA and chB edges separately.
 
-    Drops orphan edges older than 5 s of pairing horizon.
+    Returns (chA_records, chB_records, paired) where:
+      - chA_records: list of (ref_sec, chA_phase_s) in arrival order
+      - chB_records: list of (ref_sec, chB_phase_s)
+      - paired: list of (ref_sec, chA_minus_chB_ns) for those seconds
+                where both edges arrived (kept for offline re-analysis
+                of how well the DO tracks GNSS, distinct from the DO's
+                intrinsic noise).
+
+    The PRIMARY freerun-noise metric uses chA alone, detrended against
+    the TICC's Rb reference timebase (sub-100 ps TDEV(1s) per host).
+    chA−chB would mix in F9T/F10T PPS jitter and tell us the DO+GNSS
+    chain instead — that's the discipline-loop-tracking metric per
+    CLAUDE.md `### TICC stability metric: use chA alone, not chA-chB`.
     """
-    chA: dict[int, float] = {}
-    chB: dict[int, float] = {}
-    pairs: list[tuple[int, float]] = []
-    seen: set[int] = set()
+    chA_dict: dict[int, float] = {}
+    chB_dict: dict[int, float] = {}
+    chA_records: list[tuple[int, float]] = []
+    chB_records: list[tuple[int, float]] = []
+    paired: list[tuple[int, float]] = []
+    seen_pairs: set[int] = set()
     t0 = None
     with Ticc(ticc_port, wait_for_boot=False) as ticc:
         for ch, sec, ps in ticc:
@@ -97,21 +118,23 @@ def collect_phase_series(ticc_port: str, duration_s: float):
                 break
             phase_s = sec + ps * 1e-12
             if ch == 'chA':
-                chA[sec] = phase_s
+                chA_dict[sec] = phase_s
+                chA_records.append((sec, phase_s))
             elif ch == 'chB':
-                chB[sec] = phase_s
-            for s in set(chA) & set(chB):
-                if s not in seen:
-                    pairs.append((s, (chA[s] - chB[s]) * 1e9))
-                    seen.add(s)
+                chB_dict[sec] = phase_s
+                chB_records.append((sec, phase_s))
+            for s in set(chA_dict) & set(chB_dict):
+                if s not in seen_pairs:
+                    paired.append((s, (chA_dict[s] - chB_dict[s]) * 1e9))
+                    seen_pairs.add(s)
             cutoff = sec - 5
-            for s in list(chA):
-                if s < cutoff and s not in chB:
-                    del chA[s]
-            for s in list(chB):
-                if s < cutoff and s not in chA:
-                    del chB[s]
-    return pairs
+            for s in list(chA_dict):
+                if s < cutoff and s not in chB_dict:
+                    del chA_dict[s]
+            for s in list(chB_dict):
+                if s < cutoff and s not in chA_dict:
+                    del chB_dict[s]
+    return chA_records, chB_records, paired
 
 
 def detrend_linear(t: np.ndarray, y: np.ndarray):
@@ -277,15 +300,19 @@ def main() -> int:
     dac._write_code(code)
     print(f"DAC parked at code {code}")
 
-    pairs = []
+    chA_recs: list[tuple[int, float]] = []
+    chB_recs: list[tuple[int, float]] = []
+    paired: list[tuple[int, float]] = []
     try:
         print(f"\nWarmup 60s after DAC step (thermal settle)…")
         time.sleep(60)
-        print(f"\nCapturing {args.duration_s} s of TICC chA−chB…")
+        print(f"\nCapturing {args.duration_s} s of TICC chA + chB…")
         t_start = time.monotonic()
-        pairs = collect_phase_series(args.ticc_port, args.duration_s)
+        chA_recs, chB_recs, paired = collect_chA_series(args.ticc_port,
+                                                        args.duration_s)
         t_cap = time.monotonic() - t_start
-        print(f"  → {len(pairs)} chA-chB pairs in {t_cap:.0f} s")
+        print(f"  → chA edges: {len(chA_recs)}  chB edges: {len(chB_recs)}  "
+              f"paired-by-sec: {len(paired)}  ({t_cap:.0f} s wall)")
     finally:
         try:
             dac._write_code(32768)
@@ -293,24 +320,52 @@ def main() -> int:
             pass
         dac.teardown()
 
-    if len(pairs) < 60:
-        print(f"\nToo few pairs ({len(pairs)}) for meaningful statistics")
+    if len(chA_recs) < 60:
+        print(f"\nToo few chA edges ({len(chA_recs)}) for meaningful statistics")
         return 1
 
     if args.raw_csv:
         raw_path = Path(args.raw_csv)
         raw_path.parent.mkdir(parents=True, exist_ok=True)
+        # Save chA + chB separately + the (chA−chB) pairing.  All three
+        # are useful: chA alone is the freerun DO noise; chA−chB is the
+        # tracking metric; chB alone characterizes the GNSS PPS chain.
+        chA_by_sec = dict(chA_recs)
+        chB_by_sec = dict(chB_recs)
+        secs_all = sorted(set(chA_by_sec) | set(chB_by_sec))
         with open(raw_path, 'w') as f:
-            f.write("ref_sec,chA_minus_chB_ns\n")
-            for s, p in pairs:
-                f.write(f"{s},{p:.6f}\n")
-        print(f"Raw pairs saved → {raw_path}")
+            f.write("ref_sec,chA_s,chB_s,chA_minus_chB_ns\n")
+            for s in secs_all:
+                a = chA_by_sec.get(s)
+                b = chB_by_sec.get(s)
+                a_str = '' if a is None else f"{a:.12f}"
+                b_str = '' if b is None else f"{b:.12f}"
+                diff_str = '' if (a is None or b is None) else f"{(a-b)*1e9:.6f}"
+                f.write(f"{s},{a_str},{b_str},{diff_str}\n")
+        print(f"Raw chA + chB + pairs saved → {raw_path}")
 
-    secs = np.array([p[0] for p in pairs], dtype=float)
-    phase_ns = np.array([p[1] for p in pairs], dtype=float)
-    t_rel = secs - secs[0]
+    # ── PRIMARY: chA alone vs TICC's Rb reference ─────────────────
+    # The TICC's chA timestamp is the DO PPS edge time on the TICC's
+    # internal Rb-disciplined timebase.  Rb TDEV(1s) is <100 ps per
+    # the lab's TICC characterization (sub-100 ps Rb reference floor).
+    # Detrending the chA timestamps over the capture removes the
+    # constant DO frequency offset; the residual is the DO's freerun
+    # phase noise vs the Rb (DO_noise ⊕ Rb_noise ≈ DO_noise above the
+    # ~100 ps floor).
+    secs_a = np.array([r[0] for r in chA_recs], dtype=float)
+    phase_a = np.array([r[1] for r in chA_recs], dtype=float)
+    t_rel = secs_a - secs_a[0]
+    # IMPORTANT: subtract the nominal 1 PPS cadence BEFORE detrend.
+    # chA timestamps grow by ~1.0 s per sample (slope ≈ 1e9 ns/s).
+    # If we polyfit float64 chA-in-ns directly, the 1e12-ns dynamic
+    # range pollutes the residual with ~1 ns of numerical noise — we
+    # saw this on the 4th MadHat run as non-monotonic ADEV/TDEV at
+    # certain τ.  Subtract the nominal 1.0-s/sample component first
+    # so polyfit operates on the small (µs-magnitude) deviation only.
+    deviation_s = (phase_a - phase_a[0]) - t_rel  # seconds; ~µs scale
+    phase_ns = deviation_s * 1e9  # ns; ~1e3–1e4 ns scale, precise
     dts = np.diff(t_rel)
-    print(f"\n  sample spacing: min={dts.min():.3f}s median={float(np.median(dts)):.3f}s "
+    print(f"\n  chA sample spacing: min={dts.min():.3f}s median={float(np.median(dts)):.3f}s "
           f"max={dts.max():.3f}s  ({int((dts == 1.0).sum())}/{len(dts)} are exactly 1.0s)")
 
     # Detrend linear (= subtract constant frequency offset)
@@ -333,8 +388,8 @@ def main() -> int:
                   None if asd_at_targets.get(f) is None else round(asd_at_targets[f], 4)]
                  for f in _PSD_FREQS_HZ]
 
-    print(f"\n=== freerun characterization ===")
-    print(f"  duration:        {len(pairs)} s = {len(pairs)/60:.1f} min")
+    print(f"\n=== DO freerun characterization (chA vs TICC Rb reference) ===")
+    print(f"  duration:        {len(chA_recs)} s = {len(chA_recs)/60:.1f} min")
     print(f"  freq offset:     {freq_offset_ppb:+.3f} ppb")
     print(f"  residual RMS:    {rms_ns:.3f} ns")
     print(f"  residual peak:   {peak_ns:.3f} ns")
@@ -363,14 +418,14 @@ def main() -> int:
     char_section.setdefault('host', args.host or '')
     char_section.setdefault('do_label', do_label)
     char_section['captured'] = datetime.now(tz=timezone.utc).isoformat()
-    char_section['duration_s'] = len(pairs)
-    char_section['n_samples'] = len(pairs)
+    char_section['duration_s'] = len(chA_recs)
+    char_section['n_samples'] = len(chA_recs)
     char_section['parked_dac_code'] = code
     char_section['parked_dac_gain'] = args.gain
     char_section['freq_offset_ppb_at_parked_code'] = freq_offset_ppb
 
     sources = char_section.setdefault('sources', {})
-    sources['DO PPS (chA-chB)'] = {
+    sources['DO PPS (chA vs TICC Rb)'] = {
         'units': 'ns',
         'rms': round(rms_ns, 4),
         'peak': round(peak_ns, 4),
@@ -384,11 +439,16 @@ def main() -> int:
         'mdev_by_tau_s': {str(τ): round(v, 6) for τ, v in (mdev_map or {}).items()},
     }
     char_section['notes'] = (
-        "PSD curve is one-sided amplitude spectral density (ns/√Hz) "
-        "from 1 Hz TICC chA−chB samples; resolves 1/duration to 0.5 Hz. "
-        "PSD slopes: ~0=white_phase, -1=flicker_phase, -2=white_FM, "
-        "-3=flicker_FM, <-3=random_walk_FM. "
-        "Higher-band L(f) requires a phase-noise analyzer."
+        "Source is chA alone, the DO PPS edge timestamp on the TICC's "
+        "internal Rb-disciplined timebase (TDEV(1s) <100 ps reference). "
+        "Linear-detrended over the capture removes constant DO frequency "
+        "offset; residual is the DO's freerun phase noise vs Rb. "
+        "PSD curve is one-sided amplitude spectral density (ns/√Hz) from "
+        "1 Hz TICC samples; resolves 1/duration to 0.5 Hz. PSD slopes: "
+        "~0=white_phase, -1=flicker_phase, -2=white_FM, -3=flicker_FM, "
+        "<-3=random_walk_FM. Higher-band L(f) requires a phase-noise "
+        "analyzer. Raw CSV (when --raw-csv set) saves chA + chB "
+        "separately for re-analysis of either chain."
     )
     existing['updated'] = datetime.now(tz=timezone.utc).isoformat()
     out_path.parent.mkdir(parents=True, exist_ok=True)
