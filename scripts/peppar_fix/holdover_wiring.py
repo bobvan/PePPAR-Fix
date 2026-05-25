@@ -155,20 +155,39 @@ def tick_holdover(
             state.holdover_entry_mono = None
             state.gap_logged = False
 
+    # Fix E: zero P[0,2]/P[2,0] cross-covariance during HOLDOVER.
+    # Without Arm 4 (TICC, H=[-1,0,-1,0]), there's no measurement
+    # linking x[0] and x[2].  Uninformative cross-covariance growth
+    # lets Arm 6 innovations pull x[0] via K[0] = P[0,2]/S, causing
+    # runaway (PiFace cable-pull: x[0] grew 140× in 13 s).
+    if actor.wants_pseudo_obs:
+        P[0, 2] = 0.0
+        P[2, 0] = 0.0
+
     # During HOLDOVER or REACQUIRED: integrate TDCP and produce pseudo-obs.
     pseudo_obs_ns = None
     pseudo_obs_sigma_ns = None
 
     if actor.wants_pseudo_obs:
         if tdcp_freq is not None:
-            integrator.integrate(df_f=tdcp_freq, mono_s=mono_s)
-            if integrator.gap_detected and not state.gap_logged:
-                log.warning(
-                    "[HOLDOVER] TDCP gap — Arm 6 muted until REACQUIRE "
-                    "(gap at %.1f s into holdover)",
-                    holdover_dur,
-                )
-                state.gap_logged = True
+            ok = integrator.integrate(df_f=tdcp_freq, mono_s=mono_s)
+            if integrator.gap_detected:
+                if not state.gap_logged:
+                    log.warning(
+                        "[HOLDOVER] TDCP gap at %.1f s — re-seeding "
+                        "integrator at next clean epoch",
+                        holdover_dur,
+                    )
+                    state.gap_logged = True
+                # Fix A: re-seed instead of permanent mute.  The phase
+                # has a discontinuity across the gap (unknown motion),
+                # but resuming with a fresh seed is better than losing
+                # Arm 6 for the rest of the holdover.
+                integrator.reset()
+                integrator.seed(x0_phi_rx_ns=x[0], mono_s=mono_s)
+                state.gap_logged = False
+            elif not ok:
+                pass  # not seeded or dt <= 0; nothing to do
 
         frozen = actor.frozen_offset_ns
         pseudo = integrator.pseudo_obs(offset_ns=frozen)
