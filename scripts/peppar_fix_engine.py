@@ -6447,11 +6447,16 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
             _dac_reset.setup()  # writes ctrl reg + center code
             _dac_reset.teardown()
             log.info("DAC reset to center before TICC measurement")
-        _do_tadd_arm(args)
-        settle_s = 3
-        log.info("Waiting %ds for post-ARM settling before TICC measurement...",
-                 settle_s)
-        time.sleep(settle_s)
+        if not getattr(args, '_tadd_armed_this_boot', False):
+            _do_tadd_arm(args)
+            args._tadd_armed_this_boot = True
+            settle_s = 3
+            log.info("Waiting %ds for post-ARM settling before TICC measurement...",
+                     settle_s)
+            time.sleep(settle_s)
+        else:
+            log.info("TADD already ARMed this boot — skipping re-ARM "
+                     "(avoids phase step in freq measurement window)")
     else:
         # phc_bootstrap helpers expect args.ptp_dev; engine uses args.servo
         args.ptp_dev = args.servo
