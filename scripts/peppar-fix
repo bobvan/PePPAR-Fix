@@ -112,6 +112,16 @@ fi
 # Log files (--ticc-log / --extint-log / --qerr-log) open in append mode
 # in the engine, so prior session's data is preserved across re-launches.
 
+# Exponential backoff for repeated catastrophic-reject cascades.
+# A single chip-slip event resolves quickly (1× 2s sleep is enough), but
+# a sustained F9T-side condition (failed gnss-front-end reset, bad
+# correction stream) can keep tripping the catastrophic-reject gate.
+# Without backoff the wrapper burns CPU + log space relaunching every
+# few seconds.  Reset on long runs so a transient slip after hours of
+# good tracking doesn't get penalised on its second occurrence.
+# See dayplan restartHardening.
+_backoff=2
+_last_start=0
 while true; do
     # `set -e` (from `set -euo pipefail` at top of script) propagates
     # any non-zero exit from a body command in a while loop, so a bare
@@ -120,11 +130,18 @@ while true; do
     # is set-e-safe: the right side of `||` runs only on failure, but
     # `||` itself returns 0 to errexit, so the loop continues.  Found
     # by bravo's audit (recoveryRetry-main, 2026-05-11T02:31:45Z).
+    _now=$(date +%s)
+    if [ "$((_now - _last_start))" -gt 300 ]; then
+        _backoff=2
+    fi
+    _last_start=$_now
     _rc=0
     "$PYTHON_BIN" "$SCRIPT_DIR/peppar_fix_engine.py" "$@" || _rc=$?
     if [ "$_rc" -ne 5 ]; then
         exit "$_rc"
     fi
-    echo "=== peppar-fix: engine exited 5 (catastrophic re-bootstrap); relaunching in 2s ===" >&2
-    sleep 2
+    echo "=== peppar-fix: engine exited 5 (catastrophic re-bootstrap); relaunching in ${_backoff}s ===" >&2
+    sleep "$_backoff"
+    _backoff=$((_backoff * 2))
+    [ "$_backoff" -gt 60 ] && _backoff=60
 done
