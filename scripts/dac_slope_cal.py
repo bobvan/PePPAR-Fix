@@ -5,6 +5,15 @@ Steps the DAC through a sequence of codes; at each code, holds for
 thermal settling, then measures DO frequency offset via TICC chA−chB.
 Linear-fits ppb vs code → `dac_ppb_per_code`.
 
+All ppb values are reported in **engine convention**: positive ppb
+means the DO is **fast** (firing earlier than the reference each
+second).  This matches scripts/peppar_fix/timestamper.py's
+measure_differential_frequency and the DAC actuator's sign expectation
+in peppar_fix.dac_actuator.  Output `dac_ppb_per_code` can be either
+sign — negative means an OCXO with inverted EFC polarity (increasing
+DAC code → decreasing frequency).  See dayplan bootstrapSignFlip for
+the bug-history context.
+
 Workflow:
     sudo ~/peppar-fix/venv/bin/python ~/peppar-fix/scripts/dac_slope_cal.py \\
         --bus 1 --addr 0x4C --gain 0 \\
@@ -88,8 +97,14 @@ def measure_freq_offset(ticc_port: str, duration_s: int):
     den = sum((s - mean_s) ** 2 for s in secs)
     if den == 0:
         return mean_p, float('nan'), n
-    # slope in ns/s == ppb (1 ns/s drift = 1 part per billion)
-    slope_ppb = num / den
+    # slope in ns/s = ppb in *engine* convention: positive ppb means
+    # DO is fast (= chA-chB DECREASING over time).  Raw regression
+    # gives d(chA-chB)/dt, which is positive when chA-chB INCREASES
+    # i.e. DO is slow.  Negate to match the engine's convention used
+    # by timestamper.py::measure_differential_frequency and the DAC
+    # actuator's ppb/code sign in peppar_fix.dac_actuator.  See
+    # dayplan bootstrapSignFlip for the bug this fix addresses.
+    slope_ppb = -(num / den)
     return mean_p, slope_ppb, n
 
 
