@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Free-run + phase-noise characterization of a DO via TICC chA−chB.
+"""Free-run + phase-noise characterization of a DO via TICC chA vs Rb.
 
 Parks the DAC at a fixed code (default: code yielding ~0 ppb offset
 from the existing dac_slope_cal.py output, if present in the JSON;
-else mid-scale 32768), then captures TICC chA−chB for a configured
-duration.  Computes:
+else mid-scale 32768), then captures TICC chA timestamps for a
+configured duration.  Computes:
 
   - RMS of phase residual (ns)
   - PSD curve at standard offset frequencies (0.005–0.5 Hz from 1 Hz
@@ -14,16 +14,26 @@ duration.  Computes:
   - ASD at 0.1 Hz, 0.01 Hz
   - Spectral slope (log-log linear fit) + noise-type classification
   - ADEV / TDEV / MDEV at standard τ
-  - Crossover frequency (TODO: vs ref like dt_rx — N/A here)
 
 Output: a `characterization` section appended to the existing DO JSON
 file (e.g. state/dos/<label>.json).  If the file has a slope-cal
 section already (from dac_slope_cal.py), this script merges into it.
 
-The DO PPS is read on TICC chA; GNSS PPS on chB.  Linear drift
-(constant frequency offset from the parked code's residual) is
-removed before spectral analysis so the PSD reflects the *noise*
-floor, not the drift.
+# Reference: TICC's internal Rb-class timebase, not GNSS
+
+The DO PPS is read on TICC chA and measured against the TICC's own
+Rb timebase (the TICC reports each edge as <ref_sec, ref_ps> in its
+internal frame).  chB (GNSS PPS) is **deliberately ignored** — a
+freerun characterization has nothing to do with GNSS.  Mixing in
+chB introduces ~2 ns of GNSS-PPS sawtooth at τ=1 s that's unrelated
+to the DO, inflates the reported noise floor by ~40×, and makes the
+result incomparable to servoed-mode chA-vs-Rb numbers.  See dayplan
+freerunCharChAOnly for the 2026-05-26 → 27 MadHat incident that
+caught this.
+
+Linear drift (constant frequency offset from the parked code's
+residual) is removed before spectral analysis so the PSD reflects
+the *noise* floor, not the drift.
 
 Usage:
     sudo ~/peppar-fix/venv/bin/python ~/peppar-fix/scripts/do_freerun_char.py \\
@@ -79,15 +89,20 @@ def classify_noise_type(slope: float) -> str:
 
 
 def collect_phase_series(ticc_port: str, duration_s: float):
-    """Listen to TICC; pair chA/chB by ref_sec; return list of
-    (ref_sec, chA_minus_chB_ns).
+    """Listen to TICC; return list of (ref_sec, ref_ps_chA) for the
+    DO PPS edge timestamps in the TICC's internal Rb frame.
 
-    Drops orphan edges older than 5 s of pairing horizon.
+    chB (GNSS PPS) is deliberately ignored — freerun characterization
+    is the DO vs its measurement reference (the TICC's Rb), not vs
+    GNSS PPS.  See module docstring + dayplan freerunCharChAOnly.
+
+    Returns a list of (ref_sec: int, ref_ps: int) tuples in raw TICC
+    units — both integers, no float-precision loss in the capture
+    path.  Downstream analysis is responsible for converting to ns
+    while preserving precision (typical pattern: subtract ref_ps[0]
+    while still integer, then * 1e-3 → ns float).
     """
-    chA: dict[int, float] = {}
-    chB: dict[int, float] = {}
-    pairs: list[tuple[int, float]] = []
-    seen: set[int] = set()
+    samples: list[tuple[int, int]] = []
     t0 = None
     with Ticc(ticc_port, wait_for_boot=False) as ticc:
         for ch, sec, ps in ticc:
@@ -95,23 +110,9 @@ def collect_phase_series(ticc_port: str, duration_s: float):
                 t0 = time.monotonic()
             elif time.monotonic() - t0 > duration_s:
                 break
-            phase_s = sec + ps * 1e-12
             if ch == 'chA':
-                chA[sec] = phase_s
-            elif ch == 'chB':
-                chB[sec] = phase_s
-            for s in set(chA) & set(chB):
-                if s not in seen:
-                    pairs.append((s, (chA[s] - chB[s]) * 1e9))
-                    seen.add(s)
-            cutoff = sec - 5
-            for s in list(chA):
-                if s < cutoff and s not in chB:
-                    del chA[s]
-            for s in list(chB):
-                if s < cutoff and s not in chA:
-                    del chB[s]
-    return pairs
+                samples.append((sec, ps))
+    return samples
 
 
 def detrend_linear(t: np.ndarray, y: np.ndarray):
@@ -257,7 +258,7 @@ def main() -> int:
     ap.add_argument('--duration-s', type=int, default=3600,
                     help='Capture duration in seconds (default: 3600)')
     ap.add_argument('--raw-csv', default=None,
-                    help='Optional path for raw TICC pairs (ref_sec, chA_minus_chB_ns). '
+                    help='Optional path for raw chA samples (ref_sec, ref_ps). '
                          'Lets us re-analyze offline without another capture.')
     args = ap.parse_args()
 
@@ -277,15 +278,15 @@ def main() -> int:
     dac._write_code(code)
     print(f"DAC parked at code {code}")
 
-    pairs = []
+    samples = []
     try:
         print(f"\nWarmup 60s after DAC step (thermal settle)…")
         time.sleep(60)
-        print(f"\nCapturing {args.duration_s} s of TICC chA−chB…")
+        print(f"\nCapturing {args.duration_s} s of TICC chA (vs Rb)…")
         t_start = time.monotonic()
-        pairs = collect_phase_series(args.ticc_port, args.duration_s)
+        samples = collect_phase_series(args.ticc_port, args.duration_s)
         t_cap = time.monotonic() - t_start
-        print(f"  → {len(pairs)} chA-chB pairs in {t_cap:.0f} s")
+        print(f"  → {len(samples)} chA samples in {t_cap:.0f} s")
     finally:
         try:
             dac._write_code(32768)
@@ -293,21 +294,31 @@ def main() -> int:
             pass
         dac.teardown()
 
-    if len(pairs) < 60:
-        print(f"\nToo few pairs ({len(pairs)}) for meaningful statistics")
+    if len(samples) < 60:
+        print(f"\nToo few samples ({len(samples)}) for meaningful statistics")
         return 1
 
     if args.raw_csv:
         raw_path = Path(args.raw_csv)
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         with open(raw_path, 'w') as f:
-            f.write("ref_sec,chA_minus_chB_ns\n")
-            for s, p in pairs:
-                f.write(f"{s},{p:.6f}\n")
-        print(f"Raw pairs saved → {raw_path}")
+            f.write("ref_sec,ref_ps\n")
+            for s, p in samples:
+                f.write(f"{s},{p}\n")
+        print(f"Raw chA samples saved → {raw_path}")
 
-    secs = np.array([p[0] for p in pairs], dtype=float)
-    phase_ns = np.array([p[1] for p in pairs], dtype=float)
+    # Precision-preserving conversion to ns:  the only quantities we
+    # need are the relative time (s) and the chA phase residual (ns).
+    # ref_ps is an int representing picoseconds-from-some-internal-zero
+    # that grows by ~1e12 per second.  Subtracting ref_ps[0] while still
+    # int and only THEN converting to float avoids losing the sub-ns bits
+    # that we care about.  CLAUDE.md "watch for floating point error with
+    # TICC timestamps" documents this pattern.
+    secs = np.array([s for s, _ in samples], dtype=float)
+    ps0 = samples[0][1]
+    phase_ns = np.array(
+        [(p - ps0) for _, p in samples], dtype=np.int64
+    ).astype(float) * 1e-3
     t_rel = secs - secs[0]
     dts = np.diff(t_rel)
     print(f"\n  sample spacing: min={dts.min():.3f}s median={float(np.median(dts)):.3f}s "
@@ -334,7 +345,7 @@ def main() -> int:
                  for f in _PSD_FREQS_HZ]
 
     print(f"\n=== freerun characterization ===")
-    print(f"  duration:        {len(pairs)} s = {len(pairs)/60:.1f} min")
+    print(f"  duration:        {len(samples)} s = {len(samples)/60:.1f} min")
     print(f"  freq offset:     {freq_offset_ppb:+.3f} ppb")
     print(f"  residual RMS:    {rms_ns:.3f} ns")
     print(f"  residual peak:   {peak_ns:.3f} ns")
@@ -363,8 +374,8 @@ def main() -> int:
     char_section.setdefault('host', args.host or '')
     char_section.setdefault('do_label', do_label)
     char_section['captured'] = datetime.now(tz=timezone.utc).isoformat()
-    char_section['duration_s'] = len(pairs)
-    char_section['n_samples'] = len(pairs)
+    char_section['duration_s'] = len(samples)
+    char_section['n_samples'] = len(samples)
     char_section['parked_dac_code'] = code
     char_section['parked_dac_gain'] = args.gain
     char_section['freq_offset_ppb_at_parked_code'] = freq_offset_ppb
