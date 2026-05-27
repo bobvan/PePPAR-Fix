@@ -47,7 +47,7 @@ from peppar_fix.innov_control_monitor import InnovControlMonitor
 
 log = logging.getLogger(__name__)
 
-_CHI2_GATE_NSIGMA = 10.0  # gate threshold in empirical σ units
+_CHI2_GATE_THRESHOLD = 100.0  # 10σ; innov²/S > 100 skips Arm 4 update
 
 
 def _qerr(phi_tcxo_ns, tick_ns=8.0):
@@ -152,8 +152,6 @@ class DOFreqEst:
         self._last_u = initial_freq
 
         self._state_corrupted = False
-        self._ticc_innov_buffer: list[float] = []
-        self._ticc_innov_buffer_max = 30
 
         # Innov-vs-control consistency monitor (TICC arm, where u enters
         # the prediction).  See peppar_fix/innov_control_monitor.py.
@@ -443,32 +441,15 @@ class DOFreqEst:
             self.last_arm_innov['ticc'] = innov_ticc
             self.last_arm_S['ticc'] = S
 
-            # Adaptive chi-squared gate: use empirical innovation σ
-            # (MAD of recent innovations) instead of the filter-predicted
-            # S alone.  During bootstrap convergence, innovations are
-            # legitimately large and the empirical σ is wide — gate stays
-            # open.  After convergence, empirical σ tightens to match S.
-            # On a single-epoch blowup (PiFace 2026-05-24), the buffer
-            # has clean history → tight empirical σ → outlier caught.
-            buf = self._ticc_innov_buffer
-            gate_skip = False
-            if len(buf) >= 5:
-                _mad = float(np.median(np.abs(
-                    np.array(buf) - np.median(buf))))
-                _emp_sigma = max(1.4826 * _mad, math.sqrt(S))
-                if abs(innov_ticc) > _CHI2_GATE_NSIGMA * _emp_sigma:
-                    log.warning(
-                        "[EKF] Arm 4 adaptive gate: |innov|=%.1f ns, "
-                        "emp_σ=%.1f ns, threshold=%.0f×σ — update skipped",
-                        abs(innov_ticc), _emp_sigma,
-                        _CHI2_GATE_NSIGMA,
-                    )
-                    gate_skip = True
-            buf.append(innov_ticc)
-            if len(buf) > self._ticc_innov_buffer_max:
-                buf.pop(0)
-
-            if not gate_skip:
+            _chi2 = innov_ticc ** 2 / S if S > 0 else 0.0
+            if _chi2 > _CHI2_GATE_THRESHOLD:
+                log.warning(
+                    "[EKF] Arm 4 chi² gate: |innov|=%.1f ns, √S=%.1f ns, "
+                    "χ²=%.0f > %.0f — update skipped",
+                    abs(innov_ticc), math.sqrt(S), _chi2,
+                    _CHI2_GATE_THRESHOLD,
+                )
+            else:
                 K = (P_pred @ H_ticc.T) / S
                 x_pred = x_pred + K.flatten() * innov_ticc
                 P_pred = P_pred - np.outer(K.flatten(), K.flatten()) * S
