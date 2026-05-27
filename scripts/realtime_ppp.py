@@ -1776,7 +1776,6 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                         n_raw=len(raw_obs),
                         n_off_const=n_off_const,
                         n_single=n_single,
-                        clk_reset=bool(getattr(parsed, 'clkReset', 0)),
                     ))
                     n_epochs += 1
 

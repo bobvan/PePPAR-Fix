@@ -1425,21 +1425,7 @@ class FixedPosFilter:
             'elev': elev,
         }
 
-    def update(self, observations, sp3, t, clk_file=None, clk_reset=False):
-        """Run one EKF update.
-
-        Args:
-            observations, sp3, t, clk_file: standard PPP inputs.
-            clk_reset: True if RXM-RAWX.recStat.clkReset was set this
-                epoch (per ZED-F9P Interface Description UBX-18010854
-                §5.15.3 page 190: "Clock reset applied. Typically the
-                receiver clock is changed in increments of integer
-                milliseconds.").  When set, absorb the integer-ms
-                offset into dt_rx and bypass the catastrophic-reject
-                gate — the resulting large PR residuals are expected
-                and documented, not anomalies.  See dayplan
-                chipSlipHandling.
-        """
+    def update(self, observations, sp3, t, clk_file=None):
         H_rows, z_rows, R_diag = [], [], []
         # Per-row indices tracked during construction so post_resid can
         # be split into pure-PR and pure-TD-CP residual vectors for
@@ -1621,68 +1607,10 @@ class FixedPosFilter:
         z = np.array(z_rows)
         R = np.diag(R_diag)
 
-        # F9T receiver-clock realignment (chipSlipHandling).  The F9T's
-        # local clock is approximately GPS-aligned but bounded; when
-        # drift accumulates it steps in integer-ms increments, applying
-        # the same shift to all PR and CP measurements.  The F9T signals
-        # this with the clkReset bit in UBX-RXM-RAWX.recStat.  Absorb
-        # the shift into dt_rx and bypass the catastrophic gate — the
-        # large PR residuals this epoch are an expected, documented
-        # event, not a true anomaly.
-        if clk_reset and pr_idx:
-            # The shift is an integer number of milliseconds.  Use the
-            # signed median PR residual (not |median|) to recover both
-            # magnitude and sign, then round to nearest integer ms × c.
-            median_pr_signed = float(np.median(z[pr_idx]))
-            MS_C_M = 299_792.458  # 1 ms × c
-            n_ms = int(round(median_pr_signed / MS_C_M))
-            if n_ms != 0:
-                offset_m = n_ms * MS_C_M
-                # Shift dt_rx to absorb the realignment, AND rebase z
-                # so the Kalman update sees the post-realignment
-                # innovation (~baseline noise instead of 6 Mm).  Both
-                # are needed: this filter's z is constructed at line
-                # 1554 as `obs - rho_corr - self.x[0]` — i.e., dt_rx
-                # at construction time IS already subtracted into z.
-                # The Kalman step then does `x += K @ z`, so without
-                # rebasing z, the gain would re-apply the offset on top
-                # of our shift (verified empirically: 2× compensation).
-                self.x[self.IDX_CLK] += offset_m
-                z[pr_idx] = z[pr_idx] - offset_m
-                # TD-CP rows also see the F9T's CP shift in delta_phi;
-                # rebase them too.  z_td = delta_phi - delta_rho -
-                # delta_dt_rx, and the F9T applies the same realignment
-                # to phase as to code (RINEX spec, per UBX docs).  Both
-                # current phi and current dt_rx shifted by offset_m, so
-                # the construction-time residual is off by offset_m
-                # versus the post-realignment state.
-                if td_idx:
-                    z[td_idx] = z[td_idx] - offset_m
-                # prev_geo / prev_clock get re-set by the normal accept
-                # path below to the post-realignment values — which is
-                # what next epoch needs.  No clearing needed here.
-                # PR median history would inherit the post-realignment
-                # noise; clear it so the catastrophic gate's baseline
-                # rebuilds clean.
-                self._pr_median_history.clear()
-                # Any catastrophic-reject counter from a near-miss
-                # earlier in the run should not carry past a clean
-                # documented realignment.
-                self._consecutive_catastrophic_rejects = 0
-                chips = abs(offset_m) / 293.052257
-                log.info(
-                    "[CLK_REALIGN] F9T clkReset=1: median PR=%+.1fm "
-                    "(%+d ms, %.1f L1 chips) absorbed into dt_rx; "
-                    "%d PR rows adjusted, TD-CP baselines reset",
-                    median_pr_signed, n_ms, chips, len(pr_idx),
-                )
-
         # Catastrophic residual gate (I-202649 v2).  See class-level
         # comment for the design.  Trips on transient spike from a
-        # stable baseline; warmup-quiet during bootstrap.  Skipped when
-        # clk_reset=1 — the F9T's clock realignment is the documented
-        # mechanism, not a true anomaly.
-        if (not clk_reset) and pr_idx and len(self._pr_median_history) >= self.CATASTROPHIC_HISTORY_MIN:
+        # stable baseline; warmup-quiet during bootstrap.
+        if pr_idx and len(self._pr_median_history) >= self.CATASTROPHIC_HISTORY_MIN:
             pr_z_abs = np.abs(z[pr_idx])
             median_pr = float(np.median(pr_z_abs))
             baseline = max(

@@ -79,16 +79,10 @@ class ObservationEvent:
     n_raw: Optional[int] = None
     n_off_const: Optional[int] = None
     n_single: Optional[int] = None
-    # u-blox RXM-RAWX.recStat.clkReset bit.  True when the F9T performed
-    # an integer-millisecond local-clock realignment this epoch.  Per the
-    # ZED-F9P Interface Description (UBX-18010854 §5.15.3), the receiver
-    # keeps its local time approximately aligned to GPS time and steps it
-    # in integer-ms increments when drift accumulates; the bit signals
-    # the step on the affected epoch.  The catastrophic-reject path in
-    # FixedPosFilter would otherwise see the resulting PR jump as an
-    # anomaly; instead we absorb the shift into dt_rx.  See dayplan
-    # chipSlipHandling.
-    clk_reset: bool = False
+
+    def __iter__(self):
+        yield self.gps_time
+        yield self.observations
 
 
 @dataclass(frozen=True)
