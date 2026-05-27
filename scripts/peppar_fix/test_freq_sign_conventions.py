@@ -119,19 +119,19 @@ class PathB_TiccTimestamperSignTests(unittest.TestCase):
                 del sys.modules['ticc']
 
     def test_fast_DO_reports_positive(self):
-        freq_ppb, _sigma, n = self._measure(+1000.0)
+        freq_ppb, _sigma, n, _phi = self._measure(+1000.0)
         self.assertIsNotNone(freq_ppb)
         self.assertAlmostEqual(freq_ppb, +1000.0, delta=1.0,
                                 msg="Path B should return positive ppb for fast DO")
 
     def test_slow_DO_reports_negative(self):
-        freq_ppb, _sigma, n = self._measure(-1000.0)
+        freq_ppb, _sigma, n, _phi = self._measure(-1000.0)
         self.assertIsNotNone(freq_ppb)
         self.assertAlmostEqual(freq_ppb, -1000.0, delta=1.0,
                                 msg="Path B should return negative ppb for slow DO")
 
     def test_at_nominal_reports_near_zero(self):
-        freq_ppb, _sigma, n = self._measure(0.0)
+        freq_ppb, _sigma, n, _phi = self._measure(0.0)
         self.assertIsNotNone(freq_ppb)
         self.assertAlmostEqual(freq_ppb, 0.0, delta=0.1)
 
@@ -146,7 +146,7 @@ class PathB_TiccTimestamperSignTests(unittest.TestCase):
         # last edge at TICC 110 − 2µs = 109.999998 → ref_sec=109
         # (whereas a 1-ppb-fast trace's last edge would be at 109.99999999
         # also ref_sec=109; the off-by-one fires across the whole range)
-        freq_ppb, _sigma, _n = self._measure(+200.0)
+        freq_ppb, _sigma, _n, _phi = self._measure(+200.0)
         self.assertIsNotNone(freq_ppb)
         self.assertAlmostEqual(freq_ppb, +200.0, delta=1.0,
                                 msg="Off-by-one boundary bug regression")
@@ -232,7 +232,7 @@ class AllPathsAgreeTests(unittest.TestCase):
 
         # Path B (chA-only TICC bootstrap)
         path_b_test = PathB_TiccTimestamperSignTests()
-        path_B, _, _ = path_b_test._measure(freq_ppb)
+        path_B, _, _, _ = path_b_test._measure(freq_ppb)
 
         # Path C (differential)
         path_c_test = PathC_DifferentialSignTests()

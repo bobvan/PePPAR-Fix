@@ -25,13 +25,16 @@ class Timestamper(abc.ABC):
     def measure_pps_frequency(self, n_samples=10, timeout_s=20):
         """Capture PPS edges and compute the DO's frequency offset.
 
-        Returns (freq_ppb, sigma_ppb, n_intervals) on success, or
-        (None, None, 0) if not enough edges arrive.
+        Returns (freq_ppb, sigma_ppb, n_intervals, phi_end_ns) on
+        success, or (None, None, 0, None) if not enough edges arrive.
 
         freq_ppb: measured frequency offset of DO relative to GNSS PPS.
                   Positive = DO is fast.
         sigma_ppb: per-interval residual jitter (1-sigma).
         n_intervals: number of PPS intervals used.
+        phi_end_ns: residual DO phase at end of measurement window (ns).
+                    Positive = DO ahead.  Used for bootstrap glide slope.
+                    None if the timestamper doesn't provide phase.
         """
 
 
@@ -85,11 +88,11 @@ class ExttsTimestamper(Timestamper):
                      dedup.dropped)
 
         if len(samples) < 2:
-            return None, None, 0
+            return None, None, 0, None
 
         n_intervals = samples[-1][0]
         if n_intervals <= 0:
-            return None, None, 0
+            return None, None, 0, None
 
         nsec_drift = samples[-1][1] - samples[0][1]
         if nsec_drift > 500_000_000:
@@ -117,7 +120,7 @@ class ExttsTimestamper(Timestamper):
         else:
             sigma_ppb = 0.0
 
-        return freq_ppb, sigma_ppb, len(samples) - 1
+        return freq_ppb, sigma_ppb, len(samples) - 1, None
 
 
 class TiccTimestamper(Timestamper):
@@ -177,7 +180,7 @@ class TiccTimestamper(Timestamper):
         if len(edges) < 3:
             log.warning("TICC freq measurement (%s): only %d edges (need ≥3)",
                         self.channel, len(edges))
-            return None, None, 0
+            return None, None, 0, None
 
         # Compute intervals in picoseconds
         intervals_ps = []
@@ -189,7 +192,7 @@ class TiccTimestamper(Timestamper):
                 intervals_ps.append(total_ps)
 
         if len(intervals_ps) < 2:
-            return None, None, 0
+            return None, None, 0, None
 
         # Full-baseline frequency: total drift over N intervals.
         #
@@ -213,7 +216,7 @@ class TiccTimestamper(Timestamper):
         total_ps_drift = (last[0] - first[0]) * 1_000_000_000_000 + (last[1] - first[1])
         nominal_ps = n_intervals * 1_000_000_000_000
         if nominal_ps == 0:
-            return None, None, 0
+            return None, None, 0, None
 
         freq_ppb = -(total_ps_drift - nominal_ps) / nominal_ps * 1e9
 
@@ -232,7 +235,7 @@ class TiccTimestamper(Timestamper):
                  sigma_ppb / math.sqrt(max(1, len(intervals_ps))),
                  len(intervals_ps))
 
-        return freq_ppb, sigma_ppb, len(intervals_ps)
+        return freq_ppb, sigma_ppb, len(intervals_ps), None
 
 
 class TiccDifferentialTimestamper(Timestamper):
@@ -317,7 +320,7 @@ def measure_differential_frequency(ticc_port, ticc_baud=115200,
 
     if len(pairs) < 3:
         log.warning("TICC differential: only %d pairs (need ≥3)", len(pairs))
-        return None, None, 0
+        return None, None, 0, None
 
     # Linear regression: diff_ns = intercept + slope * elapsed
     # slope = frequency offset in ns/s = ppb
@@ -328,7 +331,7 @@ def measure_differential_frequency(ticc_port, ticc_baud=115200,
     sxx = sum(t * t for t, _ in pairs)
     denom = n * sxx - sx * sx
     if denom == 0:
-        return None, None, 0
+        return None, None, 0, None
 
     slope = (n * sxy - sx * sy) / denom
     intercept = (sy - slope * sx) / n
@@ -345,13 +348,19 @@ def measure_differential_frequency(ticc_port, ticc_baud=115200,
     # the EXTTS convention (positive = too fast = reduce adjfine).
     freq_ppb = -slope
 
+    # Phase at end of measurement window (for bootstrap glide slope).
+    # Sign: positive = DO PPS is ahead of ref (DO fast in phase).
+    # Negated like freq to match engine convention.
+    last_t = pairs[-1][0]
+    phase_at_end_ns = -(intercept + slope * last_t)
+
     log.info("TICC differential freq (%s-%s): %+.1f ppb (±%.1f ppb, "
-             "%d pairs, %ds baseline)",
+             "%d pairs, %ds baseline, phi_end=%+.0f ns)",
              do_channel, ref_channel, freq_ppb,
              sigma / math.sqrt(max(1, n_intervals)),
-             len(pairs), n_intervals)
+             len(pairs), n_intervals, phase_at_end_ns)
 
-    return freq_ppb, sigma, n_intervals
+    return freq_ppb, sigma, n_intervals, phase_at_end_ns
 
 
 def measure_differential_phase(ticc_port, ticc_baud=115200,

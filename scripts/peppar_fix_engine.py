@@ -5902,15 +5902,18 @@ def _bootstrap_measure_freq_and_clock(args, timestamper, known_ecef, obs_queue,
     """
     # ── 1. Measure PPS frequency ──────────────────────────────────── #
     log.info("=== DO Bootstrap: measuring DO frequency from PPS ===")
-    pps_freq_ppb, pps_freq_sigma, pps_freq_n = timestamper.measure_pps_frequency(
-        n_samples=args.bootstrap_epochs,
-        timeout_s=args.bootstrap_epochs + 15)  # +15 for TICC boot headroom
+    pps_freq_ppb, pps_freq_sigma, pps_freq_n, phi_end_ns = \
+        timestamper.measure_pps_frequency(
+            n_samples=args.bootstrap_epochs,
+            timeout_s=args.bootstrap_epochs + 15)
     if pps_freq_ppb is None:
         log.error("No PPS events — cannot bootstrap DO")
         return None
     pps_freq_unc = pps_freq_sigma / math.sqrt(max(1, pps_freq_n))
-    log.info("PPS frequency error: %.1f ±%.1f ppb (σ=%.1f, n=%d)",
-             pps_freq_ppb, pps_freq_unc, pps_freq_sigma, pps_freq_n)
+    log.info("PPS frequency error: %.1f ±%.1f ppb (σ=%.1f, n=%d, "
+             "phi_end=%s ns)",
+             pps_freq_ppb, pps_freq_unc, pps_freq_sigma, pps_freq_n,
+             f"{phi_end_ns:+.0f}" if phi_end_ns is not None else "N/A")
 
     # ── 2. Short FixedPosFilter for dt_rx ─────────────────────────── #
     log.info("Running %d-epoch FixedPosFilter for clock estimate...",
@@ -6118,7 +6121,7 @@ def _maybe_step_divider_on_phase(args):
 
 
 def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
-                          dt_rx_ns, dt_rx_series):
+                          dt_rx_ns, dt_rx_series, phi_end_ns=None):
     """Bootstrap an external VCOCXO: ARM TADD divider, seed DAC frequency.
 
     The TADD ARM synchronizes the divider's 1 PPS output to the GNSS PPS.
@@ -6172,13 +6175,42 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
         args, pps_freq_ppb, pps_freq_unc, dac.read_frequency_ppb(),
         dt_rx_series)
 
-    actual = dac.adjust_frequency_ppb(base_freq)
-    log.info("DAC frequency set: requested=%.1f ppb, actual=%.1f ppb",
-             base_freq, actual)
+    # Glide slope: pre-compensate residual phase error so the EKF
+    # doesn't overshoot.  Without this, the EKF sees the post-ARM
+    # phase error (~500 ns), aggressively drives adjfine to correct
+    # it, overshoots, and the DO drifts away.  The glide adds a
+    # frequency offset proportional to phi_0 that the second-order
+    # LQR loop absorbs smoothly.
+    #
+    # Formula: glide = -zeta * omega_n * phi_0
+    # where omega_n = sqrt(track_ki) and zeta = 0.7 (critically damped).
+    # DOFreqEst.__init__ uses base_freq for x[3] and initial_freq
+    # (= base_freq + glide) for _last_u — the difference is what
+    # drives the initial convergence.
+    glide_offset = 0.0
+    if phi_end_ns is not None and abs(phi_end_ns) > 10.0:
+        track_ki = getattr(args, 'track_ki', 0.0025)
+        omega_n = math.sqrt(track_ki)
+        zeta = getattr(args, 'glide_zeta', 0.7)
+        glide_offset = -zeta * omega_n * phi_end_ns
+        max_ppb = getattr(args, 'dac_max_ppb', None) or 500.0
+        max_glide = max_ppb - abs(base_freq)
+        if abs(glide_offset) > max_glide:
+            glide_offset = math.copysign(max_glide, glide_offset)
+        log.info("VCOCXO glide: phi_0=%+.0f ns, omega_n=%.4f, zeta=%.2f "
+                 "→ glide=%+.1f ppb (zero-crossing ~%.0f s)",
+                 phi_end_ns, omega_n, zeta, glide_offset,
+                 abs(phi_end_ns / glide_offset) if glide_offset != 0 else float('inf'))
+
+    target_freq = base_freq + glide_offset
+    actual = dac.adjust_frequency_ppb(target_freq)
+    log.info("DAC frequency set: requested=%.1f ppb (base=%.1f + glide=%.1f), "
+             "actual=%.1f ppb", target_freq, base_freq, glide_offset, actual)
 
     # Stash the bootstrap frequency so _setup_servo can re-apply it
     # after the DacActuator's setup() (which resets to center).
-    args._bootstrap_freq_ppb = base_freq
+    # target_freq includes glide; base_freq (in DO state file) does not.
+    args._bootstrap_freq_ppb = target_freq
 
     # Close I2C bus but do NOT reset DAC to center.  The OCXO must
     # stay at the seeded frequency continuously — any gap causes phase
@@ -6505,7 +6537,7 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
     if do_type == 'vcocxo':
         return _do_bootstrap_vcocxo(
             args, ptp, pps_freq_ppb, pps_freq_unc,
-            dt_rx_ns, dt_rx_series)
+            dt_rx_ns, dt_rx_series, phi_end_ns=phi_end_ns)
     else:
         # PHC and ClockMatrix both go through the PHC path
         # (ClockMatrix is a PHC + external frequency actuator)
