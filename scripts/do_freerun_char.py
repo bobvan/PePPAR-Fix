@@ -370,7 +370,13 @@ def main() -> int:
         except Exception:
             existing = {}
 
-    char_section = existing.setdefault('characterization', {})
+    # setdefault is not enough: some state JSONs carry an explicit
+    # 'characterization': null sentinel from an earlier code path, and
+    # setdefault('characterization', {}) would return that None.
+    char_section = existing.get('characterization')
+    if not isinstance(char_section, dict):
+        char_section = {}
+        existing['characterization'] = char_section
     char_section.setdefault('host', args.host or '')
     char_section.setdefault('do_label', do_label)
     char_section['captured'] = datetime.now(tz=timezone.utc).isoformat()
