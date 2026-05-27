@@ -1,22 +1,29 @@
-"""4-host discipline-study plots: disciplined chA TDEV/ADEV vs freerun baseline,
-plus DAC actuator activity over time ("light touch" view).
+"""3-host discipline-study plots: rebased-timestamp TDEV (full + per-window),
+residual time series, and DAC actuator activity.
 
-Data: data/disc-study/day0527-disc2-<host>-ticc.csv (chA + chB samples) and
-data/disc-study/day0527-disc2-<host>-arm-state.csv (DAC adj in x3_f_do_ppb).
-Freerun baseline: data/freerun-day0527-2hb-comparison/<host>.json
-(chA-vs-Rb characterization from morning runs) + the TimeHat ticc_read.py
-output.  madhat is intentionally absent — its engine couldn't bootstrap
-(see dayplan madhatBootstrapStuckPostArm).
+Rebasing convention (fixes the silent ref_ps-wrap bug from the first cut):
 
-Outputs:
-  docs/4host-disc-vs-freerun-tdev-2026-05-27.png — TDEV overlay
-  docs/4host-disc-dac-activity-2026-05-27.png    — DAC adj vs time
+    elapsed_ps_int = (s - s0) * 1_000_000_000_000 + (p - p0)
+    elapsed_ns     = elapsed_ps_int.astype(float) * 1e-3
+
+The integer subtraction stays exact (int64 holds 9e18; we cap at ~10^16
+ps over the 2.5 h capture).  The *1e-3 conversion lands inside float64's
+2^53-precision window (~9e15) so ps-resolution is preserved.
+
+The same formula is applied to the morning freerun raw CSVs so the
+comparison is apples-to-apples.  madhat is intentionally absent — see
+dayplan madhatBootstrapStuckPostArm.
+
+Outputs (under docs/):
+  3host-disc-vs-freerun-tdev-2026-05-27.png  (TDEV overlay)
+  3host-disc-per-window-tdev-2026-05-27.png  (per-window TDEV → event vs continuous)
+  3host-disc-residual-timeseries-2026-05-27.png  (where the events are)
+  3host-disc-dac-activity-2026-05-27.png   (unchanged from first cut)
 """
 from __future__ import annotations
 
 import csv
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -29,7 +36,7 @@ sys.path.insert(0, str(_REPO / 'scripts'))
 import allantools  # noqa: E402
 
 D = _REPO / 'data' / 'disc-study'
-FREERUN_DIR = _REPO / 'data' / 'freerun-day0527-2hb-comparison'
+FREERUN_DATA = _REPO / 'data'
 DOCS = _REPO / 'docs'
 
 TAUS = (1, 2, 3, 5, 7, 10, 15, 20, 30, 50, 70, 100, 150, 200, 300, 500, 700, 1000, 1500, 2000, 3000)
@@ -39,106 +46,91 @@ HOSTS = [
     ('clkPoC3', '#2ca02c'),
     ('TimeHat', '#1f77b4'),
 ]
-SKIP_BOOTSTRAP_S = 180  # discard first 3 min while EKF converges
+SKIP_BOOTSTRAP_S = 180
 
 
-def _load_ticc(host_lc: str):
-    """Return (chA_secs, chA_ps, chB_secs, chB_ps) as numpy int arrays.
+def _rebased_elapsed_ns(secs: list[int], pss: list[int]):
+    """Convert raw TICC integer (sec, ps) pairs to elapsed-ns float64,
+    rebased to first sample.  Same formula used everywhere so freerun
+    and disc are apples-to-apples.
 
-    Each chA and chB stream is returned separately (no pairing).  chA = DO
-    PPS measured against the TICC Rb; chB = GNSS PPS measured against the
-    same Rb.  We analyze each as a single-channel TDEV vs the Rb reference,
-    matching the freerun chA-vs-Rb methodology.
+    Returns (t_rel_s, elapsed_ns) ndarrays.
     """
-    chA_s, chA_p, chB_s, chB_p = [], [], [], []
-    path = D / f'day0527-disc2-{host_lc}-ticc.csv'
-    with open(path) as f:
+    s0, p0 = secs[0], pss[0]
+    elapsed_ps = np.asarray(
+        [(s - s0) * 1_000_000_000_000 + (p - p0) for s, p in zip(secs, pss)],
+        dtype=np.int64)
+    elapsed_ns = elapsed_ps.astype(float) * 1e-3
+    t_rel = np.asarray([s - s0 for s in secs], dtype=float)
+    return t_rel, elapsed_ns
+
+
+def _load_disc_ticc(host_lc: str, channel: str = 'chA'):
+    """Read disc-study ticc CSV; return (secs, pss) for one channel."""
+    secs, pss = [], []
+    with open(D / f'day0527-disc2-{host_lc}-ticc.csv') as f:
         r = csv.DictReader(f)
         for row in r:
+            if row.get('channel') != channel:
+                continue
             try:
-                ch = row['channel']
-                s = int(row['ref_sec'])
-                p = int(row['ref_ps'])
+                secs.append(int(row['ref_sec']))
+                pss.append(int(row['ref_ps']))
             except (KeyError, ValueError):
                 continue
-            if ch == 'chA':
-                chA_s.append(s); chA_p.append(p)
-            elif ch == 'chB':
-                chB_s.append(s); chB_p.append(p)
-    return chA_s, chA_p, chB_s, chB_p
+    return secs, pss
 
 
-def _phase_ns_series(secs: list[int], pss: list[int],
-                      skip_s: float = 0.0):
-    """Return (t_rel_s, phase_ns) ndarrays.  Skips the first `skip_s`
-    seconds of capture relative to the first sample.  Phase is the
-    cumulative integer-ps from sample[0], converted to ns at the end
-    (precision-preserving)."""
-    if not secs:
-        return np.array([]), np.array([])
-    secs_arr = np.asarray(secs, dtype=float)
-    t_rel = secs_arr - secs_arr[0]
-    if skip_s > 0:
-        keep = t_rel >= skip_s
-        secs = [s for s, k in zip(secs, keep) if k]
-        pss = [p for p, k in zip(pss, keep) if k]
-        if not secs:
-            return np.array([]), np.array([])
-        secs_arr = np.asarray(secs, dtype=float)
-        t_rel = secs_arr - secs_arr[0]
-    ps0 = pss[0]
-    phase_ns = np.asarray([p - ps0 for p in pss], dtype=np.int64).astype(float) * 1e-3
-    return t_rel, phase_ns
+def _load_freerun_ticc(host_lc: str):
+    """Read morning freerun raw CSV; return chA (secs, pss).  DAC-host
+    schema is `ref_sec,ref_ps`; TimeHat schema is
+    `host_time,channel,ref_sec,ref_ps` (filter chA)."""
+    secs, pss = [], []
+    if host_lc == 'timehat':
+        path = FREERUN_DATA / 'freerun-day0527-2h-timehat-raw.csv'
+        with open(path) as f:
+            r = csv.DictReader(f)
+            for row in r:
+                if row.get('channel') != 'chA':
+                    continue
+                try:
+                    secs.append(int(row['ref_sec']))
+                    pss.append(int(row['ref_ps']))
+                except (KeyError, ValueError):
+                    continue
+    else:
+        path = FREERUN_DATA / f'freerun-day0527-2hb-{host_lc}-raw.csv'
+        with open(path) as f:
+            r = csv.DictReader(f)
+            for row in r:
+                try:
+                    secs.append(int(row['ref_sec']))
+                    pss.append(int(row['ref_ps']))
+                except (KeyError, ValueError):
+                    continue
+    return secs, pss
 
 
-def _allan_metrics(t_rel, phase_ns, taus):
-    if len(phase_ns) < 60:
+def _detrend_and_tdev(t_rel, elapsed_ns, taus):
+    if len(elapsed_ns) < 60:
         return np.array([]), np.array([]), np.array([])
-    slope, intercept = np.polyfit(t_rel, phase_ns, 1)
-    residual = phase_ns - (slope * t_rel + intercept)
-    valid = [t for t in taus if t < len(residual) / 1.0 / 4]
+    slope, intercept = np.polyfit(t_rel, elapsed_ns, 1)
+    residual = elapsed_ns - (slope * t_rel + intercept)
+    valid = [t for t in taus if t < len(residual) / 4]
     tau_arr = np.array(valid, dtype=float)
     phase_s = residual * 1e-9
-    t_a, adev, _, _ = allantools.adev(phase_s, rate=1.0, data_type='phase', taus=tau_arr)
     t_t, tdev, _, _ = allantools.tdev(phase_s, rate=1.0, data_type='phase', taus=tau_arr)
-    return np.asarray(t_a), np.asarray(adev), np.asarray(tdev) * 1e9
+    return np.asarray(t_t), np.asarray(tdev) * 1e9, residual
 
 
-def _freerun_tdev(host: str):
-    """Return (taus, tdev_ns) ndarray from the morning freerun JSONs."""
-    fname = host.lower() + '.json'
-    path = FREERUN_DIR / fname
-    if not path.exists():
-        return np.array([]), np.array([])
-    j = json.loads(path.read_text())
-    c = j.get('characterization', {}) or {}
-    if host == 'TimeHat':
-        # TimeHat uses my earlier analyzer's schema
-        m = c.get('tdev_ns', {}) or {}
-        items = sorted((int(float(k)), float(v)) for k, v in m.items())
-    else:
-        src = c.get('sources', {}) or {}
-        s = src.get('DO PPS (chA-chB)') or src.get('DO PPS (chA vs TICC Rb)')
-        if not s:
-            return np.array([]), np.array([])
-        m = s.get('tdev_ns_by_tau_s', {}) or {}
-        items = sorted((int(float(k)), float(v)) for k, v in m.items())
-    if not items:
-        return np.array([]), np.array([])
-    taus = np.asarray([t for t, _ in items], dtype=float)
-    tdev = np.asarray([v for _, v in items], dtype=float)
-    return taus, tdev
+def _skip(t_rel, ns, skip_s):
+    keep = t_rel >= skip_s
+    if not keep.any():
+        return t_rel[:0], ns[:0]
+    return t_rel[keep] - skip_s, ns[keep]
 
 
 def _load_dac_adj(host_lc: str):
-    """Return (t_rel_s, dac_adj_ppb) from the arm-state log.
-
-    Column x3_f_do_ppb is the engine's current DO frequency-state estimate
-    in ppb.  The actuator command (DAC code -> applied ppb) is the
-    negative of this in tracking, but for the "light touch" view the
-    state's time-evolution is what matters — large oscillations = the
-    engine is fighting the DO; quiet = settled.
-    """
     path = D / f'day0527-disc2-{host_lc}-arm-state.csv'
     if not path.exists():
         return np.array([]), np.array([])
@@ -162,64 +154,128 @@ def main():
     series = {}
     for host, color in HOSTS:
         lc = host.lower()
-        chA_s, chA_p, chB_s, chB_p = _load_ticc(lc)
-        t_A, phA = _phase_ns_series(chA_s, chA_p, skip_s=SKIP_BOOTSTRAP_S)
-        t_B, phB = _phase_ns_series(chB_s, chB_p, skip_s=SKIP_BOOTSTRAP_S)
-        tausA, adevA, tdevA = _allan_metrics(t_A, phA, TAUS)
-        tausB, adevB, tdevB = _allan_metrics(t_B, phB, TAUS)
-        fr_taus, fr_tdev = _freerun_tdev(host)
+        # Disc chA (skip bootstrap)
+        d_secs, d_pss = _load_disc_ticc(lc, 'chA')
+        d_t, d_ns = _rebased_elapsed_ns(d_secs, d_pss)
+        d_t, d_ns = _skip(d_t, d_ns, SKIP_BOOTSTRAP_S)
+        d_taus, d_tdev, d_resid = _detrend_and_tdev(d_t, d_ns, TAUS)
+
+        # Freerun chA (rebased, same formula)
+        f_secs, f_pss = _load_freerun_ticc(lc)
+        f_t, f_ns = _rebased_elapsed_ns(f_secs, f_pss)
+        f_taus, f_tdev, f_resid = _detrend_and_tdev(f_t, f_ns, TAUS)
+
+        # DAC adj
         dac_t, dac_adj = _load_dac_adj(lc)
-        series[host] = dict(color=color,
-                            tausA=tausA, tdevA=tdevA, adevA=adevA, nA=len(phA),
-                            tausB=tausB, tdevB=tdevB,
-                            fr_taus=fr_taus, fr_tdev=fr_tdev,
-                            dac_t=dac_t, dac_adj=dac_adj)
-        print(f"{host:<10} n_chA={len(phA):>5}  TDEV_chA(1s)={tdevA[0] if len(tdevA) else float('nan'):.3f} ns  "
-              f"TDEV_chA(1000s)={tdevA[np.argmin(np.abs(tausA-1000))] if len(tausA) else float('nan'):.3f} ns")
+
+        series[host] = dict(
+            color=color,
+            d_t=d_t, d_resid=d_resid, d_taus=d_taus, d_tdev=d_tdev,
+            f_taus=f_taus, f_tdev=f_tdev,
+            dac_t=dac_t, dac_adj=dac_adj,
+        )
+        td1_disc = d_tdev[0] if len(d_tdev) else float('nan')
+        td1_free = f_tdev[0] if len(f_tdev) else float('nan')
+        print(f"{host:<10}  disc n={len(d_ns):>5}  freerun n={len(f_ns):>5}  "
+              f"TDEV(1s) disc={td1_disc:>7.3f} ns  freerun={td1_free:>7.3f} ns  "
+              f"ratio={td1_disc/td1_free if td1_free else float('nan'):>5.1f}×")
 
     tau_ref = np.array([1, 1e4], dtype=float)
 
-    # === TDEV plot ===
+    # === Plot 1: TDEV comparison (rebased) ===
     fig, ax = plt.subplots(figsize=(11, 7))
     for host, s in series.items():
-        if len(s['tausA']):
-            ax.loglog(s['tausA'], s['tdevA'], '-o', color=s['color'],
-                      markersize=5, linewidth=2, label=f"{host} chA disciplined")
-        if len(s['fr_taus']):
-            ax.loglog(s['fr_taus'], s['fr_tdev'], '--', color=s['color'],
-                      alpha=0.55, linewidth=1.6,
-                      label=f"{host} chA freerun (morning)")
-        if len(s['tausB']):
-            ax.loglog(s['tausB'], s['tdevB'], ':', color=s['color'],
-                      alpha=0.45, linewidth=1.2,
-                      label=f"{host} chB (GNSS PPS)")
-
-    # TDCP floor (24 ps @ 1 s, τ^½)
+        if len(s['d_taus']):
+            ax.loglog(s['d_taus'], s['d_tdev'], '-o', color=s['color'],
+                      markersize=5, linewidth=2, label=f"{host} disciplined")
+        if len(s['f_taus']):
+            ax.loglog(s['f_taus'], s['f_tdev'], '--', color=s['color'],
+                      alpha=0.55, linewidth=1.6, label=f"{host} freerun")
     ax.loglog(tau_ref, 0.024 * np.sqrt(tau_ref), ':', color='#9467bd',
               linewidth=2, label='TDCP measurement floor (24 ps @ 1 s, τ^½)')
-    # GPS PPS reference (F9T 2.3 ns @ 1 s, white-phase τ^(-½))
     ax.loglog(tau_ref, 2.3 / np.sqrt(tau_ref), '--', color='#7f7f7f',
-              linewidth=1.5, label='GPS PPS (F9T, 2.3 ns @ 1 s, white-phase τ^(-½))')
-    # Moonshot per-clock budget + shared-antenna excursion bound
+              linewidth=1.5, label='GPS PPS reference (F9T, 2.3 ns @ 1 s, τ^(-½))')
     ax.axhline(0.354, color='#bcbd22', linewidth=1.2, alpha=0.6,
                label='moonshot per-clock budget (354 ps)')
     ax.axhline(1.0, color='#e377c2', linewidth=1.2, alpha=0.6,
                label='shared-antenna excursion bound (1 ns)')
-
     ax.set_xlabel('τ (s)')
     ax.set_ylabel('TDEV (ns)')
-    ax.set_title(f'3-host disciplined vs freerun chA TDEV — 2026-05-27 '
-                  f'(skip first {SKIP_BOOTSTRAP_S}s of disc capture)')
+    ax.set_title(f'3-host disciplined vs freerun chA TDEV — '
+                  f'REBASED math, skip first {SKIP_BOOTSTRAP_S}s of disc (2026-05-27)')
     ax.set_xlim(0.9, 5000)
     ax.set_ylim(1e-2, 5e2)
     ax.grid(True, which='both', alpha=0.3)
     ax.legend(fontsize=8, loc='upper left', framealpha=0.9, ncol=2)
     fig.tight_layout()
-    out_t = DOCS / '3host-disc-vs-freerun-tdev-2026-05-27.png'
-    fig.savefig(out_t, dpi=140)
-    print(f"\nWrote → {out_t}")
+    out = DOCS / '3host-disc-vs-freerun-tdev-2026-05-27.png'
+    fig.savefig(out, dpi=140)
+    print(f"\nWrote → {out}")
 
-    # === DAC activity (x3_f_do_ppb) over time ===
+    # === Plot 2: TDEV per ~2500-s window (event-driven vs continuous) ===
+    windows = [('early', 180, 180 + 2500),
+               ('mid',   3000, 3000 + 2500),
+               ('late',  6000, 6000 + 2500)]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 6), sharey=True)
+    for ax, (host, s) in zip(axes, series.items()):
+        # rebuild full t,ns for the host (we have d_t in skip-rebased frame)
+        d_secs, d_pss = _load_disc_ticc(host.lower(), 'chA')
+        t_full, ns_full = _rebased_elapsed_ns(d_secs, d_pss)
+        for name, t_lo, t_hi, style in (
+                ('early', windows[0][1], windows[0][2], '-o'),
+                ('mid',   windows[1][1], windows[1][2], '-s'),
+                ('late',  windows[2][1], windows[2][2], '-^')):
+            mask = (t_full >= t_lo) & (t_full < t_hi)
+            t_sub = t_full[mask] - t_lo
+            ns_sub = ns_full[mask]
+            if len(ns_sub) < 200:
+                continue
+            taus, tdev, _ = _detrend_and_tdev(t_sub, ns_sub, TAUS)
+            ax.loglog(taus, tdev, style, markersize=4, linewidth=1.4,
+                      label=f'{name} ({t_lo}–{t_hi} s)')
+        if len(s['f_taus']):
+            ax.loglog(s['f_taus'], s['f_tdev'], '--', color='black',
+                      alpha=0.4, linewidth=1.2, label='freerun (morning)')
+        ax.axhline(0.354, color='#bcbd22', linewidth=0.8, alpha=0.5)
+        ax.set_title(f'{host}')
+        ax.set_xlabel('τ (s)')
+        if ax is axes[0]:
+            ax.set_ylabel('TDEV (ns)')
+        ax.grid(True, which='both', alpha=0.3)
+        ax.set_xlim(0.9, 1500)
+        ax.set_ylim(1e-2, 1e3)
+        ax.legend(fontsize=8, loc='upper left')
+    fig.suptitle('Per-window TDEV — event-driven noise reveals itself when one '
+                  'window deviates from the others')
+    fig.tight_layout()
+    out = DOCS / '3host-disc-per-window-tdev-2026-05-27.png'
+    fig.savefig(out, dpi=140)
+    print(f"Wrote → {out}")
+
+    # === Plot 3: chA residual time series (where the events are) ===
+    fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+    for ax, (host, _color) in zip(axes, HOSTS):
+        s = series[host]
+        if not len(s['d_resid']):
+            continue
+        ax.plot(s['d_t'], s['d_resid'], linewidth=0.7, color=s['color'])
+        ax.axhline(0, color='black', linewidth=0.4, alpha=0.3)
+        ax.set_ylabel(f'{host}\nchA residual (ns)')
+        ax.grid(True, alpha=0.3)
+        # Annotate per-window TDEV(1s) at top
+        rms = np.std(s['d_resid'])
+        ax.text(0.01, 0.96, f'RMS={rms:.1f} ns  peak={np.max(np.abs(s["d_resid"])):.1f} ns',
+                transform=ax.transAxes, ha='left', va='top', fontsize=9,
+                bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+    axes[0].set_title('chA residual (linear-detrended) time series — '
+                       'where the events live (post-bootstrap-skip frame)')
+    axes[-1].set_xlabel('seconds since bootstrap-skip')
+    fig.tight_layout()
+    out = DOCS / '3host-disc-residual-timeseries-2026-05-27.png'
+    fig.savefig(out, dpi=140)
+    print(f"Wrote → {out}")
+
+    # === Plot 4: DAC activity (unchanged) ===
     fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
     for ax, (host, _color) in zip(axes, HOSTS):
         s = series[host]
@@ -229,16 +285,15 @@ def main():
         ax.axhline(0, color='black', linewidth=0.4, alpha=0.3)
         ax.set_ylabel(f'{host}\nx3_f_do_ppb')
         ax.grid(True, alpha=0.3)
-        # mark the SKIP_BOOTSTRAP_S boundary
         ax.axvline(SKIP_BOOTSTRAP_S, color='#888', linestyle='--', linewidth=0.8,
                    alpha=0.5)
     axes[0].set_title('DO frequency state x3_f_do_ppb over capture — '
-                       '"light touch" view (dashed line = bootstrap-skip boundary)')
+                       '"light touch" view (dashed = bootstrap-skip boundary)')
     axes[-1].set_xlabel('seconds since capture start')
     fig.tight_layout()
-    out_d = DOCS / '3host-disc-dac-activity-2026-05-27.png'
-    fig.savefig(out_d, dpi=140)
-    print(f"Wrote → {out_d}")
+    out = DOCS / '3host-disc-dac-activity-2026-05-27.png'
+    fig.savefig(out, dpi=140)
+    print(f"Wrote → {out}")
 
 
 if __name__ == '__main__':
