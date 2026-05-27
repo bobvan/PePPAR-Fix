@@ -6175,37 +6175,53 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
         args, pps_freq_ppb, pps_freq_unc, dac.read_frequency_ppb(),
         dt_rx_series)
 
-    # Glide slope: pre-compensate residual phase error so the EKF
-    # doesn't overshoot.  Without this, the EKF sees the post-ARM
-    # phase error (~500 ns), aggressively drives adjfine to correct
-    # it, overshoots, and the DO drifts away.  The glide adds a
-    # frequency offset proportional to phi_0 that the second-order
-    # LQR loop absorbs smoothly.
-    #
-    # Formula: glide = -zeta * omega_n * phi_0
-    # where omega_n = sqrt(track_ki) and zeta = 0.7 (critically damped).
-    # DOFreqEst.__init__ uses base_freq for x[3] and initial_freq
-    # (= base_freq + glide) for _last_u — the difference is what
-    # drives the initial convergence.
-    glide_offset = 0.0
-    if phi_end_ns is not None and abs(phi_end_ns) > 10.0:
-        track_ki = getattr(args, 'track_ki', 0.0025)
-        omega_n = math.sqrt(track_ki)
-        zeta = getattr(args, 'glide_zeta', 0.7)
-        glide_offset = -zeta * omega_n * phi_end_ns
-        max_ppb = getattr(args, 'dac_max_ppb', None) or 500.0
-        max_glide = max_ppb - abs(base_freq)
-        if abs(glide_offset) > max_glide:
-            glide_offset = math.copysign(max_glide, glide_offset)
-        log.info("VCOCXO glide: phi_0=%+.0f ns, omega_n=%.4f, zeta=%.2f "
-                 "→ glide=%+.1f ppb (zero-crossing ~%.0f s)",
-                 phi_end_ns, omega_n, zeta, glide_offset,
-                 abs(phi_end_ns / glide_offset) if glide_offset != 0 else float('inf'))
+    # Step 1: set DAC to base_freq (corrects the freerun offset).
+    actual = dac.adjust_frequency_ppb(base_freq)
+    log.info("DAC frequency set to base: %.1f ppb (actual=%.1f)",
+             base_freq, actual)
 
-    target_freq = base_freq + glide_offset
-    actual = dac.adjust_frequency_ppb(target_freq)
-    log.info("DAC frequency set: requested=%.1f ppb (base=%.1f + glide=%.1f), "
-             "actual=%.1f ppb", target_freq, base_freq, glide_offset, actual)
+    # Step 2: measure residual phase AFTER the DAC correction.
+    # This is the phase error the EKF will see at startup — much
+    # smaller than phi_end_ns (which was measured BEFORE DAC set).
+    glide_offset = 0.0
+    ticc_port = getattr(args, 'ticc_port', None)
+    if ticc_port is not None:
+        try:
+            from peppar_fix.timestamper import measure_differential_phase
+            ticc_baud = getattr(args, 'ticc_baud', 115200)
+            do_ch = getattr(args, 'ticc_phc_channel', 'chA')
+            ref_ch = getattr(args, 'ticc_ref_channel', 'chB')
+            time.sleep(2)
+            phi_0_ns, _n = measure_differential_phase(
+                ticc_port, ticc_baud, do_ch, ref_ch,
+                n_samples=3, timeout_s=10)
+            if phi_0_ns is not None and abs(phi_0_ns) > 10.0:
+                track_ki = getattr(args, 'track_ki', 0.0025)
+                omega_n = math.sqrt(track_ki)
+                zeta = getattr(args, 'glide_zeta', 0.7)
+                glide_offset = -zeta * omega_n * phi_0_ns
+                max_ppb = getattr(args, 'dac_max_ppb', None) or 500.0
+                max_glide = max_ppb * 0.5 - abs(base_freq)
+                if abs(glide_offset) > max(max_glide, 0):
+                    glide_offset = math.copysign(max(max_glide, 0), glide_offset)
+                log.info("VCOCXO glide: phi_0=%+.0f ns → glide=%+.1f ppb "
+                         "(zero-crossing ~%.0f s)",
+                         phi_0_ns, glide_offset,
+                         abs(phi_0_ns / glide_offset) if glide_offset != 0 else float('inf'))
+            else:
+                log.info("Residual phase %s ns — no glide needed",
+                         f"{phi_0_ns:+.0f}" if phi_0_ns is not None else "N/A")
+        except Exception as e:
+            log.warning("Post-DAC phase measurement failed (%s) — no glide", e)
+
+    if glide_offset != 0:
+        target_freq = base_freq + glide_offset
+        actual = dac.adjust_frequency_ppb(target_freq)
+        log.info("DAC frequency updated with glide: %.1f ppb "
+                 "(base=%.1f + glide=%.1f), actual=%.1f",
+                 target_freq, base_freq, glide_offset, actual)
+    else:
+        target_freq = base_freq
 
     # Stash the bootstrap frequency so _setup_servo can re-apply it
     # after the DacActuator's setup() (which resets to center).
