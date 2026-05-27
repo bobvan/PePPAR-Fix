@@ -4844,10 +4844,15 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     filt.predict(dt)
             prev_t = gps_time
 
-            # EKF update
+            # EKF update.  Propagate the per-epoch F9T clkReset flag (RXM-RAWX
+            # recStat.clkReset) so the filter can absorb integer-ms receiver-
+            # clock realignments into dt_rx instead of tripping the catastrophic
+            # gate.  See dayplan chipSlipHandling.
+            clk_reset_this_epoch = bool(getattr(obs_event, 'clk_reset', False))
             n_used, resid, n_td = filt.update(
                 observations, corrections, gps_time,
                 clk_file=corrections,
+                clk_reset=clk_reset_this_epoch,
             )
 
             # Catastrophic-reject cascade (I-202649 v2 + Note A engine
