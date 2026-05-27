@@ -192,29 +192,45 @@ class TiccTimestamper(Timestamper):
             return None, None, 0
 
         # Full-baseline frequency: total drift over N intervals.
-        # Same approach as ExttsTimestamper — first-to-last, not averages.
+        #
+        # Nominal must be (N-1)*1e12 ps where N=len(edges).  Using
+        # `(last_sec - first_sec) * 1e12` as nominal — the prior
+        # formulation — was wrong: when the first/last edge straddles
+        # a TICC integer-second boundary asymmetrically, that integer
+        # difference is off by one from the actual interval count, and
+        # the result becomes catastrophic (1e8-ppb for a 1000 ppb fast
+        # DO).  This was the root cause of the bootstrapSignFlip
+        # phenomenon documented in dayplan 2026-05-26.
+        #
+        # Sign: total_ps_drift > (N-1)*1e12 means the DO took *longer*
+        # than nominal — DO is slow.  The abstract method's contract is
+        # "positive freq_ppb = DO is fast" (matching the other two
+        # measurement paths: measure_differential_frequency and
+        # dac_slope_cal post-revert), so negate here.
+        n_intervals = len(edges) - 1
         first = edges[0]
         last = edges[-1]
-        total_sec = last[0] - first[0]
         total_ps_drift = (last[0] - first[0]) * 1_000_000_000_000 + (last[1] - first[1])
-        nominal_ps = total_sec * 1_000_000_000_000
+        nominal_ps = n_intervals * 1_000_000_000_000
         if nominal_ps == 0:
             return None, None, 0
 
-        freq_ppb = (total_ps_drift - nominal_ps) / nominal_ps * 1e9
+        freq_ppb = -(total_ps_drift - nominal_ps) / nominal_ps * 1e9
 
         # Per-interval residual jitter
         nominal_1s_ps = 1_000_000_000_000
-        residuals = [iv - nominal_1s_ps - (freq_ppb * 1000) for iv in intervals_ps]
-        # freq_ppb * 1000 converts ppb to ps/interval for a 1-second nominal
+        # freq_ppb * 1000 = ps/interval for a 1-second nominal, with
+        # the same sign convention (positive = DO fast = interval
+        # shorter than nominal).
+        residuals = [iv - nominal_1s_ps + (freq_ppb * 1000) for iv in intervals_ps]
         sigma_ps = statistics.stdev(residuals) if len(residuals) >= 2 else 0.0
         sigma_ppb = sigma_ps / nominal_1s_ps * 1e9
 
         log.info("TICC freq measurement (%s): %.1f ±%.1f ppb "
-                 "(%d intervals, %ds baseline)",
+                 "(%d intervals)",
                  self.channel, freq_ppb,
                  sigma_ppb / math.sqrt(max(1, len(intervals_ps))),
-                 len(intervals_ps), total_sec)
+                 len(intervals_ps))
 
         return freq_ppb, sigma_ppb, len(intervals_ps)
 
