@@ -5967,7 +5967,7 @@ def _bootstrap_measure_freq_and_clock(args, timestamper, known_ecef, obs_queue,
     log.info("Clock estimate: dt_rx=%.1f ±%.1f ns after %d epochs",
              dt_rx_ns, dt_rx_sigma_ns, n_epochs)
 
-    return pps_freq_ppb, pps_freq_unc, dt_rx_ns, dt_rx_series
+    return pps_freq_ppb, pps_freq_unc, dt_rx_ns, dt_rx_series, phi_end_ns
 
 
 def _bootstrap_compute_base_freq(args, pps_freq_ppb, pps_freq_unc,
@@ -6528,7 +6528,7 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
         return False
     if result is None:
         return False
-    pps_freq_ppb, pps_freq_unc, dt_rx_ns, dt_rx_series = result
+    pps_freq_ppb, pps_freq_unc, dt_rx_ns, dt_rx_series, phi_end_ns = result
 
     if dfe_sm is not None:
         dfe_sm.transition(DOFreqEstState.FREQ_VERIFYING,
