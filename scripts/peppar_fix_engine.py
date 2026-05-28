@@ -6941,14 +6941,20 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         _sigma_ns = load_sigma_short_tau_from_state(_do_state_path)
         if _sigma_ns is not None:
             _do_label_gate = getattr(args, 'do_label', None) or str(do_uid_local)
+            _regime_aware = not getattr(args, 'ocxo_gate_legacy', False)
             _ocxo_gate = OcxoTrustedGate(
                 sigma_short_tau_ns=_sigma_ns,
                 k_sigma=args.ocxo_trusted_k_sigma,
                 min_age_s=args.ocxo_trusted_min_age,
-                do_label=_do_label_gate)
+                do_label=_do_label_gate,
+                regime_aware=_regime_aware,
+                lock_bias_ratio=getattr(args, 'ocxo_gate_lock_bias_ratio', 0.4),
+                unlock_bias_ratio=getattr(args, 'ocxo_gate_unlock_bias_ratio', 0.7))
             log.info("OCXO gate ENABLED: σ=%.4f ns, K=%.1f, min_age=%.1fs, "
-                     "do=%s", _sigma_ns, _ocxo_gate.k_sigma,
-                     _ocxo_gate.min_age_s, _do_label_gate)
+                     "mode=%s, do=%s", _sigma_ns, _ocxo_gate.k_sigma,
+                     _ocxo_gate.min_age_s,
+                     "regime-aware(v2)" if _regime_aware else "legacy(v1)",
+                     _do_label_gate)
         else:
             log.warning("OCXO gate requested but state JSON has no usable "
                         "TDEV(1s) for %s — gate disabled", do_uid_local)
@@ -10307,6 +10313,20 @@ Two-phase operation:
     servo.add_argument("--ocxo-trusted-min-age", type=float, default=60.0,
                        help="OCXO gate disabled for the first N seconds of "
                             "filter life (bootstrap protection).  Default 60.")
+    servo.add_argument("--ocxo-gate-legacy", action="store_true",
+                       help="Force v1 single-regime OCXO gate (tight after "
+                            "min-age regardless of lock).  Default is the v2 "
+                            "regime-aware gate: loose while acquiring, tight "
+                            "once locked (innovation bias-to-noise ratio). "
+                            "v1 can block acquisition on hosts that don't lock "
+                            "by min-age (see clkpoc3GateOverRejectsBeforeLock).")
+    servo.add_argument("--ocxo-gate-lock-bias-ratio", type=float, default=0.4,
+                       help="v2: acquiring→locked when innovation bias-to-noise "
+                            "ratio stays below this for the dwell.  Default 0.4 "
+                            "(locked≈0.22, stuck≈0.95 empirically).")
+    servo.add_argument("--ocxo-gate-unlock-bias-ratio", type=float, default=0.7,
+                       help="v2: locked→acquiring when the ratio exceeds this "
+                            "(hysteresis).  Default 0.7.")
     servo.add_argument("--servo-input", choices=("default", "tdcp"),
                        default="default",
                        help="Servo-input mode.  'default' = today's 4-arm "
