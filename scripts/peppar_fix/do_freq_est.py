@@ -68,7 +68,8 @@ class DOFreqEst:
                  tick_ns=8.0,
                  max_ppb=62_500_000.0, initial_freq=0.0,
                  initial_dt_rx_ns=None, base_freq=None,
-                 max_step_ppb=None):
+                 max_step_ppb=None,
+                 ocxo_trusted_gate=None):
         self.max_ppb = max_ppb
         # L3 of the TDCP slip-protection stack: per-epoch actuator
         # rate limit.  None = disabled (today's behavior preserved).
@@ -152,6 +153,18 @@ class DOFreqEst:
         self._last_u = initial_freq
 
         self._state_corrupted = False
+
+        # OCXO-trusted observation gate.  If provided, Arm 4 (TICC)
+        # innovations whose magnitude exceeds the DO's physically-
+        # plausible short-τ movement are rejected before the EKF
+        # update.  Anchored on the DO's freerun-characterized noise
+        # floor, independent of the filter's own R/Q tuning.  See
+        # peppar_fix.ocxo_trusted_gate.  Default None preserves
+        # pre-existing behavior (chi² gate alone).
+        self._ocxo_gate = ocxo_trusted_gate
+        # Total time the filter has been alive (sum of dt across all
+        # update() calls).  Used to feed `age_s` into the OCXO gate.
+        self._total_age_s = 0.0
 
         # Innov-vs-control consistency monitor (TICC arm, where u enters
         # the prediction).  See peppar_fix/innov_control_monitor.py.
@@ -282,6 +295,9 @@ class DOFreqEst:
             self.F[0, 1] = dt
             self.F[2, 3] = -dt
             self.B[2] = -dt
+
+        # Accumulate total filter age for the OCXO gate.
+        self._total_age_s += dt
 
         # ── Seed x[2] from first available DO-phase measurement ──
         # The seed avoids a large first-epoch innovation that would
@@ -442,14 +458,29 @@ class DOFreqEst:
             self.last_arm_S['ticc'] = S
 
             _chi2 = innov_ticc ** 2 / S if S > 0 else 0.0
-            if _chi2 > _CHI2_GATE_THRESHOLD:
+            chi2_reject = _chi2 > _CHI2_GATE_THRESHOLD
+            # OCXO-trusted physical gate.  Anchored on the DO's
+            # characterized freerun short-τ noise (not on √S), so it
+            # rejects observations that imply physically impossible
+            # DO movement even when the filter's own R/Q has loosened.
+            ocxo_reject = False
+            if self._ocxo_gate is not None:
+                accept, reason = self._ocxo_gate.evaluate(
+                    innov_ns=innov_ticc, dt_s=self.dt,
+                    age_s=self._total_age_s)
+                if not accept:
+                    ocxo_reject = True
+                    log.warning("[EKF] Arm 4 %s — update skipped", reason)
+
+            if chi2_reject:
                 log.warning(
                     "[EKF] Arm 4 chi² gate: |innov|=%.1f ns, √S=%.1f ns, "
                     "χ²=%.0f > %.0f — update skipped",
                     abs(innov_ticc), math.sqrt(S), _chi2,
                     _CHI2_GATE_THRESHOLD,
                 )
-            else:
+
+            if not (chi2_reject or ocxo_reject):
                 K = (P_pred @ H_ticc.T) / S
                 x_pred = x_pred + K.flatten() * innov_ticc
                 P_pred = P_pred - np.outer(K.flatten(), K.flatten()) * S
