@@ -1,6 +1,6 @@
 """Klobuchar single-frequency ionospheric delay model.
 
-Standard model for single-frequency receivers per ICD-GPS-200 §20.3.3.5.2.5.
+Standard model for single-frequency receivers per ICD-GPS-200N §30.3.3.5.1.7.
 Computes the slant ionospheric delay at a given (SV, receiver, epoch) using
 8 broadcast parameters (α[0..3], β[0..3]) transmitted in GPS subframe 4
 page 18.
@@ -24,7 +24,8 @@ cancels naturally.  Single-freq float-PPP contributes geometry to the float
 position; it does not contribute integer-fixable ambiguities.  See
 docs/ac-datum-mixing.md for the float-vs-AR architectural framing.
 
-Reference: ICD-GPS-200N §20.3.3.5.2.5 (Ionospheric Correction).
+Reference: ICD-GPS-200N §30.3.3.5.1.7 (Ionospheric Correction
+algorithm; the worked example used in the tests is §30.3.3.5.2.5).
 """
 
 from __future__ import annotations
@@ -85,7 +86,7 @@ def slant_iono_delay_l1_m(
     ``(f_L1 / f) ** 2`` for other frequency bands — see
     ``slant_iono_delay_m`` for the convenience wrapper.
 
-    The algorithm follows ICD-GPS-200N §20.3.3.5.2.5 step-by-step;
+    The algorithm follows ICD-GPS-200N §30.3.3.5.1.7 step-by-step;
     intermediate variables retain the ICD's notation (ψ, φ_i, λ_i,
     φ_m, t, AMP, PER, x, F) for ease of cross-reference.
     """
@@ -148,7 +149,10 @@ def slant_iono_delay_l1_m(
         t_iono_s = f_obliquity * (5.0e-9 + amp * (1.0 - x * x / 2.0
                                                   + x ** 4 / 24.0))
     else:
-        # Daytime/zenith fall-off.
+        # Nighttime floor: |x| ≥ π/2 means t_local is far from local
+        # solar noon (50400 s), where the cosine model would swing
+        # negative.  The ICD clamps the diurnal term to its night
+        # minimum (5 ns vertical) instead.
         t_iono_s = f_obliquity * 5.0e-9
 
     return t_iono_s * _C_M_PER_S

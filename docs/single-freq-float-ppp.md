@@ -65,7 +65,9 @@ Single-freq path:
   realtime_ppp builds obs = {sv, sys, pr_l1, phi_l1_m, freq_hz,
                               single_freq: True, signal_code, ...}
   PPPFilter.update_singlefreq(obs):
-    iono = klobuchar.slant_iono_delay_m(freq_hz, ...)
+    iono = klobuchar.slant_iono_delay_m(
+        params, t_gps_s, rx_lat, rx_lon, sv_elev, sv_az, freq_hz)
+        # NB: freq_hz is the LAST positional arg, not the first
     pr_pred  = ρ + clk + ISB + tropo + ZTD·m_wet + iono
     phi_pred = ρ + clk + ISB + tropo + ZTD·m_wet - iono + λ·N
                                                   ^^^^
@@ -77,11 +79,14 @@ Single-freq path:
 ```
 
 Note the phase observation: in IF, iono cancels because the L1
-and L5 phases each pick up `+I` and the IF coefficients cancel
-them.  For single-freq L1, the phase carries the FULL ionospheric
-delay with the OPPOSITE sign from PR (since iono advances phase
-and delays code).  So `phi_pred` subtracts iono where `pr_pred`
-adds it.
+and L5 phases each carry `−I_f` (carrier phase is *advanced* by
+the ionosphere, opposite the group-code delay), and the IF
+coefficients — α₁·(−I₁) − α₂·(−I₂) with α₁/α₂ = f₂²/f₁² and
+I_f ∝ 1/f² — cancel them to zero.  For single-freq L1 there is
+no second frequency to cancel against, so the phase carries the
+full `−I` while the code carries `+I`.  That is why `phi_pred`
+subtracts iono where `pr_pred` adds it (the `pr += iono`,
+`phi −= iono` convention in the sketch above is correct).
 
 ## Ambiguity state for single-freq SVs
 
