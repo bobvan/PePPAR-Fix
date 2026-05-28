@@ -6677,11 +6677,12 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                 log.error("--dac-ppb-per-code required for DAC actuator")
             else:
                 _last_code = None
-                if do_uid_local is not None:
-                    _last_code = load_last_dac_code(do_uid_local)
+                _dac_do_uid = _resolve_do_uid(args)
+                if _dac_do_uid is not None:
+                    _last_code = load_last_dac_code(_dac_do_uid)
                     if _last_code is not None:
                         log.info("Loaded last DAC code %d for %s",
-                                 _last_code, do_uid_local)
+                                 _last_code, _dac_do_uid)
                 actuator = DacActuator(
                     bus_num=args.dac_bus,
                     addr=dac_addr,
