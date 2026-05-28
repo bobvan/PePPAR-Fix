@@ -4486,6 +4486,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                         'innov_extint', 's_extint',
                         'innov_pseudo', 's_pseudo',
                         'innov_ticc',   's_ticc',
+                        'ocxo_gate_reject', 'ocxo_gate_reason',
                     ])
                     _arm_f.flush()
                 _arm_w = StridedWriter(
@@ -6897,6 +6898,29 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                         "characterization: %s", e)
 
     _max_step = getattr(args, 'max_adjfine_step_ppb', None)
+    _ocxo_gate = None
+    if getattr(args, 'ocxo_trusted_gate', False) and do_uid_local is not None:
+        from peppar_fix.ocxo_trusted_gate import (
+            OcxoTrustedGate, load_sigma_short_tau_from_state)
+        from peppar_fix.do_state import DO_STATE_DIR
+        _safe_uid = str(do_uid_local).replace(":", "-").replace("/", "_")
+        _do_state_path = Path(DO_STATE_DIR) / f"{_safe_uid}.json"
+        _sigma_ns = load_sigma_short_tau_from_state(_do_state_path)
+        if _sigma_ns is not None:
+            _do_label_gate = getattr(args, 'do_label', None) or str(do_uid_local)
+            _ocxo_gate = OcxoTrustedGate(
+                sigma_short_tau_ns=_sigma_ns,
+                k_sigma=args.ocxo_trusted_k_sigma,
+                min_age_s=args.ocxo_trusted_min_age,
+                do_label=_do_label_gate)
+            log.info("OCXO gate ENABLED: σ=%.4f ns, K=%.1f, min_age=%.1fs, "
+                     "do=%s", _sigma_ns, _ocxo_gate.k_sigma,
+                     _ocxo_gate.min_age_s, _do_label_gate)
+        else:
+            log.warning("OCXO gate requested but state JSON has no usable "
+                        "TDEV(1s) for %s — gate disabled", do_uid_local)
+    elif getattr(args, 'ocxo_trusted_gate', False):
+        log.warning("OCXO gate requested but no DO UID resolved — gate disabled")
     servo = DOFreqEst(
         sigma_ticc_ns=sigma_ticc,
         sigma_do_phase_ns=sigma_do_phase_ns_eff,
@@ -6908,6 +6932,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         initial_dt_rx_ns=bootstrap_dt_rx_ns,
         base_freq=bootstrap_base_freq,
         max_step_ppb=_max_step if _max_step and _max_step > 0 else None,
+        ocxo_trusted_gate=_ocxo_gate,
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
              "sigma_do=[%.4f ns, %.4f ppb], "
@@ -8114,6 +8139,8 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                     """Empty string when arm didn't fire; formatted float otherwise."""
                     return format(v, fmt) if v is not None else ''
 
+                _ocxo_rej = getattr(servo, 'last_ocxo_gate_rejected', False)
+                _ocxo_rsn = getattr(servo, 'last_ocxo_gate_reason', '')
                 _arm_w.writerow([
                     datetime.now(tz=timezone.utc).isoformat(),
                     f"{time.monotonic():.9f}",
@@ -8134,6 +8161,8 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                     _fmt(_innov.get('extint')), _fmt(_S_dict.get('extint')),
                     _fmt(_innov.get('pseudo')), _fmt(_S_dict.get('pseudo')),
                     _fmt(_innov.get('ticc')),   _fmt(_S_dict.get('ticc')),
+                    1 if _ocxo_rej else 0,
+                    _ocxo_rsn,
                 ])
                 if _arm_f is not None:
                     _arm_f.flush()
@@ -10231,6 +10260,18 @@ Two-phase operation:
                             "fed to the servo.  Used for ablation runs "
                             "comparing TIM-TM2-only against TICC+TIM-TM2 "
                             "performance.")
+    servo.add_argument("--ocxo-trusted-gate", action="store_true",
+                       help="Enable OCXO-trusted observation gate on Arm 4.  "
+                            "Rejects innovations exceeding the DO's "
+                            "characterized freerun noise floor (from "
+                            "state/dos/<uid>.json).  Complements the "
+                            "chi² gate — keys on physics, not filter state.")
+    servo.add_argument("--ocxo-trusted-k-sigma", type=float, default=10.0,
+                       help="OCXO gate confidence multiplier.  Threshold = "
+                            "K × σ_DO × √dt.  Default 10.0.")
+    servo.add_argument("--ocxo-trusted-min-age", type=float, default=60.0,
+                       help="OCXO gate disabled for the first N seconds of "
+                            "filter life (bootstrap protection).  Default 60.")
     servo.add_argument("--servo-input", choices=("default", "tdcp"),
                        default="default",
                        help="Servo-input mode.  'default' = today's 4-arm "

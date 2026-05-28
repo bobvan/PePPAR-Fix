@@ -192,6 +192,8 @@ class DOFreqEst:
             'ppp': None, 'qerr': None, 'tdcp': None,
             'extint': None, 'pseudo': None, 'ticc': None,
         }
+        self.last_ocxo_gate_rejected: bool = False
+        self.last_ocxo_gate_reason: str = ""
         # rx TCXO state must be initialized at construction from bootstrap
         # dt_rx to avoid a mid-run measurement model transition that
         # causes divergence.  If dt_rx wasn't available at construction,
@@ -323,6 +325,8 @@ class DOFreqEst:
         for _k in self.last_arm_innov:
             self.last_arm_innov[_k] = None
             self.last_arm_S[_k] = None
+        self.last_ocxo_gate_rejected = False
+        self.last_ocxo_gate_reason = ""
 
         # ── Adaptive Q: boost during pull-in ──
         do_phase_abs = abs(self.x[2])
@@ -470,6 +474,8 @@ class DOFreqEst:
                     age_s=self._total_age_s)
                 if not accept:
                     ocxo_reject = True
+                    self.last_ocxo_gate_rejected = True
+                    self.last_ocxo_gate_reason = reason
                     log.warning("[EKF] Arm 4 %s — update skipped", reason)
 
             if chi2_reject:
