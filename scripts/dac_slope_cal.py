@@ -283,7 +283,22 @@ def main() -> int:
         print(f"  *** SATURATION DETECTED — {n_saturated} points clipped "
               f"outside [{code_min}, {code_max}]")
 
-    out = {
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Merge into the existing DO-state JSON, not overwrite.  The same
+    # file carries the freerun characterization (written by
+    # do_freerun_char.py under the 'characterization' key) — a blind
+    # overwrite here clobbered it (lost MadHat's 47 ps freerun floor
+    # 2026-05-28).  Read-modify-write only the DAC-slope keys.
+    existing = {}
+    if out_path.exists():
+        try:
+            existing = json.loads(out_path.read_text())
+        except Exception:
+            existing = {}
+
+    existing.update({
         'unique_id': do_label,
         'do_label': do_label,
         'characterization_date': datetime.now(tz=timezone.utc).isoformat(),
@@ -303,12 +318,12 @@ def main() -> int:
         'fit_n_points': n,
         'fit_n_saturated': n_saturated,
         'measurements': results,
-    }
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    })
     with open(out_path, 'w') as f:
-        json.dump(out, f, indent=2)
-    print(f"\nSaved characterization to {out_path}")
+        json.dump(existing, f, indent=2)
+    _kept = 'characterization' in existing
+    print(f"\nSaved DAC slope cal to {out_path}"
+          f"{' (freerun characterization preserved)' if _kept else ''}")
 
     print(f"\nSuggested config/<host>.toml additions:")
     print(f"  dac_bus = {args.bus}")
