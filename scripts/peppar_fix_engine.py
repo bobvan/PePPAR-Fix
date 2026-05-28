@@ -3583,7 +3583,7 @@ class AntPosEstThread(threading.Thread):
             #   n_nl_fixed   — union of ANCHORING + ANCHORED.
             #                  Drives CONVERGING ↔ ANCHORING (fallback:
             #                  any NL integer committed, validated or not).
-            #   n_anchored   — ANCHORED only, survived ≥ 8° Δaz.
+            #   n_anchored   — ANCHORED only, survived ≥ 15° Δaz (I-224945).
             #                  Drives ANCHORING ↔ ANCHORED (the strict
             #                  "geometry-validated" milestone).
             n_anchored = self._sv_state.count_in(SvAmbState.ANCHORED)

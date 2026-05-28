@@ -74,22 +74,45 @@ class AnchoringSvPromoter:
     within a wrong-integer-free envelope.
 
     Defaults:
-      - dphi_threshold_deg=15° (was 8° pre-I-224945; the engine's
-        own comment at line 1884 already documented "≥ 15°" so this
-        restores spec/code agreement).
+      - dphi_threshold_deg=15°.  NOTE: this is a NEW spec, NOT a
+        restoration.  The Δaz threshold was deliberately lowered
+        15°→8° on 2026-04-20 (commit 7aa82e5) based on day0419h
+        overnight data, and docs/sv-lifecycle-and-pfr-split.md still
+        codifies ≥ 8° as the design spec.  I-224945 raises it back to
+        15° because day0506pm-piface-arm34-bias-v2 showed 8° is
+        structurally too loose under the current bias context: E12
+        was promoted at Δaz=8.2° with a wrong-integer fix.  15° also
+        guarantees the IF-residual gate below accumulates its
+        if_resid_min_samples before promotion is even considered
+        (at typical ~0.5°/min geometry change, 15° ≈ 30 min ≫ the
+        60-epoch IF window).  The 15° comments elsewhere in engine.py
+        are stale pre-2026-04-20 leftovers that this change happens to
+        re-align with — coincidence, not the justification.
       - if_resid_threshold_m=0.060 (60 mm signed-mean ceiling).
-        Empirical: day0506pm-piface-arm34-bias-v2 had E12's wrong
-        integer bias the IF residual to +79.5 mm signed mean over
-        its 31-min ANCHORING window; clean integer SVs in the same
-        log sat in the [-50, +25] mm range.
+        Derivation: day0506pm-piface-arm34-bias-v2 wrong-integer
+        promotions had signed-mean IF residuals of +79.5, +211, +225,
+        +134, −170, −101, −76 mm; clean-pass integer SVs sat at −53,
+        +22, +4 mm.  60 mm is the midpoint between the highest clean
+        signed-mean (−53 mm) and the lowest wrong-integer (76 mm) —
+        comfortably above clean noise, below every wrong-integer case.
       - if_resid_window_epochs=60 (1 min at 1 Hz).  Shorter than the
         clean_window so the gate is responsive without being noisy.
+      - if_resid_min_samples=30: require ≥50% fill of the 60-epoch
+        window before the gate opines, so noisy/intermittent SVs
+        (which deliver phi sporadically) don't auto-pass on a handful
+        of lucky-clean samples.
       - clean_window_epochs=180 (≈3 min @ 1 Hz, matches false-fix's
         residual window).
       - eval_every=10 matches the other monitors.
 
     Disable the IF-residual filter by passing if_resid_threshold_m=None
     (e.g. for ablation testing or hosts with no NL-residual logger).
+
+    Deployment surface: ANCHORING is only reached under --ar-mode full
+    / AntPosEst, which is NOT the operational default (--no-antposest
+    since 2026-05-20 per I-125649).  This gate ships dormant in current
+    production — a hedge for --ar-mode full and future AntPosEst
+    re-enable, with zero effect on the running --no-antposest fleet.
     """
 
     def __init__(

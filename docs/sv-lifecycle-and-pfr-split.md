@@ -53,7 +53,7 @@ independent fix sets and solutions — no shared-state confusion.
                 (receiver loses tracking → record forgotten)
                               ▲
 (receiver                     │
- acquires)   TRACKING ── admit ──► FLOAT ── WL fix ──► WL_FIXED ── NL fix ──► NL_SHORT_FIXED ── Δaz ≥ 8° ──► NL_LONG_FIXED
+ acquires)   TRACKING ── admit ──► FLOAT ── WL fix ──► WL_FIXED ── NL fix ──► NL_SHORT_FIXED ── Δaz ≥ 15° ──► NL_LONG_FIXED
                                     ▲                    │                        │   ▲                          │
                                     │                    │                        │   │                          │
                                     │     false-fix rejection (monitor)           │   │                          │
@@ -93,11 +93,16 @@ the fix set: contributes its integer to the position solution but
 does not count toward the solution-state RESOLVED declaration — the
 integer has not yet been validated across geometry change.
 
-**NL_LONG_FIXED** — the integer fix has survived ≥ 8° of satellite
+**NL_LONG_FIXED** — the integer fix has survived ≥ 15° of satellite
 azimuth motion without triggering a false-fix rejection.  Long-term
-member of the fix set: counts toward RESOLVED.  (The 8° threshold,
-reduced from 15° based on day0419h overnight data, matches the
-observed stable-window length of 30-60 min.)
+member of the fix set: counts toward RESOLVED.  (Threshold history:
+15° originally → reduced to 8° on 2026-04-20 (commit 7aa82e5) per
+day0419h overnight data → raised back to 15° by I-224945 after
+day0506pm-piface-arm34-bias-v2 showed 8° was structurally too loose
+under the current bias context — E12 promoted at Δaz=8.2° with a
+wrong-integer fix.  15° also gives the AnchoringSvPromoter's
+IF-residual gate enough ANCHORING window to accumulate its sample
+minimum before promotion.  See PR #75.)
 
 **SQUELCHED** — temporarily excluded from integer-fix attempts after
 a high-confidence cycle slip.  Cooldown-bound (default 60 epochs),
@@ -126,7 +131,7 @@ relative to that set:
 - **Long-term promoter** (NL_SHORT_FIXED → NL_LONG_FIXED): class
   `LongTermPromoter`.  Its job is to **validate** that the
   self-consistency identified by the short-term promoter survives
-  ≥ 8° of satellite-azimuth motion without triggering a false-fix
+  ≥ 15° of satellite-azimuth motion without triggering a false-fix
   rejection.  Short-term members that survive this geometric-
   diversity test graduate to long-term.
 
@@ -196,7 +201,7 @@ geometry-change test.  They drive the RESOLVED transition.
 | admit | TRACKING | FLOAT | elevation + health + constellation gate passes |
 | WL fix | FLOAT | WL_FIXED | MW tracker converges |
 | NL fix | WL_FIXED | NL_SHORT_FIXED | LAMBDA accepts integer (or rounding-path success) |
-| **promote** | NL_SHORT_FIXED | NL_LONG_FIXED | Δaz ≥ 8° accumulated with clean false-fix window |
+| **promote** | NL_SHORT_FIXED | NL_LONG_FIXED | Δaz ≥ 15° accumulated with clean false-fix window |
 | **false-fix rejection** | NL_SHORT_FIXED | FLOAT | false-fix monitor detects wrong-integer signature |
 | **setting-SV drop** | NL_SHORT_FIXED / NL_LONG_FIXED | FLOAT | setting-SV drop monitor (elev-weighted residual or below drop mask) |
 | slip (LOW) | any integer state | FLOAT | cycle-slip monitor, single-detector evidence |
