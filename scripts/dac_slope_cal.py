@@ -108,6 +108,80 @@ def measure_freq_offset(ticc_port: str, duration_s: int):
     return mean_p, slope_ppb, n
 
 
+def _fit(points, center_code):
+    """OLS fit of ppb vs (code - center). Returns (slope, intercept, rmse)."""
+    cs = [c - center_code for c, _ in points]
+    ps = [p for _, p in points]
+    n = len(points)
+    mc = sum(cs) / n
+    mp = sum(ps) / n
+    num = sum((c - mc) * (p - mp) for c, p in zip(cs, ps))
+    den = sum((c - mc) ** 2 for c in cs)
+    if den == 0:
+        return None
+    slope = num / den
+    intercept = mp - slope * mc
+    rmse = (sum((p - (intercept + slope * c)) ** 2
+                for c, p in zip(cs, ps)) / n) ** 0.5
+    return slope, intercept, rmse
+
+
+def detect_linear_region(valid, center_code=32768, min_slope_frac=0.6,
+                         resid_drop_ppb=8.0):
+    """Isolate the linear EFC region, excluding saturated tails.
+
+    OCXO EFC curves clip at one or both ends (the frequency stops
+    responding to voltage).  Past the clip, the ppb↔code slope goes
+    to ~0 and the linear model is fiction.  This finds the contiguous
+    run of codes whose consecutive-pair slope stays within
+    min_slope_frac of the steepest segment, then trims any boundary
+    point whose fit residual exceeds resid_drop_ppb.
+
+    Returns dict(slope, intercept, rmse, code_min, code_max, n_linear)
+    or None if no region can be isolated.
+    """
+    pts = sorted((r['code'], r['ppb']) for r in valid)
+    if len(pts) < 3:
+        return None
+    seg = [(pts[i + 1][1] - pts[i][1]) / (pts[i + 1][0] - pts[i][0])
+           for i in range(len(pts) - 1)]
+    max_abs = max(abs(s) for s in seg)
+    if max_abs == 0:
+        return None  # totally flat — DAC not steering the DO
+    thresh = min_slope_frac * max_abs
+    steepest = max(range(len(seg)), key=lambda i: abs(seg[i]))
+    lo, hi = steepest, steepest
+    while lo > 0 and abs(seg[lo - 1]) >= thresh:
+        lo -= 1
+    while hi < len(seg) - 1 and abs(seg[hi + 1]) >= thresh:
+        hi += 1
+    linear = pts[lo:hi + 2]  # hi is a segment index → +2 for point count
+
+    # Residual trim: drop boundary points that don't fit the line.
+    while len(linear) >= 3:
+        res = _fit(linear, center_code)
+        if res is None:
+            return None
+        slope, intercept, rmse = res
+        worst_i, worst_r = max(
+            enumerate(abs(p - (intercept + slope * (c - center_code)))
+                      for c, p in linear),
+            key=lambda x: x[1])
+        if worst_r <= resid_drop_ppb or worst_i not in (0, len(linear) - 1):
+            break
+        linear.pop(worst_i)
+
+    res = _fit(linear, center_code)
+    if res is None:
+        return None
+    slope, intercept, rmse = res
+    return {
+        'slope': slope, 'intercept': intercept, 'rmse': rmse,
+        'code_min': linear[0][0], 'code_max': linear[-1][0],
+        'n_linear': len(linear),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -166,36 +240,48 @@ def main() -> int:
             print(f"  warning: failed to recenter: {e}")
         dac.teardown()
 
-    # Linear fit on valid points
+    # Linear-region fit: exclude saturated tails where the EFC clips.
     valid = [r for r in results if r['n_pairs'] >= 5 and r['ppb'] == r['ppb']]
     if len(valid) < 3:
         print(f"\n*** TOO FEW VALID POINTS ({len(valid)}/3) — fit not produced")
         print(f"    Likely cause: TICC chA or chB silent, or DAC not steering the DO")
         return 1
 
-    cs = [r['code'] - 32768 for r in valid]
-    ps = [r['ppb'] for r in valid]
-    n = len(valid)
-    mean_c = sum(cs) / n
-    mean_p = sum(ps) / n
-    num = sum((c - mean_c) * (p - mean_p) for c, p in zip(cs, ps))
-    den = sum((c - mean_c) ** 2 for c in cs)
-    if den == 0:
-        print(f"*** ALL CODES IDENTICAL — fit not produced")
+    fit = detect_linear_region(valid, center_code=32768)
+    if fit is None:
+        print(f"*** Could not isolate a linear region — fit not produced")
         return 1
-    slope = num / den
-    intercept = mean_p - slope * mean_c
-    resids = [p - (intercept + slope * c) for c, p in zip(cs, ps)]
-    rmse = (sum(r ** 2 for r in resids) / n) ** 0.5
-    full_range_codes = min(32768, 65535 - 32768)
-    max_ppb = full_range_codes * abs(slope)
+    slope = fit['slope']
+    intercept = fit['intercept']
+    rmse = fit['rmse']
+    code_min = fit['code_min']
+    code_max = fit['code_max']
+    n = fit['n_linear']
+    n_saturated = len(valid) - n
 
-    print(f"\n=== LINEAR FIT (ppb = intercept + slope × (code − 32768)) ===")
-    print(f"  Points used:                {n} of {len(results)}")
+    # Reachable frequency range from the REAL linear region (asymmetric).
+    # NOT slope × codes-to-rail — that's fiction past saturation.
+    ppb_at_min = (code_min - 32768) * slope
+    ppb_at_max = (code_max - 32768) * slope
+    ppb_fast = max(ppb_at_min, ppb_at_max)
+    ppb_slow = min(ppb_at_min, ppb_at_max)
+    # max_ppb = the symmetric envelope (smaller one-sided range), for
+    # legacy callers.  The asymmetric truth lives in code_min/code_max.
+    max_ppb = min(abs(ppb_fast), abs(ppb_slow))
+
+    print(f"\n=== LINEAR-REGION FIT (ppb = intercept + slope × (code − 32768)) ===")
+    print(f"  Linear points:              {n} of {len(valid)} "
+          f"({n_saturated} saturated, excluded)")
+    print(f"  Linear code range:          [{code_min}, {code_max}]")
     print(f"  Slope (ppb_per_code):       {slope:+.5f}")
     print(f"  Intercept (offset @ 32768): {intercept:+.2f} ppb")
     print(f"  RMS residual:               {rmse:.2f} ppb")
-    print(f"  Estimated max_ppb (center → rail): {max_ppb:.1f}")
+    print(f"  Reachable range:            {ppb_slow:+.1f} .. {ppb_fast:+.1f} ppb "
+          f"(ASYMMETRIC)")
+    print(f"  Symmetric envelope (max_ppb): {max_ppb:.1f}")
+    if n_saturated > 0:
+        print(f"  *** SATURATION DETECTED — {n_saturated} points clipped "
+              f"outside [{code_min}, {code_max}]")
 
     out = {
         'unique_id': do_label,
@@ -209,8 +295,13 @@ def main() -> int:
         'dac_ppb_per_code': slope,
         'dac_center_freq_offset_ppb': intercept,
         'dac_max_ppb': max_ppb,
+        'dac_code_min': code_min,
+        'dac_code_max': code_max,
+        'dac_ppb_fast': ppb_fast,
+        'dac_ppb_slow': ppb_slow,
         'fit_rmse_ppb': rmse,
         'fit_n_points': n,
+        'fit_n_saturated': n_saturated,
         'measurements': results,
     }
     out_path = Path(args.output)
@@ -227,6 +318,8 @@ def main() -> int:
     print(f"  dac_gain = {args.gain}")
     print(f'  dac_ppb_per_code = "{slope:.5f}"')
     print(f"  dac_max_ppb = {max_ppb:.1f}")
+    print(f"  dac_code_min = {code_min}")
+    print(f"  dac_code_max = {code_max}")
     return 0
 
 

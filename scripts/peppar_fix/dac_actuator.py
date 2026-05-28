@@ -41,7 +41,8 @@ class DacActuator(FrequencyActuator):
 
     def __init__(self, bus_num, addr, bits=12, center_code=None,
                  ppb_per_code=1.0, max_ppb=None, dac_type="mcp4725",
-                 dac_gain=0, last_code=None):
+                 dac_gain=0, last_code=None,
+                 code_min=None, code_max=None):
         self._bus_num = bus_num
         self._addr = addr
         self._bits = bits
@@ -49,6 +50,17 @@ class DacActuator(FrequencyActuator):
         self._center_code = center_code if center_code is not None else self._max_code // 2
         self._ppb_per_code = ppb_per_code
         self._dac_type = dac_type
+        # Usable LINEAR code range — outside this the OCXO EFC saturates
+        # (frequency clips and the ppb_per_code model is fiction).  When
+        # provided (from the cal's linear-region detection), commands are
+        # clamped to [code_min, code_max] instead of [0, max_code].  This
+        # produces an ASYMMETRIC reachable frequency range, which is the
+        # norm for any OCXO whose EFC curve has shifted under temperature.
+        # See feedback_ocxo_asymmetric_pull_range.  Default None → full
+        # 0..max_code range (backward-compatible).
+        self._code_min = 0 if code_min is None else max(0, int(code_min))
+        self._code_max = (self._max_code if code_max is None
+                          else min(self._max_code, int(code_max)))
         # AD5693R control-register GAIN bit: 0 = 1× output (0..Vref),
         # 1 = 2× output (0..2×Vref).  POR default is 0; ignored on
         # other DAC types.  Per-DO state JSON should carry this so
@@ -63,12 +75,19 @@ class DacActuator(FrequencyActuator):
         self._last_code = last_code
         self._current_code = self._center_code
         self._current_ppb = 0.0
+        self._range_warned = False
 
-        # Compute range from center to rails
-        codes_up = self._max_code - self._center_code
-        codes_down = self._center_code
-        max_from_center = min(codes_up, codes_down) * abs(ppb_per_code)
-        self._max_ppb = max_ppb if max_ppb is not None else max_from_center
+        # Reachable frequency range — ASYMMETRIC when the linear code
+        # range isn't centered on center_code.  ppb at each code-range
+        # limit (positive = DO fast; sign follows ppb_per_code).
+        ppb_at_min = (self._code_min - self._center_code) * ppb_per_code
+        ppb_at_max = (self._code_max - self._center_code) * ppb_per_code
+        self._ppb_fast = max(ppb_at_min, ppb_at_max)
+        self._ppb_slow = min(ppb_at_min, ppb_at_max)
+        # max_ppb kept for legacy callers (symmetric envelope = the
+        # smaller of the two one-sided ranges).  Explicit override wins.
+        max_from_range = min(abs(self._ppb_fast), abs(self._ppb_slow))
+        self._max_ppb = max_ppb if max_ppb is not None else max_from_range
         self._resolution_ppb = abs(ppb_per_code)
 
     def setup(self):
@@ -119,16 +138,34 @@ class DacActuator(FrequencyActuator):
             self._bus = None
 
     def adjust_frequency_ppb(self, ppb):
-        """Set absolute frequency offset. Returns actual ppb applied."""
-        ppb = max(-self._max_ppb, min(self._max_ppb, ppb))
+        """Set absolute frequency offset. Returns actual ppb applied.
+
+        Clamps to the usable linear code range [code_min, code_max].
+        When a command would drive the code outside that range, it
+        saturates at the boundary and logs once — the OCXO physically
+        cannot reach the requested frequency (EFC out of linear range).
+        """
         code_offset = round(ppb / self._ppb_per_code)
         code = self._center_code + code_offset
-        code = max(0, min(self._max_code, code))
+        clamped = max(self._code_min, min(self._code_max, code))
+        if clamped != code and not self._range_warned:
+            log.warning(
+                "DAC command %d (%.1f ppb) outside linear range "
+                "[%d, %d] — saturating at %d.  OCXO cannot reach "
+                "requested frequency (asymmetric EFC range).",
+                code, ppb, self._code_min, self._code_max, clamped)
+            self._range_warned = True
+        code = clamped
         self._write_code(code)
         self._current_code = code
         actual_ppb = (code - self._center_code) * self._ppb_per_code
         self._current_ppb = actual_ppb
         return actual_ppb
+
+    @property
+    def at_range_limit(self):
+        """True if the last command saturated against a code-range limit."""
+        return self._current_code in (self._code_min, self._code_max)
 
     def read_frequency_ppb(self):
         """Return last-written frequency offset."""

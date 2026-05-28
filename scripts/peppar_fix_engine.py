@@ -6180,6 +6180,8 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
         dac_type=getattr(args, 'dac_type', 'mcp4725'),
         dac_gain=getattr(args, 'dac_gain', 0) or 0,
         last_code=_last_code,
+        code_min=getattr(args, 'dac_code_min', None),
+        code_max=getattr(args, 'dac_code_max', None),
     )
     dac.setup()
 
@@ -6693,6 +6695,8 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                     dac_type=getattr(args, 'dac_type', 'mcp4725'),
                     dac_gain=getattr(args, 'dac_gain', 0) or 0,
                     last_code=_last_code,
+                    code_min=getattr(args, 'dac_code_min', None),
+                    code_max=getattr(args, 'dac_code_max', None),
                 )
                 actuator_type = "dac"
                 log.info("Using DAC actuator: bus=%d addr=0x%02x bits=%d ppb/code=%.4f",
@@ -9477,6 +9481,8 @@ def _apply_host_config(args):
         "dac_center_code":  ("dac_center_code",  int),
         "dac_ppb_per_code": ("dac_ppb_per_code", float),
         "dac_max_ppb":      ("dac_max_ppb",      float),
+        "dac_code_min":     ("dac_code_min",     int),
+        "dac_code_max":     ("dac_code_max",     int),
         "dac_type":         ("dac_type",         str),
         "dac_gain":         ("dac_gain",         int),
         "tadd_gpio":        ("tadd_gpio",        int),
@@ -10366,6 +10372,16 @@ Two-phase operation:
                        help="Tuning sensitivity in ppb per DAC LSB (must be characterized)")
     servo.add_argument("--dac-max-ppb", type=float, default=None,
                        help="Maximum frequency adjustment in ppb (default: computed from range)")
+    servo.add_argument("--dac-code-min", type=int, default=None,
+                       help="Lower bound of the usable LINEAR DAC code "
+                            "range (from dac_slope_cal saturation detection). "
+                            "Commands clamp here instead of 0.  Handles "
+                            "asymmetric OCXO EFC ranges — see "
+                            "feedback_ocxo_asymmetric_pull_range.")
+    servo.add_argument("--dac-code-max", type=int, default=None,
+                       help="Upper bound of the usable LINEAR DAC code "
+                            "range (from dac_slope_cal saturation detection). "
+                            "Commands clamp here instead of max_code.")
     servo.add_argument("--dac-type", default=None,
                        choices=["mcp4725", "ad5693r", "generic"],
                        help="DAC chip type (default: mcp4725)")
