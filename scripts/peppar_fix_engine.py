@@ -5725,7 +5725,7 @@ def _save_osc_freq_corr(ctx):
             and carrier_tracker.drift_rate_ppb != 0):
         tcxo_corr = adjfine - carrier_tracker.drift_rate_ppb
 
-    # Save DO freq offset
+    # Save DO freq offset + last DAC code
     do_uid = ctx.get('do_unique_id')
     if do_uid is not None:
         try:
@@ -5735,6 +5735,13 @@ def _save_osc_freq_corr(ctx):
                      adjfine, do_uid)
         except Exception as e:
             log.warning("Failed to save DO state: %s", e)
+        _act = ctx.get('actuator')
+        if _act is not None and hasattr(_act, 'current_code'):
+            try:
+                from peppar_fix.do_state import save_last_dac_code
+                save_last_dac_code(do_uid, _act.current_code)
+            except Exception as e:
+                log.warning("Failed to save last DAC code: %s", e)
 
     # Save rx TCXO offset + last known dt_rx to receiver state
     receiver_uid = ctx.get('receiver_unique_id')
@@ -6159,6 +6166,10 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
         log.error("VCOCXO bootstrap requires --dac-ppb-per-code")
         return False
 
+    from peppar_fix.do_state import load_last_dac_code
+    _last_code = load_last_dac_code(do_label) if do_label else None
+    if _last_code is not None:
+        log.info("Bootstrap: loaded last DAC code %d for %s", _last_code, do_label)
     dac = DacActuator(
         bus_num=dac_bus,
         addr=dac_addr,
@@ -6168,6 +6179,7 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
         max_ppb=getattr(args, 'dac_max_ppb', None),
         dac_type=getattr(args, 'dac_type', 'mcp4725'),
         dac_gain=getattr(args, 'dac_gain', 0) or 0,
+        last_code=_last_code,
     )
     dac.setup()
 
@@ -6240,14 +6252,15 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
 
     try:
         from peppar_fix.do_state import load_do_state, save_do_state
-        from peppar_fix.do_state import new_do_state
+        from peppar_fix.do_state import new_do_state, save_last_dac_code
         do_uid = do_label
         state = load_do_state(do_uid) or new_do_state(do_uid, label=do_label)
         state["last_known_freq_offset_ppb"] = base_freq
         state["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         save_do_state(state)
-        log.info("DO freq saved: base=%.1f ppb, dt_rx=%.1f ns",
-                 base_freq, dt_rx_ns)
+        save_last_dac_code(do_uid, dac.current_code)
+        log.info("DO freq saved: base=%.1f ppb, code=%d, dt_rx=%.1f ns",
+                 base_freq, dac.current_code, dt_rx_ns)
     except Exception as e:
         log.warning("Failed to save DO state: %s", e)
 
@@ -6479,17 +6492,16 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
             log.error("TICC-only servo requires do_type=vcocxo (got %s). "
                       "PHC-based DOs need --servo.", do_type)
             return False
-        # For VCOCXO without PHC: reset DAC to center, ARM TADD, then
-        # measure frequency.  The DAC must be at a known state before
-        # TICC measures — otherwise a stale DAC setting from a prior
-        # run corrupts the frequency estimate (the TICC measures
-        # crystal + old_dac, but _bootstrap_compute_base_freq assumes
-        # current_adj=0).
-        # TODO(cleanup): this duplicates DacActuator.setup() — the
-        # TICC-drive refactor should unify the DAC lifecycle.
+        # For VCOCXO without PHC: set DAC to a known state before TICC
+        # measures.  Prefer last_code (the code we were at when we last
+        # ran) over center_code — starting from the last operating point
+        # avoids a large transient on the OCXO.
         dac_bus = getattr(args, 'dac_bus', None)
         if dac_bus is not None:
             from peppar_fix.dac_actuator import DacActuator
+            from peppar_fix.do_state import load_last_dac_code
+            _do_lbl = getattr(args, 'do_label', None)
+            _pre_last = load_last_dac_code(_do_lbl) if _do_lbl else None
             _dac_reset = DacActuator(
                 bus_num=dac_bus,
                 addr=int(getattr(args, 'dac_addr', '0x60'), 0),
@@ -6497,8 +6509,9 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
                 ppb_per_code=getattr(args, 'dac_ppb_per_code', 1.0),
                 dac_type=getattr(args, 'dac_type', 'mcp4725'),
                 dac_gain=getattr(args, 'dac_gain', 0) or 0,
+                last_code=_pre_last,
             )
-            _dac_reset.setup()  # writes ctrl reg + center code
+            _dac_reset.setup()
             _dac_reset.teardown()
             log.info("DAC reset to center before TICC measurement")
         if _maybe_step_divider_on_phase(args):
@@ -6657,11 +6670,18 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     if getattr(args, 'dac_bus', None) is not None:
         try:
             from peppar_fix.dac_actuator import DacActuator
+            from peppar_fix.do_state import load_last_dac_code
             dac_addr = int(getattr(args, 'dac_addr', '0x60'), 0)
             ppb_per_code = getattr(args, 'dac_ppb_per_code', None)
             if ppb_per_code is None:
                 log.error("--dac-ppb-per-code required for DAC actuator")
             else:
+                _last_code = None
+                if do_uid_local is not None:
+                    _last_code = load_last_dac_code(do_uid_local)
+                    if _last_code is not None:
+                        log.info("Loaded last DAC code %d for %s",
+                                 _last_code, do_uid_local)
                 actuator = DacActuator(
                     bus_num=args.dac_bus,
                     addr=dac_addr,
@@ -6671,6 +6691,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                     max_ppb=getattr(args, 'dac_max_ppb', None),
                     dac_type=getattr(args, 'dac_type', 'mcp4725'),
                     dac_gain=getattr(args, 'dac_gain', 0) or 0,
+                    last_code=_last_code,
                 )
                 actuator_type = "dac"
                 log.info("Using DAC actuator: bus=%d addr=0x%02x bits=%d ppb/code=%.4f",

@@ -41,7 +41,7 @@ class DacActuator(FrequencyActuator):
 
     def __init__(self, bus_num, addr, bits=12, center_code=None,
                  ppb_per_code=1.0, max_ppb=None, dac_type="mcp4725",
-                 dac_gain=0):
+                 dac_gain=0, last_code=None):
         self._bus_num = bus_num
         self._addr = addr
         self._bits = bits
@@ -60,6 +60,7 @@ class DacActuator(FrequencyActuator):
         # I-000711-main.
         self._dac_gain = int(dac_gain) if dac_gain is not None else 0
         self._bus = None
+        self._last_code = last_code
         self._current_code = self._center_code
         self._current_ppb = 0.0
 
@@ -71,7 +72,12 @@ class DacActuator(FrequencyActuator):
         self._resolution_ppb = abs(ppb_per_code)
 
     def setup(self):
-        """Open I2C bus, configure control register (GAIN), set DAC to center."""
+        """Open I2C bus, configure control register (GAIN), set DAC.
+
+        When ``last_code`` was provided at construction, the DAC starts
+        there — the frequency the OCXO was last running at.  Otherwise
+        falls back to ``center_code`` (DAC midscale).
+        """
         try:
             import smbus2
             self._bus = smbus2.SMBus(self._bus_num)
@@ -82,23 +88,33 @@ class DacActuator(FrequencyActuator):
         # Other DAC types ignore this — POR-default behavior preserved.
         if self._dac_type == "ad5693r":
             self._write_ad5693r_control_register()
-        # Set DAC to center
-        self._write_code(self._center_code)
-        self._current_ppb = 0.0
-        log.info("DAC actuator: bus=%d addr=0x%02x bits=%d center=%d "
-                 "ppb/code=%.4f gain=%d (%s mode)",
-                 self._bus_num, self._addr, self._bits, self._center_code,
-                 self._ppb_per_code, self._dac_gain,
-                 "2×" if self._dac_gain else "1×")
+        if self._last_code is not None:
+            start_code = max(0, min(self._max_code, int(self._last_code)))
+            self._write_code(start_code)
+            self._current_code = start_code
+            self._current_ppb = (start_code - self._center_code) * self._ppb_per_code
+            log.info("DAC actuator: bus=%d addr=0x%02x bits=%d "
+                     "last_code=%d (%.1f ppb) ppb/code=%.4f gain=%d (%s mode)",
+                     self._bus_num, self._addr, self._bits,
+                     start_code, self._current_ppb,
+                     self._ppb_per_code, self._dac_gain,
+                     "2×" if self._dac_gain else "1×")
+        else:
+            self._write_code(self._center_code)
+            self._current_code = self._center_code
+            self._current_ppb = 0.0
+            log.info("DAC actuator: bus=%d addr=0x%02x bits=%d center=%d "
+                     "ppb/code=%.4f gain=%d (%s mode)",
+                     self._bus_num, self._addr, self._bits, self._center_code,
+                     self._ppb_per_code, self._dac_gain,
+                     "2×" if self._dac_gain else "1×")
 
     def teardown(self):
-        """Return DAC to center (nominal frequency) and close bus."""
+        """Close bus.  DAC holds its last code — the OCXO keeps running
+        at the last commanded frequency through restarts."""
         if self._bus is not None:
-            try:
-                self._write_code(self._center_code)
-                log.info("DAC returned to center code %d", self._center_code)
-            except Exception as e:
-                log.warning("DAC teardown failed: %s", e)
+            log.info("DAC teardown: holding last code %d (%.1f ppb)",
+                     self._current_code, self._current_ppb)
             self._bus.close()
             self._bus = None
 
@@ -125,6 +141,10 @@ class DacActuator(FrequencyActuator):
     @property
     def resolution_ppb(self):
         return self._resolution_ppb
+
+    @property
+    def current_code(self):
+        return self._current_code
 
     def _write_ad5693r_control_register(self):
         """Write AD5693R control register with the configured GAIN bit.

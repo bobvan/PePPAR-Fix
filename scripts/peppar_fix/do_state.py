@@ -148,6 +148,37 @@ def save_do_freq_offset(unique_id, adjfine_ppb, state_dir=None):
     save_do_state(state, state_dir)
 
 
+def save_last_dac_code(unique_id, code, state_dir=None):
+    """Save the DAC code that was last used to steer this DO.
+
+    Stored under ``dac_code_by_temperature`` with key ``"last"`` — a
+    reserved sentinel meaning "current operating point, temperature
+    unknown."  When per-DO temperature logging arrives, additional
+    entries keyed by temperature (e.g. ``"25.3"``) can coexist.
+    """
+    state = load_do_state(unique_id, state_dir)
+    if state is None:
+        state = new_do_state(unique_id)
+    table = state.setdefault("dac_code_by_temperature", {})
+    table["last"] = int(code)
+    state["updated"] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    save_do_state(state, state_dir)
+
+
+def load_last_dac_code(unique_id, state_dir=None):
+    """Return the last DAC code for this DO, or None."""
+    state = load_do_state(unique_id, state_dir)
+    if state is None:
+        return None
+    table = state.get("dac_code_by_temperature")
+    if not isinstance(table, dict):
+        return None
+    code = table.get("last")
+    if code is not None:
+        return int(code)
+    return None
+
+
 def save_do_characterization(unique_id, characterization, state_dir=None):
     """Store DO characterization (from build_do_characterization.py).
 
