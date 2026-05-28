@@ -257,6 +257,9 @@ def main():
                     help='ppb |Δx3| threshold for --event dx3')
     ap.add_argument('--window', type=int, default=8,
                     help='± seconds around each event = NEAR window')
+    ap.add_argument('--skip-s', type=float, default=0.0,
+                    help='drop the first N s (e.g. acquisition transient) '
+                         'so TDEV reflects the locked steady-state')
     ap.add_argument('--out', default=None, help='PNG output path')
     ap.add_argument('--label', default='clkPoC3', help='plot title label')
     args = ap.parse_args()
@@ -266,6 +269,13 @@ def main():
     print(f"Loading arm-state from {args.arm_state}")
     ev, am, x3, reject_frac = load_arm_events(args.arm_state, args.event,
                                               args.dx3_thr)
+
+    if args.skip_s > 0:
+        t0 = mono[0]
+        keep = (mono - t0) >= args.skip_s
+        mono, phase = mono[keep], phase[keep]
+        ev = ev[(ev - t0) >= args.skip_s]
+        print(f"  skipped first {args.skip_s:.0f}s -> {len(mono)} chA samples remain")
 
     grid, mono0 = to_grid(mono, phase)
     T = len(grid)
