@@ -198,6 +198,7 @@ def main() -> int:
     print(f"  Estimated max_ppb (center → rail): {max_ppb:.1f}")
 
     out = {
+        'unique_id': do_label,
         'do_label': do_label,
         'characterization_date': datetime.now(tz=timezone.utc).isoformat(),
         'dac_type': 'ad5693r',

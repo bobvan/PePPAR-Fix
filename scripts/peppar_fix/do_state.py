@@ -142,6 +142,10 @@ def save_do_freq_offset(unique_id, adjfine_ppb, state_dir=None):
     state = load_do_state(unique_id, state_dir)
     if state is None:
         state = new_do_state(unique_id)
+    # State files written by external tools (e.g. dac_slope_cal.py) key
+    # on do_label and omit unique_id; inject it so save_do_state doesn't
+    # bail.  Without this the save silently no-ops.
+    state["unique_id"] = unique_id
     now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     state["last_known_freq_offset_ppb"] = adjfine_ppb
     state["updated"] = now
@@ -159,6 +163,7 @@ def save_last_dac_code(unique_id, code, state_dir=None):
     state = load_do_state(unique_id, state_dir)
     if state is None:
         state = new_do_state(unique_id)
+    state["unique_id"] = unique_id
     table = state.setdefault("dac_code_by_temperature", {})
     table["last"] = int(code)
     state["updated"] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -189,6 +194,7 @@ def save_do_characterization(unique_id, characterization, state_dir=None):
     state = load_do_state(unique_id, state_dir)
     if state is None:
         state = new_do_state(unique_id)
+    state["unique_id"] = unique_id
     state["characterization"] = characterization
     state["updated"] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     save_do_state(state, state_dir)
