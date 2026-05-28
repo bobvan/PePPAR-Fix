@@ -75,6 +75,20 @@ _PSD_FREQS_HZ = (0.001, 0.002, 0.003, 0.005, 0.007, 0.01, 0.02, 0.03,
 _TAUS_S = (1, 2, 5, 10, 30, 100, 300, 1000)
 
 
+def _sig(x: float, n: int = 6):
+    """Round to n significant figures.
+
+    ADEV/MDEV are dimensionless fractional-frequency values that span
+    orders of magnitude (OCXO-class σ_y ≈ 1e-11 at τ=1 s, dropping to
+    ~1e-13 at long τ).  Fixed-decimal rounding (round(v, 6)) zeroes
+    everything below 1e-6 — useless for these.  Sig-fig rounding keeps
+    the value meaningful regardless of magnitude.
+    """
+    if x is None or x == 0 or not math.isfinite(x):
+        return x
+    return round(x, -int(math.floor(math.log10(abs(x)))) + (n - 1))
+
+
 def classify_noise_type(slope: float) -> str:
     """Map log-log PSD slope to phase-noise type (rough categories)."""
     if slope > -0.5:
@@ -387,7 +401,7 @@ def main() -> int:
     char_section['freq_offset_ppb_at_parked_code'] = freq_offset_ppb
 
     sources = char_section.setdefault('sources', {})
-    sources['DO PPS (chA-chB)'] = {
+    sources['DO PPS (chA vs TICC Rb)'] = {
         'units': 'ns',
         'rms': round(rms_ns, 4),
         'peak': round(peak_ns, 4),
@@ -396,13 +410,13 @@ def main() -> int:
         'slope': None if math.isnan(psd_slope) else round(psd_slope, 3),
         'noise_type': noise_type,
         'psd_curve': psd_curve,
-        'adev_by_tau_s': {str(τ): round(v, 6) for τ, v in (adev_map or {}).items()},
+        'adev_by_tau_s': {str(τ): _sig(v) for τ, v in (adev_map or {}).items()},
         'tdev_ns_by_tau_s': {str(τ): round(v, 4) for τ, v in (tdev_map or {}).items()},
-        'mdev_by_tau_s': {str(τ): round(v, 6) for τ, v in (mdev_map or {}).items()},
+        'mdev_by_tau_s': {str(τ): _sig(v) for τ, v in (mdev_map or {}).items()},
     }
     char_section['notes'] = (
         "PSD curve is one-sided amplitude spectral density (ns/√Hz) "
-        "from 1 Hz TICC chA−chB samples; resolves 1/duration to 0.5 Hz. "
+        "from 1 Hz TICC chA-vs-Rb samples; resolves 1/duration to 0.5 Hz. "
         "PSD slopes: ~0=white_phase, -1=flicker_phase, -2=white_FM, "
         "-3=flicker_FM, <-3=random_walk_FM. "
         "Higher-band L(f) requires a phase-noise analyzer."
