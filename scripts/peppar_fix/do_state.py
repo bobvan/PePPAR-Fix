@@ -322,17 +322,22 @@ def derive_do_process_noise(characterization):
     # and diverge on long coasts (clkpoc3GateOverRejectsBeforeLock,
     # longTauGnssCoupling).
     #
-    # Primary source: `adjfine` ASD (disciplined captures) — the freq
-    # noise floor at the actuator input.  Freerun characterizations
-    # (do_freerun_char.py) have no `adjfine`; for those, derive Q[3,3]
-    # from the rising-ADEV (RWFM) tail instead — the physically-correct
-    # open-loop freq random-walk.
-    src = sources.get("adjfine")
-    if isinstance(src, dict) and src.get("units") == "ppb":
-        v = src.get("asd_at_0.1Hz")
-        if isinstance(v, (int, float)) and v > 0:
-            out["sigma_do_freq_ppb"] = float(v)
-            out["sigma_do_freq_source"] = "adjfine"
+    # Primary source: the actuator's frequency-steering command ASD
+    # (disciplined captures) — the freq noise floor at the actuator
+    # input.  Keyed "freq_command" (hardware-neutral: PHC adjfine, DAC
+    # code, or ClockMatrix FCW — see FrequencyActuator); "adjfine" is
+    # the legacy PHC-specific alias (docs/misnomers.md 2026-05-29).
+    # Freerun characterizations (do_freerun_char.py) have neither; for
+    # those, derive Q[3,3] from the rising-ADEV (RWFM) tail instead —
+    # the physically-correct open-loop freq random-walk.
+    for _freq_key in ("freq_command", "adjfine"):
+        src = sources.get(_freq_key)
+        if isinstance(src, dict) and src.get("units") == "ppb":
+            v = src.get("asd_at_0.1Hz")
+            if isinstance(v, (int, float)) and v > 0:
+                out["sigma_do_freq_ppb"] = float(v)
+                out["sigma_do_freq_source"] = _freq_key
+                break
 
     if "sigma_do_freq_ppb" not in out:
         # Prefer the ADEV from the chosen phase source, else iterate

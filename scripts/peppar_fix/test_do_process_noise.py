@@ -135,7 +135,19 @@ class _PhaseExtraction(unittest.TestCase):
 
 class _FreqExtraction(unittest.TestCase):
 
-    def test_adjfine_used_when_present(self):
+    def test_freq_command_used_when_present(self):
+        # Hardware-neutral actuator-command key (misnomers.md 2026-05-29).
+        char = {
+            "sources": {
+                "freq_command": {"units": "ppb", "asd_at_0.1Hz": 0.005},
+            },
+        }
+        out = derive_do_process_noise(char)
+        self.assertEqual(out["sigma_do_freq_ppb"], 0.005)
+        self.assertEqual(out["sigma_do_freq_source"], "freq_command")
+
+    def test_adjfine_legacy_alias_still_read(self):
+        # Back-compat: old characterizations keyed "adjfine".
         char = {
             "sources": {
                 "adjfine": {"units": "ppb", "asd_at_0.1Hz": 0.005},
@@ -144,6 +156,17 @@ class _FreqExtraction(unittest.TestCase):
         out = derive_do_process_noise(char)
         self.assertEqual(out["sigma_do_freq_ppb"], 0.005)
         self.assertEqual(out["sigma_do_freq_source"], "adjfine")
+
+    def test_freq_command_preferred_over_adjfine(self):
+        char = {
+            "sources": {
+                "freq_command": {"units": "ppb", "asd_at_0.1Hz": 0.003},
+                "adjfine": {"units": "ppb", "asd_at_0.1Hz": 0.009},
+            },
+        }
+        out = derive_do_process_noise(char)
+        self.assertEqual(out["sigma_do_freq_ppb"], 0.003)
+        self.assertEqual(out["sigma_do_freq_source"], "freq_command")
 
     def test_adjfine_wrong_units(self):
         char = {
