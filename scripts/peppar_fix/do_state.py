@@ -12,6 +12,7 @@ See docs/state-persistence-design.md for the full entity model.
 import glob as _glob
 import json
 import logging
+import math
 import os
 from datetime import datetime, timezone
 
@@ -323,6 +324,68 @@ def derive_do_process_noise(characterization):
             out["sigma_do_freq_source"] = "adjfine"
 
     return out
+
+
+def derive_coast_tdev_from_char(characterization):
+    """Power-law TDEV params for the longTauGnssCoupling coast-cap.
+
+    Returns ``(tdev_ref_ns, tdev_slope, tau_ref_s)`` for
+    ``discipline.coast_cap_from_tdev`` — the DO's characterized FREERUN
+    TDEV modeled as TDEV(τ) = tdev_ref_ns·(τ/tau_ref_s)**tdev_slope.
+    Fits the recorded ``tdev_ns_by_tau_s`` curve in log-log space;
+    ``tau_ref_s`` is fixed at 1.0 so ``tdev_ref_ns`` is TDEV(1 s).
+
+    Uses the freerun TDEV (DO's own noise floor), not the disciplined
+    output — the cap answers "how long can THIS oscillator coast
+    open-loop before its own wander exceeds budget", a DO-class
+    property.  Prefers the cleanest phase source (same order as
+    derive_do_process_noise).  Returns None if no usable TDEV curve.
+    """
+    if not isinstance(characterization, dict):
+        return None
+    sources = characterization.get("sources")
+    if not isinstance(sources, dict):
+        return None
+    tdev = None
+    for key in ("Carrier", "DO PPS (chA vs TICC Rb)", "PPS",
+                "DO PPS (chA-chB)", "PPS+qErr"):
+        s = sources.get(key)
+        if isinstance(s, dict) and isinstance(
+                s.get("tdev_ns_by_tau_s"), dict):
+            tdev = s["tdev_ns_by_tau_s"]
+            break
+    if not isinstance(tdev, dict):
+        for s in sources.values():
+            if isinstance(s, dict) and isinstance(
+                    s.get("tdev_ns_by_tau_s"), dict):
+                tdev = s["tdev_ns_by_tau_s"]
+                break
+    if not isinstance(tdev, dict):
+        return None
+    pairs = []
+    for k, v in tdev.items():
+        try:
+            tau = float(k)
+            td = float(v)
+        except (TypeError, ValueError):
+            continue
+        if tau > 0 and math.isfinite(td) and td > 0:
+            pairs.append((tau, td))
+    if len(pairs) < 2:
+        return None
+    # log-log least squares: log(tdev) = log(tdev_ref) + slope·log(tau)
+    n = len(pairs)
+    sx = sum(math.log(t) for t, _ in pairs)
+    sy = sum(math.log(d) for _, d in pairs)
+    sxx = sum(math.log(t) ** 2 for t, _ in pairs)
+    sxy = sum(math.log(t) * math.log(d) for t, d in pairs)
+    denom = n * sxx - sx * sx
+    if denom == 0:
+        return None
+    slope = (n * sxy - sx * sy) / denom
+    intercept = (sy - slope * sx) / n
+    tdev_ref_ns = math.exp(intercept)  # TDEV at τ = 1 s
+    return (tdev_ref_ns, slope, 1.0)
 
 
 # ── PHC state ────────────────────────────────────────────────────────────── #
