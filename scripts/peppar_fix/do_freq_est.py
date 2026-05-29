@@ -93,8 +93,18 @@ class DOFreqEst:
                  max_ppb=62_500_000.0, initial_freq=0.0,
                  initial_dt_rx_ns=None, base_freq=None,
                  max_step_ppb=None,
-                 ocxo_trusted_gate=None):
+                 ocxo_trusted_gate=None,
+                 routed_qerr=False):
         self.max_ppb = max_ppb
+        # routedQErrArm: per-edge chi² router for the TICC arm.  When
+        # enabled, each TICC edge is routed (priority-ordered) to ONE
+        # of three candidates — external-qErr-corrected, internal-
+        # qerr(x[0])-corrected, or raw — based on which is consistent.
+        # A mis-correlated external qErr is wrong by ~a tick = a
+        # conspicuous chi² outlier, so chi² IS the correlation-quality
+        # detector (no separate qVIR gate).  Default off preserves the
+        # single internal-qerr path.  See dayplan routedQErrArm.
+        self._routed_qerr = routed_qerr
         # L3 of the TDCP slip-protection stack: per-epoch actuator
         # rate limit.  None = disabled (today's behavior preserved).
         # When set, |adjfine_new - adjfine_prev| is clamped to this
@@ -218,6 +228,9 @@ class DOFreqEst:
         }
         self.last_ocxo_gate_rejected: bool = False
         self.last_ocxo_gate_reason: str = ""
+        # Which TICC candidate the routed-qErr selector picked last
+        # epoch ('ext'/'int'/'raw').  'int' when routing is disabled.
+        self.last_ticc_route: str = 'int'
         # rx TCXO state must be initialized at construction from bootstrap
         # dt_rx to avoid a mid-run measurement model transition that
         # causes divergence.  If dt_rx wasn't available at construction,
@@ -279,6 +292,58 @@ class DOFreqEst:
             out.append(float(P[2, 2]))
         return out
 
+    def _route_ticc_arm(self, x_pred, P_pred, ticc_diff_ns, ticc_qerr_ns,
+                        R_base, R_lin):
+        """Per-edge routed-qErr selector for the TICC arm.
+
+        Returns (z_eff, h_pred, H, R, name): the chosen candidate's
+        effective measurement, model, Jacobian, noise, and label.
+
+        Priority order (first to pass the chi² gate wins; raw is the
+        always-accepted floor):
+
+          external — z = ticc_diff + ext_qerr, h = -x[2],
+                     H = [0,0,-1,0], R = R_base.  Most informative:
+                     clean x[2]-only update, no x[0] coupling.  The
+                     receiver's own sub-tick report replaces the
+                     filter's qerr(x[0]) estimate.  Only when
+                     ticc_qerr_ns is available.
+          internal — today's behavior: h = -x[2] - qerr(x[0]),
+                     H = [-1,0,-1,0] (coupled), R = R_base + R_lin.
+          raw      — z = ticc_diff, h = -x[2], H = [0,0,-1,0],
+                     R = R_base + tick²/12 (sawtooth variance: the
+                     uncorrected sub-tick qErr is ~uniform on
+                     [-tick/2,+tick/2]).  Robust floor, always taken.
+
+        A mis-correlated external qErr is wrong by up to a half-tick
+        sawtooth → conspicuous chi² outlier vs the small external R →
+        falls through to internal/raw.  An F10T's uncorrelated qErr
+        always fails → routes to raw automatically (no per-receiver
+        flag needed).
+        """
+        H_x2 = np.array([[0.0, 0.0, -1.0, 0.0]])
+
+        candidates = []
+        if ticc_qerr_ns is not None:
+            z_ext = ticc_diff_ns + ticc_qerr_ns
+            candidates.append(('ext', z_ext, -x_pred[2], H_x2, R_base))
+        candidates.append((
+            'int', ticc_diff_ns, self._h_ticc(x_pred),
+            self._H_ticc(x_pred), R_base + R_lin))
+        candidates.append((
+            'raw', ticc_diff_ns, -x_pred[2], H_x2,
+            R_base + (self.tick_ns ** 2) / 12.0))
+
+        for name, z_eff, h_pred, H, R in candidates:
+            S = (H @ P_pred @ H.T).item() + R
+            innov = z_eff - h_pred
+            chi2 = innov ** 2 / S if S > 0 else 0.0
+            if name == 'raw' or chi2 <= _CHI2_GATE_THRESHOLD:
+                return z_eff, h_pred, H, R, name
+        # Unreachable (raw always accepted) but keep the contract total.
+        name, z_eff, h_pred, H, R = candidates[-1]
+        return z_eff, h_pred, H, R, name
+
     def update(self, *,
                dt=1.0,
                dt_rx_ns=None, dt_rx_sigma_ns=None,
@@ -286,7 +351,8 @@ class DOFreqEst:
                tdcp_freq_ppb=None, tdcp_freq_sigma_ppb=None,
                extint_phase_ns=None, extint_sigma_ns=None,
                ticc_diff_ns=None, ticc_sigma_ns=None,
-               pseudo_phase_ns=None, pseudo_phase_sigma_ns=None):
+               pseudo_phase_ns=None, pseudo_phase_sigma_ns=None,
+               ticc_qerr_ns=None):
         """Process one epoch with up to six conditional measurement arms.
 
         Per docs/dofreq-est-measurement-ladder.md and
@@ -492,11 +558,20 @@ class DOFreqEst:
             tick_third = self.tick_ns / 3.0
             R_lin = ((self.tick_ns / 2.0) ** 2 *
                      min(1.0, (sigma_x0 / tick_third) ** 2))
-            R_ticc = np.array([[R_base + R_lin]])
-            h_pred = self._h_ticc(x_pred)
-            H_ticc = self._H_ticc(x_pred)
+            if self._routed_qerr:
+                z_eff, h_pred, H_ticc, R_scalar, _routed = \
+                    self._route_ticc_arm(x_pred, P_pred, ticc_diff_ns,
+                                         ticc_qerr_ns, R_base, R_lin)
+                self.last_ticc_route = _routed
+            else:
+                z_eff = ticc_diff_ns
+                h_pred = self._h_ticc(x_pred)
+                H_ticc = self._H_ticc(x_pred)
+                R_scalar = R_base + R_lin
+                self.last_ticc_route = 'int'
+            R_ticc = np.array([[R_scalar]])
             S = (H_ticc @ P_pred @ H_ticc.T + R_ticc).item()
-            innov_ticc = ticc_diff_ns - h_pred
+            innov_ticc = z_eff - h_pred
 
             # Record innov + S BEFORE the state update.  See note on
             # _kalman_linear_update — recording before any downstream
