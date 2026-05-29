@@ -1,12 +1,13 @@
 """Tests for the longTauGnssCoupling coast-cap + graded-taper policy
 primitives in discipline.py.
 
-These are pure functions (no DisciplineScheduler state).  They cap the
-coast interval by the DO's *stochastic* phase growth — the piece the
-deterministic √(2·T/D) budget ignores — and replace the binary
-converging/tracking latch with a continuous, derived-metric taper.
-Integration into the live scheduler + closed-loop A/B is deferred to
-closedLoopServoSim; this is the unit layer.
+The first classes test the pure functions (no scheduler state).  They
+cap the coast interval by the DO's *stochastic* phase growth — the
+piece the deterministic √(2·T/D) budget ignores — and replace the
+binary converging/tracking latch with a continuous, derived-metric
+taper.  ``SchedulerCoastCapIntegrationTest`` covers the wiring into
+DisciplineScheduler.compute_adaptive_interval.  Closed-loop A/B stays
+with closedLoopServoSim.
 """
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from peppar_fix.discipline import (
+    DisciplineScheduler,
+    _MIN_FIT_SAMPLES,
     coast_cap_from_tdev,
     coast_cap_from_p22,
     normalized_distance_to_lock,
@@ -222,6 +225,76 @@ class CompositionTest(unittest.TestCase):
         target = max(1, int(min(120, tdev_cap)))               # floors to 1
         self.assertEqual(target, 1)
         self.assertEqual(graded_interval(target, 0.0), 1)
+
+
+class SchedulerCoastCapIntegrationTest(unittest.TestCase):
+    """The caps wired into DisciplineScheduler.compute_adaptive_interval.
+
+    A quiet (flat-adjfine) adaptive scheduler pins τ at max_interval via
+    the drift budget; the coast-cap + taper must rein that in.  Absent
+    config ⇒ unchanged (byte-identical to the drift-budget-only path).
+    """
+
+    def _quiet(self, **kw):
+        # Flat adjfine ⇒ D_physical≈0 ⇒ baseline τ = max_interval.
+        s = DisciplineScheduler(base_interval=1, adaptive=True,
+                                min_interval=1, max_interval=120,
+                                phase_error_budget_ns=1.0, **kw)
+        for t in range(_MIN_FIT_SAMPLES + 5):
+            s.record_actuation(float(t), 100.0)
+        return s
+
+    def test_baseline_quiet_do_hits_max_unchanged(self):
+        # No cap config, no per-call args → today's behavior.
+        self.assertEqual(self._quiet().compute_adaptive_interval(), 120)
+
+    def test_tcxo_tdev_cap_collapses_coast(self):
+        # 1.17 ns TCXO: cap < 1 s → floored to min_interval.
+        s = self._quiet(coast_tdev=(1.17, 0.5, 1.0))
+        self.assertEqual(s.compute_adaptive_interval(), 1)
+
+    def test_quiet_ocxo_tdev_cap_does_not_bite(self):
+        # 85 ps OCXO: cap ~138 s > max=120 → stays at max.
+        s = self._quiet(coast_tdev=(0.085, 0.5, 1.0))
+        self.assertEqual(s.compute_adaptive_interval(), 120)
+
+    def test_tdev_slope_zero_no_cap(self):
+        # Flat/PM TDEV (slope 0) → +inf cap → no effect.
+        s = self._quiet(coast_tdev=(0.085, 0.0, 1.0))
+        self.assertEqual(s.compute_adaptive_interval(), 120)
+
+    def test_k_sigma_tightens_tdev_cap(self):
+        # k=3: cap = 138/3**2 ≈ 15.4 → 15.
+        s = self._quiet(coast_tdev=(0.085, 0.5, 1.0), coast_cap_k_sigma=3.0)
+        self.assertEqual(s.compute_adaptive_interval(), 15)
+
+    def test_p22_cap_shortens_coast(self):
+        # σ(τ)=0.2·√τ ≤ 1 ns → τ ≤ 25.
+        s = self._quiet()
+        tau = s.compute_adaptive_interval(
+            p22_at_tau=lambda t: (0.2 ** 2) * t)
+        self.assertEqual(tau, 25)
+
+    def test_distance_to_lock_taper(self):
+        s = self._quiet()
+        self.assertEqual(
+            s.compute_adaptive_interval(distance_to_lock=1.0), 1)
+        self.assertEqual(
+            s.compute_adaptive_interval(distance_to_lock=0.0), 120)
+
+    def test_caps_compose_tightest_wins(self):
+        # OCXO tdev (~138, no bite) + p22 (25) + locked taper → 25.
+        s = self._quiet(coast_tdev=(0.085, 0.5, 1.0))
+        tau = s.compute_adaptive_interval(
+            p22_at_tau=lambda t: (0.2 ** 2) * t,
+            distance_to_lock=0.0)
+        self.assertEqual(tau, 25)
+
+    def test_caps_inactive_when_not_adaptive(self):
+        # adaptive=False short-circuits to base_interval; caps don't run.
+        s = DisciplineScheduler(base_interval=7, adaptive=False,
+                                coast_tdev=(1.17, 0.5, 1.0))
+        self.assertEqual(s.compute_adaptive_interval(distance_to_lock=1.0), 7)
 
 
 if __name__ == "__main__":

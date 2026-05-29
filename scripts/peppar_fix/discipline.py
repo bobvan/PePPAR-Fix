@@ -65,13 +65,25 @@ class DisciplineScheduler:
                  unconverge_factor=5.0,
                  error_history_len=300,
                  adjfine_history_len=300,
-                 phase_error_budget_ns=1.0):
+                 phase_error_budget_ns=1.0,
+                 coast_tdev=None,
+                 coast_cap_k_sigma=1.0):
         self.base_interval = base_interval
         self.adaptive = adaptive
         self.min_interval = min_interval
         self.max_interval = max_interval
         self.interval = base_interval
         self.phase_error_budget_ns = float(phase_error_budget_ns)
+
+        # longTauGnssCoupling coast-cap config (all optional; absent =
+        # today's drift-budget-only behavior).  coast_tdev = the DO's
+        # characterized FREERUN TDEV power law as
+        # (tdev_ref_ns, tdev_slope, tau_ref_s) — bounds the coast by the
+        # DO's stochastic wander, the piece √(2·T/D) ignores.  The
+        # sqrt(P22) cap + the graded taper come in per-call to
+        # compute_adaptive_interval() (they need the live EKF state).
+        self._coast_tdev = coast_tdev
+        self._coast_cap_k_sigma = float(coast_cap_k_sigma)
 
         self._errors = []
         self._confidences = []
@@ -312,21 +324,33 @@ class DisciplineScheduler:
         self._drift_rate_ns_per_s = abs(slope)
         self._sigma_obs_ns = sigma
 
-    def compute_adaptive_interval(self, measurement_sigma_ns=None):
-        """Compute optimal discipline interval τ from physical drift
-        budget.
+    def compute_adaptive_interval(self, measurement_sigma_ns=None,
+                                  p22_at_tau=None, distance_to_lock=None):
+        """Compute the discipline interval τ from the drift budget,
+        then bound it by the DO's stochastic wander (coast-cap) and
+        taper it by convergence (longTauGnssCoupling).
 
-        τ = √(2 · T_budget_ns / D_physical_ppb_per_s) clamped to
-        [min_interval, max_interval].
+        Baseline: τ = √(2 · T_budget_ns / D_physical_ppb_per_s).
+        A DO drifting at D ppb/s accumulates phase ∫(D·t)dt = D·t²/2;
+        solving D·τ²/2 ≤ T_budget gives τ = √(2·T_budget/D).  But that
+        budget only bounds the *deterministic* drift — a quiet DO
+        (D≈0) gets τ → max_interval and then coasts blind while its
+        *stochastic* phase wander accumulates (the tau~64–256 s hump).
 
-        Derivation: a DO drifting at D ppb/s has its frequency
-        deviation grow as D·t between corrections, accumulating
-        phase deviation ∫(D·t)dt = D·t²/2 (in ppb·s = ns).
-        Solving D·τ²/2 ≤ T_budget for τ gives τ_max = √(2·T_budget/D).
+        coast-caps bound that stochastic wander (only when configured;
+        absent ⇒ today's behavior, byte-identical):
+          - ``self._coast_tdev``: the DO's characterized freerun TDEV
+            power law → coast_cap_from_tdev.
+          - ``p22_at_tau(tau_s)→ns²``: a closure over the EKF's
+            predict-only P[2,2] growth → coast_cap_from_p22 (honest
+            only with Q-from-char; see qFromCharPerActuator).
 
-        Input-side σ_obs / residual-drift are still computed and
-        exported as diagnostics; ``measurement_sigma_ns`` arg is
-        retained for API back-compat but ignored.
+        ``distance_to_lock`` ∈ [0,1] (0=locked, 1=far) applies the
+        graded taper (graded_interval) — the continuous
+        converging→tracking transition that replaces the binary latch.
+
+        ``measurement_sigma_ns`` is retained for API back-compat but
+        ignored.
         """
         # Keep diagnostics fresh regardless of adaptive on/off.
         self._update_drift_rate_from_input()
@@ -340,21 +364,45 @@ class DisciplineScheduler:
         if len(self._adjfine_history) < _MIN_FIT_SAMPLES:
             return self.base_interval
 
-        # Quiet DO (drift below resolution) → τ = max_interval.
-        # _MIN_PHYSICAL_DRIFT_PPB_PER_S = 1e-9 is well below any real
-        # OCXO drift (~1e-5 ppb/s for aging) and protects against the
-        # √(T/0) blowup.
+        # Baseline τ from the deterministic drift budget.  Quiet DO
+        # (drift below resolution, _MIN ~1e-9 ppb/s, well under OCXO
+        # aging) ⇒ τ = max_interval — exactly the over-coast the
+        # coast-cap below must rein in.
         if self._d_physical_ppb_per_s < 1e-9:
-            self.interval = self.max_interval
-            return self.max_interval
+            tau = float(self.max_interval)
+        else:
+            tau = math.sqrt(2.0 * self.phase_error_budget_ns
+                            / self._d_physical_ppb_per_s)
 
-        # τ from physical drift budget.  Units: T_budget in ns,
-        # D in ppb/s = ns/s² (1 ppb = 1 ns/s).  So τ² has units of s².
-        tau_sec = math.sqrt(2.0 * self.phase_error_budget_ns
-                             / self._d_physical_ppb_per_s)
+        # Bound the coast by the DO's stochastic wander.
+        tau = self._apply_coast_caps(tau, p22_at_tau)
+
+        # Graded bandwidth taper by derived distance-to-lock.
+        if distance_to_lock is not None:
+            tau = graded_interval(tau, distance_to_lock, self.min_interval)
+
         tau = max(self.min_interval,
-                   min(self.max_interval, int(round(tau_sec))))
+                  min(self.max_interval, int(round(tau))))
         self.interval = tau
+        return tau
+
+    def _apply_coast_caps(self, tau, p22_at_tau):
+        """Bound τ (seconds) by the DO's stochastic phase wander.
+
+        Each configured cap can only *shorten* the coast (min()); an
+        absent cap is a no-op.  coast_cap_from_tdev returns +inf when
+        the TDEV slope ≤ 0 (no growth) so min() leaves τ unchanged.
+        """
+        if self._coast_tdev is not None:
+            tdev_ref_ns, tdev_slope, tau_ref_s = self._coast_tdev
+            tau = min(tau, coast_cap_from_tdev(
+                self.phase_error_budget_ns, tdev_ref_ns, tdev_slope,
+                tau_ref_s=tau_ref_s, k_sigma=self._coast_cap_k_sigma))
+        if p22_at_tau is not None:
+            tau = min(tau, coast_cap_from_p22(
+                self.phase_error_budget_ns, p22_at_tau,
+                k_sigma=self._coast_cap_k_sigma,
+                min_tau_s=self.min_interval, max_tau_s=self.max_interval))
         return tau
 
 
