@@ -293,8 +293,15 @@ def derive_do_process_noise(characterization):
 
     out = {}
 
-    # Phase noise — prefer Carrier (cleanest DO output) > PPS > PPS+qErr.
-    for key in ("Carrier", "PPS", "PPS+qErr"):
+    # Phase noise — prefer the cleanest DO output.  The newer
+    # do_freerun_char.py writes "DO PPS (chA vs TICC Rb)" (Rb-
+    # referenced, sawtooth-free) and "DO PPS (chA-chB)" (GNSS-
+    # referenced).  Older/synthetic sources use Carrier/PPS/PPS+qErr.
+    # Order: Carrier > chA-vs-Rb > PPS > chA-chB > PPS+qErr.  Without
+    # the freerun-char keys here, derive silently returned {} for
+    # every real characterization (the synthetic-key tests masked it).
+    for key in ("Carrier", "DO PPS (chA vs TICC Rb)", "PPS",
+                "DO PPS (chA-chB)", "PPS+qErr"):
         src = sources.get(key)
         if not isinstance(src, dict):
             continue

@@ -58,6 +58,56 @@ class _PhaseExtraction(unittest.TestCase):
         self.assertEqual(out["sigma_do_phase_ns"], 0.180)
         self.assertEqual(out["sigma_do_phase_source"], "PPS+qErr")
 
+    def test_freerun_char_rb_key_recognized(self):
+        """The key do_freerun_char.py actually writes must be read.
+        Regression for the silent key-mismatch (derive returned {}
+        for every real freerun characterization)."""
+        char = {
+            "sources": {
+                "DO PPS (chA vs TICC Rb)": {
+                    "units": "ns", "asd_at_0.1Hz": 0.0538},
+            },
+        }
+        out = derive_do_process_noise(char)
+        self.assertAlmostEqual(out["sigma_do_phase_ns"], 0.0538)
+        self.assertEqual(out["sigma_do_phase_source"],
+                         "DO PPS (chA vs TICC Rb)")
+
+    def test_freerun_char_chacb_key_recognized(self):
+        char = {
+            "sources": {
+                "DO PPS (chA-chB)": {"units": "ns", "asd_at_0.1Hz": 0.033},
+            },
+        }
+        out = derive_do_process_noise(char)
+        self.assertAlmostEqual(out["sigma_do_phase_ns"], 0.033)
+        self.assertEqual(out["sigma_do_phase_source"], "DO PPS (chA-chB)")
+
+    def test_carrier_preferred_over_rb(self):
+        """Carrier (cleanest) still wins over the Rb-referenced key."""
+        char = {
+            "sources": {
+                "Carrier": {"units": "ns", "asd_at_0.1Hz": 0.085},
+                "DO PPS (chA vs TICC Rb)": {
+                    "units": "ns", "asd_at_0.1Hz": 0.0538},
+            },
+        }
+        out = derive_do_process_noise(char)
+        self.assertEqual(out["sigma_do_phase_source"], "Carrier")
+
+    def test_rb_preferred_over_chacb(self):
+        """Rb-referenced (sawtooth-free) beats chA-chB (GNSS-ref)."""
+        char = {
+            "sources": {
+                "DO PPS (chA-chB)": {"units": "ns", "asd_at_0.1Hz": 0.033},
+                "DO PPS (chA vs TICC Rb)": {
+                    "units": "ns", "asd_at_0.1Hz": 0.0538},
+            },
+        }
+        out = derive_do_process_noise(char)
+        self.assertEqual(out["sigma_do_phase_source"],
+                         "DO PPS (chA vs TICC Rb)")
+
     def test_wrong_units_skipped(self):
         # PPS with units=ppb (wrong) should be skipped
         char = {
