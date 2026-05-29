@@ -232,6 +232,29 @@ class DOFreqEst:
         else:
             return np.array([[0.0, 0.0, -1.0, 0.0]])
 
+    def project_p22_coast(self, max_tau_s):
+        """Predict-only P[2,2] (ns²) for coasting 1..max_tau_s seconds.
+
+        Propagates P with NO measurement update — the open-loop coast —
+        so P[2,2] grows by the frequency random-walk integrated into
+        phase (F[2,3] = -dt couples x[3]→x[2]) plus the direct phase Q.
+        Returns a list indexed by whole seconds: ``out[k]`` = projected
+        P[2,2] after coasting k s (``out[0]`` = current P[2,2]).
+
+        Feeds the longTauGnssCoupling coast-cap (coast_cap_from_p22) as
+        a precomputed table (one O(max_tau) projection per epoch instead
+        of re-propagating per candidate τ).  Honest only when Q is set
+        from char (qFromCharPerActuator); an inflated Q over-grows P22
+        and caps the coast spuriously short.  Uses base Q (no pull-in
+        boost) — the coast-cap matters in the tracking regime.
+        """
+        P = self.P.copy()
+        out = [float(P[2, 2])]
+        for _ in range(int(max(0, max_tau_s))):
+            P = self.F @ P @ self.F.T + self.Q * self.dt
+            out.append(float(P[2, 2]))
+        return out
+
     def update(self, *,
                dt=1.0,
                dt_rx_ns=None, dt_rx_sigma_ns=None,
