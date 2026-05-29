@@ -50,6 +50,7 @@ from typing import Optional
 import numpy as np
 
 from peppar_fix.do_freq_est import DOFreqEst, _qerr
+from peppar_fix.discipline import coast_cap_from_p22
 from peppar_fix.ocxo_trusted_gate import OcxoTrustedGate
 
 
@@ -102,6 +103,16 @@ class SimConfig:
     # scheduler gates the coast on drift characterization, not just phase.
     coast_converge_ns: float = 5.0
     coast_converge_freq_ppb: float = 0.3
+
+    # longTauGnssCoupling coast-cap (bravo PR #86): dynamically cap the
+    # coast interval by the filter's predict-only sqrt(P[2,2]) growth so
+    # the loop never coasts longer than its own honest phase-uncertainty
+    # budget allows.  False = static `coast_interval_s` (the deterministic
+    # divergence case my faithfulness work pinned).  True = consume
+    # bravo's coast_cap_from_p22 with DOFreqEst.project_p22_coast.
+    coast_cap_enabled: bool = False
+    coast_cap_t_budget_ns: float = 5.0
+    coast_cap_k_sigma: float = 1.0
 
     # DO (disciplined oscillator) truth-noise model.
     #   do_wpm_ns:   white phase modulation, per-sample σ (ns).
@@ -385,6 +396,11 @@ class ClosedLoopSim:
         coast_every = max(1, int(round(c.coast_interval_s / c.dt_s)))
         converged = (coast_every == 1)
         last_correction_k = 0
+        # When the coast-cap is on this is reduced after each correction
+        # to the largest τ where k·√P[2,2](τ) ≤ t_budget — bravo's
+        # coast_cap_from_p22 fed by DOFreqEst.project_p22_coast.  Starts
+        # at the requested ceiling; the cap only ever tightens it.
+        dyn_coast_every = coast_every
         for k in range(n):
             # The servo corrects every `coast_every` epochs ONCE
             # converged; while still converging it corrects every epoch
@@ -397,7 +413,8 @@ class ClosedLoopSim:
                     and abs(self.ekf.estimated_phase_ns) < c.coast_converge_ns
                     and self.ekf.freq_uncertainty_ppb < c.coast_converge_freq_ppb):
                 converged = True
-            effective_every = coast_every if converged else 1
+            effective_every = (min(coast_every, dyn_coast_every)
+                               if converged else 1)
             if (k - last_correction_k) >= effective_every or k == 0:
                 gap_s = max(c.dt_s, (k - last_correction_k) * c.dt_s)
                 meas = self._emit()
@@ -413,6 +430,17 @@ class ClosedLoopSim:
                         innov_s[k] = _s
                 rejected[k] = self.ekf.last_ocxo_gate_rejected
                 routes[k] = getattr(self.ekf, "last_ticc_route", "int")
+                # Recompute the coast-cap on the post-update filter.  One
+                # O(coast_every) projection per correction, not per epoch
+                # (the closure looks up a precomputed table — addresses
+                # bravo's perf note on coast_cap_from_p22).
+                if converged and c.coast_cap_enabled:
+                    table = self.ekf.project_p22_coast(coast_every)
+                    p22_at_tau = lambda tau, _t=table: _t[int(tau)]
+                    dyn_coast_every = coast_cap_from_p22(
+                        c.coast_cap_t_budget_ns, p22_at_tau,
+                        k_sigma=c.coast_cap_k_sigma,
+                        min_tau_s=1, max_tau_s=coast_every)
 
             t_s[k] = k * c.dt_s
             phi_do[k] = self.truth.phi_do
