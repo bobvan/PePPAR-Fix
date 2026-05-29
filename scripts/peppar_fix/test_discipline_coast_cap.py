@@ -297,5 +297,73 @@ class SchedulerCoastCapIntegrationTest(unittest.TestCase):
         self.assertEqual(s.compute_adaptive_interval(distance_to_lock=1.0), 7)
 
 
+class ConvergingLatchBypassTest(unittest.TestCase):
+    """disciplineModeFsm increment #2: when distance_to_lock is fed,
+    the binary `_converging` latch in should_correct is bypassed —
+    self.interval (already tapered by graded_interval) drives the
+    decision continuously.  No signal ⇒ legacy latch behavior.
+    """
+
+    def _quiet(self, **kw):
+        # Flat adjfine ⇒ D_physical≈0 ⇒ baseline τ = max_interval.
+        s = DisciplineScheduler(base_interval=1, adaptive=True,
+                                min_interval=1, max_interval=120,
+                                phase_error_budget_ns=1.0, **kw)
+        for t in range(_MIN_FIT_SAMPLES + 5):
+            s.record_actuation(float(t), 100.0)
+        return s
+
+    def test_legacy_latch_fires_every_epoch_during_converging(self):
+        # No distance_to_lock fed → latch still active.  Even though
+        # self.interval grows to max_interval after compute, the
+        # _converging=True override forces effective_interval=1.
+        s = self._quiet()
+        s.compute_adaptive_interval()                 # no signal
+        self.assertEqual(s.interval, 120)
+        self.assertTrue(s._converging)
+        s.accumulate(0.5, 1.0, 'TEST', t_monotonic=0.0)  # under budget
+        self.assertTrue(s.should_correct())              # legacy latch
+
+    def test_locked_signal_bypasses_latch(self):
+        # distance_to_lock=0.0 ⇒ taper keeps τ at the full target (120).
+        # With the latch bypassed, should_correct uses self.interval=120;
+        # one buffered sample is not enough — wait out the coast.
+        s = self._quiet()
+        s.compute_adaptive_interval(distance_to_lock=0.0)
+        self.assertEqual(s.interval, 120)
+        s.accumulate(0.5, 1.0, 'TEST', t_monotonic=0.0)  # under budget
+        self.assertFalse(s.should_correct())             # latch BYPASSED
+
+    def test_far_signal_agrees_with_legacy_at_min(self):
+        # distance_to_lock=1.0 ⇒ taper to min_interval=1 ⇒ fires every
+        # epoch (same behavior as the legacy converging latch).
+        s = self._quiet()
+        s.compute_adaptive_interval(distance_to_lock=1.0)
+        self.assertEqual(s.interval, 1)
+        s.accumulate(0.5, 1.0, 'TEST', t_monotonic=0.0)
+        self.assertTrue(s.should_correct())
+
+    def test_signal_re_arms_legacy_latch_when_dropped(self):
+        # Continuous mode then back to legacy — the latch must return
+        # to control (so callers can opt out per-epoch without state
+        # leaking forward).
+        s = self._quiet()
+        s.compute_adaptive_interval(distance_to_lock=0.0)
+        self.assertIsNotNone(s._last_distance_to_lock)
+        s.compute_adaptive_interval()                 # drop signal
+        self.assertIsNone(s._last_distance_to_lock)
+        s.accumulate(0.5, 1.0, 'TEST', t_monotonic=0.0)
+        # Latch re-engages: _converging=True ⇒ should_correct True.
+        self.assertTrue(s.should_correct())
+
+    def test_budget_force_correct_still_honored_under_signal(self):
+        # Hard phase-error budget cap must still fire regardless of the
+        # signal — same as the legacy behavior.
+        s = self._quiet()
+        s.compute_adaptive_interval(distance_to_lock=0.0)
+        s.accumulate(5.0, 1.0, 'TEST', t_monotonic=0.0)  # exceeds 1 ns
+        self.assertTrue(s.should_correct())
+
+
 if __name__ == "__main__":
     unittest.main()

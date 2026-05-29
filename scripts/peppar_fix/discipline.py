@@ -114,6 +114,15 @@ class DisciplineScheduler:
         self._unconverge_factor = unconverge_factor
         self._converging = True
 
+        # disciplineModeFsm increment #2: when a caller drives the
+        # scheduler with the derived continuous distance_to_lock signal
+        # (via compute_adaptive_interval), the _converging latch is
+        # bypassed in should_correct() — self.interval is already
+        # tapered by graded_interval(τ, m), so reading it directly IS
+        # the converging→tracking transition, done continuously.
+        # `None` falls back to the legacy latch (default behavior).
+        self._last_distance_to_lock = None
+
     @property
     def n_accumulated(self):
         return len(self._errors)
@@ -169,7 +178,15 @@ class DisciplineScheduler:
         if abs(self._errors[-1]) > self.phase_error_budget_ns:
             return True
 
-        effective_interval = 1 if self._converging else self.interval
+        # Continuous-signal path (disciplineModeFsm increment #2): when
+        # a distance_to_lock has been fed, self.interval is already the
+        # tapered target; bypass the binary _converging latch.  Legacy
+        # behavior (no signal fed) keeps today's 1-while-converging
+        # cliff.
+        if self._last_distance_to_lock is not None:
+            effective_interval = self.interval
+        else:
+            effective_interval = 1 if self._converging else self.interval
 
         if n >= effective_interval:
             return True
@@ -355,6 +372,10 @@ class DisciplineScheduler:
         # Keep diagnostics fresh regardless of adaptive on/off.
         self._update_drift_rate_from_input()
         self._update_d_physical_from_adjfine()
+        # disciplineModeFsm increment #2: record the latest signal for
+        # should_correct().  Set unconditionally (including None) so the
+        # legacy-latch path re-arms cleanly if a caller stops feeding it.
+        self._last_distance_to_lock = distance_to_lock
 
         if not self.adaptive:
             return self.base_interval
