@@ -7020,6 +7020,23 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         coast_cap_k_sigma=getattr(args, 'coast_cap_k_sigma', 1.0),
     )
 
+    # disciplineModeFsm increment #1: the single derived continuous
+    # convergence signal (docs/discipline-convergence-state.md).  Owns
+    # distance_to_lock ∈ [0,1] computed from the EKF's √(P22); the
+    # graded taper (and future per-arm gating / source weighting) read
+    # it.  Off by default; opt in via --graded-taper.  Truthful only
+    # with Q-from-char (#83).
+    _convergence = None
+    if getattr(args, 'graded_taper', False):
+        from peppar_fix.discipline_convergence import DisciplineConvergence
+        _far_ratio = getattr(args, 'lock_far_budget_ratio', 10.0)
+        _far_ns = float(args.phase_error_budget_ns) * float(_far_ratio)
+        _convergence = DisciplineConvergence(
+            converged_ns=args.phase_error_budget_ns, far_ns=_far_ns)
+        log.info("Graded taper enabled: distance_to_lock from √(P22), "
+                 "converged=%.3f ns, far=%.3f ns (ratio=%.1fx)",
+                 args.phase_error_budget_ns, _far_ns, _far_ratio)
+
     qerr_alignment = {
         # Litmus 1: EXTTS PPS + qErr (matched to EXTTS epoch)
         "pps_var": RunningVarianceWindow(),
@@ -8256,14 +8273,20 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         # adjfine = |D_physical|; τ = √(2·budget/D).  See
         # schedulerCombinedDriftEstimator.
         scheduler.record_actuation(time.monotonic(), adjfine_ppb)
+        # disciplineModeFsm: refresh the derived convergence signal
+        # (None if --graded-taper off → scheduler ignores it).
+        _distance = None
+        if _convergence is not None:
+            _distance = _convergence.update_from_p22(float(servo.P[2, 2]))
         if getattr(args, 'coast_cap', False):
             # Precompute predict-only P[2,2] over the coast once; the
             # coast-cap (coast_cap_from_p22) looks it up per candidate τ.
             _p22 = servo.project_p22_coast(scheduler.max_interval)
             scheduler.compute_adaptive_interval(
-                p22_at_tau=lambda t, _p=_p22: _p[min(int(t), len(_p) - 1)])
+                p22_at_tau=lambda t, _p=_p22: _p[min(int(t), len(_p) - 1)],
+                distance_to_lock=_distance)
         else:
-            scheduler.compute_adaptive_interval()
+            scheduler.compute_adaptive_interval(distance_to_lock=_distance)
 
         if n_epochs % 10 == 0:
             log.info(f"  [{n_epochs}] EKF: "
@@ -10262,6 +10285,21 @@ Two-phase operation:
                        help="Confidence factor on the coast-cap (k·TDEV(τ) and "
                             "k·√(P22) ≤ budget).  >1 caps the coast shorter. "
                             "Default 1.0.")
+    servo.add_argument("--graded-taper", action="store_true", default=False,
+                       help="disciplineModeFsm increment #1: continuously taper "
+                            "the coast interval by the EKF's derived "
+                            "distance_to_lock (√(P22) normalized to "
+                            "[0,1]).  Replaces the binary converging/tracking "
+                            "latch and its 1→max actuation cliff.  Truthful "
+                            "only with Q-from-char (qFromCharPerActuator).  "
+                            "Default off; validate in closedLoopServoSim "
+                            "before enabling on hardware.")
+    servo.add_argument("--lock-far-budget-ratio", type=float, default=10.0,
+                       help="Ratio of 'far' to 'converged' in the convergence "
+                            "signal (both anchored to phase_error_budget_ns).  "
+                            "Sets the taper's steepness — small = steeper "
+                            "(reaches min_interval sooner as √(P22) grows).  "
+                            "Default 10.0 (to be sim-pinned).")
     servo.add_argument("--servo-log", default=None,
                        help="CSV log file for servo data")
     servo.add_argument("--track-max-ppb", type=float, default=None,
