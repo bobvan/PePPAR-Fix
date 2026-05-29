@@ -37,6 +37,30 @@ Between tick boundaries (98.75% of epochs when PPP sigma = 0.1 ns):
 
 This couples the rx TCXO and DO states in the measurement — the key
 insight that makes 4-state fusion work where 2-state failed.
+
+State × measurement-arm incidence
+---------------------------------
+Which of the six conditional arms (see update()) observes which state.
+● = direct (H has a 1 for that state); ◐ = intermittent coupling.
+Diagram: docs/dofreqest-state-arm-map.svg
+(regenerate via scripts/gen_dofreqest_state_arm_svg.py)
+
+                  A1    A2    A5    A3    A6    A4
+    state         PPP   qErr  TDCP  EXT   pseu  TICC    class
+    x0 φ_rx        ●                             ◐¹     measured
+    x1 f_rx              ●     ●                         measured
+    x2 φ_do                          ●     ●     ●       measured
+    x3 f_do                                              HIDDEN²
+
+¹ Arm 4 (TICC) is the only non-diagonal arm: H = [−1,0,−1,0] normally,
+  collapsing to [0,0,−1,0] right at a 125 MHz tick boundary (the qErr
+  derivative vanishes there).  So its x0 coupling is intermittent.
+² x3 (f_do) has NO arm pointing at it.  It is recovered purely through
+  the predict step: φ_do -= (f_do + adjfine)·dt folds f_do into the
+  measured x2 over time.  x3 is the state we actuate on (adjfine ≈ −f_do
+  at steady state) yet the one we never directly measure.
+
+Directly measured: x0, x1, x2.  Hidden (inferred via the dynamics): x3.
 """
 
 import logging

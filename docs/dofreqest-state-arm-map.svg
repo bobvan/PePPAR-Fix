@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="560" viewBox="0 0 920 560" font-family="Helvetica,Arial,sans-serif">
+<rect width="920" height="560" fill="white"/>
+<defs>
+  <marker id="armhead" markerWidth="8" markerHeight="8" refX="7" refY="3"
+          orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#1565c0"/></marker>
+  <marker id="dynhead" markerWidth="8" markerHeight="8" refX="7" refY="3"
+          orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#6a1b9a"/></marker>
+  <marker id="acthead" markerWidth="8" markerHeight="8" refX="7" refY="3"
+          orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#ef6c00"/></marker>
+</defs>
+<text x="460.0" y="34" text-anchor="middle" font-size="20" font-weight="bold">DOFreqEst — 4-state EKF: states × measurement arms</text>
+<text x="460.0" y="54" text-anchor="middle" font-size="12" fill="#555">green = directly measured · red = hidden (no arm; recovered via dynamics) · purple = predict-step coupling · orange = actuator</text>
+<rect x="40" y="62" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<text x="115.0" y="78" text-anchor="middle" font-size="12" font-weight="bold">A1 PPP</text>
+<text x="115.0" y="92" text-anchor="middle" font-size="9" fill="#555">σ≈0.1 ns</text>
+<rect x="40" y="132" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<text x="115.0" y="148" text-anchor="middle" font-size="12" font-weight="bold">A2 qErr</text>
+<text x="115.0" y="162" text-anchor="middle" font-size="9" fill="#555">σ≈0.3 ppb</text>
+<rect x="40" y="202" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<text x="115.0" y="218" text-anchor="middle" font-size="12" font-weight="bold">A5 TDCP</text>
+<text x="115.0" y="232" text-anchor="middle" font-size="9" fill="#555">σ≈0.026 ppb</text>
+<rect x="40" y="272" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<text x="115.0" y="288" text-anchor="middle" font-size="12" font-weight="bold">A3 EXTINT</text>
+<text x="115.0" y="302" text-anchor="middle" font-size="9" fill="#555">σ≈5–10 ns</text>
+<rect x="40" y="342" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<text x="115.0" y="358" text-anchor="middle" font-size="12" font-weight="bold">A6 pseudo</text>
+<text x="115.0" y="372" text-anchor="middle" font-size="9" fill="#555">σ grows · holdover</text>
+<rect x="40" y="412" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<text x="115.0" y="428" text-anchor="middle" font-size="12" font-weight="bold">A4 TICC</text>
+<text x="115.0" y="442" text-anchor="middle" font-size="9" fill="#555">σ≈60 ps · nonlinear / coupled</text>
+<rect x="470" y="78.0" width="230" height="64" rx="7" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2.5"/>
+<text x="484" y="102" font-size="16" font-weight="bold" fill="#2e7d32">x0  φ_rx</text>
+<text x="484" y="122" font-size="11" fill="#444">rx-TCXO phase (ns)</text>
+<text x="690" y="94.0" text-anchor="end" font-size="10" font-style="italic" fill="#2e7d32">measured</text>
+<rect x="470" y="178.0" width="230" height="64" rx="7" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2.5"/>
+<text x="484" y="202" font-size="16" font-weight="bold" fill="#2e7d32">x1  f_rx</text>
+<text x="484" y="222" font-size="11" fill="#444">rx-TCXO freq (ppb)</text>
+<text x="690" y="194.0" text-anchor="end" font-size="10" font-style="italic" fill="#2e7d32">measured</text>
+<rect x="470" y="318.0" width="230" height="64" rx="7" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2.5"/>
+<text x="484" y="342" font-size="16" font-weight="bold" fill="#2e7d32">x2  φ_do</text>
+<text x="484" y="362" font-size="11" fill="#444">DO phase (ns)</text>
+<text x="690" y="334.0" text-anchor="end" font-size="10" font-style="italic" fill="#2e7d32">measured</text>
+<rect x="470" y="418.0" width="230" height="64" rx="7" fill="#fdecea" stroke="#c62828" stroke-width="2.5" stroke-dasharray="6 3"/>
+<text x="484" y="442" font-size="16" font-weight="bold" fill="#c62828">x3  f_do</text>
+<text x="484" y="462" font-size="11" fill="#444">DO freq (ppb)</text>
+<text x="690" y="434.0" text-anchor="end" font-size="10" font-style="italic" fill="#c62828">HIDDEN — no arm</text>
+<path d="M190,80 C330.0,80 330.0,110 468,110" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M190,150 C330.0,150 330.0,210 468,210" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M190,220 C330.0,220 330.0,210 468,210" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M190,290 C330.0,290 330.0,350 468,350" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M190,360 C330.0,360 330.0,350 468,350" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M190,430 C330.0,430 330.0,120 468,120" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M190,430 C330.0,430 330.0,340 468,340" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M700,210 C728,210 728,110 700,110" fill="none" stroke="#6a1b9a" stroke-width="2" marker-end="url(#dynhead)"/>
+<text x="736" y="164.0" font-size="10" fill="#6a1b9a">∫ f_rx·dt</text>
+<path d="M700,450 C728,450 728,350 700,350" fill="none" stroke="#6a1b9a" stroke-width="2" marker-end="url(#dynhead)"/>
+<text x="736" y="404.0" font-size="10" fill="#6a1b9a">∫ (f_do+adjfine)·dt</text>
+<rect x="510" y="504" width="150" height="32" rx="5" fill="#fff3e0" stroke="#ef6c00" stroke-width="1.8"/>
+<text x="585" y="524" text-anchor="middle" font-size="12" font-weight="bold" fill="#ef6c00">adjfine = −f_do (PHC steer)</text>
+<path d="M510,482.0 L540,504" fill="none" stroke="#ef6c00" stroke-width="1.8" marker-end="url(#acthead)" stroke-dasharray="4 2"/>
+<path d="M660,520 C770,520 790,374 700,374" fill="none" stroke="#ef6c00" stroke-width="1.8" marker-end="url(#acthead)" stroke-dasharray="4 2"/>
+</svg>
