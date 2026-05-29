@@ -169,6 +169,8 @@ def _do_two_clock(args) -> list:
           f"95%={p95:.2f}ns  RMS={np.sqrt(np.mean(d**2)):.2f}ns")
     print(f"  CLAUDE.md shared-antenna bound: |Δ|≤1ns @95%  →  "
           f"{'PASS' if p95 <= 1.0 else 'FAIL'}")
+    print("  NOTE: run_two_clock is NOT yet faithful (v1 shares the whole "
+          "RNG) — this |Δ| is a plumbing smoke test, not the bound (see docs).")
     return [res_a, res_b]
 
 

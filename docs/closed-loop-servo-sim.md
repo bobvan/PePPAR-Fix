@@ -93,6 +93,22 @@ jitter.  Wiring the real scheduler + a fat-tail innovation model is the
 next increment — and it is exactly the test bed bravo needs for
 `longTauGnssCoupling` (sweep coast-cap / bandwidth deterministically).
 
+### Scope — what the sim cannot tell you
+
+The plant and the filter **import the same** `_qerr`/tick model
+(`peppar_fix.do_freq_est._qerr`).  That is deliberate — it keeps the
+loop self-consistent — but it means the sim validates the loop
+**dynamics** faithfully and **cannot reveal a bug in the qerr/tick
+measurement model itself**: if that model were wrong, plant and filter
+would be wrong together and the loop would still close.  Hardware and
+the recorded captures remain the truth for measurement-model
+correctness.  Likewise, `run_two_clock` is **not yet faithful** (it
+reseeds clock B with A's RNG, sharing the *whole* noise realization
+including DO noise, and desyncs once the two arm configs draw different
+numbers of randoms per epoch) — do **not** trust its |Δ| for the 1 ns
+cross-host bound until next-increment #3 feeds one shared rx/GNSS
+realization to both plants with independent per-DO noise streams.
+
 ## Findings the sim already surfaces
 
 1. **The OCXO gate only gates Arm 4 (TICC).**  Whether a gated host

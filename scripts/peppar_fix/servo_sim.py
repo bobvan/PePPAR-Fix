@@ -496,19 +496,21 @@ def preset(name: str, **overrides) -> SimConfig:
 # ────────────────────────────────────────────────────────────────────
 def run_two_clock(cfg_a: SimConfig, cfg_b: SimConfig,
                   share_gnss: bool = True):
-    """Run two sims sharing one GNSS truth; return (res_a, res_b, diff_ns).
+    """Run two sims toward the CLAUDE.md cross-host excursion bound
+    (|Δ| ≤ 1 ns shared antenna); return (res_a, res_b, diff_ns).
 
-    Tests the CLAUDE.md cross-host excursion bound (|Δ| ≤ 1 ns shared
-    antenna) in simulation.  When share_gnss=True the two plants see the
-    same rx-TCXO/GNSS realization (common-mode cancels in the diff), so
-    the residual is the two discipline loops' own contribution.
+    NOT YET FAITHFUL (v1) — do not trust the |Δ| numbers for the 1 ns
+    bound.  share_gnss=True reseeds B with A's seed, which shares the
+    WHOLE noise realization (DO noise included, not just GNSS) and
+    desyncs the moment the two arm configs draw a different number of
+    randoms per epoch.  Next-increment #3 replaces this with ONE shared
+    rx/GNSS realization fed to both plants plus INDEPENDENT per-DO noise
+    streams; until then this is a smoke test of the two-clock plumbing,
+    not a cross-host bound measurement (see docs "Scope").
     """
     sim_a = ClosedLoopSim(cfg_a)
     sim_b = ClosedLoopSim(cfg_b)
     if share_gnss:
-        # Lock-step the rx-TCXO realization: drive B's GNSS RNG from the
-        # same seed and copy A's rx truth each epoch.  Simplest faithful
-        # shared-antenna model: identical φ_rx for both hosts.
         sim_b.rng = np.random.default_rng(cfg_a.seed)
         sim_b.truth.f_rx = sim_a.truth.f_rx
     res_a = sim_a.run()
