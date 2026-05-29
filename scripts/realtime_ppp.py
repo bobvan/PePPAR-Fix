@@ -986,6 +986,30 @@ def _sv_label(gnss_id, sv_id):
     return f"{prefix}{int(sv_id):02d}"
 
 
+# Verbose NAV-SIG logging throttle.  The full per-(SV,signal) dump is
+# ~50 lines/epoch; at 1 Hz that is ~340 MB/day to the run log.  On the
+# SD/eMMC lab hosts (all but PiFace, which has NVMe) that both burns the
+# card's limited write life AND periodically stalls the engine main loop
+# on write-back — the ~32 s obs gaps that drove the clkpoc3F9tInputReboot
+# exit-5 cascade (docs/clkpoc3-f9t-input-reboot-2026-05-29.md).  The
+# nav_sig_store still updates every epoch (the gate + disagreement
+# detector consume it); only the human-readable log dump is throttled to
+# a periodic sample.
+_NAV_SIG_LOG_INTERVAL_S = 30.0
+_nav_sig_log_last_mono = None
+
+
+def _nav_sig_log_due(now_mono=None):
+    """True at most once per _NAV_SIG_LOG_INTERVAL_S (wall-clock sample)."""
+    global _nav_sig_log_last_mono
+    now = time.monotonic() if now_mono is None else now_mono
+    if (_nav_sig_log_last_mono is None
+            or (now - _nav_sig_log_last_mono) >= _NAV_SIG_LOG_INTERVAL_S):
+        _nav_sig_log_last_mono = now
+        return True
+    return False
+
+
 def _emit_nav_sig_log(store, parsed_msg):
     """Emit a structured per-epoch [NAV-SIG] log line.
 
@@ -1209,7 +1233,12 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
             # epoch (default 1 Hz when CFG-MSGOUT-UBX_NAV_SIG_*=1).
             if msg_id == 'NAV-SIG' and nav_sig_store is not None:
                 nav_sig_store.update(parsed)
-                _emit_nav_sig_log(nav_sig_store, parsed)
+                # Store updates every epoch (gate + disagree detector);
+                # the verbose ~50-line dump is throttled to a periodic
+                # sample to spare the SD/eMMC write life + avoid the
+                # write-back stalls behind clkpoc3F9tInputReboot.
+                if _nav_sig_log_due():
+                    _emit_nav_sig_log(nav_sig_store, parsed)
 
             # NAV-CLOCK: receiver's own clock bias / drift / accuracy.
             # Diagnostic visibility into receiver-side time state for

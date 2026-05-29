@@ -4834,6 +4834,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 log.info("  EKF clock state reset after PHC step")
 
             # EKF predict
+            gap_recovery_this_epoch = False
             if prev_t is not None:
                 dt = (gps_time - prev_t).total_seconds()
                 if dt <= 0:
@@ -4842,12 +4843,21 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     prev_t = gps_time
                     continue
                 if dt > 30:
-                    # Gap recovery: reset filter time but don't skip the epoch.
-                    # Clamp predict to 1s so the filter doesn't diverge, then
-                    # let the update re-anchor from pseudoranges.
+                    # Gap recovery: reset filter time but don't skip the
+                    # epoch.  Clamp predict to 1s so the OTHER states don't
+                    # diverge under Q·dt inflation, then flag gap_recovery
+                    # so the update re-anchors the clock from the median PR
+                    # instead of cascading into the catastrophic gate (the
+                    # receiver clock drifted ~clkD·dt un-tracked over the
+                    # gap; that's an expected re-anchor, not an anomaly).
+                    # Without the flag this caused the clkpoc3F9tInputReboot
+                    # 30-reject exit-5 cascade — see
+                    # docs/clkpoc3-f9t-input-reboot-2026-05-29.md.
                     skip_stats["dt_suspicious"] += 1
-                    log.warning(f"Gap dt={dt:.1f}s, resetting filter time (not skipping)")
+                    log.warning(f"Gap dt={dt:.1f}s, resetting filter time "
+                                f"(not skipping; gap-recovery re-anchor)")
                     filt.predict(1.0)
+                    gap_recovery_this_epoch = True
                 else:
                     filt.predict(dt)
             prev_t = gps_time
@@ -4861,6 +4871,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 observations, corrections, gps_time,
                 clk_file=corrections,
                 clk_reset=clk_reset_this_epoch,
+                gap_recovery=gap_recovery_this_epoch,
             )
 
             # Catastrophic-reject cascade (I-202649 v2 + Note A engine

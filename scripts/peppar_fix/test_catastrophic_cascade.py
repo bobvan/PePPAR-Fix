@@ -194,5 +194,76 @@ class CounterAccumulationTest(unittest.TestCase):
                          "empty-obs n_pr<1 path must NOT advance counter")
 
 
+class GapRecoveryTest(unittest.TestCase):
+    """gap_recovery absorbs a post-gap common-mode clock drift instead of
+    cascading into the catastrophic gate (clkpoc3GapAbsorb).
+
+    Reproduces the clkpoc3F9tInputReboot mechanism: a long obs gap leaves
+    the receiver clock drifted ~clkD·dt un-tracked, so every post-gap PR
+    residual carries the same large common-mode offset.  Without the flag
+    that trips the catastrophic gate 30× → exit-5.  With it, the offset is
+    absorbed into dt_rx and the epoch is accepted.
+    """
+
+    # ~8 µs of clock drift over a 32 s gap at clkD≈260 ns/s — the real
+    # clkPoC3 value (2415 m measured on day0528-xhost).
+    _GAP_DRIFT_M = 2415.0
+
+    def _gap_obs(self, ranges):
+        return [_make_obs(sv, "gps",
+                          ranges[sv] + self._GAP_DRIFT_M,
+                          phi_if_m=ranges[sv] + self._GAP_DRIFT_M)
+                for sv in ranges]
+
+    def test_gap_offset_without_flag_cascades(self):
+        """Control: the same common-mode offset WITHOUT gap_recovery is
+        catastrophic-rejected — the gate still protects normal operation."""
+        f, sp3, ranges, t = _build_filter_with_history()
+        n_pr, _, _ = f.update(self._gap_obs(ranges),
+                              sp3, t + timedelta(seconds=1), clk_file=None)
+        self.assertEqual(n_pr, 0, "offset without flag should be rejected")
+        self.assertEqual(f._consecutive_catastrophic_rejects, 1)
+
+    def test_gap_recovery_absorbs_and_accepts(self):
+        """With gap_recovery=True the offset is absorbed into dt_rx, the
+        epoch is accepted (n_used>0), and the catastrophic counter stays 0."""
+        f, sp3, ranges, t = _build_filter_with_history()
+        clk_before = f.x[FixedPosFilter.IDX_CLK]
+        n_pr, _, _ = f.update(self._gap_obs(ranges),
+                              sp3, t + timedelta(seconds=1),
+                              clk_file=None, gap_recovery=True)
+        self.assertGreater(n_pr, 0, "gap-recovery epoch must be accepted")
+        self.assertEqual(f._consecutive_catastrophic_rejects, 0)
+        # dt_rx re-anchored by ~the drift (within the post-update Kalman
+        # correction; the absorb shifts the bulk, the update trims it).
+        clk_moved = f.x[FixedPosFilter.IDX_CLK] - clk_before
+        self.assertAlmostEqual(clk_moved, self._GAP_DRIFT_M, delta=50.0)
+
+    def test_gap_recovery_clears_prior_reject_counter(self):
+        """A gap-recovery epoch after a few near-miss rejects resets the
+        counter — a transient pre-gap burst must not push the post-gap
+        re-anchor over the exit-5 limit."""
+        f, sp3, ranges, t = _build_filter_with_history()
+        for k in range(3):
+            f.update(self._gap_obs(ranges), sp3,
+                     t + timedelta(seconds=k + 1), clk_file=None)
+        self.assertEqual(f._consecutive_catastrophic_rejects, 3)
+        f.update(self._gap_obs(ranges), sp3,
+                 t + timedelta(seconds=4), clk_file=None, gap_recovery=True)
+        self.assertEqual(f._consecutive_catastrophic_rejects, 0)
+
+    def test_gap_recovery_drops_stale_tdcp_baseline(self):
+        """gap_recovery drops the pre-gap TD-CP baseline (a >30 s baseline
+        may straddle undetected slips); the epoch re-anchors on PR alone
+        (n_td == 0) and rebuilds a clean baseline for the next epoch."""
+        f, sp3, ranges, t = _build_filter_with_history()
+        self.assertTrue(f.prev_geo, "warmup should leave a TD-CP baseline")
+        _, _, n_td = f.update(self._gap_obs(ranges), sp3,
+                              t + timedelta(seconds=1),
+                              clk_file=None, gap_recovery=True)
+        self.assertEqual(n_td, 0, "no TD-CP rows on the gap-recovery epoch")
+        self.assertTrue(f.prev_geo, "baseline rebuilt for the next epoch")
+
+
 if __name__ == "__main__":
     unittest.main()

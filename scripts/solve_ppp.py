@@ -1425,7 +1425,8 @@ class FixedPosFilter:
             'elev': elev,
         }
 
-    def update(self, observations, sp3, t, clk_file=None, clk_reset=False):
+    def update(self, observations, sp3, t, clk_file=None, clk_reset=False,
+               gap_recovery=False):
         """Run one EKF update.
 
         Args:
@@ -1439,7 +1440,28 @@ class FixedPosFilter:
                 gate — the resulting large PR residuals are expected
                 and documented, not anomalies.  See dayplan
                 chipSlipHandling.
+            gap_recovery: True on the first epoch after a long
+                observation gap (engine: dt > 30 s).  During the gap the
+                receiver clock drifts (clkD·dt) un-tracked, so the
+                pre-fit PR residuals carry a large COMMON-MODE offset
+                that is NOT an anomaly — it is the expected re-anchor.
+                When set, absorb the (sub-ms, un-rounded) median PR into
+                dt_rx, drop the now-stale TD-CP baseline (a >30 s
+                baseline may straddle undetected cycle slips), and
+                bypass the catastrophic-reject gate for this one epoch.
+                This is the sub-ms analogue of the integer-ms clk_reset
+                path; without it the gate rejects the re-anchor and a
+                30-reject cascade forces an exit-5 re-bootstrap.  See
+                docs/clkpoc3-f9t-input-reboot-2026-05-29.md +
+                dayplan clkpoc3GapAbsorb.
         """
+        # After a long gap the previous-epoch carrier-phase baseline is
+        # stale (it predates the gap), so any TD-CP formed against it
+        # would span the whole gap and may hide cycle slips.  Drop it;
+        # the normal accept path rebuilds a clean 1 s baseline next epoch.
+        # PR alone re-anchors the clock this epoch.
+        if gap_recovery:
+            self.prev_geo = {}
         H_rows, z_rows, R_diag = [], [], []
         # Per-row indices tracked during construction so post_resid can
         # be split into pure-PR and pure-TD-CP residual vectors for
@@ -1677,12 +1699,35 @@ class FixedPosFilter:
                     median_pr_signed, n_ms, chips, len(pr_idx),
                 )
 
+        # Gap-recovery realignment (clkpoc3GapAbsorb).  After a long obs
+        # gap the receiver clock has drifted (clkD·dt) un-tracked, so the
+        # pre-fit PR residuals share a large COMMON-MODE offset — the
+        # expected re-anchor, not an anomaly.  Unlike clk_reset this is a
+        # continuous (sub-ms) drift, so absorb the FULL signed median PR
+        # into dt_rx (no integer-ms rounding) and rebase z so the Kalman
+        # step sees baseline-noise innovations instead of re-applying the
+        # offset (same 2×-compensation hazard the clk_reset path avoids).
+        # TD-CP rows were already dropped at the top (prev_geo cleared),
+        # so only PR rows need rebasing.
+        if gap_recovery and pr_idx:
+            offset_m = float(np.median(z[pr_idx]))
+            self.x[self.IDX_CLK] += offset_m
+            z[pr_idx] = z[pr_idx] - offset_m
+            self._pr_median_history.clear()
+            self._consecutive_catastrophic_rejects = 0
+            log.warning(
+                "[GAP_REALIGN] obs-gap clock drift: median PR=%+.1fm "
+                "(%.2f us) absorbed into dt_rx; %d PR rows rebased, "
+                "TD-CP baseline reset — catastrophic gate bypassed",
+                offset_m, offset_m / 299.792458, len(pr_idx),
+            )
+
         # Catastrophic residual gate (I-202649 v2).  See class-level
         # comment for the design.  Trips on transient spike from a
         # stable baseline; warmup-quiet during bootstrap.  Skipped when
-        # clk_reset=1 — the F9T's clock realignment is the documented
-        # mechanism, not a true anomaly.
-        if (not clk_reset) and pr_idx and len(self._pr_median_history) >= self.CATASTROPHIC_HISTORY_MIN:
+        # clk_reset=1 (F9T realignment) or gap_recovery=1 (post-gap
+        # re-anchor) — both are documented mechanisms, not anomalies.
+        if (not clk_reset) and (not gap_recovery) and pr_idx and len(self._pr_median_history) >= self.CATASTROPHIC_HISTORY_MIN:
             pr_z_abs = np.abs(z[pr_idx])
             median_pr = float(np.median(pr_z_abs))
             baseline = max(
