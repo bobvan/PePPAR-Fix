@@ -7031,14 +7031,27 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         _sigma_ns = load_sigma_short_tau_from_state(_do_state_path)
         if _sigma_ns is not None:
             _do_label_gate = getattr(args, 'do_label', None) or str(do_uid_local)
+            # disciplineModeFsm increment #3 — observability bound: TICC
+            # is sole observer of x[2] when no other arm carries it
+            # (Arm 3 EXTINT or Arm 6 TDCP-holdover).  Soft-weighting /
+            # rejecting a sole carrier starves the filter — the
+            # clkpoc3GateOverRejectsBeforeLock finding and the
+            # sole-observer memory.  Force admit on those hosts.
+            _ticc_is_sole_x2_observer = (
+                extint_store is None
+                and getattr(args, 'servo_input', '') != 'tdcp'
+            )
             _ocxo_gate = OcxoTrustedGate(
                 sigma_short_tau_ns=_sigma_ns,
                 k_sigma=args.ocxo_trusted_k_sigma,
                 min_age_s=args.ocxo_trusted_min_age,
-                do_label=_do_label_gate)
+                do_label=_do_label_gate,
+                is_sole_observer=_ticc_is_sole_x2_observer)
             log.info("OCXO gate ENABLED: σ=%.4f ns, K=%.1f, min_age=%.1fs, "
-                     "do=%s", _sigma_ns, _ocxo_gate.k_sigma,
-                     _ocxo_gate.min_age_s, _do_label_gate)
+                     "do=%s, sole_observer=%s",
+                     _sigma_ns, _ocxo_gate.k_sigma,
+                     _ocxo_gate.min_age_s, _do_label_gate,
+                     _ticc_is_sole_x2_observer)
         else:
             log.warning("OCXO gate requested but state JSON has no usable "
                         "TDEV(1s) for %s — gate disabled", do_uid_local)
