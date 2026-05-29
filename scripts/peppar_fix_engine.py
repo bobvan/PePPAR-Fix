@@ -9653,6 +9653,7 @@ def _apply_host_config(args):
         "tadd_gpio":        ("tadd_gpio",        int),
         "tadd_hold_s":      ("tadd_hold_s",      float),
         "ticc_port":        ("ticc_port",        str),
+        "max_adjfine_step_ppb": ("max_adjfine_step_ppb", float),
         "phase_step_bias_ns": ("phase_step_bias_ns", float),
         "ar_elev_mask_deg": ("ar_elev_mask",         float),
         "pmc_uds":          ("pmc",              str),

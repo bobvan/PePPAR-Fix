@@ -58,6 +58,19 @@ dac_type = "ad5693r"
 # TADD-2 Mini divider: ARM on GPIO 16, syncs 10 MHz → 1 PPS.
 tadd_gpio = 16
 
+# pifaceShortTauGlitches mitigation (docs/piface-shorttau-glitches-2026-05-29.md).
+# The v1 OCXO gate rejects 99.6% of TICC here (the GNSS-PPS carrier), so the loop
+# runs open between corrections and the DO drifts far; the catch-up lands as a
+# large sporadic freq kick (≤16.7 ppb measured) that kinks chA by up to 341 ns,
+# putting NEAR(±8 s of a kick) TDEV(1s) 188× above the QUIET floor.  Clamp the
+# per-epoch adjfine change to bound the kink injection.  2 ppb sits ~10× above
+# the empirical p95 normal correction (0.19 ppb) — no impact on the 99 % of
+# clean corrections, but every one of the 80 overnight kicks (range 0.5-16.7
+# ppb) is bounded.  Band-aid until the gate redesign lands (routedQErrArm #79
+# / disciplineModeFsm).  Engine L3 rate limit; engages only after the first
+# adjfine, so bootstrap is unaffected.
+max_adjfine_step_ppb = 2.0
+
 # TICC #3: chA = DO PPS, chB = GNSS PPS.
 # TICC competes as a servo source whenever ticc_port is configured.
 ticc_port = "/dev/ticc3"
