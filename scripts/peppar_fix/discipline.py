@@ -356,3 +356,134 @@ class DisciplineScheduler:
                    min(self.max_interval, int(round(tau_sec))))
         self.interval = tau
         return tau
+
+
+# ---------------------------------------------------------------------------
+# longTauGnssCoupling — coast-cap + graded-taper policy primitives
+#
+# The deterministic drift budget above (τ = √(2·T/D)) bounds only the
+# *signed* aging/thermal ramp.  A quiet DO (D≈0) gets τ → max_interval,
+# but its *stochastic* phase wander (random-walk / white-FM) keeps
+# accumulating over a long coast — the tau~64-256 s TDEV hump observed
+# in the 2026-05-29 overnight runs (PiFace 6.4 ns @ 64 s, MadHat 3.6 ns
+# @ 256 s), precisely where the GNSS reference is at its best.
+#
+# These are pure functions: the building blocks the engine/sim compose
+# to (a) cap the coast by the DO's *stochastic* phase growth and (b)
+# replace the binary converging/tracking latch with a continuous taper.
+# They have no effect on DisciplineScheduler until wired — integration
+# is validated in closedLoopServoSim (charlie) before hardware.  The
+# sqrt(P22) path additionally requires the honest small Q from freerun
+# characterization (qFromCharPerActuator); with an inflated Q the cap
+# is spuriously tight.
+# ---------------------------------------------------------------------------
+
+def coast_cap_from_tdev(t_budget_ns, tdev_ref_ns, tdev_slope,
+                        tau_ref_s=1.0, k_sigma=1.0):
+    """Largest coast interval τ (s) whose characterized DO phase wander
+    stays within budget, from a power-law TDEV model.
+
+    Models the DO's *freerun* phase wander as
+
+        TDEV(τ) = tdev_ref_ns · (τ / tau_ref_s) ** tdev_slope
+
+    Common slopes: +0.5 white-FM, +1.0 flicker-FM, +1.5 random-walk-FM.
+    A slope ≤ 0 (white/flicker-PM, or a flat floor) means the wander
+    does not grow with τ → no coast constraint → returns +inf.
+
+    Solves  k_sigma · TDEV(τ) ≤ t_budget_ns  for the largest τ:
+
+        τ_cap = tau_ref_s · (t_budget_ns / (k_sigma·tdev_ref_ns))
+                          ** (1 / tdev_slope)
+
+    Returns float seconds (caller clamps to [min,max] and rounds).  Use
+    the DO's *characterized freerun* TDEV here, not the disciplined
+    output TDEV — the cap answers "how long can this oscillator coast
+    open-loop before its own noise floor exceeds budget", which is a
+    DO-class property (long for an OCXO, short for a TCXO).
+    """
+    if tdev_slope <= 0.0 or tdev_ref_ns <= 0.0 or k_sigma <= 0.0:
+        return float("inf")
+    ratio = t_budget_ns / (k_sigma * tdev_ref_ns)
+    if ratio <= 0.0:
+        return 0.0
+    return tau_ref_s * (ratio ** (1.0 / tdev_slope))
+
+
+def coast_cap_from_p22(t_budget_ns, p22_at_tau, k_sigma=1.0,
+                       min_tau_s=1, max_tau_s=120):
+    """Largest integer coast interval τ ∈ [min,max] whose projected
+    filter phase-state uncertainty stays within budget.
+
+    ``p22_at_tau(tau_s)`` → projected P[2,2] (ns²) of the DO phase state
+    after coasting ``tau_s`` seconds with no measurement update.  The
+    engine passes a closure over DOFreqEst's predict-only covariance
+    growth; this layer only needs the callable.
+
+    Returns the largest τ with  k_sigma · √(p22_at_tau(τ)) ≤ budget,
+    or ``min_tau_s`` if even the shortest coast is already over budget.
+
+    Assumes P22 grows monotonically with coast length (true under
+    predict-only EKF propagation): scans ascending and returns the τ
+    just before the first violation.  sqrt(P22) is the filter's own
+    honest accumulated-uncertainty estimate — but only in the
+    characterized small-Q regime (qFromCharPerActuator); an inflated Q
+    makes this cap spuriously tight.
+    """
+    if k_sigma <= 0.0 or t_budget_ns <= 0.0:
+        return min_tau_s
+    # Compare in variance space; a relative epsilon keeps the ≤ test
+    # honest at an exact boundary (e.g. 0.2²·25 == 1.0 up to float
+    # rounding) without admitting anything physically over budget.
+    budget_var = (t_budget_ns / k_sigma) ** 2 * (1.0 + 1e-9)
+    best = min_tau_s
+    for tau in range(int(min_tau_s), int(max_tau_s) + 1):
+        if p22_at_tau(tau) <= budget_var:
+            best = tau
+        else:
+            break
+    return best
+
+
+def normalized_convergence(metric_ns, converged_ns, far_ns):
+    """Map a raw convergence signal (√(P22) or σ_total, in ns) to a
+    [0,1] convergence metric — the single derived signal every
+    discipline policy reads (disciplineModeFsm reframe: continuous, not
+    a latched state).
+
+    Linear ramp: ≤ ``converged_ns`` → 0.0 (converged, trust the DO);
+    ≥ ``far_ns`` → 1.0 (far, correct aggressively); linear between.
+    Continuous and monotone, so policies keyed on it cannot chatter on
+    enter/exit/re-enter the way a thresholded state can.
+
+    Requires far_ns > converged_ns ≥ 0.
+    """
+    if far_ns <= converged_ns:
+        raise ValueError("far_ns must exceed converged_ns")
+    frac = (metric_ns - converged_ns) / (far_ns - converged_ns)
+    return min(1.0, max(0.0, frac))
+
+
+def graded_interval(target_interval, convergence_metric, min_interval=1):
+    """Continuously taper the coast interval by a derived convergence
+    metric — replaces the binary ``1 if converging else interval``
+    latch (and the 1→120 s actuation cliff it creates).
+
+    ``convergence_metric`` m ∈ [0,1] (see normalized_convergence):
+    0 = fully converged → coast the full ``target_interval`` (low loop
+    bandwidth, trust the DO); 1 = far → ``min_interval`` (high
+    bandwidth, correct every epoch).  Geometric taper:
+
+        τ_eff = round(target · (min/target) ** m)
+
+    Continuous and monotone in m, so — unlike the latch — it cannot
+    chatter on enter/exit/re-enter (Bob's emergent-not-event
+    preference).  The taper *is* the converging→tracking transition,
+    done continuously.
+    """
+    m = min(1.0, max(0.0, convergence_metric))
+    target = max(int(min_interval), int(target_interval))
+    if target <= min_interval:
+        return int(min_interval)
+    tau = target * (float(min_interval) / target) ** m
+    return max(int(min_interval), min(target, int(round(tau))))
