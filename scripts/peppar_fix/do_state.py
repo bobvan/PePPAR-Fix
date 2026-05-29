@@ -314,8 +314,19 @@ def derive_do_process_noise(characterization):
             out["sigma_do_phase_source"] = key
             break
 
-    # Frequency noise — adjfine ASD measures the DO's freq-domain
-    # noise floor at the actuator input.
+    # Frequency noise (Q[3,3]) — the random-walk-FM knob.  Per Main's
+    # qFromCharPerActuator analysis this, not Q[2,2] (phase), is what
+    # governs the EKF's coast/convergence P-growth: during a coast the
+    # frequency-state uncertainty integrates into phase (Var_φ ≈
+    # q_f·τ³/3), so an under-set Q[3,3] makes the filter overconfident
+    # and diverge on long coasts (clkpoc3GateOverRejectsBeforeLock,
+    # longTauGnssCoupling).
+    #
+    # Primary source: `adjfine` ASD (disciplined captures) — the freq
+    # noise floor at the actuator input.  Freerun characterizations
+    # (do_freerun_char.py) have no `adjfine`; for those, derive Q[3,3]
+    # from the rising-ADEV (RWFM) tail instead — the physically-correct
+    # open-loop freq random-walk.
     src = sources.get("adjfine")
     if isinstance(src, dict) and src.get("units") == "ppb":
         v = src.get("asd_at_0.1Hz")
@@ -323,7 +334,64 @@ def derive_do_process_noise(characterization):
             out["sigma_do_freq_ppb"] = float(v)
             out["sigma_do_freq_source"] = "adjfine"
 
+    if "sigma_do_freq_ppb" not in out:
+        # Prefer the ADEV from the chosen phase source, else iterate
+        # the same explicit phase-source order (charlie's #83 nit:
+        # don't rely on dict insertion order for the fallback).
+        adev = None
+        chosen = out.get("sigma_do_phase_source")
+        if chosen and isinstance(sources.get(chosen), dict):
+            adev = sources[chosen].get("adev_by_tau_s")
+        if not isinstance(adev, dict):
+            for key in ("Carrier", "DO PPS (chA vs TICC Rb)", "PPS",
+                        "DO PPS (chA-chB)", "PPS+qErr"):
+                s = sources.get(key)
+                if isinstance(s, dict) and isinstance(
+                        s.get("adev_by_tau_s"), dict):
+                    adev = s["adev_by_tau_s"]
+                    break
+        sigma_f, tau_used = _sigma_do_freq_ppb_from_adev(adev)
+        if sigma_f is not None:
+            out["sigma_do_freq_ppb"] = sigma_f
+            out["sigma_do_freq_source"] = f"adev@{tau_used:g}s (RWFM)"
+
     return out
+
+
+def _sigma_do_freq_ppb_from_adev(adev_by_tau_s):
+    """Random-walk-FM frequency process noise from an ADEV curve.
+
+    For RWFM the Allan variance is σ_y²(τ) = q·τ/3, where q is the
+    frequency random-walk diffusion (the EKF's Q[3,3] = sigma_do_freq²,
+    in ppb²/s).  Inverting at the τ where RWFM dominates:
+
+        sigma_do_freq_ppb = √3 · ADEV(τ)·1e9 / √τ        (ADEV fractional)
+
+    Evaluated at the LARGEST available τ — RWFM dominates the long-τ
+    tail, and where it does not (still white-FM / flicker), ADEV(τ) is
+    above the true RWFM contribution, so this over-estimates Q[3,3]
+    rather than under (the safe direction: an over-set freq Q can't
+    cause the overconfident-coast divergence; the longTauGnssCoupling
+    coast-cap bounds the coast on the same honest sqrt(P22)).
+
+    Returns (sigma_do_freq_ppb, tau_s) or (None, None).
+    """
+    if not isinstance(adev_by_tau_s, dict):
+        return (None, None)
+    pairs = []
+    for k, v in adev_by_tau_s.items():
+        try:
+            tau = float(k)
+            a = float(v)
+        except (TypeError, ValueError):
+            continue
+        if tau > 0 and math.isfinite(a) and a > 0:
+            pairs.append((tau, a))
+    if not pairs:
+        return (None, None)
+    tau, adev = max(pairs, key=lambda p: p[0])
+    sigma_ppb = math.sqrt(3.0) * adev * 1e9 / math.sqrt(tau)
+    return (sigma_ppb, tau)
 
 
 def derive_coast_tdev_from_char(characterization):
