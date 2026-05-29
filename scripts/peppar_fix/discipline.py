@@ -445,13 +445,17 @@ def coast_cap_from_p22(t_budget_ns, p22_at_tau, k_sigma=1.0,
     return best
 
 
-def normalized_convergence(metric_ns, converged_ns, far_ns):
+def normalized_distance_to_lock(metric_ns, converged_ns, far_ns):
     """Map a raw convergence signal (√(P22) or σ_total, in ns) to a
-    [0,1] convergence metric — the single derived signal every
+    [0,1] *distance-to-lock* — the single derived signal every
     discipline policy reads (disciplineModeFsm reframe: continuous, not
     a latched state).
 
-    Linear ramp: ≤ ``converged_ns`` → 0.0 (converged, trust the DO);
+    Named for what the return value means: 0.0 = locked/converged,
+    1.0 = far from lock (NOT "fully converged" — naming-honesty, per
+    charlie's PR #80 review; docs/misnomers.md).
+
+    Linear ramp: ≤ ``converged_ns`` → 0.0 (locked, trust the DO);
     ≥ ``far_ns`` → 1.0 (far, correct aggressively); linear between.
     Continuous and monotone, so policies keyed on it cannot chatter on
     enter/exit/re-enter the way a thresholded state can.
@@ -464,13 +468,13 @@ def normalized_convergence(metric_ns, converged_ns, far_ns):
     return min(1.0, max(0.0, frac))
 
 
-def graded_interval(target_interval, convergence_metric, min_interval=1):
-    """Continuously taper the coast interval by a derived convergence
-    metric — replaces the binary ``1 if converging else interval``
-    latch (and the 1→120 s actuation cliff it creates).
+def graded_interval(target_interval, distance_to_lock, min_interval=1):
+    """Continuously taper the coast interval by the derived
+    distance-to-lock — replaces the binary ``1 if converging else
+    interval`` latch (and the 1→120 s actuation cliff it creates).
 
-    ``convergence_metric`` m ∈ [0,1] (see normalized_convergence):
-    0 = fully converged → coast the full ``target_interval`` (low loop
+    ``distance_to_lock`` m ∈ [0,1] (see normalized_distance_to_lock):
+    0 = locked → coast the full ``target_interval`` (low loop
     bandwidth, trust the DO); 1 = far → ``min_interval`` (high
     bandwidth, correct every epoch).  Geometric taper:
 
@@ -481,7 +485,7 @@ def graded_interval(target_interval, convergence_metric, min_interval=1):
     preference).  The taper *is* the converging→tracking transition,
     done continuously.
     """
-    m = min(1.0, max(0.0, convergence_metric))
+    m = min(1.0, max(0.0, distance_to_lock))
     target = max(int(min_interval), int(target_interval))
     if target <= min_interval:
         return int(min_interval)

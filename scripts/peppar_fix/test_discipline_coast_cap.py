@@ -21,7 +21,7 @@ if _SCRIPTS_DIR not in sys.path:
 from peppar_fix.discipline import (
     coast_cap_from_tdev,
     coast_cap_from_p22,
-    normalized_convergence,
+    normalized_distance_to_lock,
     graded_interval,
 )
 
@@ -124,31 +124,31 @@ class CoastCapFromP22Test(unittest.TestCase):
         self.assertEqual(cap, 20)
 
 
-class NormalizedConvergenceTest(unittest.TestCase):
-    """Linear [converged,far] → [0,1] ramp; clamped, monotone."""
+class NormalizedDistanceToLockTest(unittest.TestCase):
+    """Linear [converged,far] → [0,1] ramp; 0=locked, 1=far; clamped, monotone."""
 
     def test_converged_floor(self):
-        self.assertEqual(normalized_convergence(0.05, 0.1, 1.0), 0.0)
-        self.assertEqual(normalized_convergence(0.1, 0.1, 1.0), 0.0)
+        self.assertEqual(normalized_distance_to_lock(0.05, 0.1, 1.0), 0.0)
+        self.assertEqual(normalized_distance_to_lock(0.1, 0.1, 1.0), 0.0)
 
     def test_far_ceiling(self):
-        self.assertEqual(normalized_convergence(1.0, 0.1, 1.0), 1.0)
-        self.assertEqual(normalized_convergence(5.0, 0.1, 1.0), 1.0)
+        self.assertEqual(normalized_distance_to_lock(1.0, 0.1, 1.0), 1.0)
+        self.assertEqual(normalized_distance_to_lock(5.0, 0.1, 1.0), 1.0)
 
     def test_midpoint(self):
-        m = normalized_convergence(0.55, 0.1, 1.0)
+        m = normalized_distance_to_lock(0.55, 0.1, 1.0)
         self.assertAlmostEqual(m, 0.5, places=6)
 
     def test_monotone(self):
         xs = [0.1, 0.3, 0.5, 0.7, 0.9]
-        ms = [normalized_convergence(x, 0.1, 1.0) for x in xs]
+        ms = [normalized_distance_to_lock(x, 0.1, 1.0) for x in xs]
         self.assertEqual(ms, sorted(ms))
 
     def test_invalid_range_raises(self):
         with self.assertRaises(ValueError):
-            normalized_convergence(0.5, 1.0, 1.0)
+            normalized_distance_to_lock(0.5, 1.0, 1.0)
         with self.assertRaises(ValueError):
-            normalized_convergence(0.5, 1.0, 0.5)
+            normalized_distance_to_lock(0.5, 1.0, 0.5)
 
 
 class GradedIntervalTest(unittest.TestCase):
@@ -204,14 +204,14 @@ class CompositionTest(unittest.TestCase):
         p22_cap = coast_cap_from_p22(
             1.0, lambda tau: (0.05 ** 2) * tau)                # 120 (max)
         target = min(drift_tau, int(min(tdev_cap, 1e9)), p22_cap)
-        m = normalized_convergence(0.08, 0.1, 1.0)             # converged
+        m = normalized_distance_to_lock(0.08, 0.1, 1.0)             # converged
         tau = graded_interval(target, m)
         self.assertEqual(tau, 120)
 
     def test_far_from_converged_corrects_fast(self):
         # Same quiet DO but far from converged → taper forces tight.
         target = 120
-        m = normalized_convergence(0.9, 0.1, 1.0)              # ~0.89
+        m = normalized_distance_to_lock(0.9, 0.1, 1.0)              # ~0.89
         tau = graded_interval(target, m)
         self.assertLessEqual(tau, 3)
 
