@@ -65,13 +65,25 @@ class DisciplineScheduler:
                  unconverge_factor=5.0,
                  error_history_len=300,
                  adjfine_history_len=300,
-                 phase_error_budget_ns=1.0):
+                 phase_error_budget_ns=1.0,
+                 coast_tdev=None,
+                 coast_cap_k_sigma=1.0):
         self.base_interval = base_interval
         self.adaptive = adaptive
         self.min_interval = min_interval
         self.max_interval = max_interval
         self.interval = base_interval
         self.phase_error_budget_ns = float(phase_error_budget_ns)
+
+        # longTauGnssCoupling coast-cap config (all optional; absent =
+        # today's drift-budget-only behavior).  coast_tdev = the DO's
+        # characterized FREERUN TDEV power law as
+        # (tdev_ref_ns, tdev_slope, tau_ref_s) — bounds the coast by the
+        # DO's stochastic wander, the piece √(2·T/D) ignores.  The
+        # sqrt(P22) cap + the graded taper come in per-call to
+        # compute_adaptive_interval() (they need the live EKF state).
+        self._coast_tdev = coast_tdev
+        self._coast_cap_k_sigma = float(coast_cap_k_sigma)
 
         self._errors = []
         self._confidences = []
@@ -312,21 +324,33 @@ class DisciplineScheduler:
         self._drift_rate_ns_per_s = abs(slope)
         self._sigma_obs_ns = sigma
 
-    def compute_adaptive_interval(self, measurement_sigma_ns=None):
-        """Compute optimal discipline interval τ from physical drift
-        budget.
+    def compute_adaptive_interval(self, measurement_sigma_ns=None,
+                                  p22_at_tau=None, distance_to_lock=None):
+        """Compute the discipline interval τ from the drift budget,
+        then bound it by the DO's stochastic wander (coast-cap) and
+        taper it by convergence (longTauGnssCoupling).
 
-        τ = √(2 · T_budget_ns / D_physical_ppb_per_s) clamped to
-        [min_interval, max_interval].
+        Baseline: τ = √(2 · T_budget_ns / D_physical_ppb_per_s).
+        A DO drifting at D ppb/s accumulates phase ∫(D·t)dt = D·t²/2;
+        solving D·τ²/2 ≤ T_budget gives τ = √(2·T_budget/D).  But that
+        budget only bounds the *deterministic* drift — a quiet DO
+        (D≈0) gets τ → max_interval and then coasts blind while its
+        *stochastic* phase wander accumulates (the tau~64–256 s hump).
 
-        Derivation: a DO drifting at D ppb/s has its frequency
-        deviation grow as D·t between corrections, accumulating
-        phase deviation ∫(D·t)dt = D·t²/2 (in ppb·s = ns).
-        Solving D·τ²/2 ≤ T_budget for τ gives τ_max = √(2·T_budget/D).
+        coast-caps bound that stochastic wander (only when configured;
+        absent ⇒ today's behavior, byte-identical):
+          - ``self._coast_tdev``: the DO's characterized freerun TDEV
+            power law → coast_cap_from_tdev.
+          - ``p22_at_tau(tau_s)→ns²``: a closure over the EKF's
+            predict-only P[2,2] growth → coast_cap_from_p22 (honest
+            only with Q-from-char; see qFromCharPerActuator).
 
-        Input-side σ_obs / residual-drift are still computed and
-        exported as diagnostics; ``measurement_sigma_ns`` arg is
-        retained for API back-compat but ignored.
+        ``distance_to_lock`` ∈ [0,1] (0=locked, 1=far) applies the
+        graded taper (graded_interval) — the continuous
+        converging→tracking transition that replaces the binary latch.
+
+        ``measurement_sigma_ns`` is retained for API back-compat but
+        ignored.
         """
         # Keep diagnostics fresh regardless of adaptive on/off.
         self._update_drift_rate_from_input()
@@ -340,19 +364,178 @@ class DisciplineScheduler:
         if len(self._adjfine_history) < _MIN_FIT_SAMPLES:
             return self.base_interval
 
-        # Quiet DO (drift below resolution) → τ = max_interval.
-        # _MIN_PHYSICAL_DRIFT_PPB_PER_S = 1e-9 is well below any real
-        # OCXO drift (~1e-5 ppb/s for aging) and protects against the
-        # √(T/0) blowup.
+        # Baseline τ from the deterministic drift budget.  Quiet DO
+        # (drift below resolution, _MIN ~1e-9 ppb/s, well under OCXO
+        # aging) ⇒ τ = max_interval — exactly the over-coast the
+        # coast-cap below must rein in.
         if self._d_physical_ppb_per_s < 1e-9:
-            self.interval = self.max_interval
-            return self.max_interval
+            tau = float(self.max_interval)
+        else:
+            tau = math.sqrt(2.0 * self.phase_error_budget_ns
+                            / self._d_physical_ppb_per_s)
 
-        # τ from physical drift budget.  Units: T_budget in ns,
-        # D in ppb/s = ns/s² (1 ppb = 1 ns/s).  So τ² has units of s².
-        tau_sec = math.sqrt(2.0 * self.phase_error_budget_ns
-                             / self._d_physical_ppb_per_s)
+        # Bound the coast by the DO's stochastic wander.
+        tau = self._apply_coast_caps(tau, p22_at_tau)
+
+        # Graded bandwidth taper by derived distance-to-lock.
+        if distance_to_lock is not None:
+            tau = graded_interval(tau, distance_to_lock, self.min_interval)
+
         tau = max(self.min_interval,
-                   min(self.max_interval, int(round(tau_sec))))
+                  min(self.max_interval, int(round(tau))))
         self.interval = tau
         return tau
+
+    def _apply_coast_caps(self, tau, p22_at_tau):
+        """Bound τ (seconds) by the DO's stochastic phase wander.
+
+        Each configured cap can only *shorten* the coast (min()); an
+        absent cap is a no-op.  coast_cap_from_tdev returns +inf when
+        the TDEV slope ≤ 0 (no growth) so min() leaves τ unchanged.
+        """
+        if self._coast_tdev is not None:
+            tdev_ref_ns, tdev_slope, tau_ref_s = self._coast_tdev
+            tau = min(tau, coast_cap_from_tdev(
+                self.phase_error_budget_ns, tdev_ref_ns, tdev_slope,
+                tau_ref_s=tau_ref_s, k_sigma=self._coast_cap_k_sigma))
+        if p22_at_tau is not None:
+            tau = min(tau, coast_cap_from_p22(
+                self.phase_error_budget_ns, p22_at_tau,
+                k_sigma=self._coast_cap_k_sigma,
+                min_tau_s=self.min_interval, max_tau_s=self.max_interval))
+        return tau
+
+
+# ---------------------------------------------------------------------------
+# longTauGnssCoupling — coast-cap + graded-taper policy primitives
+#
+# The deterministic drift budget above (τ = √(2·T/D)) bounds only the
+# *signed* aging/thermal ramp.  A quiet DO (D≈0) gets τ → max_interval,
+# but its *stochastic* phase wander (random-walk / white-FM) keeps
+# accumulating over a long coast — the tau~64-256 s TDEV hump observed
+# in the 2026-05-29 overnight runs (PiFace 6.4 ns @ 64 s, MadHat 3.6 ns
+# @ 256 s), precisely where the GNSS reference is at its best.
+#
+# These are pure functions: the building blocks the engine/sim compose
+# to (a) cap the coast by the DO's *stochastic* phase growth and (b)
+# replace the binary converging/tracking latch with a continuous taper.
+# They have no effect on DisciplineScheduler until wired — integration
+# is validated in closedLoopServoSim (charlie) before hardware.  The
+# sqrt(P22) path additionally requires the honest small Q from freerun
+# characterization (qFromCharPerActuator); with an inflated Q the cap
+# is spuriously tight.
+# ---------------------------------------------------------------------------
+
+def coast_cap_from_tdev(t_budget_ns, tdev_ref_ns, tdev_slope,
+                        tau_ref_s=1.0, k_sigma=1.0):
+    """Largest coast interval τ (s) whose characterized DO phase wander
+    stays within budget, from a power-law TDEV model.
+
+    Models the DO's *freerun* phase wander as
+
+        TDEV(τ) = tdev_ref_ns · (τ / tau_ref_s) ** tdev_slope
+
+    Common slopes: +0.5 white-FM, +1.0 flicker-FM, +1.5 random-walk-FM.
+    A slope ≤ 0 (white/flicker-PM, or a flat floor) means the wander
+    does not grow with τ → no coast constraint → returns +inf.
+
+    Solves  k_sigma · TDEV(τ) ≤ t_budget_ns  for the largest τ:
+
+        τ_cap = tau_ref_s · (t_budget_ns / (k_sigma·tdev_ref_ns))
+                          ** (1 / tdev_slope)
+
+    Returns float seconds (caller clamps to [min,max] and rounds).  Use
+    the DO's *characterized freerun* TDEV here, not the disciplined
+    output TDEV — the cap answers "how long can this oscillator coast
+    open-loop before its own noise floor exceeds budget", which is a
+    DO-class property (long for an OCXO, short for a TCXO).
+    """
+    if tdev_slope <= 0.0 or tdev_ref_ns <= 0.0 or k_sigma <= 0.0:
+        return float("inf")
+    ratio = t_budget_ns / (k_sigma * tdev_ref_ns)
+    if ratio <= 0.0:
+        return 0.0
+    return tau_ref_s * (ratio ** (1.0 / tdev_slope))
+
+
+def coast_cap_from_p22(t_budget_ns, p22_at_tau, k_sigma=1.0,
+                       min_tau_s=1, max_tau_s=120):
+    """Largest integer coast interval τ ∈ [min,max] whose projected
+    filter phase-state uncertainty stays within budget.
+
+    ``p22_at_tau(tau_s)`` → projected P[2,2] (ns²) of the DO phase state
+    after coasting ``tau_s`` seconds with no measurement update.  The
+    engine passes a closure over DOFreqEst's predict-only covariance
+    growth; this layer only needs the callable.
+
+    Returns the largest τ with  k_sigma · √(p22_at_tau(τ)) ≤ budget,
+    or ``min_tau_s`` if even the shortest coast is already over budget.
+
+    Assumes P22 grows monotonically with coast length (true under
+    predict-only EKF propagation): scans ascending and returns the τ
+    just before the first violation.  sqrt(P22) is the filter's own
+    honest accumulated-uncertainty estimate — but only in the
+    characterized small-Q regime (qFromCharPerActuator); an inflated Q
+    makes this cap spuriously tight.
+    """
+    if k_sigma <= 0.0 or t_budget_ns <= 0.0:
+        return min_tau_s
+    # Compare in variance space; a relative epsilon keeps the ≤ test
+    # honest at an exact boundary (e.g. 0.2²·25 == 1.0 up to float
+    # rounding) without admitting anything physically over budget.
+    budget_var = (t_budget_ns / k_sigma) ** 2 * (1.0 + 1e-9)
+    best = min_tau_s
+    for tau in range(int(min_tau_s), int(max_tau_s) + 1):
+        if p22_at_tau(tau) <= budget_var:
+            best = tau
+        else:
+            break
+    return best
+
+
+def normalized_distance_to_lock(metric_ns, converged_ns, far_ns):
+    """Map a raw convergence signal (√(P22) or σ_total, in ns) to a
+    [0,1] *distance-to-lock* — the single derived signal every
+    discipline policy reads (disciplineModeFsm reframe: continuous, not
+    a latched state).
+
+    Named for what the return value means: 0.0 = locked/converged,
+    1.0 = far from lock (NOT "fully converged" — naming-honesty, per
+    charlie's PR #80 review; docs/misnomers.md).
+
+    Linear ramp: ≤ ``converged_ns`` → 0.0 (locked, trust the DO);
+    ≥ ``far_ns`` → 1.0 (far, correct aggressively); linear between.
+    Continuous and monotone, so policies keyed on it cannot chatter on
+    enter/exit/re-enter the way a thresholded state can.
+
+    Requires far_ns > converged_ns ≥ 0.
+    """
+    if far_ns <= converged_ns:
+        raise ValueError("far_ns must exceed converged_ns")
+    frac = (metric_ns - converged_ns) / (far_ns - converged_ns)
+    return min(1.0, max(0.0, frac))
+
+
+def graded_interval(target_interval, distance_to_lock, min_interval=1):
+    """Continuously taper the coast interval by the derived
+    distance-to-lock — replaces the binary ``1 if converging else
+    interval`` latch (and the 1→120 s actuation cliff it creates).
+
+    ``distance_to_lock`` m ∈ [0,1] (see normalized_distance_to_lock):
+    0 = locked → coast the full ``target_interval`` (low loop
+    bandwidth, trust the DO); 1 = far → ``min_interval`` (high
+    bandwidth, correct every epoch).  Geometric taper:
+
+        τ_eff = round(target · (min/target) ** m)
+
+    Continuous and monotone in m, so — unlike the latch — it cannot
+    chatter on enter/exit/re-enter (Bob's emergent-not-event
+    preference).  The taper *is* the converging→tracking transition,
+    done continuously.
+    """
+    m = min(1.0, max(0.0, distance_to_lock))
+    target = max(int(min_interval), int(target_interval))
+    if target <= min_interval:
+        return int(min_interval)
+    tau = target * (float(min_interval) / target) ** m
+    return max(int(min_interval), min(target, int(round(tau))))

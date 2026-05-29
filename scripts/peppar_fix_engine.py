@@ -6930,6 +6930,27 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             log.warning("Could not derive DO process noise from "
                         "characterization: %s", e)
 
+    # longTauGnssCoupling coast-cap: derive the DO's freerun TDEV power
+    # law from its characterization so the scheduler can bound the coast
+    # by the DO's stochastic wander, not just the deterministic drift.
+    _coast_tdev = None
+    if getattr(args, 'coast_cap', False) and do_uid_local is not None:
+        try:
+            from peppar_fix.do_state import derive_coast_tdev_from_char
+            _ds_cc = load_do_state(do_uid_local)
+            if _ds_cc and _ds_cc.get('characterization'):
+                _coast_tdev = derive_coast_tdev_from_char(
+                    _ds_cc['characterization'])
+            if _coast_tdev is not None:
+                log.info("coast-cap: DO freerun TDEV(1s)=%.4f ns, slope=%+.3f",
+                         _coast_tdev[0], _coast_tdev[1])
+            else:
+                log.warning("coast-cap requested but no usable TDEV curve in "
+                            "characterization for %s — TDEV cap disabled "
+                            "(P22 cap still active)", do_uid_local)
+        except Exception as e:
+            log.warning("coast-cap: could not derive TDEV params: %s", e)
+
     _max_step = getattr(args, 'max_adjfine_step_ppb', None)
     _ocxo_gate = None
     if getattr(args, 'ocxo_trusted_gate', False) and do_uid_local is not None:
@@ -6984,6 +7005,8 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         settle_window=args.scheduler_settle_window,
         unconverge_factor=args.scheduler_unconverge_factor,
         phase_error_budget_ns=args.phase_error_budget_ns,
+        coast_tdev=_coast_tdev,
+        coast_cap_k_sigma=getattr(args, 'coast_cap_k_sigma', 1.0),
     )
 
     qerr_alignment = {
@@ -8222,7 +8245,14 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         # adjfine = |D_physical|; τ = √(2·budget/D).  See
         # schedulerCombinedDriftEstimator.
         scheduler.record_actuation(time.monotonic(), adjfine_ppb)
-        scheduler.compute_adaptive_interval()
+        if getattr(args, 'coast_cap', False):
+            # Precompute predict-only P[2,2] over the coast once; the
+            # coast-cap (coast_cap_from_p22) looks it up per candidate τ.
+            _p22 = servo.project_p22_coast(scheduler.max_interval)
+            scheduler.compute_adaptive_interval(
+                p22_at_tau=lambda t, _p=_p22: _p[min(int(t), len(_p) - 1)])
+        else:
+            scheduler.compute_adaptive_interval()
 
         if n_epochs % 10 == 0:
             log.info(f"  [{n_epochs}] EKF: "
@@ -10208,6 +10238,19 @@ Two-phase operation:
                        help="Consecutive corrections required to declare settled (default: 10)")
     servo.add_argument("--scheduler-unconverge-factor", type=float, default=5.0,
                        help="Re-enter convergence when error exceeds threshold*f (default: 5.0)")
+    servo.add_argument("--coast-cap", action="store_true", default=False,
+                       help="longTauGnssCoupling: bound the adaptive coast "
+                            "interval by the DO's STOCHASTIC wander, not just "
+                            "the deterministic drift budget.  Caps τ by the "
+                            "DO's characterized freerun TDEV and by the EKF's "
+                            "predict-only √(P22) (honest only with Q-from-char, "
+                            "qFromCharPerActuator).  Targets the τ~64-256 s "
+                            "long-τ hump.  Default off; validate in "
+                            "closedLoopServoSim before enabling on hardware.")
+    servo.add_argument("--coast-cap-k-sigma", type=float, default=1.0,
+                       help="Confidence factor on the coast-cap (k·TDEV(τ) and "
+                            "k·√(P22) ≤ budget).  >1 caps the coast shorter. "
+                            "Default 1.0.")
     servo.add_argument("--servo-log", default=None,
                        help="CSV log file for servo data")
     servo.add_argument("--track-max-ppb", type=float, default=None,
