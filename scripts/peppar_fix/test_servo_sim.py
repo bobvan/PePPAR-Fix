@@ -114,3 +114,94 @@ def test_determinism_same_seed():
 def test_unknown_preset_raises():
     with pytest.raises(KeyError):
         preset("nonesuch")
+
+
+# ── #110 router v2 A/B harness — qVIR-routed two-candidate ── #
+
+def _v2_sole_ticc_cfg(*, mode, ext_noise, override=None):
+    """Sole-TICC MadHat-like warm-start; mode in {'off','v1','v2'}."""
+    cfg = SimConfig(
+        label=f"{mode}-v2-ext{ext_noise}", duration_s=2000.0, seed=0,
+        use_ppp=False, use_qerr=False, use_tdcp=False,
+        use_extint=False, use_ticc=True,
+        rx_f0_ppb=16.0,
+        do_wfm_ppb=0.050, do_f0_ppb=-44.0,
+        initial_freq_ppb=44.0,
+        initial_phi_do_ns=0.5, initial_dt_rx_ns=0.0,
+        gate_sigma_ns=None,
+        ext_qerr_noise_ns=ext_noise,
+        ticc_ext_correlated_override=override)
+    if mode == 'v1':
+        cfg.routed_qerr_enabled = True
+    elif mode == 'v2':
+        cfg.router_v2_enabled = True
+    return cfg
+
+
+def _route_counts(sim):
+    from collections import Counter
+    skip = 300
+    routes = sim.last_routes[skip:]
+    return Counter(routes.tolist())
+
+
+def test_router_v2_clean_ext_routes_to_ext():
+    """F9T-clean ext (0.1 ns < 1 ns) → ticc_ext_correlated=True →
+    router picks 'ext' every epoch."""
+    sim = ClosedLoopSim(_v2_sole_ticc_cfg(mode='v2', ext_noise=0.1))
+    sim.run()
+    rc = _route_counts(sim)
+    assert rc.get('ext', 0) > 1000
+    assert rc.get('int', 0) == 0   # v2 has no internal candidate
+    assert rc.get('raw', 0) == 0
+
+
+def test_router_v2_noisy_ext_routes_to_raw():
+    """F10T-noisy ext (3 ns > 1 ns) → ticc_ext_correlated=False →
+    router falls back to 'raw' (NEVER to v1's 'internal')."""
+    sim = ClosedLoopSim(_v2_sole_ticc_cfg(mode='v2', ext_noise=3.0))
+    sim.run()
+    rc = _route_counts(sim)
+    assert rc.get('raw', 0) > 1000
+    assert rc.get('int', 0) == 0   # the v2 design guarantee
+    assert rc.get('ext', 0) == 0
+
+
+def test_router_v2_no_regression_vs_v1_at_clean_ext():
+    """Headline regression check bravo asked for: v2 must not be worse
+    than v1 in the F9T-clean regime where v1 was already optimal."""
+    sim_v1 = ClosedLoopSim(_v2_sole_ticc_cfg(mode='v1', ext_noise=0.1))
+    sim_v2 = ClosedLoopSim(_v2_sole_ticc_cfg(mode='v2', ext_noise=0.1))
+    res_v1 = sim_v1.run(); res_v2 = sim_v2.run()
+    inn_v1 = res_v1.ticc_innov_ns[~np.isnan(res_v1.ticc_innov_ns)]
+    inn_v2 = res_v2.ticc_innov_ns[~np.isnan(res_v2.ticc_innov_ns)]
+    rms_v1 = float(np.sqrt((inn_v1**2).mean()))
+    rms_v2 = float(np.sqrt((inn_v2**2).mean()))
+    # Allow tiny float drift; v2 should be within 10% of v1's RMS.
+    assert rms_v2 < rms_v1 * 1.1, f"v2 regressed: {rms_v2} vs v1 {rms_v1}"
+
+
+def test_router_v2_beats_v1_in_noisy_regime():
+    """The structural win: dropping 'internal' means v2's worst-case
+    fallback ('raw') is better than v1's worst-case fallback ('int'
+    via rx-TCXO leakage)."""
+    sim_v1 = ClosedLoopSim(_v2_sole_ticc_cfg(mode='v1', ext_noise=3.0))
+    sim_v2 = ClosedLoopSim(_v2_sole_ticc_cfg(mode='v2', ext_noise=3.0))
+    res_v1 = sim_v1.run(); res_v2 = sim_v2.run()
+    inn_v1 = res_v1.ticc_innov_ns[~np.isnan(res_v1.ticc_innov_ns)]
+    inn_v2 = res_v2.ticc_innov_ns[~np.isnan(res_v2.ticc_innov_ns)]
+    rms_v1 = float(np.sqrt((inn_v1**2).mean()))
+    rms_v2 = float(np.sqrt((inn_v2**2).mean()))
+    assert rms_v2 < rms_v1, (
+        f"expected v2 ({rms_v2}) better than v1 ({rms_v1}) in noisy regime")
+
+
+def test_router_v2_override_forces_decision():
+    """ticc_ext_correlated_override bypasses the noise-magnitude heuristic
+    so tests can pin the router to a specific branch."""
+    sim = ClosedLoopSim(_v2_sole_ticc_cfg(
+        mode='v2', ext_noise=0.1, override=False))   # clean but force not-correlated
+    sim.run()
+    rc = _route_counts(sim)
+    assert rc.get('raw', 0) > 1000   # forced to raw despite clean ext
+    assert rc.get('ext', 0) == 0
