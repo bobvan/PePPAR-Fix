@@ -50,7 +50,8 @@ from typing import Optional
 import numpy as np
 
 from peppar_fix.do_freq_est import DOFreqEst, _qerr
-from peppar_fix.discipline import coast_cap_from_p22
+from peppar_fix.discipline import (
+    coast_cap_from_p22, graded_interval, normalized_distance_to_lock)
 from peppar_fix.ocxo_trusted_gate import OcxoTrustedGate
 
 
@@ -113,6 +114,16 @@ class SimConfig:
     coast_cap_enabled: bool = False
     coast_cap_t_budget_ns: float = 5.0
     coast_cap_k_sigma: float = 1.0
+
+    # disciplineModeFsm graded-taper (bravo PR #92 + #94 composed).  When
+    # enabled, replace the binary 1→coast_every cliff at the converging
+    # boundary with a continuous taper of `distance_to_lock` derived from
+    # the EKF's √(P[2,2]).  Honest only with Q-from-char (#83); with an
+    # inflated Q, √P22 reads locked too early.  Composes with coast-cap:
+    # the taper produces the smooth approach, the cap bounds the ceiling.
+    graded_taper_enabled: bool = False
+    taper_converged_ns: float = 0.5
+    taper_far_ns: float = 5.0
 
     # DO (disciplined oscillator) truth-noise model.
     #   do_wpm_ns:   white phase modulation, per-sample σ (ns).
@@ -413,8 +424,19 @@ class ClosedLoopSim:
                     and abs(self.ekf.estimated_phase_ns) < c.coast_converge_ns
                     and self.ekf.freq_uncertainty_ppb < c.coast_converge_freq_ppb):
                 converged = True
-            effective_every = (min(coast_every, dyn_coast_every)
-                               if converged else 1)
+            # Coast-cap (when on) bounds the target; graded-taper (when
+            # on) smooths the approach to that bound.  Composing both is
+            # what my #92 A/B verdict showed restores baseline TDEV.
+            target_every = (min(coast_every, dyn_coast_every)
+                            if c.coast_cap_enabled else coast_every)
+            if c.graded_taper_enabled:
+                sqrt_p22 = math.sqrt(max(0.0, float(self.ekf.P[2, 2])))
+                m = normalized_distance_to_lock(
+                    sqrt_p22, c.taper_converged_ns, c.taper_far_ns)
+                effective_every = graded_interval(target_every, m,
+                                                  min_interval=1)
+            else:
+                effective_every = target_every if converged else 1
             if (k - last_correction_k) >= effective_every or k == 0:
                 gap_s = max(c.dt_s, (k - last_correction_k) * c.dt_s)
                 meas = self._emit()
