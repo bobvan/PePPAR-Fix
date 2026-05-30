@@ -4582,11 +4582,29 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
         "servo_outlier": 0,
         "obs_idle_holdover": 0,
         "obs_input_timeouts": 0,
-        "obs_deferred_stalls": 0,
+        # Renamed 2026-05-30 (was obs_deferred_stalls — misnomer logged in
+        # docs/misnomers.md "Pass — 2026-05-30").  One-shot alarm-fires for
+        # "obs queue has events but none correlatable to PPS this loop
+        # pass, AND args.obs_idle_timeout_s elapsed, AND alarm not already
+        # armed."  N over a run = N distinct correlation-gate alarm
+        # episodes, not N stalls.
+        "obs_uncorrelated_alarms": 0,
         "obs_dropped_expired": 0,
         "obs_dropped_queued": 0,
         "ticc_missing_pair": 0,
         "catastrophic": 0,    # FixedPosFilter catastrophic-reject (Note B)
+        # Main-loop CPU-stall observability.  Every epoch with dt above
+        # ordinary jitter buckets into one or more counters; max_stall_s
+        # records the worst dt observed in the run.  Buckets:
+        # gt_1.5s catches mild stalls (above ordinary jitter), gt_5s
+        # catches notable stalls, gt_30s matches the gap-recovery
+        # trigger.  Distribution and max are visible at a glance in the
+        # periodic Skip stats log.  Companion: ticc.Ticc emits a
+        # parallel chB-stall warning when its serial reader stalls.
+        "n_stalls_gt_1.5s": 0,
+        "n_stalls_gt_5s": 0,
+        "n_stalls_gt_30s": 0,
+        "max_stall_s": 0.0,
         "consumption_alarm": False,
     }
     # PPP-AR belongs in AntPosEst (the background PPPFilter that refines
@@ -4717,7 +4735,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                         stall_s >= args.obs_idle_timeout_s and
                         not deferred_alarm
                     ):
-                        skip_stats["obs_deferred_stalls"] += 1
+                        skip_stats["obs_uncorrelated_alarms"] += 1
                         log.warning(
                             "Observation pipeline stalled without holdover: reason=obs_received_but_deferred "
                             "stalled_for=%.1fs queued=%d input_quiet_for=%.1fs",
@@ -4843,6 +4861,20 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     log.warning(f"Suspicious dt={dt:.1f}s, skipping")
                     prev_t = gps_time
                     continue
+                # Main-loop CPU-stall accounting (every epoch above
+                # ordinary jitter).  Counters surface in the periodic
+                # Skip stats log so the operator sees the stall
+                # distribution + worst-case at a glance.  Above 30 s
+                # also triggers gap_recovery below; 5–30 s is logged as
+                # a warning (was silent until now); 1.5–5 s as info.
+                if dt > 1.5:
+                    skip_stats["n_stalls_gt_1.5s"] += 1
+                    if dt > 5:
+                        skip_stats["n_stalls_gt_5s"] += 1
+                    if dt > 30:
+                        skip_stats["n_stalls_gt_30s"] += 1
+                    if dt > skip_stats["max_stall_s"]:
+                        skip_stats["max_stall_s"] = dt
                 if dt > 30:
                     # Gap recovery: reset filter time but don't skip the
                     # epoch.  Clamp predict to 1s so the OTHER states don't
@@ -4860,6 +4892,18 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     filt.predict(1.0)
                     gap_recovery_this_epoch = True
                 else:
+                    if dt > 5:
+                        # Sub-gap-recovery stall.  No re-anchor needed
+                        # (PR drift over 5–30 s is within the filter's
+                        # predict(dt) handling), but the operator should
+                        # see it — sub-30 s stalls were silent until now.
+                        log.warning(
+                            "Main-loop stall: dt=%.1fs "
+                            "(sub-gap-recovery, predict(dt))", dt)
+                    # Sub-5 s stalls are captured in n_stalls_gt_1.5s for
+                    # the periodic Skip stats summary; no per-epoch log
+                    # line (would be noisy on a host that flutters near
+                    # jitter — per bravo's #101 review).
                     filt.predict(dt)
             prev_t = gps_time
 
