@@ -7552,6 +7552,13 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         'tdcp_sigma_ppb': float(getattr(args, 'tdcp_sigma_ppb', 0.13)),
         'holdover_state': init_holdover(args),
         'holdover_log_counter': 0,
+        # disciplineModeFsm objects — owned by _setup_servo's scope,
+        # consumed per-epoch by _servo_epoch.  PRs #92/#95/#103/#107
+        # forgot to thread them through ctx; bare-name references in
+        # _servo_epoch raised NameError on first servo epoch any time
+        # --graded-taper was set (lab repro 2026-05-30 PiFace/MadHat).
+        'convergence': _convergence,
+        'binary_layer': _binary_layer,
     }
 
     # ── Optional noise-buffer CSV (I-162848 Step 1) ───────────────── #
@@ -8395,6 +8402,11 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         _pseudo_phase_ns = None
         _pseudo_phase_sigma_ns = None
         _ho = ctx.get('holdover_state')
+        # disciplineModeFsm objects threaded via ctx from _setup_servo
+        # (2026-05-30 lab fix — PRs #92/#95/#103/#107 left these as
+        # bare-name references in this scope, NameError on first epoch).
+        _convergence = ctx.get('convergence')
+        _binary_layer = ctx.get('binary_layer')
         if _ho is not None:
             _hw_healthy = (extint_phase_ns is not None or
                            ticc_diff_ns is not None)
