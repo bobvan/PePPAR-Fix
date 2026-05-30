@@ -6998,6 +6998,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         base_freq=bootstrap_base_freq,
         max_step_ppb=_max_step if _max_step and _max_step > 0 else None,
         ocxo_trusted_gate=_ocxo_gate,
+        routed_qerr=getattr(args, 'routed_qerr_arm', False),
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
              "sigma_do=[%.4f ns, %.4f ppb], "
@@ -8191,6 +8192,9 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             ticc_sigma_ns=ticc_sigma_ns,
             pseudo_phase_ns=_pseudo_phase_ns,
             pseudo_phase_sigma_ns=_pseudo_phase_sigma_ns,
+            ticc_qerr_ns=(qerr_for_ticc_pps_ns
+                          if getattr(args, 'routed_qerr_arm', False)
+                          else None),
         )
         # ── --arm-state-log: post-update DOFreqEst state vector ─────
         _arm_w = ctx.get('arm_state_log_writer')
@@ -10361,6 +10365,15 @@ Two-phase operation:
     servo.add_argument("--ocxo-trusted-min-age", type=float, default=60.0,
                        help="OCXO gate disabled for the first N seconds of "
                             "filter life (bootstrap protection).  Default 60.")
+    servo.add_argument("--routed-qerr-arm", action="store_true",
+                       help="Route each TICC edge (per-edge chi²) to "
+                            "external-qErr-corrected, internal-qerr(x[0]), "
+                            "or raw — whichever is consistent.  A mis-"
+                            "correlated external qErr is a tick-scale chi² "
+                            "outlier → falls through to raw, so chi² is the "
+                            "correlation-quality detector (no qVIR gate).  "
+                            "Needs the honest small Q (from DO char) to "
+                            "discriminate tick mismatches.  Default off.")
     servo.add_argument("--servo-input", choices=("default", "tdcp"),
                        default="default",
                        help="Servo-input mode.  'default' = today's 4-arm "
