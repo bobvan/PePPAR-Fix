@@ -6962,6 +6962,40 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         except Exception as e:
             log.warning("coast-cap: could not derive TDEV params: %s", e)
 
+    # Charlie's #93 sim caveat: --coast-cap fails silently open when
+    # t_budget is too loose vs the natural √P22(max_tau) AND TDEV(max_tau)
+    # growth — the cap predicate never engages and divergence re-emerges.
+    # Assess at startup and warn (don't refuse — operator may have
+    # intentionally loose budget for other reasons).
+    if getattr(args, 'coast_cap', False):
+        from peppar_fix.discipline import assess_coast_cap_safety
+        _safety = assess_coast_cap_safety(
+            t_budget_ns=args.phase_error_budget_ns,
+            max_tau_s=args.max_interval,
+            sigma_do_phase_ns=sigma_do_phase_ns_eff,
+            sigma_do_freq_ppb=sigma_do_freq_ppb_eff,
+            coast_tdev=_coast_tdev,
+            k_sigma=getattr(args, 'coast_cap_k_sigma', 1.0),
+        )
+        if _safety['ok']:
+            log.info("coast-cap safety: p22_active=%s tdev_active=%s "
+                     "√P22(max)=%.2f ns",
+                     _safety['p22_cap_active'],
+                     _safety['tdev_cap_active'],
+                     _safety['p22_sqrt_max_ns'])
+        else:
+            log.warning(
+                "coast-cap: t_budget=%.2f ns is TOO LOOSE — neither the P22 "
+                "cap (√P22(%ds)=%.2f ns) nor the TDEV cap (%s ns) will "
+                "engage within max_tau; --coast-cap will fail open and "
+                "divergence will re-emerge.  Recommend t_budget ≤ %.2f ns "
+                "for the cap to be active at the current Q + max_interval.",
+                args.phase_error_budget_ns,
+                args.max_interval, _safety['p22_sqrt_max_ns'],
+                ("%.2f" % _safety['tdev_at_max_ns']
+                 if _safety['tdev_at_max_ns'] is not None else "N/A"),
+                _safety['advised_max_budget_ns'])
+
     _max_step = getattr(args, 'max_adjfine_step_ppb', None)
     _ocxo_gate = None
     if getattr(args, 'ocxo_trusted_gate', False) and do_uid_local is not None:

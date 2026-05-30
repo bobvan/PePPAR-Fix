@@ -493,6 +493,91 @@ def coast_cap_from_p22(t_budget_ns, p22_at_tau, k_sigma=1.0,
     return best
 
 
+def assess_coast_cap_safety(t_budget_ns, max_tau_s, sigma_do_phase_ns,
+                            sigma_do_freq_ppb, coast_tdev=None,
+                            k_sigma=1.0, margin=2.0):
+    """Will the coast-cap actually engage at this t_budget, or fail open?
+
+    Charlie's #93 sim A/B finding: with t_budget too loose vs the
+    natural √P22(max_tau) growth, ``coast_cap_from_p22`` returns
+    ``max_tau`` (predicate never satisfied) — i.e., the cap is silently
+    inactive, and a coast-divergence regime that #86 nominally
+    protects against re-emerges (Charlie at sigma_do_freq=0.01,
+    t_budget=20 ns, max_tau=120: DIVERGES because k·√P22 never reaches
+    20 ns within 120 s).  The TDEV cap fails open the same way when
+    t_budget > k·TDEV(max_tau).
+
+    The lab-safety question is: do EITHER cap engage within ``max_tau``
+    at the current ``t_budget``, with the suggested ``margin`` (2×)?
+    If neither, ``--coast-cap`` is on the books but doing nothing —
+    the engine should WARN at startup.
+
+    P22 max-growth from clean steady state (Q-only, ignoring initial P):
+
+        Var(φ, τ) ≈ σ_phase² · τ + σ_freq² · τ³ / 3
+
+    (phase RW direct + freq RW integrated into phase via F[2,3] = −dt;
+    units check: σ_freq in ppb/√s = ns/s/√s so σ_freq² · τ³ is ns²).
+    Useful at startup before the EKF has run; gives the natural-growth
+    ceiling without needing live state.
+
+    TDEV cap reach at max_tau, for the configured power law:
+
+        TDEV(max_tau) = tdev_ref · (max_tau / tau_ref) ** slope
+
+    Active iff slope > 0 and k · TDEV(max_tau) ≥ margin · t_budget.
+
+    Args:
+        t_budget_ns: ``phase_error_budget_ns`` (same budget feeds both caps).
+        max_tau_s: scheduler ``max_interval``.
+        sigma_do_phase_ns: DOFreqEst Q[2,2]^0.5 (ns/√s).
+        sigma_do_freq_ppb:  DOFreqEst Q[3,3]^0.5 (ppb/√s).
+        coast_tdev: optional (tdev_ref_ns, tdev_slope, tau_ref_s).
+        k_sigma: confidence factor matching the caps' k_sigma.
+        margin: required safety margin (default 2.0, per charlie).
+
+    Returns dict:
+        ok                — True iff at least one cap engages.
+        p22_sqrt_max_ns   — √Var(φ, max_tau) from Q-only growth.
+        p22_cap_active    — k·p22_sqrt_max_ns ≥ margin·t_budget.
+        tdev_at_max_ns    — TDEV(max_tau) if coast_tdev else None.
+        tdev_cap_active   — k·tdev_at_max_ns ≥ margin·t_budget (or None).
+        advised_max_budget_ns — largest t_budget where SOME cap is
+                                still active, given the supplied
+                                margin (k·max_reach/margin).
+    """
+    out = {}
+    # P22 max-growth (Q-only).
+    var_phase = (sigma_do_phase_ns ** 2) * float(max_tau_s)
+    var_freq = (sigma_do_freq_ppb ** 2) * (float(max_tau_s) ** 3) / 3.0
+    sqrt_max = math.sqrt(max(0.0, var_phase + var_freq))
+    out["p22_sqrt_max_ns"] = sqrt_max
+    out["p22_cap_active"] = (
+        k_sigma * sqrt_max >= margin * t_budget_ns and t_budget_ns > 0)
+
+    # TDEV cap reach at max_tau (when configured + growing).
+    out["tdev_at_max_ns"] = None
+    out["tdev_cap_active"] = None
+    if coast_tdev is not None:
+        tdev_ref_ns, tdev_slope, tau_ref_s = coast_tdev
+        if (tdev_slope > 0 and tdev_ref_ns > 0 and tau_ref_s > 0
+                and max_tau_s > 0):
+            tdev_at_max = tdev_ref_ns * (
+                (float(max_tau_s) / float(tau_ref_s)) ** tdev_slope)
+            out["tdev_at_max_ns"] = tdev_at_max
+            out["tdev_cap_active"] = (
+                k_sigma * tdev_at_max >= margin * t_budget_ns)
+
+    out["ok"] = bool(out["p22_cap_active"]) or bool(out["tdev_cap_active"])
+
+    # Largest budget at which SOME cap is still active.
+    max_reach = sqrt_max
+    if out["tdev_at_max_ns"] is not None:
+        max_reach = max(max_reach, out["tdev_at_max_ns"])
+    out["advised_max_budget_ns"] = k_sigma * max_reach / max(margin, 1e-12)
+    return out
+
+
 def normalized_distance_to_lock(metric_ns, converged_ns, far_ns):
     """Map a raw convergence signal (√(P22) or σ_total, in ns) to a
     [0,1] *distance-to-lock* — the single derived signal every
