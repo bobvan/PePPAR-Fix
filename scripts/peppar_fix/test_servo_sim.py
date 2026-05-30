@@ -114,3 +114,67 @@ def test_determinism_same_seed():
 def test_unknown_preset_raises():
     with pytest.raises(KeyError):
         preset("nonesuch")
+
+
+# ── #107 binary-layer A/B harness — gross-fault detector + holdover ── #
+
+_DROP = (300.0, 600.0)
+
+
+def _binary_layer_cfg(*, in_holdover=False, enabled=True):
+    """PiFace-preset short A/B: 300s of dropped measurements forces
+    sustained distance_to_lock=1.0; toggle in_holdover to test
+    suppression."""
+    return preset(
+        "piface-ungated", duration_s=800.0,
+        drop_measurements_window_s=_DROP,
+        in_holdover_window_s=(_DROP if in_holdover else None),
+        binary_layer_enabled=enabled,
+        binary_layer_consec_max_epochs=60)
+
+
+def test_binary_layer_disabled_records_no_faults():
+    """Feature off ⇒ no events recorded even when distance_to_lock
+    saturates during the drop window."""
+    sim = ClosedLoopSim(_binary_layer_cfg(enabled=False))
+    sim.run()
+    assert sim.gross_fault_events == []
+
+
+def test_binary_layer_fires_outside_holdover():
+    """Sustained distance_to_lock=1.0 outside holdover ⇒ at least one
+    gross_fault, first firing after consec_max_epochs from window
+    start (drop@300 + ~14s P22 saturation + 60s consec = ~374s)."""
+    sim = ClosedLoopSim(_binary_layer_cfg(in_holdover=False))
+    sim.run()
+    assert len(sim.gross_fault_events) >= 1, "expected at least one fault"
+    t_first, _p22 = sim.gross_fault_events[0]
+    assert 360.0 <= t_first <= 420.0, (
+        f"first fault at {t_first}s, expected ~374s post-window-start")
+
+
+def test_binary_layer_suppressed_in_holdover():
+    """Same drop window but with in_holdover=True for its duration ⇒
+    the layer must not fire even though distance_to_lock=1.0 sustains."""
+    sim = ClosedLoopSim(_binary_layer_cfg(in_holdover=True))
+    sim.run()
+    assert sim.gross_fault_events == [], (
+        f"expected suppression, got {len(sim.gross_fault_events)} fault(s)")
+
+
+def test_binary_layer_reset_preserves_actuator_command():
+    """servo.reset() default-preserves the actuator command (DO keeps
+    coasting at last good freq while the filter rebuilds).  Adjfine
+    should be byte-identical across the reset epoch."""
+    sim = ClosedLoopSim(_binary_layer_cfg(in_holdover=False))
+    res = sim.run()
+    assert sim.gross_fault_events, "test prerequisite: needs ≥1 fault"
+    t_fault = sim.gross_fault_events[0][0]
+    idx = int(t_fault / sim.cfg.dt_s)
+    # Compare adjfine one step before and one step after the reset
+    # epoch.  Reset preserves _last_u / freq, so the next applied
+    # adjfine is the same value.
+    pre = float(res.adjfine_ppb[idx - 1])
+    post = float(res.adjfine_ppb[idx + 1])
+    assert abs(post - pre) < 1e-9, (
+        f"adjfine changed across reset: pre={pre}, post={post}")

@@ -49,6 +49,7 @@ from typing import Optional
 
 import numpy as np
 
+from peppar_fix.binary_layer import BinaryLayer
 from peppar_fix.do_freq_est import DOFreqEst, _qerr
 from peppar_fix.discipline import (
     coast_cap_from_p22, graded_interval, normalized_distance_to_lock)
@@ -124,6 +125,28 @@ class SimConfig:
     graded_taper_enabled: bool = False
     taper_converged_ns: float = 0.5
     taper_far_ns: float = 5.0
+
+    # disciplineModeFsm #107 binary layer A/B harness.  When enabled,
+    # construct a BinaryLayer (bravo's gross-fault detector), compute
+    # distance_to_lock per epoch from the same √(P[2,2]) anchors as the
+    # graded-taper, and call evaluate(distance_to_lock, in_holdover)
+    # each epoch.  On 'gross_fault' the sim calls servo.reset() (the
+    # in-process reset path) and binary_layer.clear_after_reset() —
+    # the same call sequence as the engine wiring at
+    # peppar_fix_engine.py: _binary_layer.evaluate / servo.reset /
+    # _convergence.reset / _binary_layer.clear_after_reset.
+    #
+    # To induce sustained distance_to_lock=1.0 deterministically, use
+    # drop_measurements_window_s = (t_start, t_end): for epochs inside
+    # the window the sim skips emitting measurements (the EKF runs
+    # predict-only, P[2,2] grows, distance_to_lock climbs to 1.0).
+    # in_holdover_window_s flips the in_holdover input to True during
+    # its window — overlap the two for the suppression A/B (holdover
+    # → no reset); use drop alone for the gross-fault A/B (reset).
+    binary_layer_enabled: bool = False
+    binary_layer_consec_max_epochs: int = 60
+    drop_measurements_window_s: Optional[tuple] = None
+    in_holdover_window_s: Optional[tuple] = None
 
     # DO (disciplined oscillator) truth-noise model.
     #   do_wpm_ns:   white phase modulation, per-sample σ (ns).
@@ -339,6 +362,13 @@ class ClosedLoopSim:
             ocxo_trusted_gate=gate,
             routed_qerr=cfg.routed_qerr_enabled)
         self.adjfine = cfg.initial_freq_ppb
+        # Binary layer for the gross-fault A/B (#107 consumption).
+        self.binary_layer = BinaryLayer(
+            consec_max_epochs=cfg.binary_layer_consec_max_epochs,
+            enabled=cfg.binary_layer_enabled)
+        # Per-epoch gross-fault event log; populated only when the
+        # binary layer fires.  Tests assert on the length + timestamps.
+        self.gross_fault_events: list = []
 
     # ── plant ──
     def _step_truth(self, dt: float, adjfine: float):
@@ -446,13 +476,23 @@ class ClosedLoopSim:
                                                   min_interval=1)
             else:
                 effective_every = target_every if converged else 1
+            t_now = k * c.dt_s
+            in_drop_win = (c.drop_measurements_window_s is not None
+                           and c.drop_measurements_window_s[0]
+                           <= t_now <= c.drop_measurements_window_s[1])
             if (k - last_correction_k) >= effective_every or k == 0:
                 gap_s = max(c.dt_s, (k - last_correction_k) * c.dt_s)
-                meas = self._emit()
-                # dt handed to the filter is the gap since the last
-                # correction, so its predict grows P over the whole coast.
-                meas["dt"] = gap_s
-                self.adjfine = -self.ekf.update(**meas)
+                if in_drop_win:
+                    # Predict-only correction: P grows, no arm fires,
+                    # adjfine unchanged.  Induces sustained
+                    # distance_to_lock=1.0 for the binary-layer A/B.
+                    self.ekf.update(dt=gap_s)
+                else:
+                    meas = self._emit()
+                    # dt handed to the filter is the gap since the last
+                    # correction; predict grows P over the coast.
+                    meas["dt"] = gap_s
+                    self.adjfine = -self.ekf.update(**meas)
                 last_correction_k = k
                 if self.ekf.last_arm_innov.get("ticc") is not None:
                     innov[k] = self.ekf.last_arm_innov["ticc"]
@@ -489,6 +529,26 @@ class ClosedLoopSim:
             if c.adjfine_lsb_ppb > 0:
                 applied = round(applied / c.adjfine_lsb_ppb) * c.adjfine_lsb_ppb
             self._step_truth(c.dt_s, applied)
+
+            # disciplineModeFsm #107 binary-layer per-epoch evaluation.
+            # Mirrors the engine's call sequence at engine:8334-8360:
+            # compute distance_to_lock from √(P[2,2]) with the taper
+            # anchors, query the holdover state, evaluate; on
+            # 'gross_fault' call servo.reset() (preserves the actuator
+            # command) + binary_layer.clear_after_reset().  Default off
+            # (BinaryLayer.evaluate returns None when disabled).
+            if c.binary_layer_enabled:
+                sqrt_p22 = math.sqrt(max(0.0, float(self.ekf.P[2, 2])))
+                d2l = normalized_distance_to_lock(
+                    sqrt_p22, c.taper_converged_ns, c.taper_far_ns)
+                in_holdover = (c.in_holdover_window_s is not None
+                               and c.in_holdover_window_s[0]
+                               <= t_s[k] <= c.in_holdover_window_s[1])
+                if self.binary_layer.evaluate(d2l, in_holdover) == "gross_fault":
+                    self.gross_fault_events.append(
+                        (float(t_s[k]), sqrt_p22))
+                    self.ekf.reset()
+                    self.binary_layer.clear_after_reset()
 
         # Routed-qErr diagnostics: per-epoch S for chi² computation +
         # the per-epoch route selection ('ext'/'int'/'raw').  Attached to
