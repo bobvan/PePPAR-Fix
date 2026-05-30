@@ -33,6 +33,27 @@ exit** (including on ^C / unhandled exception), so the script is
 safe to interrupt without leaving the host's clock in a wrong
 state.
 
+**Caveat (SIGKILL):** the restore runs in a ``try/finally``, which
+covers Ctrl-C and unhandled exceptions but **not** ``SIGKILL`` —
+if the script is killed hard mid-capture, the adjfine stays at
+the parked value and the host's drift file is wrong by however
+much the engine had it offset.  Inherent limitation of in-process
+restore.  If you SIGKILL this script, also restart the engine —
+its bootstrap re-applies the drift-file freq.
+
+**During-capture caveat (operator-visible):** ``--park-adjfine-ppb
+0`` (the default = true freerun) means the DO runs at its
+uncorrected crystal rate for the full ``--duration-s``.  On a
+TCXO host with a non-zero freerun offset (TimeHat i226: ~-41 ppb)
+that's a ~150 µs phase drift over a 3600 s capture.  The prior
+adjfine is restored on exit, but during the capture the DO has
+visibly drifted relative to GPS.  This is intentional — the
+characterization captures the free-run noise floor — but if the
+host is currently serving downstream consumers, pass
+``--park-adjfine-ppb VAL`` with the host's calibrated freerun-
+correction value (from ``calibrate_do.py`` or the engine's drift
+file) to park at the GPS-aligned offset instead.
+
 Usage:
     sudo ~/peppar-fix/venv/bin/python ~/peppar-fix/scripts/do_freerun_char_phc.py \\
         --ptp-device /dev/ptp_i226 \\
