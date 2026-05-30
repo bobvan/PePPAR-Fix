@@ -369,7 +369,8 @@ class Ticc:
     """
 
     def __init__(self, port: str, baud: int = 115200,
-                 wait_for_boot: bool = True):
+                 wait_for_boot: bool = True,
+                 chb_stall_threshold_s: float = 1.5):
         self.port = port
         self.baud = baud
         self.wait_for_boot = wait_for_boot
@@ -379,6 +380,19 @@ class Ticc:
             sigma_scale=4.0,
         )
         self._shared_port = _get_shared_port(self.port, self.baud)
+        # chB host_monotonic stall watchdog (CPU-starvation indicator).
+        # chB fires at 1 Hz; a delta >> 1 s between consecutive recv_mono
+        # stamps means the serial-reader thread didn't run for that
+        # long — i.e. CPU stall on the engine host.  Counters are
+        # exposed as instance attributes so consumers (e.g. the engine
+        # status log) can surface cumulative state.  Warnings are
+        # emitted inline so each stall lands in the run log as it
+        # happens.  Companion: peppar_fix_engine.run_steady_state
+        # tracks main-loop stalls in `skip_stats[n_stalls_gt_*]`.
+        self.chb_stall_threshold_s = float(chb_stall_threshold_s)
+        self._last_chb_recv_mono: float | None = None
+        self.n_chb_stalls: int = 0
+        self.max_chb_stall_s: float = 0.0
 
     def __enter__(self) -> "Ticc":
         # Exclusive access is enforced by the serial port's TIOCEXCL
@@ -414,6 +428,11 @@ class Ticc:
                 continue
             ref_sec = int(m.group(1))
             ref_ps = int(m.group(2).ljust(12, '0'))
+            # chB stall watchdog — see __init__ comment.  Fires only on
+            # chB (1 Hz cadence) to avoid the chA/chB interleave producing
+            # spurious "stalls" from same-second pair ordering.
+            if m.group(3) == 'chB':
+                self._observe_chb_event(recv_mono)
             base_confidence = estimate_correlation_confidence(
                 queue_remains=queue_remains,
                 parse_age_s=0.0,
@@ -440,3 +459,27 @@ class Ticc:
                 ),
                 estimator_residual_s=estimator_sample["residual_s"],
             )
+
+    def _observe_chb_event(self, recv_mono: float) -> None:
+        """Update chB stall watchdog state and emit a warning if the
+        interval since the previous chB exceeds the configured
+        threshold.  Pulled out of ``iter_events`` so unit tests can
+        exercise it without mocking the serial port.
+
+        Initial call (``_last_chb_recv_mono is None``) bootstraps the
+        timer; no warning can fire from the very first chB sample
+        because there's no previous to compare against.
+        """
+        if self._last_chb_recv_mono is not None:
+            delta = recv_mono - self._last_chb_recv_mono
+            if delta > self.chb_stall_threshold_s:
+                self.n_chb_stalls += 1
+                if delta > self.max_chb_stall_s:
+                    self.max_chb_stall_s = delta
+                log.warning(
+                    "[TICC] chB stall: %.2fs since last chB "
+                    "(threshold %.2fs); cum n=%d max=%.2fs",
+                    delta, self.chb_stall_threshold_s,
+                    self.n_chb_stalls, self.max_chb_stall_s,
+                )
+        self._last_chb_recv_mono = recv_mono
