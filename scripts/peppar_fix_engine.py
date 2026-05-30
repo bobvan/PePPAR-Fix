@@ -4900,9 +4900,10 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                         log.warning(
                             "Main-loop stall: dt=%.1fs "
                             "(sub-gap-recovery, predict(dt))", dt)
-                    elif dt > 1.5:
-                        log.info(
-                            "Main-loop minor stall: dt=%.1fs", dt)
+                    # Sub-5 s stalls are captured in n_stalls_gt_1.5s for
+                    # the periodic Skip stats summary; no per-epoch log
+                    # line (would be noisy on a host that flutters near
+                    # jitter — per bravo's #101 review).
                     filt.predict(dt)
             prev_t = gps_time
 
