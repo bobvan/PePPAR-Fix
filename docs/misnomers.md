@@ -454,6 +454,48 @@ signals.
 when next touching `do_freerun_char.py`'s writer, with a back-compat
 read alias (`char.get("signals") or char.get("sources")`), not as a
 standalone rename.
+## Pass — 2026-05-30
+
+Found during the clkPoC3 4-exit-5 overnight investigation
+(`day0529-gapfix-clkpoc3`).
+
+### `skip_stats["obs_deferred_stalls"]` — Misleading
+
+**Where**: `scripts/peppar_fix_engine.py:4584` (init in the
+`skip_stats` dict) and `:4719` (increment).  Surfaced in the
+periodic `Skip stats` INFO log.
+**Claim**: A count of observation-pipeline stalls deferred for
+re-processing.  Reader naturally parses it as "how many stalls
+has this run seen."
+**Actual**: A count of **alarm fires** for the specific
+condition "obs queue has events but none can be correlated to
+PPS this loop pass, AND `args.obs_idle_timeout_s` has elapsed
+since the last usable obs, AND the alarm isn't already armed."
+One-shot per episode — the `deferred_alarm` boolean blocks
+further increments until a successful obs resets it at the
+top of the next correlatable iteration.  So `N` over a run
+means N **distinct correlation-gate alarm episodes**, not N
+stalls and not N seconds of stall.
+**Why it matters**: On the clkPoC3 overnight (2026-05-30), the
+engine experienced multiple 30+ s main-loop freezes (16
+`Gap dt=` events absorbed by the gap-recovery path plus 4
+exit-5 cascades), and this counter showed `0` across every
+Skip-stats sample — leading to "wait, are we even counting
+stalls?" before realising the counter measures one specific
+correlation-gate alarm, not CPU starvation or general stalls.
+The log message at the same site is accurate
+(`reason=obs_received_but_deferred`); only the dict key
+oversells.
+**Proposed**: `obs_uncorrelated_alarms` — concise, keeps the
+`obs_` prefix for parity with sibling counters, and the
+`_alarms` suffix correctly conveys one-shot-per-episode (not
+per epoch).  Alternative: `obs_correlation_stall_alarms` if
+explicitness is preferred.
+**Notes**: Two occurrences, both in the same function in
+`peppar_fix_engine.py`.  Rename deferred to the in-flight
+CPU-stall observability work — that PR adds new counters to
+this same `skip_stats` dict and is the natural opportunistic
+touch.
 
 ## Adding to this list
 
