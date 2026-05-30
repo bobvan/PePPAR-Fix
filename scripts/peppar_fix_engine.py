@@ -7173,7 +7173,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             log.info("Binary layer ENABLED: gross-fault reset after %d "
                      "consecutive epochs at distance_to_lock=1.0 "
                      "(outside holdover)",
-                     _binary_layer._consec_max)
+                     _binary_layer.consec_max_epochs)
 
     qerr_alignment = {
         # Litmus 1: EXTTS PPS + qErr (matched to EXTTS epoch)
@@ -8353,7 +8353,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                     "for %d epochs outside holdover — resetting EKF "
                     "(actuator preserved at freq=%.3f ppb); "
                     "cumulative resets=%d",
-                    _binary_layer._consec_max,
+                    _binary_layer.consec_max_epochs,
                     servo.freq,
                     _binary_layer.n_gross_fault_resets + 1)
                 servo.reset()

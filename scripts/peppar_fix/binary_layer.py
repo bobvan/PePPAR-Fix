@@ -69,6 +69,11 @@ class BinaryLayer:
         """Current consecutive-at-max count (read-only, for observability)."""
         return self._consec
 
+    @property
+    def consec_max_epochs(self) -> int:
+        """Configured trigger threshold (consecutive epochs at max)."""
+        return self._consec_max
+
     def evaluate(self, distance_to_lock: Optional[float],
                  in_holdover: bool) -> Optional[str]:
         """Per-epoch evaluation.

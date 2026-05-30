@@ -295,6 +295,16 @@ class DOFreqEst:
         ``initial_dt_rx_ns`` defaults to None ⇒ rebuild the wider
         (uninitialised-tcxo) bootstrap covariance.  Pass a known
         dt_rx_ns to keep the tighter 4-state covariance.
+
+        POST-RESET ACTUATOR DYNAMICS: the command is preserved AT THE
+        INSTANT OF RESET (self.freq / _last_u carry forward), but
+        subsequent ``update()`` calls operate on a freshly-bootstrapped
+        wider-P filter — the LQR can step normally as it re-acquires.
+        L3 actuator rate-limit (``max_step_ppb``, #91) bounds the
+        per-epoch swing during that recovery window; if it's disabled,
+        the first few post-reset adjfine commands can be larger than
+        steady-state.  This is intentional (the filter needs latitude
+        to re-converge).
         """
         if initial_freq is None:
             initial_freq = self.freq
