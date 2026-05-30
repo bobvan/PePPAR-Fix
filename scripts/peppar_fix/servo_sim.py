@@ -139,6 +139,16 @@ class SimConfig:
     # hosts.
     gnss_pps_jitter_ns: float = 2.3
 
+    # routedQErrArm (bravo PR #79).  When True, the sim emits an
+    # external-qErr stream alongside TICC (modelling the F9T's TIM-TP
+    # sub-tick report) and DOFreqEst's per-edge chi² router picks
+    # 'ext'/'int'/'raw' per epoch.  ext_qerr_noise_ns models the
+    # receiver-specific quality of that report: ~0.1 ns for F9T (clean
+    # → 'ext' wins), ~3 ns for F10T (noisy → router falls back to
+    # 'raw').  Default off preserves the single internal-qerr path.
+    routed_qerr_enabled: bool = False
+    ext_qerr_noise_ns: float = 0.1
+
     # Actuator (PHC adjfine / DAC) quantization step in ppb.  The servo
     # commands a continuous adjfine; the hardware applies the nearest
     # representable value.  The filter's predict uses the COMMANDED
@@ -287,10 +297,16 @@ class ClosedLoopSim:
             sigma_tcxo_freq_ppb=cfg.sigma_tcxo_freq_ppb,
             tick_ns=cfg.tick_ns,
             initial_freq=cfg.initial_freq_ppb,
-            base_freq=0.0,
+            # Pass the same value as base_freq so x[3] (DO freq estimate)
+            # seeds to -initial_freq_ppb.  Hardcoding 0 made every
+            # non-zero initial_freq_ppb start the filter with x[3]=0
+            # disagreeing with truth — fine for cold-start A/Bs, broken
+            # for warm-start scenarios like routedQErrArm's MadHat config.
+            base_freq=cfg.initial_freq_ppb,
             initial_dt_rx_ns=cfg.initial_dt_rx_ns,
             max_step_ppb=cfg.max_step_ppb,
-            ocxo_trusted_gate=gate)
+            ocxo_trusted_gate=gate,
+            routed_qerr=cfg.routed_qerr_enabled)
         self.adjfine = cfg.initial_freq_ppb
 
     # ── plant ──
@@ -343,6 +359,12 @@ class ClosedLoopSim:
             m["ticc_diff_ns"] = (-t.phi_do - _qerr(edge, c.tick_ns)
                                  + rng.normal(0.0, c.sigma_ticc_ns))
             m["ticc_sigma_ns"] = c.sigma_ticc_ns
+            # External qErr stream — the F9T/F10T's TIM-TP report of
+            # its own sub-tick at this edge.  qerr() of the actual edge
+            # plus receiver-specific reporting noise.
+            if c.routed_qerr_enabled:
+                m["ticc_qerr_ns"] = (_qerr(edge, c.tick_ns)
+                                     + rng.normal(0.0, c.ext_qerr_noise_ns))
         return m
 
     def run(self) -> SimResult:
@@ -355,7 +377,10 @@ class ClosedLoopSim:
         est_phi = np.empty(n)
         est_f = np.empty(n)
         innov = np.full(n, np.nan)
+        innov_s = np.full(n, np.nan)
         rejected = np.zeros(n, dtype=bool)
+        routes = np.empty(n, dtype=object)
+        routes[:] = ""
 
         coast_every = max(1, int(round(c.coast_interval_s / c.dt_s)))
         converged = (coast_every == 1)
@@ -383,7 +408,11 @@ class ClosedLoopSim:
                 last_correction_k = k
                 if self.ekf.last_arm_innov.get("ticc") is not None:
                     innov[k] = self.ekf.last_arm_innov["ticc"]
+                    _s = self.ekf.last_arm_S.get("ticc")
+                    if _s is not None:
+                        innov_s[k] = _s
                 rejected[k] = self.ekf.last_ocxo_gate_rejected
+                routes[k] = getattr(self.ekf, "last_ticc_route", "int")
 
             t_s[k] = k * c.dt_s
             phi_do[k] = self.truth.phi_do
@@ -402,6 +431,12 @@ class ClosedLoopSim:
                 applied = round(applied / c.adjfine_lsb_ppb) * c.adjfine_lsb_ppb
             self._step_truth(c.dt_s, applied)
 
+        # Routed-qErr diagnostics: per-epoch S for chi² computation +
+        # the per-epoch route selection ('ext'/'int'/'raw').  Attached to
+        # the instance (don't bloat SimResult; only the routed_qerr A/B
+        # consumes them).
+        self.last_innov_s = innov_s
+        self.last_routes = routes
         return SimResult(
             t_s=t_s, phi_do_true_ns=phi_do, phi_rx_true_ns=phi_rx,
             adjfine_ppb=adj, est_phi_do_ns=est_phi, est_f_do_ppb=est_f,
