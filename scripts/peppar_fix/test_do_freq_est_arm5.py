@@ -127,7 +127,7 @@ def test_arm5_after_reset_starts_clean():
     f.update(dt=1.0, tdcp_freq_ppb=0.5, tdcp_freq_sigma_ppb=0.026)
     assert abs(f.x[1]) > 1e-3  # pulled toward 0.5
 
-    f.reset(current_freq=0.0)
+    f.reset(initial_freq=0.0)
     assert f.x[1] == 0.0
 
 
