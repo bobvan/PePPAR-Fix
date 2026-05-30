@@ -67,6 +67,16 @@ class DisciplineConvergence:
         in √(P22).  Read by every consumer policy."""
         return self._distance_to_lock
 
+    def reset(self) -> None:
+        """Reset ``distance_to_lock`` to 1.0 (bootstrap = far from lock).
+
+        Called by the binary layer (disciplineModeFsm #4) immediately
+        after a gross-fault reset of the EKF.  Without this, the
+        cached signal would carry the diverged filter's value forward
+        into the freshly-reset state, defeating the reset.
+        """
+        self._distance_to_lock = 1.0
+
     def update_from_p22(self, p22_ns_sq):
         """Recompute the signal from the EKF DO-phase variance P[2,2]
         (units ns²).  Returns the new ``distance_to_lock``.

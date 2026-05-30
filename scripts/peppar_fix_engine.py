@@ -7153,6 +7153,28 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                  "converged=%.3f ns, far=%.3f ns (ratio=%.1fx)",
                  args.phase_error_budget_ns, _far_ns, _far_ratio)
 
+    # disciplineModeFsm increment #4: binary layer.  Watches the
+    # convergence signal for sustained-at-max outside holdover →
+    # in-process gross-fault reset (replaces the exit-5 wrapper
+    # relaunch path).  Default-off; needs --graded-taper to have a
+    # signal to watch.  Truthful only on honest Q[3,3] (#83).
+    _binary_layer = None
+    if getattr(args, 'gross_fault_reset', False):
+        from peppar_fix.binary_layer import BinaryLayer
+        if _convergence is None:
+            log.warning("--gross-fault-reset requested without "
+                        "--graded-taper; no convergence signal to "
+                        "watch — binary layer DISABLED.")
+        else:
+            _binary_layer = BinaryLayer(
+                enabled=True,
+                consec_max_epochs=getattr(args,
+                                          'gross_fault_consec_epochs', 60))
+            log.info("Binary layer ENABLED: gross-fault reset after %d "
+                     "consecutive epochs at distance_to_lock=1.0 "
+                     "(outside holdover)",
+                     _binary_layer.consec_max_epochs)
+
     qerr_alignment = {
         # Litmus 1: EXTTS PPS + qErr (matched to EXTTS epoch)
         "pps_var": RunningVarianceWindow(),
@@ -8312,6 +8334,32 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                     )
             else:
                 ctx['holdover_log_counter'] = 0
+        # disciplineModeFsm increment #4 — binary layer: gross-fault
+        # detector + in-process reset, suppressed during holdover.
+        # Runs BEFORE servo.update so a known-broken filter doesn't
+        # see this epoch's measurements; the reset preserves the
+        # actuator command (DO continues coasting at its last good
+        # freq while the filter rebuilds).  No-op when
+        # --gross-fault-reset / --graded-taper absent.
+        if _binary_layer is not None:
+            _in_holdover = (_ho is not None and _ho.in_holdover())
+            _distance_for_layer = (
+                _convergence.distance_to_lock
+                if _convergence is not None else None)
+            if _binary_layer.evaluate(_distance_for_layer,
+                                      _in_holdover) == "gross_fault":
+                log.warning(
+                    "[GROSS_FAULT_RESET] distance_to_lock=1.0 sustained "
+                    "for %d epochs outside holdover — resetting EKF "
+                    "(actuator preserved at freq=%.3f ppb); "
+                    "cumulative resets=%d",
+                    _binary_layer.consec_max_epochs,
+                    servo.freq,
+                    _binary_layer.n_gross_fault_resets + 1)
+                servo.reset()
+                _convergence.reset()
+                _binary_layer.clear_after_reset()
+
         # disciplineModeFsm increment #3 wiring (cf. #95 deferred
         # follow-up): pass the cached convergence signal into the
         # per-arm gate.  Reads _convergence.distance_to_lock (the
@@ -10449,6 +10497,23 @@ Two-phase operation:
                             "Sets the taper's steepness — small = steeper "
                             "(reaches min_interval sooner as √(P22) grows).  "
                             "Default 10.0 (to be sim-pinned).")
+    servo.add_argument("--gross-fault-reset", action="store_true",
+                       default=False,
+                       help="disciplineModeFsm increment #4 (binary layer): "
+                            "in-process EKF reset when distance_to_lock=1.0 "
+                            "is sustained outside holdover.  Replaces the "
+                            "exit-5 wrapper-relaunch path for filter "
+                            "divergence; preserves the actuator command "
+                            "(DO continues coasting at last good freq while "
+                            "the filter rebuilds).  Requires --graded-taper "
+                            "to have a signal to watch.  Default off; "
+                            "validate in closedLoopServoSim before enabling.")
+    servo.add_argument("--gross-fault-consec-epochs", type=int, default=60,
+                       help="How many consecutive epochs at "
+                            "distance_to_lock=1.0 (outside holdover) before "
+                            "--gross-fault-reset fires.  Default 60 (60 s at "
+                            "1 Hz cadence).  Lower = more aggressive resets; "
+                            "higher = more tolerance of transient divergence.")
     servo.add_argument("--servo-log", default=None,
                        help="CSV log file for servo data")
     servo.add_argument("--track-max-ppb", type=float, default=None,

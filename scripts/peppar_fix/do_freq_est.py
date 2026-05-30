@@ -277,6 +277,64 @@ class DOFreqEst:
         else:
             return np.array([[0.0, 0.0, -1.0, 0.0]])
 
+    def reset(self, *, initial_freq=None, initial_dt_rx_ns=None):
+        """In-process reset of the EKF state — re-init x, P, and the
+        per-epoch innovation/route history.  Preserves the actuator
+        command (via ``initial_freq``; default = self.freq, i.e. the
+        last commanded adjfine) and ALL configured Q/R/B/F/L (this is
+        a state reset, not a re-configure).
+
+        Used by the binary layer (disciplineModeFsm #4) when the
+        gross-fault detector fires — sustained distance_to_lock=1.0
+        outside holdover.  The replacement for the exit-5 wrapper-
+        relaunch path: the DO continues coasting at its last good freq
+        while the filter rebuilds.  Cumulative diagnostic counters
+        (n_route_*, innov_monitor) are preserved so the operator can
+        see history across resets.
+
+        ``initial_dt_rx_ns`` defaults to None ⇒ rebuild the wider
+        (uninitialised-tcxo) bootstrap covariance.  Pass a known
+        dt_rx_ns to keep the tighter 4-state covariance.
+
+        POST-RESET ACTUATOR DYNAMICS: the command is preserved AT THE
+        INSTANT OF RESET (self.freq / _last_u carry forward), but
+        subsequent ``update()`` calls operate on a freshly-bootstrapped
+        wider-P filter — the LQR can step normally as it re-acquires.
+        L3 actuator rate-limit (``max_step_ppb``, #91) bounds the
+        per-epoch swing during that recovery window; if it's disabled,
+        the first few post-reset adjfine commands can be larger than
+        steady-state.  This is intentional (the filter needs latitude
+        to re-converge).
+        """
+        if initial_freq is None:
+            initial_freq = self.freq
+        phi_tcxo_init = (initial_dt_rx_ns if initial_dt_rx_ns is not None
+                         else 0.0)
+        # Same convention as __init__: crystal_freq drives x[3] (DO
+        # freq estimate); _last_u drives the LQR step.  At steady
+        # state both are initial_freq → f_do + u = 0.
+        crystal_freq = initial_freq
+        self.x = np.array(
+            [phi_tcxo_init, 0.0, 0.0, -crystal_freq])
+        if initial_dt_rx_ns is not None:
+            self.P = np.diag([100.0**2, 10.0**2, 5000.0**2, 1.0**2])
+            self._tcxo_initialized = True
+        else:
+            self.P = np.diag([1e6, 100.0**2, 1000.0**2, 100.0**2])
+            self._tcxo_initialized = False
+        self._last_u = initial_freq
+        self.freq = initial_freq
+        # Clear per-epoch innovation/diagnostics so the next epoch's
+        # arm-state CSV row reflects "no arm has fired yet on the
+        # post-reset filter" (vs stale entries from the diverged run).
+        self.last_innov = 0.0
+        for _k in self.last_arm_innov:
+            self.last_arm_innov[_k] = None
+            self.last_arm_S[_k] = None
+        self.last_ocxo_gate_rejected = False
+        self.last_ocxo_gate_reason = ""
+        self.last_ticc_route = "int"
+
     def project_p22_coast(self, max_tau_s):
         """Predict-only P[2,2] (ns²) for coasting 1..max_tau_s seconds.
 
@@ -700,16 +758,6 @@ class DOFreqEst:
         x_new = x_pred + K.flatten() * innov
         P_new = P_pred - np.outer(K.flatten(), K.flatten()) * S
         return x_new, P_new
-
-    def reset(self, current_freq):
-        self.x = np.array([0.0, 0.0, 0.0, 0.0])
-        self.P = np.diag([1e6, 100.0**2, 1000.0**2, 100.0**2])
-        self._last_u = 0.0
-        self._tcxo_initialized = False
-        self.freq = current_freq
-        self.innov_monitor.reset()
-        self.last_innov = 0.0
-        self.last_S = 0.0
 
     @property
     def estimated_phase_ns(self):
