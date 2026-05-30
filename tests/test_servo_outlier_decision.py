@@ -115,6 +115,35 @@ class ServoOutlierDecisionTests(unittest.TestCase):
         self.assertEqual(out, "ok")
         self.assertIsNone(exit5)
 
+    def test_converging_resets_accumulated_cascade(self):
+        # Bravo's #109 review catch: the original inline code reset
+        # consecutive_outliers in the catchall else, which covered the
+        # converging branch.  Re-entering convergence means prior
+        # cascade state is stale and should be thrown away — without
+        # this reset, the cascade resumes from its accumulated value
+        # when the scheduler exits convergence mode.
+        self.ctx["consecutive_outliers"] = 25
+        out, _ = engine._servo_outlier_decision(
+            self.ctx,
+            outlier_observable_ns=500.0,
+            track_outlier_ns=100.0,
+            converging=True,
+            gap_recovery=False,
+        )
+        self.assertEqual(out, "ok")
+        self.assertEqual(self.ctx["consecutive_outliers"], 0)
+        # A subsequent non-converging outlier starts at 1, not 26.
+        out2, exit5_2 = engine._servo_outlier_decision(
+            self.ctx,
+            outlier_observable_ns=500.0,
+            track_outlier_ns=100.0,
+            converging=False,
+            gap_recovery=False,
+        )
+        self.assertEqual(out2, "outlier")
+        self.assertFalse(exit5_2)
+        self.assertEqual(self.ctx["consecutive_outliers"], 1)
+
     def test_in_range_resets_counter(self):
         self.ctx["consecutive_outliers"] = 5
         out, exit5 = engine._servo_outlier_decision(

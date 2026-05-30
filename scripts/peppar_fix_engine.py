@@ -7857,6 +7857,16 @@ def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
     if track_outlier_ns is None:
         return ("ok", None)
     if converging:
+        # Convergence mode forgives accumulated cascade: a deliberate
+        # state-change (glide, step, re-converge) makes prior outlier
+        # state stale.  Matches the pre-refactor inline code's
+        # catchall ``else: ctx['consecutive_outliers'] = 0`` that
+        # also covered the converging branch.  Without this reset, a
+        # cascade-counter that almost tripped before entering
+        # convergence would resume from its accumulated value on
+        # exit instead of starting fresh.  Caught by bravo's #109
+        # review.
+        ctx['consecutive_outliers'] = 0
         return ("ok", None)
     if abs(outlier_observable_ns) <= track_outlier_ns:
         ctx['consecutive_outliers'] = 0
