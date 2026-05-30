@@ -459,7 +459,13 @@ standalone rename.
 Found during the clkPoC3 4-exit-5 overnight investigation
 (`day0529-gapfix-clkpoc3`).
 
-### `skip_stats["obs_deferred_stalls"]` — Misleading
+### ~~`skip_stats["obs_deferred_stalls"]` — Misleading~~
+
+**FIXED** 2026-05-30 — renamed to `obs_uncorrelated_alarms` in PR
+#101 (`534ee5f`), opportunistically alongside the CPU-stall
+observability counters in the same `skip_stats` dict.  Entry kept
+(struck through) per the audit-history rule in the file footer.
+
 
 **Where**: `scripts/peppar_fix_engine.py:4584` (init in the
 `skip_stats` dict) and `:4719` (increment).  Surfaced in the
