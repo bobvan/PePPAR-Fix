@@ -8268,6 +8268,20 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                     )
             else:
                 ctx['holdover_log_counter'] = 0
+        # disciplineModeFsm increment #3 wiring: thread the derived
+        # continuous convergence signal into servo.update so the OCXO
+        # gate's per-arm engagement (PR #95) is exercised end-to-end.
+        # _convergence is created when --graded-taper is on (PR #92);
+        # otherwise None ⇒ gate falls through to its legacy age-based
+        # path.  Read the persisted .distance_to_lock — the gate is
+        # making its accept/reject decision PRE-update, so the
+        # previous epoch's value is the right input; the existing
+        # scheduler-side wiring still calls update_from_p22 AFTER
+        # servo.update to advance the signal for the next epoch.
+        _distance_for_gate = (
+            _convergence.distance_to_lock
+            if _convergence is not None else None
+        )
         adjfine_ppb = -servo.update(
             dt=dt_actual,
             dt_rx_ns=dt_rx_ns_arg, dt_rx_sigma_ns=dt_rx_sigma_arg,
@@ -8283,6 +8297,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             ticc_qerr_ns=(qerr_for_ticc_pps_ns
                           if getattr(args, 'routed_qerr_arm', False)
                           else None),
+            distance_to_lock=_distance_for_gate,
         )
         # ── --arm-state-log: post-update DOFreqEst state vector ─────
         _arm_w = ctx.get('arm_state_log_writer')
