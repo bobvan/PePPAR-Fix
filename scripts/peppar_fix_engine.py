@@ -6907,13 +6907,30 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                  bootstrap_base_freq, current_adj,
                  current_adj - bootstrap_base_freq)
 
-    # doProcessNoiseFromChar-main: override sigma_do_{phase,freq} from
-    # measured DO characterization when available.  Defaults (0.92 ns,
-    # args.kalman_sigma_freq) describe a generic PHC + TCXO; real OCXO
-    # noise floors are 10-100× tighter, and the gap drives over-
-    # aggressive servo response.  Falls back to defaults if no char or
-    # extraction fails.
-    sigma_do_phase_ns_eff = 0.92
+    # doProcessNoiseFromChar / qFromCharPerActuator: prefer process
+    # noise derived from a measured DO characterization; fall back to a
+    # PER-ACTUATOR-TYPE floor (not a universal 0.92 ns literal) only
+    # when no char exists.
+    #
+    # The real win is the char-derived path below: a freerun char now
+    # drives Q[3,3] (sigma_do_freq) from the rising-ADEV (RWFM) tail —
+    # the coast/convergence knob (Main, qFromCharPerActuator).  Q[3,3],
+    # not Q[2,2] (phase), governs coast P-growth: the freq-state
+    # uncertainty integrates into phase (Var_φ≈q_f·τ³/3), so an
+    # under-set Q[3,3] makes the filter overconfident and diverge on a
+    # long coast.
+    #
+    # The fallback below is per-actuator-STRUCTURED but currently
+    # behavior-preserving (same values for all types) — NOT inventing a
+    # pessimistic uncharacterized-OCXO freq constant here.  The honest
+    # path for an OCXO host is to run do_freerun_char so Q comes from
+    # ADEV.  Differentiating the uncharacterized-OCXO floor is a
+    # follow-up that needs a measured value or an agreed constant +
+    # closedLoopServoSim validation, not a guess.
+    _PHASE_FALLBACK_NS = 0.92
+    _q_phase_source = f"fallback[{actuator_type}]"
+    _q_freq_source = f"fallback[{actuator_type}]"
+    sigma_do_phase_ns_eff = _PHASE_FALLBACK_NS
     sigma_do_freq_ppb_eff = args.kalman_sigma_freq
     if do_uid_local is not None:
         try:
@@ -6931,6 +6948,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                                  p, derived.get('sigma_do_phase_source'),
                                  sigma_do_phase_ns_eff)
                         sigma_do_phase_ns_eff = p
+                        _q_phase_source = derived.get('sigma_do_phase_source')
                     if f is not None:
                         log.info("DOFreqEst: sigma_do_freq override from "
                                  "characterization: %.4f ppb/√s (source=%s, "
@@ -6938,9 +6956,14 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                                  f, derived.get('sigma_do_freq_source'),
                                  sigma_do_freq_ppb_eff)
                         sigma_do_freq_ppb_eff = f
+                        _q_freq_source = derived.get('sigma_do_freq_source')
         except Exception as e:
             log.warning("Could not derive DO process noise from "
                         "characterization: %s", e)
+    log.info("DOFreqEst Q: sigma_do_phase=%.4f ns/√s (%s), "
+             "sigma_do_freq=%.4f ppb/√s (%s)",
+             sigma_do_phase_ns_eff, _q_phase_source,
+             sigma_do_freq_ppb_eff, _q_freq_source)
 
     # longTauGnssCoupling coast-cap: derive the DO's freerun TDEV power
     # law from its characterization so the scheduler can bound the coast

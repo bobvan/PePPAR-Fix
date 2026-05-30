@@ -398,6 +398,63 @@ spherical-harmonic sums it would compute are inlined in
 `gmf_at` and `GMFProvider.__init__`.  Author's leftover —
 remove next time the file is touched.
 
+## 2026-05-29 — qFromCharPerActuator audit
+
+### `"adjfine"` characterization source key — Misleading
+
+**Where**: `scripts/peppar_fix/do_state.py` (`derive_do_process_noise`,
+the `sources.get("adjfine")` read for `sigma_do_freq`); synthetic
+test fixtures in `test_do_process_noise.py`.
+**Claim**: `adjfine` is the Linux PTP `clock_adjtime` fine-frequency
+adjustment — a **PHC-specific** mechanism.  As a characterization
+source key it implies "the PHC adjfine command stream".
+**Actual**: the concept it stands for is actuator-agnostic — the
+frequency-steering command (ppb) applied to the DO, whether by PHC
+adjfine, DAC code, or ClockMatrix FCW.  The abstraction already
+exists: `FrequencyActuator.adjust_frequency_ppb(ppb)`
+(`phc_actuator.py` / `dac_actuator.py` / `clockmatrix_actuator.py`).
+Naming the source after one hardware mechanism leaks PHC details into
+a level that should be hardware-neutral.
+**Why it matters**: on DAC/ClockMatrix hosts (most DOs now), there is
+no "adjfine"; a reader expecting that key on those hosts is confused,
+and a future characterization writer would have to choose between an
+honest key and the legacy one.  (Aggravating: nothing currently
+*writes* an `"adjfine"` source — freerun chars write
+`"DO PPS (chA vs TICC Rb)"` — so the read path is also vestigial.)
+**Proposed**: `"freq_command"` (Bob, 2026-05-29) — the commanded
+frequency offset, ppb, hardware-neutral.  Reserve "adjfine" strictly
+for PHC contexts.
+**Notes**: opportunistically adopted in `do_state.py` on the
+qFromCharPerActuator branch — `derive_do_process_noise` now reads
+`"freq_command"` as primary, `"adjfine"` as a back-compat alias.  When
+a characterization tool starts writing the actuator-command noise, it
+should use `"freq_command"`.
+
+### characterization `"sources"` dict — Misleading
+
+**Where**: top-level key in the DO characterization JSON.  Written by
+`do_freerun_char.py:403`; read by `do_state.py:291`,
+`peppar_fix_engine.py:5810`, `ocxo_trusted_gate.py:157`,
+`validate_ocxo_gate_phase4.py:106`, `analyze_discipline_noise.py:234`.
+**Claim**: "sources" — reads as source-vs-sink (a source of commands /
+data flow).
+**Actual**: it's a dict of *characterized signals* — each entry is a
+recorded signal plus its noise statistics (ASD/TDEV/ADEV).  "Source"
+here means only "source of characterization samples."  Worse, one
+entry (`freq_command`/`adjfine`) is a recording of a signal that flows
+to an actuator **sink**, so a sink-bound signal lives under "sources"
+— Bob (2026-05-29): "I think of it as a sink... so I still don't
+understand what it means to 'get' adjfine."
+**Why it matters**: invites the reader to interpret control-loop
+direction where none is meant; obscures that these are just measured
+signals.
+**Proposed**: `"signals"` (or `"characterized_signals"`).
+**Notes**: DEFERRED — larger blast radius than an opportunistic fix
+(1 writer + 5 readers + persisted state JSONs on lab hosts).  Do it
+when next touching `do_freerun_char.py`'s writer, with a back-compat
+read alias (`char.get("signals") or char.get("sources")`), not as a
+standalone rename.
+
 ## Adding to this list
 
 When you find another candidate while doing other work, add

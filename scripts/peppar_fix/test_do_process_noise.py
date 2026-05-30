@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import unittest
 
 from peppar_fix.do_state import derive_do_process_noise
@@ -134,7 +135,19 @@ class _PhaseExtraction(unittest.TestCase):
 
 class _FreqExtraction(unittest.TestCase):
 
-    def test_adjfine_used_when_present(self):
+    def test_freq_command_used_when_present(self):
+        # Hardware-neutral actuator-command key (misnomers.md 2026-05-29).
+        char = {
+            "sources": {
+                "freq_command": {"units": "ppb", "asd_at_0.1Hz": 0.005},
+            },
+        }
+        out = derive_do_process_noise(char)
+        self.assertEqual(out["sigma_do_freq_ppb"], 0.005)
+        self.assertEqual(out["sigma_do_freq_source"], "freq_command")
+
+    def test_adjfine_legacy_alias_still_read(self):
+        # Back-compat: old characterizations keyed "adjfine".
         char = {
             "sources": {
                 "adjfine": {"units": "ppb", "asd_at_0.1Hz": 0.005},
@@ -143,6 +156,17 @@ class _FreqExtraction(unittest.TestCase):
         out = derive_do_process_noise(char)
         self.assertEqual(out["sigma_do_freq_ppb"], 0.005)
         self.assertEqual(out["sigma_do_freq_source"], "adjfine")
+
+    def test_freq_command_preferred_over_adjfine(self):
+        char = {
+            "sources": {
+                "freq_command": {"units": "ppb", "asd_at_0.1Hz": 0.003},
+                "adjfine": {"units": "ppb", "asd_at_0.1Hz": 0.009},
+            },
+        }
+        out = derive_do_process_noise(char)
+        self.assertEqual(out["sigma_do_freq_ppb"], 0.003)
+        self.assertEqual(out["sigma_do_freq_source"], "freq_command")
 
     def test_adjfine_wrong_units(self):
         char = {
@@ -195,6 +219,99 @@ class _RealisticInput(unittest.TestCase):
         # adjfine gives freq
         self.assertEqual(out["sigma_do_freq_ppb"], 0.005)
         self.assertEqual(out["sigma_do_freq_source"], "adjfine")
+
+
+class _FreqFromAdev(unittest.TestCase):
+    """Q[3,3] (sigma_do_freq) from the rising-ADEV (RWFM) tail when a
+    freerun char has no adjfine source — the qFromCharPerActuator gap.
+
+    RWFM: σ_y²(τ)=q·τ/3 ⇒ sigma_do_freq_ppb = √3·ADEV(τ)·1e9/√τ,
+    evaluated at the largest τ.
+    """
+
+    def test_freq_from_adev_rwfm_formula(self):
+        char = {"sources": {
+            "DO PPS (chA vs TICC Rb)": {
+                "units": "ns", "asd_at_0.1Hz": 0.054,
+                "adev_by_tau_s": {"100.0": 1e-11}}}}
+        out = derive_do_process_noise(char)
+        self.assertAlmostEqual(out["sigma_do_freq_ppb"],
+                               math.sqrt(3.0) * 1e-3, places=9)
+        self.assertIn("adev@100", out["sigma_do_freq_source"])
+        self.assertIn("RWFM", out["sigma_do_freq_source"])
+
+    def test_adev_uses_largest_tau(self):
+        char = {"sources": {
+            "DO PPS (chA vs TICC Rb)": {
+                "units": "ns", "asd_at_0.1Hz": 0.054,
+                "adev_by_tau_s": {"1.0": 2e-11, "100.0": 5e-12,
+                                  "1024.0": 3e-11}}}}
+        out = derive_do_process_noise(char)
+        self.assertAlmostEqual(
+            out["sigma_do_freq_ppb"],
+            math.sqrt(3.0) * 3e-11 * 1e9 / math.sqrt(1024.0), places=9)
+        self.assertIn("1024", out["sigma_do_freq_source"])
+
+    def test_adjfine_preferred_over_adev(self):
+        char = {"sources": {
+            "adjfine": {"units": "ppb", "asd_at_0.1Hz": 0.005},
+            "DO PPS (chA vs TICC Rb)": {
+                "units": "ns", "asd_at_0.1Hz": 0.054,
+                "adev_by_tau_s": {"1024.0": 3e-11}}}}
+        out = derive_do_process_noise(char)
+        self.assertEqual(out["sigma_do_freq_ppb"], 0.005)
+        self.assertEqual(out["sigma_do_freq_source"], "adjfine")
+
+    def test_adev_skips_nonfinite_and_nonpositive(self):
+        char = {"sources": {
+            "DO PPS (chA vs TICC Rb)": {
+                "units": "ns", "asd_at_0.1Hz": 0.054,
+                "adev_by_tau_s": {"1.0": 1e-11, "10.0": 0.0,
+                                  "100.0": -1.0, "50.0": "nan"}}}}
+        out = derive_do_process_noise(char)
+        # Only τ=1.0 is valid → uses it.
+        self.assertAlmostEqual(out["sigma_do_freq_ppb"],
+                               math.sqrt(3.0) * 1e-11 * 1e9, places=9)
+        self.assertIn("adev@1", out["sigma_do_freq_source"])
+
+    def test_no_adev_no_adjfine_no_freq(self):
+        char = {"sources": {
+            "DO PPS (chA vs TICC Rb)": {
+                "units": "ns", "asd_at_0.1Hz": 0.054}}}
+        out = derive_do_process_noise(char)
+        self.assertIn("sigma_do_phase_ns", out)
+        self.assertNotIn("sigma_do_freq_ppb", out)
+
+    def test_adev_from_non_chosen_phase_source(self):
+        # Carrier wins phase but has no ADEV; pull ADEV from the
+        # Rb-referenced source that does.
+        char = {"sources": {
+            "Carrier": {"units": "ns", "asd_at_0.1Hz": 0.075},
+            "DO PPS (chA vs TICC Rb)": {
+                "units": "ns", "asd_at_0.1Hz": 0.054,
+                "adev_by_tau_s": {"512.0": 2e-11}}}}
+        out = derive_do_process_noise(char)
+        self.assertEqual(out["sigma_do_phase_source"], "Carrier")
+        self.assertAlmostEqual(
+            out["sigma_do_freq_ppb"],
+            math.sqrt(3.0) * 2e-11 * 1e9 / math.sqrt(512.0), places=9)
+
+    def test_realistic_freerun_char_schema(self):
+        # Matches do_freerun_char.py output: one source with
+        # asd_at_0.1Hz + adev_by_tau_s, no adjfine.
+        char = {"do_label": "ocxo-33-madhat", "sources": {
+            "DO PPS (chA vs TICC Rb)": {
+                "units": "ns", "asd_at_0.1Hz": 0.0538,
+                "slope": -2.1, "noise_type": "white_FM",
+                "adev_by_tau_s": {"1.0": 4.6e-11, "10.0": 1.5e-11,
+                                  "100.0": 8e-12, "1024.0": 2.5e-11}}}}
+        out = derive_do_process_noise(char)
+        self.assertEqual(out["sigma_do_phase_ns"], 0.0538)
+        self.assertEqual(out["sigma_do_phase_source"],
+                         "DO PPS (chA vs TICC Rb)")
+        self.assertAlmostEqual(
+            out["sigma_do_freq_ppb"],
+            math.sqrt(3.0) * 2.5e-11 * 1e9 / math.sqrt(1024.0), places=9)
 
 
 if __name__ == "__main__":
