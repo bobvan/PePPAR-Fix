@@ -119,22 +119,45 @@ interaction.
 ## Implementation sketch (when ready)
 
 1. Add a per-edge qVIR signal source to `DOFreqEst.update`.  v1
-   already accepts `ticc_qerr_ns`; add a `ticc_qvir` kwarg (or
-   `ticc_ext_correlated: bool` if the qvir-vs-threshold decision is
-   made engine-side from `RunningVarianceWindow`).  Engine-side is
-   simpler — the EKF stays oblivious to the windowing mechanism.
-2. New `_route_ticc_arm_v2(...)` (or fold into v1 behind a config):
+   already accepts `ticc_qerr_ns`; add a `ticc_ext_correlated: bool`
+   kwarg with the qvir-vs-threshold decision made engine-side.  The
+   EKF stays oblivious to the windowing mechanism.
+2. **Reuse `servo_ctx['qvir']` — the existing `RunningVarianceWindow`
+   at `peppar_fix_engine.py:774` is the single source of truth for
+   "is qErr correlated right now" (Main #98 review).  Do NOT
+   instantiate a separate window in the router — saves cycles and
+   prevents two-windows-disagreeing bugs.
+3. New `_route_ticc_arm_v2(...)` (or fold into v1 behind a config):
    two candidates, return `'ext'` or `'raw'`.  No chi² internal to
    the router; the router's job is candidate SELECTION, the
    measurement update's own filtering happens downstream.
-3. Engine: thread `qvir_ok` (bool, from `servo_ctx['qvir'] > 1.5`)
+4. Engine: thread `ticc_ext_correlated = (servo_ctx['qvir'] > 1.5)`
    into `servo.update`.  `last_ticc_route` reports `'ext'`/`'raw'`
    only; route counters update accordingly.
-4. Flag: keep `--routed-qerr-arm` (semantics unchanged: "use the
+5. Flag: keep `--routed-qerr-arm` (semantics unchanged: "use the
    external-qErr router") with a new `--router-version {v1,v2}` or
    `--router-qvir` knob.  Default v1 until v2 is sim-validated.
 
 The two-candidate router collapses to ~30 lines vs v1's ~50.
+
+### Legacy non-routed path — long-term fate
+
+Main flagged this on #98 review: PR #97's observability noted "legacy
+single-candidate path counts as `int` for parity," meaning hosts
+running without `--routed-qerr-arm` (the current default) still
+execute the internal-coupled `H = [−1,0,−1,0]` model — i.e., the
+leakage path is renamed out of the router menu but lives on as the
+default code path.  **v2 deprecates that path too:** the long-term
+migration is
+
+> v2 ships with `--router-qvir` opt-in → sim A/B clears → lab A/B
+> clears → flip `--routed-qerr-arm` default to on → after a stage
+> window, decommission the v1 router AND the legacy non-routed code
+> path together.
+
+Internal is truly gone only at the last step.  Until then, calling v2
+"the fix" without addressing the default code path overstates the
+shipped state.
 
 ## Validation plan
 
@@ -145,9 +168,16 @@ The two-candidate router collapses to ~30 lines vs v1's ~50.
    match v1 on all three regimes — clean ext → 100% ext, noisy ext
    → graceful raw fallthrough, pathological → 100% raw.  If any
    regression: don't ship.
-2. **Lab A/B on MadHat** (Main coordinates).  Same hosts and
+2. **Bootstrap convergence-time check** (Main #98 review): on a
+   clean-F9T config, the first ~60 s of the qVIR window are not yet
+   full, so v2 routes to `raw` (safe, always-accepted) while qErr
+   correction is delayed.  The bootstrap glide actuator is in
+   initial-acquisition anyway, so this should be invisible — but
+   measure bootstrap convergence time in the sim A/B and assert no
+   regression vs v1.
+3. **Lab A/B on MadHat** (Main coordinates).  Same hosts and
    procedure as #79's lab validation.
-3. **Honesty check:** qVIR threshold sweep (1.5 today; what's the
+4. **Honesty check:** qVIR threshold sweep (1.5 today; what's the
    sensitivity?).
 
 ## Open questions
