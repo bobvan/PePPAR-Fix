@@ -94,7 +94,8 @@ class DOFreqEst:
                  initial_dt_rx_ns=None, base_freq=None,
                  max_step_ppb=None,
                  ocxo_trusted_gate=None,
-                 routed_qerr=False):
+                 routed_qerr=False,
+                 routed_qerr_v2=False):
         self.max_ppb = max_ppb
         # routedQErrArm: per-edge chi² router for the TICC arm.  When
         # enabled, each TICC edge is routed (priority-ordered) to ONE
@@ -105,6 +106,14 @@ class DOFreqEst:
         # detector (no separate qVIR gate).  Default off preserves the
         # single internal-qerr path.  See dayplan routedQErrArm.
         self._routed_qerr = routed_qerr
+        # routedQErrArm v2 (docs/routed-qerr-router-v2-qvir.md): drops
+        # the v1 'internal' candidate (H=[-1,0,-1,0], the rx-TCXO
+        # leakage path).  Two candidates only — 'ext' and 'raw', both
+        # H=[0,0,-1,0] — routed by the engine-side qVIR-vs-threshold
+        # decision (passed as `ticc_ext_correlated`) instead of v1's
+        # chi².  Mutually exclusive with v1 (engine raises if both
+        # flags are set).  See PR #98 design.
+        self._routed_qerr_v2 = routed_qerr_v2
         # L3 of the TDCP slip-protection stack: per-epoch actuator
         # rate limit.  None = disabled (today's behavior preserved).
         # When set, |adjfine_new - adjfine_prev| is clamped to this
@@ -410,6 +419,49 @@ class DOFreqEst:
         name, z_eff, h_pred, H, R = candidates[-1]
         return z_eff, h_pred, H, R, name
 
+    def _route_ticc_arm_v2(self, x_pred, ticc_diff_ns, ticc_qerr_ns,
+                           ticc_ext_correlated, R_base):
+        """Two-candidate qVIR-routed TICC selector — routedQErrArm v2
+        (docs/routed-qerr-router-v2-qvir.md, PR #98).
+
+        Returns ``(z_eff, h_pred, H, R, name)`` for the chosen
+        candidate.  Drops v1's 'internal' candidate entirely (its
+        H=[-1,0,-1,0] is the rx-TCXO leakage path the router was
+        designed to bypass).  Both candidates use H=[0,0,-1,0] — no
+        x[0] coupling — so neither bleeds rx-TCXO noise into z_ticc.
+
+          external — z = ticc_diff + ext_qerr, h = -x[2],
+                     R = R_base.  Chosen when the caller (engine) says
+                     the qVIR window says qErr is correlated right now
+                     (qVIR > 1.5 litmus, per Main #98 review use
+                     servo_ctx['qvir'] / ticc qVIR window — single
+                     source of truth, decided engine-side).
+          raw      — z = ticc_diff, h = -x[2],
+                     R = R_base + tick²/12 (sawtooth variance; the
+                     uncorrected sub-tick qErr is ~uniform on
+                     [-tick/2, +tick/2]).  Robust floor.
+
+        Bootstrap (qVIR window not yet full → ticc_ext_correlated
+        False) defaults to raw — the always-safe candidate.  Per Main
+        #98 review the bootstrap window-not-full latency is acceptable
+        (the actuator is in initial-acquisition during that window
+        anyway); confirm no bootstrap-convergence-time regression
+        vs v1 in the sim A/B.
+
+        No chi² inside the router (the v1 filter-state coupling we
+        explicitly removed).  No 'internal' candidate to fall through
+        to — the legacy non-routed code path (default, no flag) still
+        runs the v1 internal model and decommissions in lockstep with
+        v1 once v2 becomes default (PR #98 long-term migration plan).
+        """
+        H_x2 = np.array([[0.0, 0.0, -1.0, 0.0]])
+        h_pred = -x_pred[2]
+        if ticc_ext_correlated and ticc_qerr_ns is not None:
+            return (ticc_diff_ns + ticc_qerr_ns, h_pred, H_x2, R_base,
+                    'ext')
+        return (ticc_diff_ns, h_pred, H_x2,
+                R_base + (self.tick_ns ** 2) / 12.0, 'raw')
+
     def update(self, *,
                dt=1.0,
                dt_rx_ns=None, dt_rx_sigma_ns=None,
@@ -419,7 +471,8 @@ class DOFreqEst:
                ticc_diff_ns=None, ticc_sigma_ns=None,
                pseudo_phase_ns=None, pseudo_phase_sigma_ns=None,
                ticc_qerr_ns=None,
-               distance_to_lock=None):
+               distance_to_lock=None,
+               ticc_ext_correlated=False):
         """Process one epoch with up to six conditional measurement arms.
 
         Per docs/dofreq-est-measurement-ladder.md and
@@ -625,7 +678,20 @@ class DOFreqEst:
             tick_third = self.tick_ns / 3.0
             R_lin = ((self.tick_ns / 2.0) ** 2 *
                      min(1.0, (sigma_x0 / tick_third) ** 2))
-            if self._routed_qerr:
+            if self._routed_qerr_v2:
+                # v2: two-candidate, qVIR-routed (engine-side decision
+                # via ticc_ext_correlated).  No 'internal' candidate
+                # by design.
+                z_eff, h_pred, H_ticc, R_scalar, _routed = \
+                    self._route_ticc_arm_v2(
+                        x_pred, ticc_diff_ns, ticc_qerr_ns,
+                        ticc_ext_correlated, R_base)
+                self.last_ticc_route = _routed
+                if _routed == 'ext':
+                    self.n_route_ext += 1
+                else:  # 'raw' (no 'int' in v2)
+                    self.n_route_raw += 1
+            elif self._routed_qerr:
                 z_eff, h_pred, H_ticc, R_scalar, _routed = \
                     self._route_ticc_arm(x_pred, P_pred, ticc_diff_ns,
                                          ticc_qerr_ns, R_base, R_lin)
