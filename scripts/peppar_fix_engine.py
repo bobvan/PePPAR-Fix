@@ -4494,6 +4494,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                         'innov_pseudo', 's_pseudo',
                         'innov_ticc',   's_ticc',
                         'ocxo_gate_reject', 'ocxo_gate_reason',
+                        'ticc_route',
                     ])
                     _arm_f.flush()
                 _arm_w = StridedWriter(
@@ -8234,6 +8235,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                     _fmt(_innov.get('ticc')),   _fmt(_S_dict.get('ticc')),
                     1 if _ocxo_rej else 0,
                     _ocxo_rsn,
+                    getattr(servo, 'last_ticc_route', ''),
                 ])
                 if _arm_f is not None:
                     _arm_f.flush()
@@ -8287,6 +8289,24 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                 hr.epochs, hr.corr_u_innov, hr.norm_bias, hr.nis,
                 hr.status, hr.consec_bad,
             )
+        # Periodic cumulative route-selection report for the
+        # routed-qErr router (#79 follow-up: surface what the router is
+        # doing on hardware; without this we only had an in-memory
+        # last_ticc_route per epoch).
+        if (n_epochs % 60 == 0 and getattr(args, 'routed_qerr_arm', False)
+                and hasattr(servo, 'n_route_ext')):
+            _ne = servo.n_route_ext
+            _ni = servo.n_route_int
+            _nr = servo.n_route_raw
+            _tot = _ne + _ni + _nr
+            if _tot > 0:
+                log.info(
+                    "  [ROUTED_QERR] n=%d ext=%d (%.1f%%) int=%d (%.1f%%) "
+                    "raw=%d (%.1f%%) last=%s",
+                    _tot, _ne, 100.0 * _ne / _tot,
+                    _ni, 100.0 * _ni / _tot,
+                    _nr, 100.0 * _nr / _tot,
+                    getattr(servo, 'last_ticc_route', ''))
     else:
         if n_epochs % 10 == 0:
             log.info(f"  [{n_epochs}] EKF: "

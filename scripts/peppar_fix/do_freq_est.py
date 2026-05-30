@@ -231,6 +231,14 @@ class DOFreqEst:
         # Which TICC candidate the routed-qErr selector picked last
         # epoch ('ext'/'int'/'raw').  'int' when routing is disabled.
         self.last_ticc_route: str = 'int'
+        # Cumulative route counters — production observability for the
+        # routed-qErr router (Main's #79 follow-up: shipped only the
+        # last_ticc_route field; without counters we can't see what the
+        # router is doing on hardware).  Engine surfaces these to the
+        # arm-state CSV and a periodic [ROUTED_QERR] log.
+        self.n_route_ext: int = 0
+        self.n_route_int: int = 0
+        self.n_route_raw: int = 0
         # rx TCXO state must be initialized at construction from bootstrap
         # dt_rx to avoid a mid-run measurement model transition that
         # causes divergence.  If dt_rx wasn't available at construction,
@@ -563,12 +571,21 @@ class DOFreqEst:
                     self._route_ticc_arm(x_pred, P_pred, ticc_diff_ns,
                                          ticc_qerr_ns, R_base, R_lin)
                 self.last_ticc_route = _routed
+                if _routed == 'ext':
+                    self.n_route_ext += 1
+                elif _routed == 'int':
+                    self.n_route_int += 1
+                else:
+                    self.n_route_raw += 1
             else:
                 z_eff = ticc_diff_ns
                 h_pred = self._h_ticc(x_pred)
                 H_ticc = self._H_ticc(x_pred)
                 R_scalar = R_base + R_lin
                 self.last_ticc_route = 'int'
+                # Legacy single-candidate path counts as 'int' for
+                # parity with last_ticc_route's default.
+                self.n_route_int += 1
             R_ticc = np.array([[R_scalar]])
             S = (H_ticc @ P_pred @ H_ticc.T + R_ticc).item()
             innov_ticc = z_eff - h_pred
