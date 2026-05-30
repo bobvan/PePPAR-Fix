@@ -4875,6 +4875,22 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 gap_recovery=gap_recovery_this_epoch,
             )
 
+            # When either absorb path successfully ran (GAP_REALIGN /
+            # CLK_REALIGN), the filter's dt_rx jumps but the raw PPS-
+            # side measurements (chA-chB / EXTTS) still read the
+            # pre-absorb offset.  Without telegraphing the jump to
+            # `consecutive_outliers`, the outlier counter keeps
+            # incrementing post-absorb until the LQR catches up — and
+            # if catch-up takes > 30 epochs, exit-5 fires for a
+            # phantom outlier sustained-burst.  This is the
+            # completeness leak Main caught on the 2026-05-29 clkPoC3
+            # overnight (16 GAP_REALIGN absorbed cleanly, 4 leaked
+            # to exit-5).  Tell _servo_epoch to reset its counter on
+            # this single epoch; it rebuilds normally next epoch if
+            # the DO is actually broken.
+            if (gap_recovery_this_epoch or clk_reset_this_epoch) and n_used > 0:
+                ctx['clock_jump_this_epoch'] = True
+
             # Catastrophic-reject cascade (I-202649 v2 + Note A engine
             # integration).  The filter rejects an epoch via the
             # residual-consistency gate by returning n_used=0 *and*
@@ -8038,6 +8054,17 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         pps_err_ticc_ns if pps_err_ticc_ns is not None
         else pps_err_extts_ns
     )
+    # If the filter absorbed a clock jump this epoch (GAP_REALIGN /
+    # CLK_REALIGN), reset the outlier counter — the raw PPS-side
+    # observable hasn't caught up yet, but the filter's dt_rx has, so
+    # a sustained-outlier exit-5 here would be a false positive.  The
+    # counter rebuilds normally if the DO is actually broken.  Fixes
+    # the 4/20 leak Main caught on the 2026-05-29 clkPoC3 overnight.
+    if ctx.pop('clock_jump_this_epoch', False):
+        if ctx.get('consecutive_outliers', 0) > 0:
+            log.info("  outlier counter reset on clock-jump absorb "
+                     "(%d → 0)", ctx['consecutive_outliers'])
+        ctx['consecutive_outliers'] = 0
     if (
         TRACK_OUTLIER_NS is not None and
         abs(outlier_observable_ns) > TRACK_OUTLIER_NS and
