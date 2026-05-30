@@ -7101,6 +7101,14 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                         "TDEV(1s) for %s — gate disabled", do_uid_local)
     elif getattr(args, 'ocxo_trusted_gate', False):
         log.warning("OCXO gate requested but no DO UID resolved — gate disabled")
+    # Router v1 (--routed-qerr-arm, chi²) and v2 (--router-qvir, qVIR)
+    # are mutually exclusive — they're different routers with the same
+    # purpose.  Refuse both rather than silently picking one.
+    if (getattr(args, 'routed_qerr_arm', False)
+            and getattr(args, 'router_qvir', False)):
+        raise SystemExit(
+            "--routed-qerr-arm (v1, chi²) and --router-qvir (v2, qVIR) "
+            "are mutually exclusive: pick one.")
     servo = DOFreqEst(
         sigma_ticc_ns=sigma_ticc,
         sigma_do_phase_ns=sigma_do_phase_ns_eff,
@@ -7114,6 +7122,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         max_step_ppb=_max_step if _max_step and _max_step > 0 else None,
         ocxo_trusted_gate=_ocxo_gate,
         routed_qerr=getattr(args, 'routed_qerr_arm', False),
+        routed_qerr_v2=getattr(args, 'router_qvir', False),
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
              "sigma_do=[%.4f ns, %.4f ppb], "
@@ -7180,6 +7189,15 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         "pps_var": RunningVarianceWindow(),
         "pps_qerr_plus_var": RunningVarianceWindow(),
         "pps_qerr_minus_var": RunningVarianceWindow(),
+        # routedQErrArm v2 (--router-qvir): TICC-side qVIR for the
+        # router's ext-vs-raw decision.  Mirrors the EXTTS-side
+        # pair above but applied to the TICC arm.  Δvar(ticc_diff) /
+        # Δvar(ticc_diff + ext_qerr) — > 1.5 ⇒ ext correlated ⇒
+        # route 'ext'; otherwise 'raw'.  Per Main #98 review: this
+        # IS the single source of truth for "is qErr correlated
+        # right now" on the TICC arm.
+        "ticc_var": RunningVarianceWindow(),
+        "ticc_qerr_plus_var": RunningVarianceWindow(),
     }
 
     # PPS event queue
@@ -8369,6 +8387,39 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         # which makes the gate use its legacy age-based engagement.
         _distance_for_gate = (_convergence.distance_to_lock
                               if _convergence is not None else None)
+
+        # routedQErrArm v2 (--router-qvir): TICC-side qVIR feeds the
+        # engine-side ext-vs-raw routing decision.  Per Main #98
+        # review: this IS the single source of truth — same machinery
+        # as the EXTTS-side qVIR pair, just applied to the TICC arm.
+        # Update both windows whenever both ticc_diff_ns AND
+        # qerr_for_ticc_pps_ns are available; the variance ratio
+        # gates the v2 router each epoch.  Bootstrap (window <8
+        # samples) ⇒ ticc_ext_correlated=False ⇒ raw (always safe).
+        _ticc_ext_correlated = False
+        _route_v2 = getattr(args, 'router_qvir', False)
+        _ticc_qerr_for_router = qerr_for_ticc_pps_ns if (
+            getattr(args, 'routed_qerr_arm', False) or _route_v2) else None
+        if (_route_v2 and ticc_diff_ns is not None
+                and qerr_for_ticc_pps_ns is not None):
+            qerr_alignment["ticc_var"].add(ticc_diff_ns)
+            qerr_alignment["ticc_qerr_plus_var"].add(
+                ticc_diff_ns + qerr_for_ticc_pps_ns)
+            _ticc_var = qerr_alignment["ticc_var"].diff_variance()
+            _ticc_plus_var = qerr_alignment[
+                "ticc_qerr_plus_var"].diff_variance()
+            if (_ticc_var is not None and _ticc_plus_var is not None
+                    and _ticc_plus_var > 0.0
+                    and qerr_alignment["ticc_qerr_plus_var"].count() >= 8):
+                _ticc_qvir = _ticc_var / _ticc_plus_var
+                _ticc_ext_correlated = _ticc_qvir > 1.5
+                if n_epochs % 60 == 0:
+                    log.info("  [ROUTED_QERR v2] TICC qVIR = %.2f "
+                             "(threshold 1.5 → ext_correlated=%s, "
+                             "window n=%d)",
+                             _ticc_qvir, _ticc_ext_correlated,
+                             qerr_alignment["ticc_qerr_plus_var"].count())
+
         adjfine_ppb = -servo.update(
             dt=dt_actual,
             dt_rx_ns=dt_rx_ns_arg, dt_rx_sigma_ns=dt_rx_sigma_arg,
@@ -8381,10 +8432,9 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             ticc_sigma_ns=ticc_sigma_ns,
             pseudo_phase_ns=_pseudo_phase_ns,
             pseudo_phase_sigma_ns=_pseudo_phase_sigma_ns,
-            ticc_qerr_ns=(qerr_for_ticc_pps_ns
-                          if getattr(args, 'routed_qerr_arm', False)
-                          else None),
+            ticc_qerr_ns=_ticc_qerr_for_router,
             distance_to_lock=_distance_for_gate,
+            ticc_ext_correlated=_ticc_ext_correlated,
         )
         # ── --arm-state-log: post-update DOFreqEst state vector ─────
         _arm_w = ctx.get('arm_state_log_writer')
@@ -10621,7 +10671,21 @@ Two-phase operation:
                             "outlier → falls through to raw, so chi² is the "
                             "correlation-quality detector (no qVIR gate).  "
                             "Needs the honest small Q (from DO char) to "
-                            "discriminate tick mismatches.  Default off.")
+                            "discriminate tick mismatches.  Default off.  "
+                            "Mutually exclusive with --router-qvir (v2).")
+    servo.add_argument("--router-qvir", action="store_true", default=False,
+                       help="routedQErrArm v2 (docs/routed-qerr-router-v2-"
+                            "qvir.md, PR #98): two-candidate router "
+                            "(ext vs raw, both H=[0,0,-1,0]), routed by "
+                            "qVIR > 1.5 on the TICC arm instead of v1's "
+                            "chi².  Drops v1's 'internal' candidate (the "
+                            "rx-TCXO leakage path).  qVIR uses the engine's "
+                            "RunningVarianceWindow machinery applied to "
+                            "the TICC stream (Δvar(raw)/Δvar(raw+qerr)); "
+                            "bootstrap (window <8 samples) routes to raw.  "
+                            "Default off; mutually exclusive with "
+                            "--routed-qerr-arm.  Validate in "
+                            "closedLoopServoSim before enabling.")
     servo.add_argument("--servo-input", choices=("default", "tdcp"),
                        default="default",
                        help="Servo-input mode.  'default' = today's 4-arm "
