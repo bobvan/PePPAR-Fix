@@ -209,6 +209,14 @@ class SimConfig:
 
     # OCXO-trusted gate.  None → no gate (chi² gate inside DOFreqEst
     # still runs).  Otherwise (sigma_short_tau_ns, k_sigma, min_age_s).
+    # disciplineModeFsm #95: sole-observer override for the OCXO gate.
+    # When the TICC arm is the only carrier of x[2] (no EXTINT, no
+    # TDCP-holdover), the gate must always admit — soft-weighting or
+    # rejecting a sole carrier starves the filter (clkpoc3 acquisition
+    # never-locks; MadHat R-inflation diverged).  The engine infers
+    # this automatically; the sim sets it explicitly to test both
+    # gate paths.
+    gate_sole_observer: bool = False
     gate_sigma_ns: Optional[float] = None
     gate_k_sigma: float = 10.0
     gate_min_age_s: float = 60.0
@@ -309,6 +317,7 @@ class ClosedLoopSim:
                 sigma_short_tau_ns=cfg.gate_sigma_ns,
                 k_sigma=cfg.gate_k_sigma,
                 min_age_s=cfg.gate_min_age_s,
+                is_sole_observer=cfg.gate_sole_observer,
                 do_label=cfg.label)
         self.gate = gate
         self.ekf = DOFreqEst(
