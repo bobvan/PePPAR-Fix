@@ -360,7 +360,8 @@ class DOFreqEst:
                extint_phase_ns=None, extint_sigma_ns=None,
                ticc_diff_ns=None, ticc_sigma_ns=None,
                pseudo_phase_ns=None, pseudo_phase_sigma_ns=None,
-               ticc_qerr_ns=None):
+               ticc_qerr_ns=None,
+               distance_to_lock=None):
         """Process one epoch with up to six conditional measurement arms.
 
         Per docs/dofreq-est-measurement-ladder.md and
@@ -608,9 +609,14 @@ class DOFreqEst:
             # DO movement even when the filter's own R/Q has loosened.
             ocxo_reject = False
             if self._ocxo_gate is not None:
+                # disciplineModeFsm increment #3: when distance_to_lock
+                # is fed, the gate engages continuously (1−m loosening)
+                # and observability-overrides for sole carriers — both
+                # supersede the legacy min_age trigger.  None → legacy.
                 accept, reason = self._ocxo_gate.evaluate(
                     innov_ns=innov_ticc, dt_s=self.dt,
-                    age_s=self._total_age_s)
+                    age_s=self._total_age_s,
+                    distance_to_lock=distance_to_lock)
                 if not accept:
                     ocxo_reject = True
                     self.last_ocxo_gate_rejected = True

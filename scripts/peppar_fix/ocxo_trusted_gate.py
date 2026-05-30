@@ -65,7 +65,8 @@ class OcxoTrustedGate:
                  sigma_short_tau_ns: float,
                  k_sigma: float = 10.0,
                  min_age_s: float = 60.0,
-                 do_label: str = ""):
+                 do_label: str = "",
+                 is_sole_observer: bool = False):
         """Construct a gate.
 
         Args:
@@ -76,10 +77,25 @@ class OcxoTrustedGate:
                 10 is the v1 default — corresponds to "an event 100×
                 more powerful than typical OCXO noise".  Lower values
                 reject more; higher values let more through.
-            min_age_s: gate is disabled for the first `min_age_s`
-                seconds of the EKF's life, so bootstrap convergence
-                isn't impeded.
+            min_age_s: legacy age-based engagement; gate is disabled
+                for the first `min_age_s` seconds.  Used only when
+                evaluate() is called WITHOUT distance_to_lock (the
+                continuous path supersedes it — disciplineModeFsm #3).
             do_label: optional human-readable name for log messages.
+            is_sole_observer: when True, this arm is the only carrier
+                of its filter state on this host; the gate ALWAYS
+                admits (Main's observability refinement on #89, and
+                the sole-observer memory — soft-weighting / rejecting
+                a sole carrier starves the filter).  Determined
+                config-side by the engine (TICC is sole observer of
+                x[2] when neither EXTINT nor TDCP-holdover is active).
+                Set ONCE at construction — both predicates are
+                config-bound (EXTINT presence comes from the host's
+                extint_store wiring; TDCP-holdover from
+                --servo-input).  Runtime degradation (e.g. EXTINT
+                loses lock mid-run, leaving TICC truly alone) is a
+                follow-up; today the runtime answer matches the
+                construction-time answer for the lifetime of the run.
         """
         if sigma_short_tau_ns <= 0:
             raise ValueError(f"sigma_short_tau_ns must be > 0, got {sigma_short_tau_ns}")
@@ -89,29 +105,64 @@ class OcxoTrustedGate:
         self.k_sigma = float(k_sigma)
         self.min_age_s = float(min_age_s)
         self.do_label = do_label
+        self.is_sole_observer = bool(is_sole_observer)
         self.n_rejected = 0
         self.n_accepted = 0
         self.n_skipped_pre_age = 0
+        self.n_admitted_sole_observer = 0
+        self.n_admitted_continuous_off = 0
 
     def evaluate(self, *,
                  innov_ns: float,
                  dt_s: float,
-                 age_s: float) -> Tuple[bool, str]:
+                 age_s: Optional[float] = None,
+                 distance_to_lock: Optional[float] = None,
+                 ) -> Tuple[bool, str]:
         """Return (accept, reason).
 
         Args:
             innov_ns: the measurement innovation, in ns.
-            dt_s: time since last successful update (for OCXO drift integration).
-            age_s: time since DOFreqEst init / bootstrap complete.
+            dt_s: time since last successful update.
+            age_s: legacy engagement signal (seconds since bootstrap).
+                Used only when ``distance_to_lock`` is None.
+            distance_to_lock: derived continuous convergence signal in
+                [0, 1] (0=locked, 1=far) — supersedes age_s when set.
+                Engagement = max(0, 1 − m): at m=0 the threshold is
+                today's k·σ·√dt; at m=0.5 it doubles; the
+                ``1/engagement`` scaling grows rapidly near m=1
+                (e.g. ~10× at m=0.9, ~100× at m=0.99) by design — the
+                "gate mostly off pre-lock" intent is "asymptotically
+                off," not a sharp transition.  At m=1 exactly the
+                early-return below admits unconditionally — the
+                "converging = no rejection, tracking = gate on"
+                continuum, done continuously (SatPulse 0.2, our own
+                clkpoc3GateOverRejectsBeforeLock finding).
         """
-        if age_s < self.min_age_s:
+        # Observability override: a sole-carrier arm cannot be
+        # soft-weighted or rejected without starving its state.
+        if self.is_sole_observer:
+            self.n_admitted_sole_observer += 1
+            return True, "sole_observer"
+
+        # Engagement: continuous (m) takes precedence over legacy
+        # (age_s).  Backward-compat: callers passing only age_s get
+        # today's behavior.
+        if distance_to_lock is not None:
+            engagement = max(0.0, 1.0 - float(distance_to_lock))
+            if engagement <= 0.0:
+                self.n_admitted_continuous_off += 1
+                return True, "off_far_from_lock"
+            threshold_scale = 1.0 / engagement
+        elif age_s is not None and age_s < self.min_age_s:
             self.n_skipped_pre_age += 1
             return True, "pre_min_age"
-        # Expected OCXO phase movement over dt_s, in ns.  For τ ≥ 1,
-        # τ scales by √τ for white-FM; we use √dt as a reasonable bound
-        # that's tight at τ=1 s and loosens slowly for longer gaps.
+        else:
+            threshold_scale = 1.0
+
+        # Expected OCXO phase movement over dt_s.  τ scales by √τ for
+        # white-FM; √dt is a tight-at-τ=1-s bound that loosens slowly.
         sigma_oc_dt = self.sigma_short_tau_ns * math.sqrt(max(1.0, dt_s))
-        threshold_ns = self.k_sigma * sigma_oc_dt
+        threshold_ns = self.k_sigma * sigma_oc_dt * threshold_scale
         if abs(innov_ns) > threshold_ns:
             self.n_rejected += 1
             return False, f"ocxo_gate: |innov|={abs(innov_ns):.2f} > {threshold_ns:.2f} ns"
@@ -124,10 +175,13 @@ class OcxoTrustedGate:
             n_rejected=self.n_rejected,
             n_accepted=self.n_accepted,
             n_skipped_pre_age=self.n_skipped_pre_age,
+            n_admitted_sole_observer=self.n_admitted_sole_observer,
+            n_admitted_continuous_off=self.n_admitted_continuous_off,
             sigma_short_tau_ns=self.sigma_short_tau_ns,
             k_sigma=self.k_sigma,
             min_age_s=self.min_age_s,
             do_label=self.do_label,
+            is_sole_observer=self.is_sole_observer,
         )
 
 
