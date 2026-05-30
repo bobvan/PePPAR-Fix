@@ -7636,7 +7636,11 @@ def _enter_obs_holdover(ctx, args, reason_code, detail):
     # if temperature hasn't changed, the old frequency is correct.
     _purge_pps_state(ctx)
     from peppar_fix import DisciplineScheduler
-    ctx['servo'].reset(last_freq)
+    # reset() is keyword-only since #107 (binary layer rewrote it from the
+    # old positional reset(current_freq)).  Pass initial_freq= to preserve
+    # the pre-#107 semantics: hold the EKF's commanded freq at the last
+    # adjfine while the filter rebuilds.  A positional call raises TypeError.
+    ctx['servo'].reset(initial_freq=last_freq)
     ctx['scheduler'] = DisciplineScheduler(
         base_interval=args.discipline_interval,
         adaptive=args.adaptive_interval,
