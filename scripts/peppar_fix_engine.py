@@ -5417,6 +5417,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     dt_rx_ns, dt_rx_sigma, n_used, known_ecef,
                     resid_rms, isb_gal_ns, isb_bds_ns,
                     pps_match=pps_match,
+                    gap_recovery=gap_recovery_this_epoch,
                 )
                 if servo_result == "no_pps":
                     skip_stats["servo_no_pps"] += 1
@@ -7821,9 +7822,65 @@ def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
     return "ok"
 
 
+def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
+                            converging, gap_recovery):
+    """Pure decision: does the servo PPS-side outlier check trip this epoch?
+
+    Returns one of:
+      ``("ok", None)``      — observable in range, scheduler converging,
+                              threshold disabled, OR gap_recovery is
+                              active (post-gap measurement let through
+                              so the EKF can absorb the offset).
+      ``("outlier", False)`` — single outlier, cascade counter incremented
+                              but below exit-5 limit.  Caller should log
+                              + skip the EKF update.
+      ``("outlier", True)``  — cascade limit reached.  Caller should log
+                              the exit-5 error and unwind.
+
+    Mutates ``ctx['consecutive_outliers']``: resets to 0 in the ok branch
+    (including the gap_recovery branch), increments in the outlier branch.
+
+    The ``gap_recovery`` branch is the PR #88 follow-up: when the
+    gap-recovery path rebases dt_rx (absorbing the rx-clock drift across
+    the gap), the DO clock has separately drifted by
+    ``residual_commanded_freq_error · gap``, which surfaces as a
+    systematic pps_err on the first post-gap epoch (~500 ns at typical
+    residual freq error × 30 s gap).  Without the bypass, the existing
+    PR-side gap-absorb still leaves the PPS-side cascade to trip on the
+    flat post-gap offset (clkPoC3 exit-5 #1, 2026-05-30).  Letting the
+    measurement through to the EKF allows it to absorb the offset rather
+    than skipping the update each epoch.
+    """
+    if gap_recovery:
+        ctx['consecutive_outliers'] = 0
+        return ("ok", None)
+    if track_outlier_ns is None:
+        return ("ok", None)
+    if converging:
+        # Convergence mode forgives accumulated cascade: a deliberate
+        # state-change (glide, step, re-converge) makes prior outlier
+        # state stale.  Matches the pre-refactor inline code's
+        # catchall ``else: ctx['consecutive_outliers'] = 0`` that
+        # also covered the converging branch.  Without this reset, a
+        # cascade-counter that almost tripped before entering
+        # convergence would resume from its accumulated value on
+        # exit instead of starting fresh.  Caught by bravo's #109
+        # review.
+        ctx['consecutive_outliers'] = 0
+        return ("ok", None)
+    if abs(outlier_observable_ns) <= track_outlier_ns:
+        ctx['consecutive_outliers'] = 0
+        return ("ok", None)
+    ctx['consecutive_outliers'] += 1
+    if ctx['consecutive_outliers'] >= 30:
+        return ("outlier", True)
+    return ("outlier", False)
+
+
 def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                  dt_rx_ns, dt_rx_sigma, n_used, known_ecef,
-                 resid_rms, isb_gal_ns, isb_bds_ns, pps_match=None):
+                 resid_rms, isb_gal_ns, isb_bds_ns, pps_match=None,
+                 gap_recovery=False):
     """Process one servo epoch: read PPS, compute error, steer PHC."""
 
     # ClockMatrix TDC fast path: read phase directly via I2C, skip EXTTS/PPS
@@ -8122,13 +8179,15 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         pps_err_ticc_ns if pps_err_ticc_ns is not None
         else pps_err_extts_ns
     )
-    if (
-        TRACK_OUTLIER_NS is not None and
-        abs(outlier_observable_ns) > TRACK_OUTLIER_NS and
-        not scheduler._converging
-    ):
-        ctx['consecutive_outliers'] += 1
-        if ctx['consecutive_outliers'] >= 30:
+    _decision, _exit5 = _servo_outlier_decision(
+        ctx,
+        outlier_observable_ns=outlier_observable_ns,
+        track_outlier_ns=TRACK_OUTLIER_NS,
+        converging=scheduler._converging,
+        gap_recovery=gap_recovery,
+    )
+    if _decision == "outlier":
+        if _exit5:
             log.error("  %d consecutive outliers — servo has lost control. "
                       "Exiting for re-bootstrap (exit code 5).",
                       ctx['consecutive_outliers'])
@@ -8141,8 +8200,14 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         log.warning(f"  Outlier: pps_err={outlier_observable_ns:+.0f}ns, "
                     f"skipping ({ctx['consecutive_outliers']}/30)")
         return "outlier"
-    else:
-        ctx['consecutive_outliers'] = 0
+    elif gap_recovery and outlier_observable_ns is not None and abs(
+            outlier_observable_ns) > (TRACK_OUTLIER_NS or float('inf')):
+        # Visibility: log when the gap_recovery bypass swallowed what
+        # would otherwise have been an outlier-class measurement.  Pure
+        # observability — the bypass already happened in the decision.
+        log.warning(
+            "  Gap-recovery PPS bypass: pps_err=%+.0fns (post-gap "
+            "DO drift, EKF will absorb)", outlier_observable_ns)
 
     # Scheduler input: |x[2]| is the EKF's DO-phase-vs-GPS-time estimate,
     # the direct one-to-one replacement for the old source-mux output.
