@@ -503,6 +503,53 @@ CPU-stall observability work — that PR adds new counters to
 this same `skip_stats` dict and is the natural opportunistic
 touch.
 
+## 2026-05-31
+
+### `HoldoverState.holdover_entry_mono` — Dangerous
+
+**Where**: `scripts/peppar_fix/holdover_wiring.py:34` (class
+`HoldoverState`); read sites at `holdover_wiring.py:123` and
+`peppar_fix_engine.py:8444` (after the binaryLayerHoldoverCheck
+fix, commit `f384b9f`).
+**Claim**: A timestamp — "the monotonic time we entered
+holdover."  The type annotation is `float | None`.
+**Actual**: **Dual-purpose** — both a timestamp AND the canonical
+"are we in holdover right now?" sentinel.  `holdover_entry_mono is
+None` means *not* in holdover; non-`None` means in holdover and
+the value tells you for how long.  There is no separate
+`in_holdover` property or method on the class.
+**Why it matters**: PR #107 (disciplineModeFsm binary layer)
+wrote `_ho.in_holdover()` at engine line 8444 — a method that
+does not exist on `HoldoverState`.  It looked obviously correct
+to the reviewer (and to me on the disciplineModeFsmCtxThreading
+hotfix that first brought the line into scope), because *of
+course* a class named `HoldoverState` would expose "are we in
+holdover?" as a predicate.  It doesn't.  The bug was latent
+across the entire moonshot stack and only surfaced when
+`--gross-fault-reset` was combined with `--servo-input tdcp`
+(the only path that creates a non-`None` `_ho` *and* runs
+through the binary-layer code), at which point the engine
+`AttributeError`-crashed on the first servo epoch (lab repro
+2026-05-31).
+**Proposed**: Add an explicit `@property def in_holdover(self)
+-> bool: return self.holdover_entry_mono is not None` to the
+class.  Leaves the timestamp field for the "how long?" callers
+(`holdover_wiring.py:124`).  Optionally rename the field to
+`_holdover_entry_mono` to signal "internal — prefer the
+property" — but only worth doing if you're already in the file.
+The property is additive; existing callers continue to work.
+**Notes**: This is the third PR #107 latent bug landed in
+2026-05 that turned on a flag-combination not exercised in the
+original PR's tests.  Sequence:
+`disciplineModeFsmCtxThreading` (commit `24fac8d` — #107 forgot
+to thread `_convergence` + `_binary_layer` through `servo_ctx`),
+`holdoverResetKwarg` (PR #115 — #107 changed `DOFreqEst.reset`
+to keyword-only but didn't update the older call site), this
+one.  An engine-level integration test that exercises all four
+discipline flags together would catch the *next* one of these
+— flagged on multiple PR reviews and the right longer-term
+ask.
+
 ## Adding to this list
 
 When you find another candidate while doing other work, add
