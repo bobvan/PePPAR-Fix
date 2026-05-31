@@ -26,6 +26,8 @@ import os
 import time
 from datetime import datetime, timezone
 
+import numpy as np
+
 log = logging.getLogger("peppar_fix.noise_estimator")
 
 
@@ -269,8 +271,17 @@ def _compute_tdev(phases, taus=None):
     This is equivalent to TDEV(τ) = τ/√3 × MDEV(τ), where MDEV is the
     modified Allan deviation computed with nested averaging.
 
+    VECTORIZED via numpy.  The pre-2026-05-30 form was a pure-Python
+    triple-nested loop (~30 M iterations per call on the 7200-sample
+    steady-state buffer) and consumed 28 % of engine CPU on clkPoC3
+    (Pi 4), producing 30-40 s main-loop stalls.  The inner second
+    difference d[k] = x[k+2n] - 2x[k+n] + x[k] is a single slice
+    arithmetic; the outer sum-of-n-consecutive is one np.convolve.
+    Equivalence vs the original loop is pinned by
+    test_noise_estimator_compute_tdev.py.
+
     Args:
-        phases: list of phase values (ns), equally spaced at tau0=1s
+        phases: list/array of phase values (ns), equally spaced at tau0=1s
         taus: list of averaging factors n to compute (default: 1, 2, 4, ..., N/4)
 
     Returns:
@@ -287,21 +298,24 @@ def _compute_tdev(phases, taus=None):
             taus.append(n)
             n *= 2
 
+    # Cast once at the top — phases is typically a Python list of floats.
+    phi = np.asarray(phases, dtype=np.float64)
     result = {}
     for n in taus:
         if 3 * n >= N:
             break
-        # Outer sum: j = 0 .. N-3n
-        outer_count = N - 3 * n + 1
+        # Inner second-difference vector: d[k] = phi[k+2n] - 2*phi[k+n] + phi[k]
+        # for k = 0 .. N-2n-1.  Length: N - 2n.
+        d = phi[2 * n:] - 2.0 * phi[n:N - n] + phi[:N - 2 * n]
+        # Outer sum: for each starting j in 0..N-3n, sum d[j..j+n-1].
+        # That's exactly np.convolve(d, ones(n), mode='valid') which
+        # yields the N-3n+1 = outer_count moving sums of length n.
+        inner_sums = np.convolve(d, np.ones(n, dtype=np.float64),
+                                  mode='valid')
+        outer_count = inner_sums.size
         if outer_count < 1:
             break
-        total = 0.0
-        for j in range(outer_count):
-            # Inner sum: average n consecutive second-differences
-            inner = 0.0
-            for i in range(j, j + n):
-                inner += phases[i + 2 * n] - 2 * phases[i + n] + phases[i]
-            total += inner * inner
+        total = float(np.dot(inner_sums, inner_sums))
         # τ₀ = 1s, so τ₀² = 1
         tdev_sq = total / (6.0 * n * n * outer_count)
         result[n] = math.sqrt(tdev_sq)
