@@ -67,6 +67,60 @@ from peppar_fix.timebase_estimator import TimebaseRelationEstimator
 # Integer part DOT 11-or-12 fractional digits whitespace ch followed by A or B.
 _LINE_RE = re.compile(r"^(\d+)\.(\d{11,12})\s+(ch[AB])$")
 
+
+def _drain_serial_until_quiet(ser: "serial.Serial",
+                              quiet_threshold_s: float = 0.1,
+                              max_total_s: float = 2.0) -> int:
+    """Read and discard any pending serial input until the buffer stays
+    empty for ``quiet_threshold_s`` consecutive seconds.
+
+    This is the cleanest answer to "is the TICC's output stream caught
+    up with the kernel buffer, or am I about to read stale / mid-pulse
+    bytes?"  After reset_input_buffer + a readline-loop that exits on
+    the first valid line, the kernel can still have a partial /
+    duplicate / out-of-order timestamp queued behind it that survives
+    into the next reader's first reads.
+
+    Algorithm — analogue of "read non-blocking until EWOULDBLOCK":
+      - Poll ``ser.in_waiting``; if > 0, drain those bytes and restart
+        the quiet timer.
+      - When ``in_waiting`` has been zero continuously for
+        ``quiet_threshold_s``, we know any in-flight bytes have
+        already been emitted by the TICC and read out by us — the
+        next ``readline`` call will block on genuinely-fresh output.
+
+    ``quiet_threshold_s`` of 100 ms is comfortably longer than the
+    TICC's ~10 ms-per-line serialization at 115200 baud (~58 chars
+    of timestamp + channel), so a 100 ms quiet window guarantees
+    no line is still in flight.
+
+    ``max_total_s`` bounds the worst case — if the TICC is producing
+    a non-stop stream faster than we drain (unlikely at 1 PPS but
+    safer to bound), give up rather than spin forever.
+
+    Returns the number of bytes drained, for logging / diagnostics.
+    """
+    deadline_quiet = _time.monotonic() + quiet_threshold_s
+    hard_deadline = _time.monotonic() + max_total_s
+    total_drained = 0
+    while _time.monotonic() < hard_deadline:
+        try:
+            n = ser.in_waiting
+        except (serial.SerialException, OSError):
+            break
+        if n > 0:
+            try:
+                drained = ser.read(n)
+                total_drained += len(drained)
+            except (serial.SerialException, OSError):
+                break
+            deadline_quiet = _time.monotonic() + quiet_threshold_s
+        else:
+            if _time.monotonic() >= deadline_quiet:
+                return total_drained
+            _time.sleep(0.005)
+    return total_drained
+
 # Boot sentinel: the TICC prints this line just before starting timestamp output.
 _BOOT_SENTINEL = "# timestamp"
 
@@ -123,7 +177,8 @@ class _SharedTiccPort:
         return ser
 
     def acquire(self, wait_for_boot: bool) -> None:
-        if self.serial is None:
+        first_open = self.serial is None
+        if first_open:
             self.serial = self._open_serial()
             self.serial.reset_input_buffer()
             self.booted = False
@@ -131,6 +186,26 @@ class _SharedTiccPort:
         if wait_for_boot and not self.booted:
             self._wait_for_boot()
             self.booted = True
+        if first_open:
+            # Drain anything else in the kernel buffer so the first
+            # consumer's reads see truly fresh TICC output, not
+            # buffered transients.  reset_input_buffer() above clears
+            # at one instant, but bytes can arrive between that call
+            # and the consumer's first read — and _wait_for_boot()
+            # exits as soon as it sees ONE valid timestamp line,
+            # which can leave a partial / out-of-order / duplicate
+            # timestamp queued behind it.
+            #
+            # The 2026-05-31 TimeHat freerun reproduced this directly:
+            # first 4 rows of the chA stream had one corrupt ref_sec
+            # (TICC startup partial-message parse), one out-of-order
+            # ref_sec, and one exact-duplicate of the first row.
+            # Inflated TDEV(1s) from a realistic 3.76 ns to 2826 ns.
+            # The same risk exists on every TICC + every consumer
+            # (DAC-actuator hosts just happen to feed cleaner chA
+            # signals so the symptom is quieter).  Drain belongs
+            # here once for all callers.
+            _drain_serial_until_quiet(self.serial)
 
     def release(self) -> None:
         if self.refcount > 0:
