@@ -43,12 +43,18 @@ relevant close-in number for a GPSDO discipline loop.
 | **NDK ENE3311B** (or A/D/E/F) | 10 MHz | 5 V | HCMOS / sine variants | ~1 × 10⁻¹¹ | ~−130 dBc/Hz | 26 × 26 mm, 4-pin SC-cut | $3–6 | Yes with pad drilling |
 | **IsoTemp OCXO33-80** (parts-bin, 069683-002H, 51×51 mm) | **5 MHz** | likely 12 V (or 6.71 V Lucent OEM) | likely sine into 50 Ω | **~1–5 × 10⁻¹²** | ~−130 to −140 | **51 × 51 mm, MV89A-class double-oven SC-cut** | n/a | **No** — too big for X1; needs carrier + 5 MHz divider |
 | **Morion MV89A** | 10 MHz | **12 V** | sine, +7 ± 2 dBm/50 Ω | **2 × 10⁻¹²** | **−130 dBc/Hz** | 51 × 51 × 38 mm | $30–60 | **No** — physically too big |
+| **Rakon STP3593LF / ROX5242T1N family** (used in SparkPNT GNSSDO) | 10 MHz | 5 V | sine, +5 to +9 dBm/50 Ω | **1.5 × 10⁻¹² typ, 5 × 10⁻¹² max** | **−130 dBc/Hz typ** | 52 × 42 × 14 mm, 5-pin | sample-only (no public price) | **No** — too big for X1 + integrated 5-pin pinout includes I²C; needs custom carrier |
 
 ADEV ranking @ τ=1s, best first:
-**MV89A ≈ OCXO33-80 > OSC5A2B02 > NDK ENE3311 > OCXO-131-100.**
+**Rakon STP3593LF ≥ MV89A ≈ OCXO33-80 > OSC5A2B02 > NDK ENE3311 > OCXO-131-100.**
 The MV89A and parts-bin OCXO33-80 are in the same architectural
 tier (double-oven SC-cut, telecom-grade), about an order of
-magnitude better than OCXO-131-100 at short tau.
+magnitude better than OCXO-131-100 at short tau.  The Rakon
+STP3593LF family sits at or just above the MV89A tier (typical
+1.5 ppt vs MV89A's 2 ppt), with the major architectural
+difference that the DAC + thermal compensation + power management
+are integrated into the module rather than supplied by the
+carrier board.
 
 **On the OCXO33-80 designation**: this *is* the Isotemp **OCXO 33
 family**, but in the larger 51 × 51 mm OEM package — not the
@@ -184,6 +190,148 @@ spend a separate ~$30–50 on a protoboard carrier and a
 programmable EFC DAC (see options below) to put one of these
 parts-bin units onto the bench.
 
+## Rakon STP3593LF / ROX5242T1N — premium integrated digital OCXO module
+
+Found while reviewing the SparkPNT GNSSDO BOM in 2026-05.  The
+datasheet is for the **STP3593LF / ROX5242T1N family**; SparkPNT
+ships a specific variant from this family (the page footer of the
+preliminary datasheet identifies the documented variant as
+`ROX5242T1N-CO @ 10MHz Sine 5V`).  Family numbers below are
+typical/max envelopes — a specific binned variant may land
+anywhere within them, so treat these as the upper bound on what
+that family can deliver rather than the guaranteed shipping
+spec of any one part.
+
+The whole reason this part is interesting is that it folds the
+"upgrade the EFC DAC" path (see [EFC DAC options](#efc-dac-options)
+below) **into the OCXO can itself**: a 20-bit, 0.8 ppt/step
+internal DAC driven over I²C, with thermal compensation and
+power-supply management already integrated.  An external
+microcontroller writes a 20-bit register; the module's own
+thermal-comp loop + double-oven OCXO do everything else.
+
+**Headline specs** (preliminary datasheet, 2020-11-03 draft —
+disclaimer §17 explicitly states samples are pre-production and
+no performance warranty applies):
+
+| Parameter | Typ | Max |
+|---|---|---|
+| ADEV(τ = 1 s to 100 s) | **1.5 × 10⁻¹² (1.5 ppt)** | **5 × 10⁻¹² (5 ppt)** |
+| Freq stability over temp (−32 to +70 °C, p-p) | 0.03 ppb (30 ppt) | 0.05 ppb (50 ppt) |
+| Aging | 0.2 ppb/day | 30 ppb/year, 300 ppb/10 yr |
+| Phase noise @ 10 Hz | −130 dBc/Hz | −125 dBc/Hz |
+| Phase noise @ 1 kHz | −155 dBc/Hz | −150 dBc/Hz |
+| EFC range | > ±350 ppb (>700 ppb total) | |
+| EFC resolution | **20-bit, 0.8 ppt/step** (≈ 0.0008 ppb LSB) | |
+| Warm-up to ±10 ppb of final | 3 min @ +25 °C, 5 min @ −40 °C | |
+| Retrace (24h on / 24h off / 1h on) | ±1 ppb | ±5 ppb |
+| Power, steady state | 3.0 W @ +25 °C still air | |
+| Power, warm-up | 7.5 W peak | |
+| Control bus | I²C slave, addr 0xE0, 400 kHz max | |
+| Size | **52 × 42 × 14 mm** (17.6 mm max with pins) | |
+
+**Why it's interesting for the lab**
+
+- ADEV(1 s) typ **1.5 ppt** sits 2× tighter than MV89A
+  (2 × 10⁻¹²) and 13–20× tighter than what we actually run today
+  (PiFace's Isotemp-class freerun TDEV(1 s) ≈ 85 ps ≈ ADEV ≈
+  3 × 10⁻¹¹ — see [`freerun-characterization.md`](freerun-characterization.md)).
+  At τ = 1 s integrated, 1.5 ppt → ~1.5 ps RMS phase noise — two
+  orders of magnitude below the ~150–200 ps `σ_DO_above_BW`
+  budget the [two-site sync budget](two-site-sync-budget.md) §7
+  needs to hit the 1 ns shared-antenna excursion bound.
+- The integrated 20-bit DAC is **exactly the AD5781 + LTC6655 Vref
+  upgrade path** the budget recommends (§7), folded into the can.
+  No separate Vref board, no DAC noise + drift to characterize
+  independently, no software DAC-temp model — just an I²C write.
+- I²C control matches the **existing AD5693R plumbing on PiFace
+  + MadHat** and the **Renesas 8A34002 ClockMatrix bus on
+  ptBoat + otcBob1**.  No new infrastructure.
+- 5 V single supply (vs MV89A's 12 V) simplifies the carrier and
+  lets it share a buck regulator with the Pi.
+
+**Why it's not a drop-in**
+
+- **Form factor** — 52 × 42 × 14 mm.  Won't fit PulsePuppy X1
+  (27 × 36 mm Eurocase), won't fit X2 (CXOH20 footprint),
+  won't fit any of our existing carriers.  Same custom-carrier
+  problem as the parts-bin OCXO33-80.
+- **Power & thermal** — 3.0 W steady-state at +25 °C with max
+  2 m/s airflow.  In a small Pi 5 enclosure with TICC + GNSS
+  receiver also running, the host's own dissipation drives
+  ambient walk that the OCXO has to ride out.  The 50 ppt
+  over-temp headline assumes maintained airflow; without it,
+  performance degrades toward the operable-but-not-spec range.
+  This is the largest practical risk to characterize before
+  committing to the part.
+- **Sample-only commercial status** — the datasheet is a 2020
+  preliminary draft labeled "Draft" in the revision history,
+  with §17 disclaiming all warranties.  No public price, no
+  Rakon distributor stock that we've found.  SparkPNT may be
+  buying these direct from Rakon at a volume Rakon doesn't
+  catalog publicly.
+- **Family vs. specific variant** — the spec table is the
+  envelope across the family.  A specific binned variant
+  (especially a sample from SparkPNT's pipeline) could land
+  at typical (1.5 ppt) or at the loose end (5 ppt).  Without a
+  guaranteed lower bound from the vendor, any moonshot-class
+  budget allocation should plan against the **max-spec** numbers,
+  not the typical.
+
+**Honest framing vs. our actual measurement chain**
+
+Our rx-side observation floor is **not** the F9T PPS edge (TDEV(1 s)
+~2.1 ns, [`ticc-baseline-2026-04-01.md`](ticc-baseline-2026-04-01.md))
+— that's the F9T-PPS-via-EXTTS chain quantized at 125 MHz.  The
+**TDCP arm** (Time-Differenced Carrier Phase, Phase D / Arm 5/6 in
+the engine) reads the rx-TCXO motion directly from per-epoch
+carrier-phase increments and hits **TDEV(1 s) well below 100 ps**:
+roughly **23 ps on PiFace's F9T-20B, 54 ps on clkPoC3's F9T-20B**
+(per-unit crystal-noise floor, white-FM PSD differs 5× between
+units; see `rxTcxoInherentVsThermal` 2026-05-24).  An ensemble TDCP
+prototype across multiple F9T units has reached ~15 ps short-tau
+floor.
+
+So the relevant comparison is:
+
+| Source | TDEV(1 s) | Note |
+|---|---|---|
+| F9T PPS via TICC (chA-chB diff) | ~2.1 ns | 125 MHz quantization; gates EXTTS-derived input only |
+| **TDCP arm** | **23–54 ps per host, ~15 ps ensemble** | Sub-ns observation arm currently in use |
+| PiFace Isotemp DO (freerun, Rb-ref) | ~85 ps | Current host's DO floor sits **above** TDCP |
+| clkPoC3 DO (freerun, Rb-ref) | ~45–69 ps | Same — DO floor above the host's TDCP |
+| **Rakon STP3593LF (typ)** | **~1.5 ps** | Below TDCP by ~10–35× per-host |
+
+That ordering matters: today, **TDCP is below the DO**, so any DO
+upgrade *reduces* the on-host TDEV(1 s) ceiling we measure (the
+TDCP arm sees the better DO).  At the Rakon's claimed floor we'd
+**cross over** — TDCP would become the dominant short-τ floor, not
+the DO.  The implication for the moonshot decision:
+
+- The Rakon's short-τ improvement **is observable** in our existing
+  measurement chain (via TDCP), not "above the servo BW only" as
+  this section originally claimed.  The loop can actually use it.
+- The biggest practical wins still land in **holdover** (the better
+  short-τ floor extends the time before phase wanders past the
+  budget) and at **τ > 100 s** (where DO RWFM dominates over both
+  TDCP and the loop's correction bandwidth).
+- A 1.5 ps DO behind a 15–54 ps TDCP arm means the **measurement
+  chain becomes the floor**, not the DO — so the next budgeted
+  investment after a Rakon-class DO is **TDCP-arm improvements**
+  (ensemble across units, longer integration, better cycle-slip
+  exclusion), not another DO upgrade.
+
+**Where it would fit in our lab**
+
+Same architectural slot as the parts-bin OCXO33-80: needs a
+custom carrier, replaces an existing PiFace / MadHat / clkPoC3
+DO outright rather than going into a PulsePuppy.  Different
+question from "what to put in PulsePuppy X1" — that question still
+answers IsoTemp OCXO-131-100 — and more like "what's the moonshot
+upgrade for the highest-grade lab host."  Worth probing SparkPNT
+for stand-alone module pricing before committing to a discrete
+AD5781-on-MV89A path.
+
 ## EFC DAC options
 
 For driving the EFC pin under software discipline.  Assuming a 5 V
@@ -230,6 +378,11 @@ parts cost step up.
   modules with SMA out** — pre-built reference boards, not bare
   oscillators.  Won't go on a PulsePuppy and you can't
   characterize the underlying crystal independently.
+- **Rakon STP3593LF / ROX5242T1N family** — not a PulsePuppy
+  candidate (52 × 42 × 14 mm + I²C-only frequency control), but
+  worth tracking as a candidate for premium hosts on a custom
+  carrier.  See the [premium integrated module section](#rakon-stp3593lf--rox5242t1n--premium-integrated-digital-ocxo-module)
+  above for full specs.
 
 ## Sources
 
@@ -249,3 +402,4 @@ parts cost step up.
 - [EEVblog forum — Recommend me an OCXO](https://www.eevblog.com/forum/projects/recommend-me-an-ocxo/)
 - [Tom Van Baak's PICDIV firmware page (leapsecond.com)](http://www.leapsecond.com/pic/picdiv.htm)
 - [aewallin/PICDIV on GitHub](https://github.com/aewallin/PICDIV)
+- [Rakon STP3593LF / ROX5242T1N preliminary datasheet (SparkPNT mirror, 2020-11-03 draft)](https://docs.sparkpnt.com/GNSSDO/files/component_documentation/STP3593LF_ROX5242T1N_Preliminary_Datasheet.pdf)
