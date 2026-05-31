@@ -8441,7 +8441,16 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         # freq while the filter rebuilds).  No-op when
         # --gross-fault-reset / --graded-taper absent.
         if _binary_layer is not None:
-            _in_holdover = (_ho is not None and _ho.in_holdover())
+            # HoldoverState exposes "are we in holdover?" via
+            # holdover_entry_mono — set when the integrator enters
+            # holdover (peppar_fix/holdover_wiring.py:146), cleared
+            # when it exits (line 155).  Earlier code here mis-called
+            # _ho.in_holdover() (a method that doesn't exist on the
+            # class) — latent until --gross-fault-reset and --servo-
+            # input tdcp were combined (the only path that creates a
+            # non-None _ho and runs through the binary layer).
+            _in_holdover = (_ho is not None
+                            and _ho.holdover_entry_mono is not None)
             _distance_for_layer = (
                 _convergence.distance_to_lock
                 if _convergence is not None else None)
