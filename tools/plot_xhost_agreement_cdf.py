@@ -46,7 +46,13 @@ _PS_PER_S = 10 ** 12
 _PAIR_TOLERANCE_PS = 5 * 10 ** 11   # 500 ms — anything beyond is not a pair
 
 
-def load_pairs(path: Path) -> tuple[np.ndarray, np.ndarray]:
+def _read_ts(row: dict, ts_col: str):
+    """Parse a UTC ISO 8601 timestamp from a CSV row."""
+    from datetime import datetime
+    return datetime.fromisoformat(row[ts_col].replace('Z', '+00:00'))
+
+
+def load_pairs(path: Path, skip_before=None) -> tuple[np.ndarray, np.ndarray]:
     """Load chA/chB, pair each chA with closest-in-time chB, return
     (sample_index, Δ_in_ps).
 
@@ -92,7 +98,14 @@ def load_pairs(path: Path) -> tuple[np.ndarray, np.ndarray]:
     chA_list: list[int] = []
     chB_list: list[int] = []
     with open(path) as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        ts_col = ('ts_iso' if 'ts_iso' in reader.fieldnames
+                  else 'host_timestamp' if 'host_timestamp' in reader.fieldnames
+                  else None)
+        for row in reader:
+            if skip_before is not None and ts_col is not None:
+                if _read_ts(row, ts_col) < skip_before:
+                    continue
             s = int(row['ref_sec'])
             p = int(row['ref_ps'])
             total = s * _PS_PER_S + p   # Python int — exact
@@ -157,15 +170,66 @@ def cdf_xy(abs_residual: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return sorted_x, y_pct
 
 
+def _virtual_pair_load(path_a: Path, path_b: Path, skip_before=None
+                       ) -> tuple[np.ndarray, np.ndarray]:
+    """Load chA from two per-host TICC csvs and produce (t_idx, Δ_ps_int64).
+
+    The lab's TICCs share a common Rb reference, so each TICC's timescale
+    differs only by a constant offset + near-zero rate.  Pair by NTP-
+    synced wall clock (ts_iso / host_timestamp rounded to 0.5 s grid)
+    and subtract in Python int (subtract-separately pattern — sec and
+    ps stay combined as Python arbitrary-precision int through the
+    subtraction, then we cast the result to int64).  Validated 2026-05-31
+    vs a dedicated cross-host TICC (see docs/moonshot-overnight-2026-05-31.md
+    and tools/plot_xhost_virtual.py).
+    """
+    from datetime import datetime, timezone
+
+    def _load_cha(path: Path) -> list[tuple[float, int]]:
+        samples: list[tuple[float, int]] = []
+        with open(path) as f:
+            reader = csv.DictReader(f)
+            ts_col = ('ts_iso' if 'ts_iso' in reader.fieldnames
+                      else 'host_timestamp')
+            for row in reader:
+                if row['channel'] != 'chA':
+                    continue
+                ts = datetime.fromisoformat(row[ts_col].replace('Z', '+00:00'))
+                if skip_before is not None and ts < skip_before:
+                    continue
+                key = round(ts.timestamp() * 2) / 2.0   # 0.5 s grid
+                total = (int(row['ref_sec']) * _PS_PER_S
+                         + int(row['ref_ps']))   # Python int — exact
+                samples.append((key, total))
+        return samples
+
+    A = dict(_load_cha(path_a))
+    B = dict(_load_cha(path_b))
+    common = sorted(set(A) & set(B))
+    if not common:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+    deltas = [A[k] - B[k] for k in common]
+    return (np.arange(len(deltas), dtype=np.int64),
+            np.array(deltas, dtype=np.int64))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__.split('\n\n')[0],
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--input', action='append', required=True, type=Path,
-                    help='ticc_capture-format CSV.  Repeat for overlay.')
+    ap.add_argument('--input', action='append', default=[], type=Path,
+                    help='Combined-TICC CSV (chA = host A, chB = host B '
+                         'on a shared cross-host TICC).  Repeat for overlay.')
+    ap.add_argument('--virtual-pair', action='append', default=[],
+                    type=Path, nargs=2, metavar=('A_CSV', 'B_CSV'),
+                    help='Per-host TICC CSV pair (both contain chA from one '
+                         'host each).  Tool computes virtual Δ via the '
+                         'subtract-separately int math; works because lab '
+                         "TICCs share an Rb reference.  Repeat for overlay.")
     ap.add_argument('--label', action='append', default=None,
-                    help='Label for each --input (positional pairing). '
-                         'Defaults to file stem.')
+                    help='Label for each input.  Order: all --input curves '
+                         'first (in command-line order), then all '
+                         '--virtual-pair curves.  Defaults to file stem(s).')
     ap.add_argument('--output', required=True, type=Path,
                     help='Output PNG path.')
     ap.add_argument('--title', default='Two-clock phase-agreement CDF')
@@ -173,21 +237,46 @@ def main() -> int:
                     help='Lower x-axis bound in ps (default 60 = TICC res).')
     ap.add_argument('--xmax-ps', type=float, default=None,
                     help='Upper x-axis bound (default: 1.2× worst data).')
+    ap.add_argument('--skip-before', default=None,
+                    help='ISO 8601 UTC timestamp; drop earlier rows from all '
+                         'inputs (useful for skipping bootstrap windows).')
     args = ap.parse_args()
 
-    labels = args.label if args.label else [p.stem for p in args.input]
-    if len(labels) != len(args.input):
-        ap.error(f'--label count ({len(labels)}) != --input count '
-                 f'({len(args.input)})')
+    skip_dt = None
+    if args.skip_before:
+        from datetime import datetime
+        skip_dt = datetime.fromisoformat(
+            args.skip_before.replace('Z', '+00:00'))
+
+    if not args.input and not args.virtual_pair:
+        ap.error('at least one --input or --virtual-pair required')
+
+    # Build the ordered curve list.  --input curves first, then --virtual-pair.
+    curves: list[tuple[str, str, callable]] = []   # (label, default_label, loader)
+    for path in args.input:
+        curves.append((None, path.stem,
+                       (lambda p=path: load_pairs(p, skip_before=skip_dt))))
+    for pair in args.virtual_pair:
+        a, b = pair
+        curves.append((None, f'{a.stem} ↔ {b.stem} (virtual)',
+                       (lambda pa=a, pb=b:
+                        _virtual_pair_load(pa, pb, skip_before=skip_dt))))
+
+    # Resolve labels.  Caller-provided --label entries override defaults
+    # in command-line order.
+    labels = args.label if args.label else [c[1] for c in curves]
+    if len(labels) != len(curves):
+        ap.error(f'--label count ({len(labels)}) != total curves '
+                 f'({len(curves)})')
 
     fig, ax = plt.subplots(figsize=(9, 6))
     max_x_seen = args.xmin_ps
     rows_printed = False
-    for path, label in zip(args.input, labels):
-        t, delta = load_pairs(path)
+    for label, (_, _, loader) in zip(labels, curves):
+        t, delta = loader()
         n = len(delta)
         if n < 60:
-            print(f'WARN: {path} has only {n} paired samples — skipping',
+            print(f'WARN: {label} has only {n} paired samples — skipping',
                   file=sys.stderr)
             continue
         abs_r = detrend_and_abs(t, delta)
