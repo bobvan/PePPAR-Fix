@@ -152,15 +152,90 @@ def load_freerun_char(path: Path
 
 
 def _parse_host_input(spec: str
-                      ) -> tuple[str, Path, Path | None]:
-    """``LABEL=TICC_CSV[,FREERUN_JSON]`` → (label, ticc_path, freerun_path)."""
+                      ) -> tuple[str, Path, Path | None, Path | None]:
+    """``LABEL=TICC_CSV[,FREERUN_JSON[,ARM_STATE_CSV]]`` →
+    (label, ticc_path, freerun_path, arm_state_path).
+
+    arm-state path is optional and is used to compute the TDCP-derived
+    frequency-domain stability overlay (when ``arm_tdcp_used == 1``
+    rows exist).  If absent, the tool tries to auto-infer it from the
+    ticc-csv path by replacing ``-ticc.csv`` with ``-arm-state.csv``.
+    TDCP overlay is silently skipped when no data is present (engine
+    must run with ``--servo-input tdcp`` to populate ``tdcp_freq_ppb``).
+    """
     if '=' not in spec:
         raise ValueError(f'expected LABEL=PATH..., got {spec!r}')
     label, rest = spec.split('=', 1)
     parts = [s.strip() for s in rest.split(',')]
     ticc = Path(parts[0])
     freerun = Path(parts[1]) if len(parts) > 1 and parts[1] else None
-    return label.strip(), ticc, freerun
+    arm_state = Path(parts[2]) if len(parts) > 2 and parts[2] else None
+    # Auto-infer arm-state path: foo-ticc.csv → foo-arm-state.csv
+    if arm_state is None:
+        guess = Path(str(ticc).replace('-ticc.csv', '-arm-state.csv'))
+        if guess != ticc and guess.exists():
+            arm_state = guess
+    return label.strip(), ticc, freerun, arm_state
+
+
+def load_tdcp_freq_ppb(arm_state_path: Path | None,
+                       skip_before: datetime | None = None
+                       ) -> np.ndarray:
+    """Extract per-epoch TDCP frequency observations (ppb) from arm-state.csv.
+
+    TDCP (Time-Differenced Carrier Phase) is the cleanest GNSS-side
+    frequency reference — reaches ~15 ps TDEV(1 s) in prototype
+    captures, well below the ~2-5 ns of raw chB GNSS-PPS.  Engine
+    column ``tdcp_freq_ppb`` is the per-epoch Arm 5 observation,
+    populated only when ``arm_tdcp_used == 1`` (i.e. when the engine
+    was started with ``--servo-input tdcp`` and the per-epoch gate
+    admitted the observation).
+
+    Returns the freq series in ppb (fractional frequency × 1e9).  Empty
+    array if the file is missing or no rows have valid TDCP.
+    """
+    if arm_state_path is None or not arm_state_path.exists():
+        return np.array([])
+    samples: list[float] = []
+    with open(arm_state_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get('arm_tdcp_used') != '1':
+                continue
+            if skip_before is not None:
+                if _read_ts(row, 'host_timestamp') < skip_before:
+                    continue
+            v = row.get('tdcp_freq_ppb', '').strip()
+            if not v:
+                continue
+            try:
+                samples.append(float(v))
+            except ValueError:
+                continue
+    return np.array(samples, dtype=np.float64)
+
+
+def adev_tdev_from_freq_ppb(freq_ppb: np.ndarray
+                            ) -> tuple[dict, dict]:
+    """ADEV/TDEV from a fractional-frequency series given in ppb.
+
+    Allantools wants fractional frequency (dimensionless) so ppb is
+    scaled by 1e-9.  Output ADEV is dimensionless; TDEV is converted
+    from seconds to ns for plotting parity with the phase-domain
+    curves.
+    """
+    if len(freq_ppb) < 60:
+        return {}, {}
+    fractional = freq_ppb * 1e-9
+    feasible = _TAUS[_TAUS * 3 < len(fractional)]
+    if not len(feasible):
+        return {}, {}
+    taus_a, adev, _, _ = allantools.adev(fractional, rate=1.0,
+                                         taus=feasible, data_type='freq')
+    taus_t, tdev, _, _ = allantools.tdev(fractional, rate=1.0,
+                                         taus=feasible, data_type='freq')
+    return ({float(t): float(a) for t, a in zip(taus_a, adev)},
+            {float(t): float(td * 1e9) for t, td in zip(taus_t, tdev)})
 
 
 def _plot_map(ax, x_taus: np.ndarray, ymap: dict, color: str,
@@ -200,30 +275,35 @@ def main() -> int:
         skip_dt = datetime.fromisoformat(
             args.skip_before.replace('Z', '+00:00'))
 
-    hosts: list[tuple[str, Path, Path | None]] = []
+    hosts: list[tuple[str, Path, Path | None, Path | None]] = []
     for spec in args.host_input:
         hosts.append(_parse_host_input(spec))
 
-    print(f'{"host":<14s} {"chA n":>8s} {"chB n":>8s} '
-          f'{"chA tdev(1s) ns":>18s} {"chB tdev(1s) ns":>18s}',
+    print(f'{"host":<14s} {"chA n":>8s} {"chB n":>8s} {"tdcp n":>8s} '
+          f'{"chA tdev(1s) ns":>16s} {"chB tdev(1s) ns":>16s} '
+          f'{"tdcp tdev(1s) ns":>17s}',
           file=sys.stderr)
-    print('-' * 72, file=sys.stderr)
+    print('-' * 96, file=sys.stderr)
 
     per_host: dict[str, dict] = {}
-    for label, ticc_path, freerun_path in hosts:
+    for label, ticc_path, freerun_path, arm_state_path in hosts:
         chA = load_chA_phase(ticc_path, skip_dt, channel='chA')
         chB = load_chA_phase(ticc_path, skip_dt, channel='chB')
         adev_d, tdev_d = adev_tdev_from_phase(chA)
         adev_g, tdev_g = adev_tdev_from_phase(chB)
         adev_f, tdev_f = load_freerun_char(freerun_path)
+        tdcp_freq = load_tdcp_freq_ppb(arm_state_path, skip_dt)
+        adev_t, tdev_t = adev_tdev_from_freq_ppb(tdcp_freq)
         per_host[label] = {
             'disciplined': (adev_d, tdev_d),
             'gnss':        (adev_g, tdev_g),
             'freerun':     (adev_f, tdev_f),
+            'tdcp':        (adev_t, tdev_t),
         }
-        print(f'{label:<14s} {len(chA):>8d} {len(chB):>8d} '
-              f'{tdev_d.get(1.0, float("nan")):>18.2f} '
-              f'{tdev_g.get(1.0, float("nan")):>18.2f}',
+        print(f'{label:<14s} {len(chA):>8d} {len(chB):>8d} {len(tdcp_freq):>8d} '
+              f'{tdev_d.get(1.0, float("nan")):>16.3f} '
+              f'{tdev_g.get(1.0, float("nan")):>16.3f} '
+              f'{tdev_t.get(1.0, float("nan")):>17.3f}',
               file=sys.stderr)
 
     if args.gnss_from is None or args.gnss_from == 'all':
@@ -232,9 +312,12 @@ def main() -> int:
         if args.gnss_from not in per_host:
             ap.error(f'--gnss-from {args.gnss_from!r} not in --host-input labels')
         gnss_labels = [args.gnss_from]
+    # Convenience map for the GNSS overlay loop below (avoids unpacking
+    # the now-4-tuple hosts list and forgetting an element).
+    host_index = {h[0]: i for i, h in enumerate(hosts)}
 
     fig, (ax_tdev, ax_adev) = plt.subplots(1, 2, figsize=(13, 6))
-    for i, (label, _, freerun_path) in enumerate(hosts):
+    for i, (label, _, freerun_path, arm_state_path) in enumerate(hosts):
         color = _HOST_COLORS[i % len(_HOST_COLORS)]
         h = per_host[label]
         # Disciplined chA — solid
@@ -248,13 +331,19 @@ def main() -> int:
                       f'{label} freerun', lw=1.4, marker='s', alpha=0.7)
             _plot_map(ax_adev, _TAUS, h['freerun'][0], color, '--',
                       f'{label} freerun', lw=1.4, marker='s', alpha=0.7)
+        # TDCP — dash-dot, lighter still.  Only plotted if data exists.
+        if h['tdcp'][0]:
+            _plot_map(ax_tdev, _TAUS, h['tdcp'][1], color, '-.',
+                      f'{label} TDCP', lw=1.4, marker='D', alpha=0.7)
+            _plot_map(ax_adev, _TAUS, h['tdcp'][0], color, '-.',
+                      f'{label} TDCP', lw=1.4, marker='D', alpha=0.7)
 
     # GNSS PPS — one dotted curve per host in gnss_labels.  Each host
     # uses its own colour (matching the disciplined curve) so the
     # reader can correlate "this host's GNSS source" with "this host's
     # disciplined output" at a glance.
     for gnss_label in gnss_labels:
-        i = next(j for j, (lbl, _, _) in enumerate(hosts) if lbl == gnss_label)
+        i = host_index[gnss_label]
         color = _HOST_COLORS[i % len(_HOST_COLORS)]
         g = per_host[gnss_label]['gnss']
         _plot_map(ax_tdev, _TAUS, g[1], color, ':',

@@ -198,36 +198,103 @@ def per_host_block_residuals(path: Path,
                              ) -> tuple[list[datetime], np.ndarray]:
     """5-min-block-detrended residuals for a single host's chA stream.
 
-    Subtract the integer 1Hz rate (i * PS_PER_S) in int math, then
+    Subtract the integer 1Hz rate (block-local) in int math, then
     polyfit each block in float64.  Residuals returned in ns.  The
     block length is short enough that the local TICC Rb drift is
     negligible at this scale.
+
+    Gap handling: blocks are restarted at any discontinuity in
+    ``ref_sec`` (engine restart, intentional disturbance-window
+    edit on the host).  Without this, the index-based 1 Hz rate
+    subtraction inflates the per-host residual by ~PS_PER_S × gap_s
+    on the post-gap samples (caught by the 2026-05-31 MadHat
+    overnight test: disturbance trim created a 1621-s gap).
     """
     samples = load_ticc_cha(path, skip_before=skip_before)
     if len(samples) < 60:
         return [], np.array([])
-    s0 = int(samples[0].total_ps // _PS_PER_S)
-    p0 = int(samples[0].total_ps % _PS_PER_S)
-    # Detect contiguous runs (avoid using sample index across gaps).
-    # The 1Hz cadence means consecutive ts_iso should be ~1s apart.
+    # Identify contiguous runs by checking ref_sec strides between
+    # consecutive samples.  A gap-of-1 is the normal 1 Hz step; anything
+    # > 2 s starts a new run.
+    secs = [s.total_ps // _PS_PER_S for s in samples]
+    run_starts: list[int] = [0]
+    for i in range(1, len(samples)):
+        if secs[i] - secs[i - 1] > 2:   # any gap > 1 normal step
+            run_starts.append(i)
+    run_starts.append(len(samples))
+
     times = [s.ts for s in samples]
     residuals = np.zeros(len(samples), dtype=np.float64)
-    for start in range(0, len(samples), block_s):
-        end = min(start + block_s, len(samples))
-        if end - start < 60:
-            continue
-        block = samples[start:end]
-        # Per-block: index-based 1Hz rate subtraction in int64
-        dev_int = np.empty(end - start, dtype=np.int64)
-        for i, s in enumerate(block):
-            sec = int(s.total_ps // _PS_PER_S)
-            ps = int(s.total_ps % _PS_PER_S)
-            dev_int[i] = (sec - s0 - (start + i)) * _PS_PER_S + (ps - p0)
-        dev_f = dev_int.astype(np.float64)
-        x = np.arange(end - start, dtype=np.float64)
-        poly = np.polyfit(x, dev_f, 1)
-        residuals[start:end] = dev_f - np.polyval(poly, x)
+
+    # Per-run, then per-block within the run.
+    for rs_idx in range(len(run_starts) - 1):
+        run_lo, run_hi = run_starts[rs_idx], run_starts[rs_idx + 1]
+        # Block-local origin so the rate subtraction is per-run.
+        run_s0 = int(samples[run_lo].total_ps // _PS_PER_S)
+        run_p0 = int(samples[run_lo].total_ps % _PS_PER_S)
+        for start in range(run_lo, run_hi, block_s):
+            end = min(start + block_s, run_hi)
+            if end - start < 60:
+                continue
+            block = samples[start:end]
+            dev_int = np.empty(end - start, dtype=np.int64)
+            for i, s in enumerate(block):
+                sec = int(s.total_ps // _PS_PER_S)
+                ps = int(s.total_ps % _PS_PER_S)
+                # Block-local 1Hz rate from the RUN origin (not the
+                # whole-file origin) so a prior gap doesn't poison this
+                # block's math.
+                offset_in_run = (start - run_lo) + i
+                dev_int[i] = ((sec - run_s0 - offset_in_run) * _PS_PER_S
+                              + (ps - run_p0))
+            dev_f = dev_int.astype(np.float64)
+            x = np.arange(end - start, dtype=np.float64)
+            poly = np.polyfit(x, dev_f, 1)
+            residuals[start:end] = dev_f - np.polyval(poly, x)
     return times, residuals * 1e-3   # ps → ns
+
+
+def load_scheduler_interval(arm_state_path: Path | None,
+                            skip_before: datetime | None = None
+                            ) -> tuple[np.ndarray, np.ndarray]:
+    """Read (t_h, dt_actual_s) from an arm-state.csv.
+
+    ``dt_actual_s`` is the engine's effective scheduler interval per
+    EKF-update epoch — the wall-clock time elapsed since the previous
+    update.  When the discipline scheduler is in tight-cadence mode
+    it sits at 1 s; when relaxed it can climb to many tens of seconds.
+    Plotting this lets the operator see how the scheduler reacts to
+    convergence + transients across the run.
+
+    Returns (t_hours_since_first, dt_actual_s_array).  Empty arrays
+    if the file is missing.
+    """
+    if arm_state_path is None or not arm_state_path.exists():
+        return np.array([]), np.array([])
+    times: list[datetime] = []
+    intervals: list[float] = []
+    with open(arm_state_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ts_raw = row.get('host_timestamp', '').strip()
+            if not ts_raw:
+                continue
+            ts = datetime.fromisoformat(ts_raw.replace('Z', '+00:00'))
+            if skip_before is not None and ts < skip_before:
+                continue
+            v = row.get('dt_actual_s', '').strip()
+            if not v:
+                continue
+            try:
+                intervals.append(float(v))
+            except ValueError:
+                continue
+            times.append(ts)
+    if not times:
+        return np.array([]), np.array([])
+    t0 = times[0]
+    t_h = np.array([(t - t0).total_seconds() / 3600.0 for t in times])
+    return t_h, np.array(intervals, dtype=np.float64)
 
 
 def fmt_ns(v: float) -> str:
@@ -257,7 +324,25 @@ def main() -> int:
                     help='Optional path to a dedicated cross-host TICC '
                          'csv (chA = host A, chB = host B); the tool '
                          'prints how the virtual diff matches.')
+    ap.add_argument('--arm-state-A', default=None, type=Path,
+                    help='Per-host arm-state.csv for host A.  If omitted, '
+                         "the tool tries to auto-infer by replacing "
+                         "'-ticc.csv' with '-arm-state.csv' in --input-A. "
+                         'Used to plot the discipline scheduler interval '
+                         '(dt_actual_s) panel.')
+    ap.add_argument('--arm-state-B', default=None, type=Path,
+                    help='Per-host arm-state.csv for host B (see --arm-state-A).')
     args = ap.parse_args()
+
+    # Auto-infer arm-state paths if not given.
+    if args.arm_state_A is None:
+        guess = Path(str(args.input_A).replace('-ticc.csv', '-arm-state.csv'))
+        if guess != args.input_A and guess.exists():
+            args.arm_state_A = guess
+    if args.arm_state_B is None:
+        guess = Path(str(args.input_B).replace('-ticc.csv', '-arm-state.csv'))
+        if guess != args.input_B and guess.exists():
+            args.arm_state_B = guess
 
     skip = None
     if args.skip_before:
@@ -352,8 +437,24 @@ def main() -> int:
               file=sys.stderr)
 
     # Plot
+    # Load scheduler interval series per host (optional)
+    sched_t_a, sched_a = load_scheduler_interval(args.arm_state_A, skip)
+    sched_t_b, sched_b = load_scheduler_interval(args.arm_state_B, skip)
+    have_sched = len(sched_a) > 0 or len(sched_b) > 0
+    if have_sched:
+        print(f'\nDiscipline scheduler interval (dt_actual_s):',
+              file=sys.stderr)
+        for lbl, dt in [(args.label_A, sched_a), (args.label_B, sched_b)]:
+            if len(dt) == 0:
+                continue
+            print(f'  {lbl:25s}: n={len(dt):5d}  median={np.median(dt):.2f} s  '
+                  f'p95={np.percentile(dt, 95):.1f} s  '
+                  f'max={dt.max():.1f} s', file=sys.stderr)
+
     title = args.title or f'{args.label_A} ↔ {args.label_B} — virtual cross-host'
-    fig, axes = plt.subplots(3, 1, figsize=(11, 8.5), sharex=True)
+    n_panels = 4 if have_sched else 3
+    fig, axes = plt.subplots(n_panels, 1, figsize=(11, 2.8 * n_panels),
+                              sharex=True)
 
     ax = axes[0]
     ax.plot(t_sec / 3600, dev_dt / 1e3, lw=0.4, color='#1f77b4')
@@ -366,9 +467,6 @@ def main() -> int:
     ax.grid(True, alpha=0.3)
 
     ax = axes[1]
-    # Both per-host residuals on the same time axis.  Each per-host run
-    # may have slightly different start times; align by sample index
-    # (both 1Hz so equivalent post-trim).
     n_show = min(len(res_a), len(res_b))
     t_h = np.arange(n_show) / 3600
     ax.plot(t_h, res_a[:n_show], lw=0.4, color='#ff7f0e',
@@ -384,9 +482,24 @@ def main() -> int:
     ax = axes[2]
     ax.plot(roll_t, roll_std, lw=0.6, color='#d62728')
     ax.set_ylabel('rolling 5-min\nstdev of signed Δ (ns)')
-    ax.set_xlabel('hours since first paired epoch')
+    if not have_sched:
+        ax.set_xlabel('hours since first paired epoch')
     ax.set_title('Stability tracker — lower = more stable')
     ax.grid(True, alpha=0.3)
+
+    if have_sched:
+        ax = axes[3]
+        if len(sched_a) > 0:
+            ax.plot(sched_t_a, sched_a, lw=0.5, color='#ff7f0e',
+                    label=args.label_A, alpha=0.85)
+        if len(sched_b) > 0:
+            ax.plot(sched_t_b, sched_b, lw=0.5, color='#2ca02c',
+                    label=args.label_B, alpha=0.85)
+        ax.set_ylabel('discipline scheduler\ninterval (s)\n[low = tight cadence]')
+        ax.set_xlabel('hours since first paired epoch')
+        ax.set_yscale('log')
+        ax.legend(loc='upper right', fontsize=9)
+        ax.grid(True, which='both', alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(args.output, dpi=130)
