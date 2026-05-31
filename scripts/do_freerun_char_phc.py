@@ -112,6 +112,32 @@ def main() -> int:
     ap.add_argument('--raw-csv', default=None,
                     help='Optional path for raw chA samples (ref_sec, ref_ps). '
                          'Lets us re-analyze offline without another capture.')
+    ap.add_argument('--enable-perout-pin', type=int, default=None,
+                    metavar='PIN',
+                    help='SDP pin index to bring up for PEROUT before '
+                         'capture.  Required when the engine has been '
+                         'stopped and PEROUT does not survive engine '
+                         'exit (TimeHat i226, 2026-05-31 lab repro).  '
+                         'Typically 0 for SDP0 on i226 hosts.  Omit '
+                         'when PEROUT is already armed by something '
+                         'else (engine, ptp4l with periodic-output, '
+                         'or a TICC-driven sibling tool that already '
+                         'ran setup_perout).')
+    ap.add_argument('--enable-perout-channel', type=int, default=0,
+                    metavar='CH',
+                    help='PEROUT channel index when --enable-perout-pin '
+                         'is set (default: 0)')
+    ap.add_argument('--perout-period-ns', type=int, default=1_000_000_000,
+                    metavar='NS',
+                    help='PEROUT pulse period (default: 1_000_000_000 = '
+                         '1 Hz).  i226 half-period-firing hosts may need '
+                         '2_000_000_000 — see memory project_madhat_'
+                         'perout_both_halves_2026_05_17.')
+    ap.add_argument('--no-perout-verify', action='store_true',
+                    help='Skip the TICC chA/chB phase verification step '
+                         'after enabling PEROUT.  Saves the ~4-6 s wait '
+                         'but may accept a misaligned (500 ms-off) '
+                         'PEROUT phase on igc hardware.  Off by default.')
     args = ap.parse_args()
 
     out_path = Path(args.output)
@@ -133,6 +159,45 @@ def main() -> int:
     prior_adjfine_ppb = actuator.read_frequency_ppb()
     print(f"PHC prior adjfine: {prior_adjfine_ppb:+.3f} ppb (will restore)")
 
+    # PEROUT setup — needed when the engine has been stopped and the
+    # i226 kernel/driver state releases PEROUT on the engine's fd
+    # close.  Without this, chA at TICC is silent and the freerun
+    # captures 0 samples (TimeHat 2026-05-30 morning + evening repros).
+    # See dayplan ``freerunPhcPeroutArm``.  Skipped when
+    # --enable-perout-pin is not supplied; caller is responsible for
+    # making sure PEROUT is alive some other way.
+    perout_enabled_by_us = False
+    if args.enable_perout_pin is not None:
+        from peppar_fix.perout_setup import setup_perout
+        print(f"\nEnabling PEROUT: pin={args.enable_perout_pin} "
+              f"channel={args.enable_perout_channel} "
+              f"period_ns={args.perout_period_ns} "
+              f"verify={'off' if args.no_perout_verify else 'via TICC'}")
+        ok = setup_perout(
+            ptp,
+            pin_index=args.enable_perout_pin,
+            channel=args.enable_perout_channel,
+            period_ns=args.perout_period_ns,
+            program_pin=True,
+            ptp_dev_path=args.ptp_device,
+            verify_via_ticc_port=(None if args.no_perout_verify
+                                  else args.ticc_port),
+        )
+        if not ok:
+            print("ERROR: PEROUT setup failed — chA will be empty.  "
+                  "Aborting (this would just produce another zero-sample "
+                  "capture; better to fail loudly).")
+            try:
+                actuator.adjust_frequency_ppb(prior_adjfine_ppb)
+            except Exception:
+                pass
+            try: actuator.teardown()
+            except Exception: pass
+            try: ptp.close()
+            except Exception: pass
+            return 1
+        perout_enabled_by_us = True
+
     samples = []
     try:
         actuator.adjust_frequency_ppb(args.park_adjfine_ppb)
@@ -146,6 +211,15 @@ def main() -> int:
         t_cap = time.monotonic() - t_start
         print(f"  → {len(samples)} chA samples in {t_cap:.0f} s")
     finally:
+        # If we armed PEROUT ourselves, disable it on the way out so the
+        # next engine launch arms a fresh one rather than inheriting our
+        # parked state.
+        if perout_enabled_by_us:
+            try:
+                ptp.disable_perout(args.enable_perout_channel)
+                print(f"PEROUT disabled (channel {args.enable_perout_channel})")
+            except Exception as e:
+                print(f"WARN: could not disable PEROUT: {e}")
         # Restore prior adjfine — see PhcAdjfineActuator.teardown()
         # docstring: that method deliberately does NOT zero the
         # adjfine (to preserve the engine's drift-file value across
