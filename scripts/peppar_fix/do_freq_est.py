@@ -235,6 +235,27 @@ class DOFreqEst:
             'ppp': None, 'qerr': None, 'tdcp': None,
             'extint': None, 'pseudo': None, 'ticc': None,
         }
+        # Per-arm pull attribution (pullAttributionLog).  Captures K
+        # (Kalman gain vector) and would_pull (K · innov — state delta
+        # this arm *would* apply if admitted) for every arm that fires
+        # this epoch, REGARDLESS of whether downstream gates accept
+        # the update.  Lets post-mortem analysis separate "information
+        # the loop consumed" from "information the gate rejected":
+        #   admitted_pull = would_pull * arm_X_used
+        #   rejected_info = would_pull * (1 - arm_X_used)
+        # Kalman gain recovered post-hoc as K = would_pull / innov.
+        self.last_arm_K: dict[str, list[float] | None] = {
+            'ppp': None, 'qerr': None, 'tdcp': None,
+            'extint': None, 'pseudo': None, 'ticc': None,
+        }
+        self.last_arm_would_pull: dict[str, list[float] | None] = {
+            'ppp': None, 'qerr': None, 'tdcp': None,
+            'extint': None, 'pseudo': None, 'ticc': None,
+        }
+        self.last_arm_chi2: dict[str, float | None] = {
+            'ppp': None, 'qerr': None, 'tdcp': None,
+            'extint': None, 'pseudo': None, 'ticc': None,
+        }
         self.last_ocxo_gate_rejected: bool = False
         self.last_ocxo_gate_reason: str = ""
         # Which TICC candidate the routed-qErr selector picked last
@@ -340,6 +361,9 @@ class DOFreqEst:
         for _k in self.last_arm_innov:
             self.last_arm_innov[_k] = None
             self.last_arm_S[_k] = None
+            self.last_arm_K[_k] = None
+            self.last_arm_would_pull[_k] = None
+            self.last_arm_chi2[_k] = None
         self.last_ocxo_gate_rejected = False
         self.last_ocxo_gate_reason = ""
         self.last_ticc_route = "int"
@@ -725,7 +749,20 @@ class DOFreqEst:
             self.last_arm_innov['ticc'] = innov_ticc
             self.last_arm_S['ticc'] = S
 
+            # Pull attribution (pullAttributionLog): compute K + the
+            # would-have-applied state delta once here, BEFORE the gate
+            # checks.  This captures the rejected-information time
+            # series that the chi² and OCXO gates suppress.  The K
+            # vector below is reused for the actual state update when
+            # the gates accept — no double computation.
+            K_ticc = (P_pred @ H_ticc.T) / S
+            _K_ticc_flat = K_ticc.flatten()
+            self.last_arm_K['ticc'] = _K_ticc_flat.tolist()
+            self.last_arm_would_pull['ticc'] = (
+                _K_ticc_flat * innov_ticc).tolist()
+
             _chi2 = innov_ticc ** 2 / S if S > 0 else 0.0
+            self.last_arm_chi2['ticc'] = _chi2
             chi2_reject = _chi2 > _CHI2_GATE_THRESHOLD
             # OCXO-trusted physical gate.  Anchored on the DO's
             # characterized freerun short-τ noise (not on √S), so it
@@ -756,9 +793,9 @@ class DOFreqEst:
                 )
 
             if not (chi2_reject or ocxo_reject):
-                K = (P_pred @ H_ticc.T) / S
-                x_pred = x_pred + K.flatten() * innov_ticc
-                P_pred = P_pred - np.outer(K.flatten(), K.flatten()) * S
+                # K_ticc already computed above for pull attribution
+                x_pred = x_pred + _K_ticc_flat * innov_ticc
+                P_pred = P_pred - np.outer(_K_ticc_flat, _K_ticc_flat) * S
                 self.innov_monitor.observe(self._last_u, innov_ticc, S)
 
         self.x = x_pred
@@ -817,10 +854,19 @@ class DOFreqEst:
         """
         innov = z - (H @ x_pred).item()
         S = (H @ P_pred @ H.T + R).item()
+        K = (P_pred @ H.T) / S
         if arm_name is not None:
             self.last_arm_innov[arm_name] = innov
             self.last_arm_S[arm_name] = S
-        K = (P_pred @ H.T) / S
+            # Pull attribution (pullAttributionLog): record K and the
+            # would-have-applied state delta before the caller's gate
+            # checks.  These are the same K and (K·innov) the update
+            # below applies, so logged values exactly match the state
+            # delta when the arm is admitted.
+            _K_flat = K.flatten()
+            self.last_arm_K[arm_name] = _K_flat.tolist()
+            self.last_arm_would_pull[arm_name] = (_K_flat * innov).tolist()
+            self.last_arm_chi2[arm_name] = (innov * innov / S) if S > 0 else 0.0
         x_new = x_pred + K.flatten() * innov
         P_new = P_pred - np.outer(K.flatten(), K.flatten()) * S
         return x_new, P_new
