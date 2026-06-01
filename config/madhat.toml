@@ -18,12 +18,31 @@
 #   baud = 115200
 #   ubx_port = "USB"
 #   receiver = "f9t-l5"
-serial = "/dev/f10t"
-baud = 38400
-ubx_port = "UART"
-receiver = "f10t"
-ptp_profile = "i226"
-ptp_dev = "/dev/ptp_i226"
+serial = "/dev/ttyACM1"  # F9P, 2026-05-31 swap-in
+baud = 115200  # F9P default; was 38400 for F10T
+ubx_port = "USB"  # F9P over CDC ACM; was UART for F10T
+receiver = "f9p"
+# ptp_profile = "i226"  # disabled 2026-05-24: i226 removed, IsoTemp OCXO-33 + AD5693R DAC instead
+# ptp_dev = "/dev/ptp_i226"  # disabled 2026-05-24
+
+# IsoTemp OCXO-33 + AD5693R DAC (post-i226 swap, install 2026-05-24)
+# Characterization: state/dos/isotemp-ocxo-33-madhat.json
+# 2026-05-28 saturation-aware cal (linear region [5000, 40000]);
+# operating override to code_max=42000 reaches GPS-rate 0-crossing
+# at ~code 41000 (knee mildly nonlinear, EKF under-steps safely).
+do_label = "isotemp-ocxo-33-madhat"
+do_type = "vcocxo"
+dac_bus = 1
+dac_addr = "0x4C"
+dac_bits = 16
+dac_type = "ad5693r"
+dac_gain = 1
+dac_ppb_per_code = "-0.01111"
+dac_max_ppb = 100.0
+dac_code_min = 5000
+dac_code_max = 42000
+# TADD-2 Mini divider: ARM on GPIO 16, syncs 5 MHz -> 1 PPS.
+tadd_gpio = 16
 ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
 # 2026-05-01 evening: revert to morning's known-good config
