@@ -141,6 +141,26 @@ F9T_L5_SIGNAL_CONFIG = {
     "CFG_SIGNAL_QZSS_ENA": 0,
 }
 
+# F9P positioning receiver: L1+L2 for GPS, E1+E5b for GAL, B1I+B2I for
+# BDS legacy.  F9P RF front-end has no 1176.45 MHz band, so L5/E5A/B2A
+# keys are NOT sent (sending them NAKs and trips the "signal config
+# NAK'd" fallback).  GLO/SBAS/QZSS explicitly off — F9P supports them
+# but we don't process those constellations.
+F9P_SIGNAL_CONFIG = {
+    "CFG_SIGNAL_GPS_ENA": 1,
+    "CFG_SIGNAL_GPS_L1CA_ENA": 1,
+    "CFG_SIGNAL_GPS_L2C_ENA": 1,
+    "CFG_SIGNAL_GAL_ENA": 1,
+    "CFG_SIGNAL_GAL_E1_ENA": 1,
+    "CFG_SIGNAL_GAL_E5B_ENA": 1,
+    "CFG_SIGNAL_BDS_ENA": 1,
+    "CFG_SIGNAL_BDS_B1_ENA": 1,
+    "CFG_SIGNAL_BDS_B2_ENA": 1,
+    "CFG_SIGNAL_GLO_ENA": 0,
+    "CFG_SIGNAL_SBAS_ENA": 0,
+    "CFG_SIGNAL_QZSS_ENA": 0,
+}
+
 # Required UBX messages for peppar-fix operation.
 # SFRBX and PVT are optional on bandwidth-limited transports (E810 I2C).
 REQUIRED_MESSAGES = {"RXM-RAWX", "RXM-SFRBX", "NAV-PVT", "TIM-TP"}
@@ -223,6 +243,13 @@ SIGNAL_NAMES.update(F9T_BDS_SIG_NAMES)
 
 F10T_SIGNAL_NAMES = dict(_GPS_GAL_SIG_NAMES)
 F10T_SIGNAL_NAMES.update(F10_BDS_SIG_NAMES)
+
+# F9P HPG 1.51 uses the same BDS sigId table as the F10 chipset (per
+# F9 HPG 1.51 Interface Description UBXDOC-963802114-13124).  F9P only
+# tracks (3,0)=B1I and (3,2)=B2I in practice — no B1C, no B2a, no B3I —
+# so the extra F10 entries are inert but kept for forward consistency.
+F9P_SIGNAL_NAMES = dict(_GPS_GAL_SIG_NAMES)
+F9P_SIGNAL_NAMES.update(F10_BDS_SIG_NAMES)
 
 SYS_MAP = {
     0: "gps",
@@ -358,6 +385,39 @@ class F10TDriver(ReceiverDriver):
     )
 
 
+class F9PDriver(ReceiverDriver):
+    """ZED-F9P positioning receiver — GPS L1+L2, GAL E1+E5b, BDS B1I+B2I.
+
+    The F9P is u-blox's high-precision positioning receiver, not a
+    timing receiver — no TMODE3, no L5/E5A/B2A RF band.  Confirmed on
+    MadHat 2026-05-31 with FW HPG 1.51 (SEC-UNIQID 5d58b2dad4).
+
+    Differs from F9TL2E5bDriver: F9P NAKs the L5/E5A/B2A enable-or-
+    disable keys entirely (F9T-L2-E5B sends them as "=0" to be explicit;
+    F9P doesn't recognize the keys at all).  F9P_SIGNAL_CONFIG omits
+    those keys so configure_signals() doesn't trip the NAK gate.
+
+    Tracks GPS L2CL (sigId=3), the long L2C pilot code.  CNES SSR
+    publishes GPS L1C + L2W + L5I + L5Q phase biases — no L2L — so
+    GPS L2CL observations admit and run in float mode but do not fix
+    AR (same constraint as F9TL2E5bDriver; the AR path on this driver
+    is GAL E1+E5b, both of which CNES publishes).
+    """
+    name = "ZED-F9P"
+    protver = "32"  # HPG 1.50–1.51 era
+    default_baud = 38400  # F9P factory default; USB CDC-ACM ignores baud
+    supports_timing_mode = False
+    supports_l5_health_override = False  # no L5 to override
+    signal_config = F9P_SIGNAL_CONFIG
+    signal_names = F9P_SIGNAL_NAMES
+    nav_timegps_rate = 1
+    if_pairs = (
+        ('GPS', 'GPS-L1CA', 'GPS-L2CL', 'G'),
+        ('GAL', 'GAL-E1C',  'GAL-E5bQ', 'E'),
+        ('BDS', 'BDS-B1I',  'BDS-B2I',  'C'),
+    )
+
+
 def get_driver(name):
     """Return the receiver driver for a CLI receiver name."""
     key = (name or "f9t").strip().lower()
@@ -369,6 +429,8 @@ def get_driver(name):
         return F9TL2E5bDriver()
     if key == "f10t":
         return F10TDriver()
+    if key == "f9p":
+        return F9PDriver()
     raise ValueError(f"Unknown receiver model: {name}")
 
 
