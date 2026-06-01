@@ -135,9 +135,21 @@ def adev_tdev_from_phase(phase_ns: np.ndarray
 
 def load_freerun_char(path: Path
                       ) -> tuple[dict, dict] | tuple[None, None]:
-    """Pull adev/tdev maps from a do_freerun_char.py JSON (chA-vs-Rb)."""
-    if not path or not path.exists():
+    """Pull adev/tdev maps from a do_freerun_char.py JSON (chA-vs-Rb).
+
+    Raises ``FileNotFoundError`` if a path was supplied but the file
+    doesn't exist — the previous silent-skip behaviour led to plots
+    missing a host's freerun curve without any user-visible signal
+    (caught 2026-05-31 when clkPoC3's JSON wasn't pulled to dev box).
+    A caller that wants disciplined-only (no freerun curve) should
+    omit the JSON from the --host-input spec entirely.
+    """
+    if not path:
         return None, None
+    if not path.exists():
+        raise FileNotFoundError(
+            f'Freerun JSON not found: {path}.  Pass an existing path '
+            f'or omit the JSON from --host-input to plot disciplined-only.')
     data = json.loads(path.read_text())
     cha = (data.get('characterization', {}).get('sources', {})
                 .get('DO PPS (chA vs TICC Rb)') or {})
