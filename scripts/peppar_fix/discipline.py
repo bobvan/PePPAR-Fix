@@ -69,7 +69,8 @@ class DisciplineScheduler:
                  coast_tdev=None,
                  coast_cap_k_sigma=1.0,
                  sigma_freerun_short_ns=None,
-                 transient_k_sigma=3.0):
+                 transient_k_sigma=3.0,
+                 sigma_actuator_q_ns=None):
         self.base_interval = base_interval
         self.adaptive = adaptive
         self.min_interval = min_interval
@@ -105,6 +106,24 @@ class DisciplineScheduler:
         self.sigma_freerun_short_ns = (None if sigma_freerun_short_ns is None
                                        else float(sigma_freerun_short_ns))
         self.transient_k_sigma = float(transient_k_sigma)
+
+        # Quiet-regime principled cadence ("Goldilocks").  At each
+        # coast end, the DO's predicted phase wander grows like
+        # TDEV_DO(τ).  Actuating injects σ_actuator_q of quantization
+        # noise.  Coast as long as the next-actuation budget is still
+        # better than just letting the DO drift:
+        #   k · TDEV_DO(τ_coast) = σ_actuator_q
+        #   ⇒ τ_coast = (σ_q / (k · σ_DO(1s))) ** (1/tdev_slope)
+        # For 16-bit DAC (σ_q ≈ 18 ps) + typical OCXO (σ_DO(1s) ≈ 18 ps,
+        # slope ≈ 0.5): τ_coast ≈ 1 s — i.e., the 1 Hz Goldilocks
+        # cadence the lab confirmed empirically 2026-06-02.
+        #
+        # None ⇒ feature not configured; fall through to the max-
+        # interval default (preserving the merged PR #123 quiet
+        # behavior).  When configured, computed once per
+        # compute_adaptive_interval() call from coast_tdev params.
+        self.sigma_actuator_q_ns = (None if sigma_actuator_q_ns is None
+                                    else float(sigma_actuator_q_ns))
 
         self._errors = []
         self._confidences = []
@@ -362,6 +381,48 @@ class DisciplineScheduler:
         self._drift_rate_ns_per_s = abs(slope)
         self._sigma_obs_ns = sigma
 
+    def _quiet_coast_breakeven_seconds(self):
+        """Quiet-regime principled coast: how long can we coast before
+        the DO's free-running phase wander matches the actuator
+        quantization noise we'd inject by firing?
+
+        Solve:  k · σ_DO(1s) · τ^slope  =  σ_actuator_q
+              ⇒ τ  =  (σ_q / (k · σ_DO(1s)))^(1/slope)
+
+        Returns max_interval when:
+          - sigma_actuator_q_ns or coast_tdev is unset (operator hasn't
+            given us the quantum)
+          - slope ≤ 0 (degenerate; can't invert)
+          - the formula's pow() raises (numerical edge cases)
+
+        Otherwise returns the raw breakeven τ.  Upper-bound clamping
+        to max_interval is the caller's responsibility (the natural
+        place is the graded_interval step).
+
+        The empirically-derived Goldilocks cadence on the 16-bit-DAC +
+        OCXO fleet is ~1 s; this formula gives exactly that when
+        σ_q≈18 ps, σ_DO(1s)≈18 ps, slope≈0.5.
+        """
+        if self.sigma_actuator_q_ns is None:
+            return float(self.max_interval)
+        if self._coast_tdev is None:
+            return float(self.max_interval)
+        tdev_ref_ns, slope, tau_ref_s = self._coast_tdev
+        if slope <= 0 or tdev_ref_ns <= 0:
+            return float(self.max_interval)
+        threshold = self._coast_cap_k_sigma * tdev_ref_ns
+        # τ where k · TDEV(τ) = σ_q.  When σ_q < threshold (= k · TDEV(1s))
+        # the DO is noisier than σ_q at τ=1s already → τ_breakeven < 1s →
+        # fire every epoch (clamped by min_interval at the caller).
+        # When σ_q ≥ threshold the DO is quieter than σ_q at τ=1s → can
+        # coast longer.
+        ratio = self.sigma_actuator_q_ns / threshold
+        try:
+            tau = tau_ref_s * (ratio ** (1.0 / slope))
+        except (ValueError, OverflowError):
+            return float(self.max_interval)
+        return tau
+
     def _in_transient_regime(self):
         """True iff the latest |err| is meaningfully above the DO's
         free-running short-τ noise floor.
@@ -443,9 +504,14 @@ class DisciplineScheduler:
             if self._in_transient_regime():
                 tau = float(self.min_interval)
             else:
-                # Quiet regime: coast as long as physics allows.  Caps
-                # below shorten by DO noise model / EKF predict P22.
-                tau = float(self.max_interval)
+                # Quiet regime: principled "Goldilocks" cadence.  Coast
+                # exactly as long as the DO's predicted free-running
+                # phase wander stays below the actuator quantization
+                # noise — actuating sooner injects more noise than the
+                # DO would naturally accumulate; actuating later lets
+                # the DO drift past what the actuator could correct.
+                # See _quiet_coast_breakeven_seconds() docstring.
+                tau = self._quiet_coast_breakeven_seconds()
         else:
             # Legacy path: d_physical-derived baseline.  Preserved
             # byte-identical when sigma_freerun_short_ns is unset
