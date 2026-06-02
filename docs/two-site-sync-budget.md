@@ -493,7 +493,7 @@ TCXO).  **Designated best-effort.** Not part of sync target.
 | Host | DO | Class | TDEV(1 s) measured | TDEV(100 s) measured | Notes |
 |---|---|---|---|---|---|
 | PiFace | CTI OSC5A2B02 | OCXO | 88 ps | 607 ps | Calibrated TICC + EXTINT bias against otcBob1 (2026-05-06).  Cleanest mid-tau of the fleet. |
-| clkPoC3 | OCXO (per state/dos/ocxo-clkpoc3-v2.json) | OCXO | 148 ps | 3537 ps | TICC bias calibrated transitively against PiFace; no EXTINT wired. Worst mid-tau bulge — gate-lockout pathology most pronounced. |
+| clkPoC3 | OCXO (per state/dos/ocxo-clkpoc3-v2.json) | OCXO | 148 ps | 3537 ps | TICC bias calibrated transitively against PiFace; EXTINT wired (96.3% admit in 2026-06-01 steady-state, +9.17 ns persistent innov bias, uncalibrated).  Worst mid-tau bulge — gate-lockout pathology most pronounced. |
 | MadHat | IsoTemp OCXO-33 | OCXO | 103 ps | 1471 ps | No TICC bias calibrated.  EXTINT wired 2026-06-01, observed -40 ns innov bias (uncalibrated).  Mid-tau between PiFace and clkPoC3. |
 | TimeHat | i226 internal TCXO | TCXO | 2.7 ns | 15.2 ns | Designated best-effort.  Not graded against budget. |
 
@@ -629,6 +629,31 @@ architecture before DAC upgrade.
    proportionally.  Single-host A/B run validates: TDEV(100s) on
    clkPoC3 should drop from 3.5 ns toward PiFace's 0.6 ns.
 
+   **Observability-override required.**  R-inflation IS de-weighting,
+   which collides with the `sole_observer_cannot_be_deweighted`
+   finding (memory item, 2026-05-29): on a host where one arm is the
+   sole observer of a state dimension, de-weighting that arm
+   starves the state.  Soft-gate must inherit the observability
+   floor that #95's OCXO physical gate already enforces: when an arm
+   is the only one observing a state, R-inflation must be bounded
+   so the arm continues to update the state (the gate-vs-noise
+   trade-off becomes "admit with bounded weight" instead of "admit
+   with arbitrarily inflated R").  The current fleet has multiple
+   x[2] observers on all OCXO hosts (TICC + EXTINT both wired on
+   PiFace, clkPoC3, and MadHat as of 2026-06-01) so the sole-observer
+   case is not currently triggered, but the override must be in the
+   implementation before any future host or arm-disable scenario can
+   regress.
+
+   **Step-2/step-3 ordering is host-dependent.**  On a sole-observer
+   host, slow-integrator (#3, adds information) or bias calibration
+   (#4) is the safer first move; soft-gate alone could under-correct
+   while waiting for the slow path to engage.  On multi-observer
+   hosts, either ordering works.  The clkPoC3 prediction in #2 is
+   itself the test: if soft-gate doesn't drop clkPoC3's TDEV(100s),
+   sole-observer de-weighting is the most likely cause and #3 needs
+   to land alongside.
+
 3. **Land slow innovation-mean integrator (Architecture A).**
    Feed `mean(innov/√S)` from the existing
    `InnovControlMonitor` rolling window back into a slow
@@ -637,6 +662,10 @@ architecture before DAC upgrade.
    information that the gate currently throws away.  Complementary
    to #2; either alone may close the budget but both together is
    the design Bob and main converged on this morning.
+
+   Per the host-dependent ordering note in #2: on sole-observer
+   hosts, land this BEFORE soft-gate.  On multi-observer hosts,
+   either order; the validation gate is the same.
 
 4. **Per-host TICC + EXTINT bias calibration.**  PiFace was
    calibrated against otcBob1 PPS on 2026-05-06 (1131 samples,
