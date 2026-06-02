@@ -67,7 +67,9 @@ class DisciplineScheduler:
                  adjfine_history_len=300,
                  phase_error_budget_ns=1.0,
                  coast_tdev=None,
-                 coast_cap_k_sigma=1.0):
+                 coast_cap_k_sigma=1.0,
+                 sigma_freerun_short_ns=None,
+                 transient_k_sigma=3.0):
         self.base_interval = base_interval
         self.adaptive = adaptive
         self.min_interval = min_interval
@@ -84,6 +86,25 @@ class DisciplineScheduler:
         # compute_adaptive_interval() (they need the live EKF state).
         self._coast_tdev = coast_tdev
         self._coast_cap_k_sigma = float(coast_cap_k_sigma)
+
+        # schedulerNoiseFloorCadence: physics-based transient detector
+        # that replaces the d_physical-derived baseline.  When the
+        # latest |err| is within K · σ_DO_freerun(τ≈1s), the residual
+        # is in the DO's own noise floor — nothing useful to track,
+        # coast.  Above the floor, real signal — fire every epoch.
+        # Decouples cadence from steady-state actuator pull magnitude
+        # (the bug we hit on PiFace ≠ clkPoC3 cadence: d_physical
+        # scaled with the loop's micro-corrections, which scale with
+        # the steady-state adj offset — a control-output artifact, not
+        # a physical drift signal).
+        #
+        # sigma_freerun_short_ns: per-DO from characterization (e.g.,
+        # TDEV(1s) in state/dos/<do_label>.json).  None ⇒ host not
+        # characterized; fall back to the legacy d_physical branch,
+        # byte-identical to today's behavior.
+        self.sigma_freerun_short_ns = (None if sigma_freerun_short_ns is None
+                                       else float(sigma_freerun_short_ns))
+        self.transient_k_sigma = float(transient_k_sigma)
 
         self._errors = []
         self._confidences = []
@@ -341,6 +362,38 @@ class DisciplineScheduler:
         self._drift_rate_ns_per_s = abs(slope)
         self._sigma_obs_ns = sigma
 
+    def _in_transient_regime(self):
+        """True iff the latest |err| is meaningfully above the DO's
+        free-running short-τ noise floor.
+
+        Decision rule:  ``|err| > k · σ_DO_freerun_short``  →  transient.
+
+        Below the noise floor, the loop has nothing useful to chase —
+        firing on noise just injects actuator jitter.  Above the floor,
+        the residual is real signal we need to track at full cadence.
+
+        Host-independent in form (the ratio |err| / σ_freerun is
+        dimensionless); the per-DO σ_freerun is a characterization
+        constant, NOT a control-output-derived quantity.  This
+        replaces the d_physical-derived baseline that scaled with
+        steady-state actuator pull magnitude — which gave PiFace fast
+        cadence by accident (its loop pulls +135 ppb, so micro-
+        corrections aliased into the slope estimator) while clkPoC3
+        coasted (loop pulls just −20 ppb, slope estimator stays near
+        zero).  Net: cadence shouldn't depend on which side of nominal
+        the DO's natural rate sits.
+
+        Returns False when ``sigma_freerun_short_ns`` is unset (host
+        not characterized) — caller falls through to the legacy
+        d_physical path for backwards compatibility.
+        """
+        if self.sigma_freerun_short_ns is None:
+            return False
+        if not self._errors:
+            return False
+        threshold = self.transient_k_sigma * self.sigma_freerun_short_ns
+        return abs(self._errors[-1]) > threshold
+
     def compute_adaptive_interval(self, measurement_sigma_ns=None,
                                   p22_at_tau=None, distance_to_lock=None):
         """Compute the discipline interval τ from the drift budget,
@@ -380,20 +433,40 @@ class DisciplineScheduler:
         if not self.adaptive:
             return self.base_interval
 
-        # Bootstrap: D_physical not yet measured (not enough actuations
-        # recorded).  Use base_interval until we have data.
-        if len(self._adjfine_history) < _MIN_FIT_SAMPLES:
-            return self.base_interval
-
-        # Baseline τ from the deterministic drift budget.  Quiet DO
-        # (drift below resolution, _MIN ~1e-9 ppb/s, well under OCXO
-        # aging) ⇒ τ = max_interval — exactly the over-coast the
-        # coast-cap below must rein in.
-        if self._d_physical_ppb_per_s < 1e-9:
-            tau = float(self.max_interval)
+        # schedulerNoiseFloorCadence path (characterized DO): physics-
+        # based transient detector + coast caps from DO noise model.
+        # Replaces the d_physical-derived baseline that scaled with
+        # steady-state actuator pull magnitude (a control-output
+        # artifact, not a physical drift signal — the PiFace/clkPoC3
+        # cadence-mismatch root cause, 2026-06-02).
+        if self.sigma_freerun_short_ns is not None:
+            if self._in_transient_regime():
+                tau = float(self.min_interval)
+            else:
+                # Quiet regime: coast as long as physics allows.  Caps
+                # below shorten by DO noise model / EKF predict P22.
+                tau = float(self.max_interval)
         else:
-            tau = math.sqrt(2.0 * self.phase_error_budget_ns
-                            / self._d_physical_ppb_per_s)
+            # Legacy path: d_physical-derived baseline.  Preserved
+            # byte-identical when sigma_freerun_short_ns is unset
+            # (uncharacterized DO).  Migration target: characterize
+            # every DO so this branch goes away.
+
+            # Bootstrap: D_physical not yet measured (not enough
+            # actuations recorded).  Use base_interval until we have
+            # data.
+            if len(self._adjfine_history) < _MIN_FIT_SAMPLES:
+                return self.base_interval
+
+            # Baseline τ from the deterministic drift budget.  Quiet
+            # DO (drift below resolution, _MIN ~1e-9 ppb/s, well under
+            # OCXO aging) ⇒ τ = max_interval — exactly the over-coast
+            # the coast-cap below must rein in.
+            if self._d_physical_ppb_per_s < 1e-9:
+                tau = float(self.max_interval)
+            else:
+                tau = math.sqrt(2.0 * self.phase_error_budget_ns
+                                / self._d_physical_ppb_per_s)
 
         # Bound the coast by the DO's stochastic wander.
         tau = self._apply_coast_caps(tau, p22_at_tau)
