@@ -7078,6 +7078,37 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                     "characterization for %s — TDEV cap disabled "
                     "(P22 cap still active)", do_uid_local)
 
+    # schedulerGoldilocksBreakeven: σ_actuator_q for the quiet-regime
+    # breakeven formula τ = (σ_q / (k · σ_DO(1s)))^(1/slope).  For DAC
+    # actuators this is the LSB phase quantum integrated over 1 s of
+    # coast: 1 ppb of frequency offset = 1 ns of phase per second, so
+    # σ_q (ns) = |dac_ppb_per_code|.  For PHC actuators adjfine's LSB
+    # (2^-16 ppm ≈ 1.5e-5 ppb) is effectively zero — leave σ_q=None and
+    # the scheduler falls back to max_interval-bounded coasting.
+    _sigma_actuator_q_ns = None
+    _ppb_per_code = getattr(args, 'dac_ppb_per_code', None)
+    if _ppb_per_code is not None and _ppb_per_code != 0.0:
+        _sigma_actuator_q_ns = abs(float(_ppb_per_code))
+        log.info("scheduler: DAC σ_actuator_q=%.4f ns/LSB "
+                 "(from --dac-ppb-per-code=%.6f)",
+                 _sigma_actuator_q_ns, _ppb_per_code)
+        if _coast_tdev is not None:
+            # Log the predicted Goldilocks cadence as a sanity check;
+            # actual scheduler decision happens at runtime via the
+            # quiet branch of compute_adaptive_interval.
+            tdev_1s, slope, _ = _coast_tdev
+            k = float(getattr(args, 'coast_cap_k_sigma', 1.0))
+            if slope > 0 and tdev_1s > 0:
+                ratio = _sigma_actuator_q_ns / (k * tdev_1s)
+                try:
+                    _goldilocks_tau = ratio ** (1.0 / slope)
+                    log.info("scheduler: predicted Goldilocks τ=%.3fs "
+                             "(σ_q=%.4f ns, k·σ_DO(1s)=%.4f ns, slope=%.2f)",
+                             _goldilocks_tau, _sigma_actuator_q_ns,
+                             k * tdev_1s, slope)
+                except (ValueError, OverflowError):
+                    pass
+
     # Charlie's #93 sim caveat: --coast-cap fails silently open when
     # t_budget is too loose vs the natural √P22(max_tau) AND TDEV(max_tau)
     # growth — the cap predicate never engages and divergence re-emerges.
@@ -7192,6 +7223,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         coast_tdev=_coast_tdev,
         coast_cap_k_sigma=getattr(args, 'coast_cap_k_sigma', 1.0),
         sigma_freerun_short_ns=_sigma_freerun_short_ns,
+        sigma_actuator_q_ns=_sigma_actuator_q_ns,
     )
 
     # disciplineModeFsm increment #1: the single derived continuous
@@ -7563,6 +7595,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         'servo': servo,
         'scheduler': scheduler,
         'sigma_freerun_short_ns': _sigma_freerun_short_ns,
+        'sigma_actuator_q_ns': _sigma_actuator_q_ns,
         'qerr_store': qerr_store,
         'extint_store': extint_store,
         'bias_extint_ns': _load_timestamper_bias(args, "extint:default"),
@@ -7729,6 +7762,7 @@ def _enter_obs_holdover(ctx, args, reason_code, detail):
         # on ctx at engine startup; None when DO uncharacterized (legacy
         # d_physical path).
         sigma_freerun_short_ns=ctx.get('sigma_freerun_short_ns'),
+        sigma_actuator_q_ns=ctx.get('sigma_actuator_q_ns'),
     )
     ctx['phase'] = 'tracking'
     ctx['tracking_large_error_count'] = 0
