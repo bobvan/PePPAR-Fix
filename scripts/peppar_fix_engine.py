@@ -7215,6 +7215,24 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                      "(outside holdover)",
                      _binary_layer.consec_max_epochs)
 
+    # exitFiveToServoReset: shared windowed budget for ALL in-process
+    # resets — the binary layer's gross fault AND the B/C/D outlier/
+    # restep cascades draw from one window (decision (c)).  Enabled
+    # whenever --gross-fault-reset is on; bounds in-process recovery so
+    # a genuinely-broken host falls through to exit-5 + wrapper
+    # re-bootstrap rather than resetting forever.
+    from peppar_fix.reset_budget import ResetBudget
+    _reset_budget = ResetBudget(
+        max_resets=getattr(args, 'reset_budget_max', 3),
+        window_s=getattr(args, 'reset_budget_window_s', 300.0),
+        enabled=bool(getattr(args, 'gross_fault_reset', False)),
+    )
+    if _reset_budget.enabled:
+        log.info("Reset budget ENABLED: ≤ %d in-process servo resets per "
+                 "%.0f s (shared across binary-layer + outlier/restep "
+                 "cascades); over budget → exit-5 re-bootstrap",
+                 _reset_budget.max_resets, _reset_budget.window_s)
+
     qerr_alignment = {
         # Litmus 1: EXTTS PPS + qErr (matched to EXTTS epoch)
         "pps_var": RunningVarianceWindow(),
@@ -7589,6 +7607,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         # --graded-taper was set (lab repro 2026-05-30 PiFace/MadHat).
         'convergence': _convergence,
         'binary_layer': _binary_layer,
+        'reset_budget': _reset_budget,
     }
 
     # ── Optional noise-buffer CSV (I-162848 Step 1) ───────────────── #
@@ -7691,6 +7710,55 @@ def _enter_obs_holdover(ctx, args, reason_code, detail):
     ctx['phase'] = 'tracking'
     ctx['tracking_large_error_count'] = 0
     ctx['tracking_mode'] = 'ekf'
+
+
+def _request_servo_reset(ctx, reason, scope="servo", *, now=time.monotonic):
+    """Consult the shared ResetBudget and either reset the servo in
+    process or signal exit-5.  Returns ``"reset"`` (done in process) or
+    ``"exit5"`` (caller should set ``phc_diverged`` / return 5).
+
+    The single funnel for every in-process reset — the binary layer's
+    gross fault and the B/C/D outlier/restep cascades all route through
+    here so (a) a callee signature change can't strand a scattered call
+    site (the #115 failure mode), and (b) the reset budget is enforced
+    in ONE place across all reasons (decision (c) of
+    docs/exit-five-to-servo-reset.md).
+
+    ``scope="servo"`` resets the EKF (``DOFreqEst.reset()`` — preserves
+    the actuator command) and the convergence signal.  The caller is
+    responsible for clearing its own cascade counter (e.g.
+    ``consecutive_outliers``) so it doesn't immediately re-fire.
+
+    ``now`` is injected (default ``time.monotonic``) so the budget
+    window is deterministically testable.  When the budget is absent or
+    disabled (in-process reset not opted in via --gross-fault-reset),
+    this returns ``"exit5"`` and the engine keeps its legacy behavior.
+    """
+    budget = ctx.get('reset_budget')
+    if budget is None or not budget.enabled:
+        return "exit5"
+    if not budget.request(reason, now()):
+        log.error(
+            "[SERVO_RESET] reason=%s — reset budget exhausted "
+            "(%d resets in last %.0f s, max %d) — falling through to "
+            "exit-5 for wrapper re-bootstrap",
+            reason, budget.resets_in_window, budget.window_s,
+            budget.max_resets)
+        return "exit5"
+    servo = ctx['servo']
+    servo.reset()
+    _conv = ctx.get('convergence')
+    if _conv is not None:
+        _conv.reset()
+    log.warning(
+        "[SERVO_RESET] reason=%s scope=%s — EKF reset, actuator "
+        "preserved at freq=%.3f ppb; resets in last %.0f s: %d "
+        "(this reason cumulative=%d, total=%d)",
+        reason, scope, servo.freq, budget.window_s,
+        budget.resets_in_window,
+        budget.cumulative_by_reason.get(reason, 0),
+        budget.total_allowed)
+    return "reset"
 
 
 def _exit_holdover(ctx, detail):
@@ -7798,6 +7866,12 @@ def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
     if TRACK_OUTLIER_NS is not None and abs(phase_ns) > TRACK_OUTLIER_NS:
         ctx['consecutive_outliers'] = ctx.get('consecutive_outliers', 0) + 1
         if ctx['consecutive_outliers'] >= 30:
+            # exitFiveToServoReset site C (ClockMatrix outlier cascade):
+            # try in-process reset before exit-5.  Within budget →
+            # reset the EKF, clear the counter, keep coasting.
+            if _request_servo_reset(ctx, 'cm_outlier') == "reset":
+                ctx['consecutive_outliers'] = 0
+                return "outlier"
             log.error("  %d consecutive outliers — exiting (code 5)",
                       ctx['consecutive_outliers'])
             ctx['phc_diverged'] = True
@@ -8229,6 +8303,14 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     )
     if _decision == "outlier":
         if _exit5:
+            # exitFiveToServoReset site B (PHC/EKF outlier cascade):
+            # try in-process reset before exit-5.  Within budget → reset
+            # the EKF (actuator preserved), clear the counter, keep
+            # coasting; the filter re-acquires from the wide bootstrap
+            # covariance.  Over budget → the legacy exit-5 path.
+            if _request_servo_reset(ctx, 'ekf_outlier') == "reset":
+                ctx['consecutive_outliers'] = 0
+                return "outlier"
             log.error("  %d consecutive outliers — servo has lost control. "
                       "Exiting for re-bootstrap (exit code 5).",
                       ctx['consecutive_outliers'])
@@ -8292,13 +8374,28 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         else:
             ctx['tracking_large_error_count'] = 0
         if ctx['tracking_large_error_count'] >= 3:
-            log.error(
-                "PHC error above %.0fns for %d consecutive epochs — "
-                "exiting for PHC re-bootstrap (exit code 5)",
-                TRACK_RESTEP_NS,
-                ctx['tracking_large_error_count'],
-            )
-            ctx['phc_diverged'] = True
+            # exitFiveToServoReset site D (PHC-error-restep cascade):
+            # try in-process reset before exit-5.  Within budget → reset
+            # the EKF, clear the counter, and skip the rest of this epoch
+            # (return "outlier", as sites B/C do) so NO servo correction
+            # is computed on the freshly-bootstrapped filter below; the
+            # loop re-acquires next epoch.  (The pre-budget code always
+            # exited here, so the post-reset fall-through is a new path
+            # — skipping it keeps D consistent with B/C.  D's block is
+            # gated on `not args.freerun`, so the freerun auto-stop
+            # below is unreachable from here anyway.)  Over budget →
+            # the legacy exit-5 path.
+            if _request_servo_reset(ctx, 'phc_restep') == "reset":
+                ctx['tracking_large_error_count'] = 0
+                return "outlier"
+            else:
+                log.error(
+                    "PHC error above %.0fns for %d consecutive epochs — "
+                    "exiting for PHC re-bootstrap (exit code 5)",
+                    TRACK_RESTEP_NS,
+                    ctx['tracking_large_error_count'],
+                )
+                ctx['phc_diverged'] = True
 
     # Freerun auto-stop: exit when PPS error grows too large for
     # the correlation gate to work reliably.
@@ -8488,15 +8585,19 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                                       _in_holdover) == "gross_fault":
                 log.warning(
                     "[GROSS_FAULT_RESET] distance_to_lock=1.0 sustained "
-                    "for %d epochs outside holdover — resetting EKF "
-                    "(actuator preserved at freq=%.3f ppb); "
-                    "cumulative resets=%d",
-                    _binary_layer.consec_max_epochs,
-                    servo.freq,
-                    _binary_layer.n_gross_fault_resets + 1)
-                servo.reset()
-                _convergence.reset()
+                    "for %d epochs outside holdover — requesting EKF "
+                    "reset (actuator at freq=%.3f ppb)",
+                    _binary_layer.consec_max_epochs, servo.freq)
+                # Route through the shared reset budget (exitFiveToServo
+                # Reset): servo.reset() + convergence.reset() happen
+                # inside the helper when within budget; over budget →
+                # exit-5.  clear_after_reset() advances the binary
+                # layer's own consec/cumulative bookkeeping either way
+                # so it doesn't re-fire on the next epoch.
+                _outcome = _request_servo_reset(ctx, 'binary_layer')
                 _binary_layer.clear_after_reset()
+                if _outcome == "exit5":
+                    ctx['phc_diverged'] = True
 
         # disciplineModeFsm increment #3 wiring (cf. #95 deferred
         # follow-up): pass the cached convergence signal into the
@@ -10710,6 +10811,18 @@ Two-phase operation:
                             "--gross-fault-reset fires.  Default 60 (60 s at "
                             "1 Hz cadence).  Lower = more aggressive resets; "
                             "higher = more tolerance of transient divergence.")
+    servo.add_argument("--reset-budget-max", type=int, default=3,
+                       help="exitFiveToServoReset: max in-process servo "
+                            "resets allowed per --reset-budget-window-s, "
+                            "SHARED across the binary layer and the outlier/"
+                            "restep cascades.  Over budget → fall through to "
+                            "exit-5 + wrapper re-bootstrap.  Only consulted "
+                            "when --gross-fault-reset is on.  Default 3.")
+    servo.add_argument("--reset-budget-window-s", type=float, default=300.0,
+                       help="exitFiveToServoReset: rolling window (s) for "
+                            "--reset-budget-max.  Default 300 (5 min).  A "
+                            "single transient fault never trips it; a genuine "
+                            "thrash escalates to exit-5 within the window.")
     servo.add_argument("--servo-log", default=None,
                        help="CSV log file for servo data")
     servo.add_argument("--track-max-ppb", type=float, default=None,
