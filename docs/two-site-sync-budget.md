@@ -2,11 +2,15 @@
 
 **Status**: design / moonshot specification.  Drafted 2026-05-13 in
 response to Bob's observation that *"TDEV(1s)=250 ps doesn't mean
-two clocks stay sub-ns — they can drift 1 ns in 4 s."*  This doc does
-the math for what TDEV/ADEV regime, servo bandwidth, actuator
-resolution, and DO class are actually needed to hit a probability-
-bounded **excursion** target, separately for the shared-antenna and
-two-site cases, then lays out the hardware path implied.
+two clocks stay sub-ns — they can drift 1 ns in 4 s."*  Substantially
+revised 2026-06-01 after first clean shared-antenna acceptance-test
+run revealed σ_servo_residual is the binding constraint via
+chi²-gate lockout, not the actuator/DO terms originally predicted.
+This doc does the math for what TDEV/ADEV regime, servo bandwidth,
+actuator resolution, and DO class are actually needed to hit a
+probability-bounded **excursion** target, separately for the
+shared-antenna and two-site cases, then lays out the hardware path
+implied.
 
 The moonshot in CLAUDE.md (updated in lockstep with this doc) is the
 operational statement of the targets derived here.
@@ -140,11 +144,100 @@ At τ=1 s, with loop time-constant ~1 s, this is dominated by
 The concern is **plant-model error** — if `dac_ppb_per_code` is
 mis-scaled by factor α, the EKF systematically under- or
 over-corrects, and σ_servo_residual carries a bias term `∝ u·(1−α)`.
-That term is detected by the **innov-vs-control monitor** filed as
-`innovControlMonitor-main` (2026-05-13).  Treat it as a separate
-hazard with its own gate, not an additive σ here.
+That term is detected by the **innov-vs-control monitor**
+(`innovControlMonitor-main`, landed 2026-05-13, code in
+`scripts/peppar_fix/innov_control_monitor.py`).  Treat it as a
+separate hazard with its own gate, not an additive σ here.
 
-**σ_servo_residual ≈ 10-20 ps**, assuming plant model is correct. ✓
+#### 3.2.1 Gate-lockout failure mode (revised 2026-06-01)
+
+The 10-20 ps estimate above assumes the loop is *actually closed* —
+i.e., the arms supplying load-bearing phase information are being
+admitted to the state update.  In practice we observe the opposite:
+
+The TICC arm carries a hard chi² gate at `K=100` (≈10σ).  During
+real-world transients — physical phase steps from cable disturbance,
+multi-second EKF state drift after a long coast, even just a
+brief PPP outlier feeding back through the coupled `H_ticc =
+[-1, 0, -1, 0]` — the arm's innovation lands above threshold and is
+*entirely* rejected.  The EKF then runs on TDCP frequency only,
+with no phase observation.  The DO drifts open-loop on phase at
+its free-running rate (mid-tau OCXO drift is real once you remove
+the phase feedback).
+
+When the gate finally relents (which it does as predicted variance
+S grows during the coast, eventually crossing the innovation), the
+EKF snaps to the accumulated TICC error in a single epoch.  That
+snap is the disturbance the cold-start cascade dance (Bob's "4
+wrong starts before lock" observation) is built from, and the
+mid-tau TDEV bulge it leaves behind is the budget failure.
+
+**Empirical evidence (overnight 2026-05-31 → 2026-06-01, three
+OCXO-class hosts, full moonshot servo stack with --router-qvir
+--coast-cap --max-adjfine-step-ppb 2.0 --servo-input tdcp):**
+
+```
+TDEV(τ) [ps]      τ=1s   τ=10s   τ=50s   τ=100s  τ=200s  τ=500s
+PiFace             88     309    506     607     631     589
+clkPoC3           148     270   1655    3537    3457    2821
+MadHat            103     129    944    1471    1846    1250
+budget target     354    354    354     354     354     354
+```
+
+PiFace is at most 2× over the per-clock target and shows a gentle
+monotonic positive slope.  clkPoC3 hits **10× over** at τ=100 s.
+MadHat is **5× over** at τ=200 s.  Same OCXO class, same SSR mount,
+same servo flags — but a 5× spread in mid-tau noise.  The delta
+between PiFace and the other two is gate-rejection behavior, not
+DO noise floor (per §3.3, the DO floor is ~10 ps — three orders of
+magnitude below the budget).  The TimeHat 1.85 µs excursion on
+2026-06-01 02:54 UTC after a 345 ns TICC step is the same
+mechanism in extremis: 70 s of chi²-locked coast, ~1.5 µs of
+open-loop drift, then a corrective snap.
+
+**Updated σ_servo_residual model.**  When the rejection rate of
+load-bearing phase arms exceeds a threshold (empirically: above
+~90 % over a window > the DO's mid-tau coherence time), σ_servo_
+residual is no longer bounded by `(σ_meas / SNR_loop)`.  It is
+bounded above by the *integrated DO free-running phase drift over
+the coast window*:
+
+```
+σ_servo_residual(τ) ≤ σ_y(τ_DO) · τ_coast     for τ > τ_coast
+```
+
+where `τ_DO` is the DO's intrinsic coherence time and `τ_coast` is
+the typical lockout duration (50-200 s in observed data).
+
+Implication: **the per-term decomposition in §3 is correct only
+under a soft-gate or always-admit architecture.**  Under hard chi²
+rejection at K=100, σ_servo_residual swallows the entire 354 ps
+budget on hosts where the gate rejects more than the lockout
+threshold.
+
+**Architectural fixes on the table (`docs/pull-attribution-mid-
+tau-2026-06-01.md` for the analysis, PR #118 for the diagnostic
+schema):**
+
+- **Soft gate**: R-inflation by `max(1, (innov/(K·√S))²)` instead
+  of binary reject.  Admits all samples; the EKF's own variance
+  weighting handles outliers proportionally.  Most-promising
+  single fix.
+- **Slow innovation-mean integrator**: feed `mean(innov/√S)` from
+  the existing `InnovControlMonitor` window back into a slow
+  state-correction term.  Captures the long-term mean of
+  rejected samples (which still carries information; only the
+  per-epoch high-frequency content is noisy).  Independent of
+  the gate; complementary to soft-gate.
+- **Per-arm pull-attribution logging** (PR #118): observability
+  prerequisite.  Without per-arm `K · innov` logged, no way to
+  validate either fix or to diagnose which arm's information is
+  being lost on a given host.
+
+**σ_servo_residual under the current hard-gate architecture:
+50-3500 ps depending on host and τ.  Under the proposed soft-gate
++ slow-integrator architecture: projected back to the original
+10-20 ps estimate, *to be empirically validated*.**
 
 ### 3.3 Free-running DO noise above servo BW — σ_DO_above_BW
 
@@ -206,6 +299,15 @@ quantization term entirely** (4 ps is negligible against the
 quantization concern; 20-bit+ (digital OCXO with internal DCO) is
 overkill but harmless.
 
+**Priority note (revised 2026-06-01).**  The 18-bit DAC upgrade was
+ordered as work item #3 in §8 before mid-tau data was clean.  With
+2026-06-01 overnight data showing σ_servo_residual blown out by
+~100× from gate-rejection behavior (§3.2.1), the 14 ps quantization
+delta between 16-bit and 18-bit is *not the current limiter on any
+host*.  The DAC upgrade remains a good investment for headroom but
+is no longer the highest-leverage next step.  See §8 for revised
+work-item ordering.
+
 ---
 
 ## 4. Shared-antenna case — math, achievability
@@ -218,38 +320,83 @@ shared antenna, 95% excursion ≤ 1 ns:
   → σ_clock(τ) ≤ 354 ps per clock
 ```
 
-### 4.2 Per-term allocation (OCXO + 18-bit DAC + 1 Hz servo)
+### 4.2 Per-term allocation (OCXO + 16-bit DAC + 1 Hz servo)
 
-| Term | Allocation | Actual | Headroom |
+**Theoretical (assumes loop closed across all arms):**
+
+| Term | Allocation | Theoretical actual | Empirical actual (2026-06-01) |
 |---|---|---|---|
-| σ_meas (TD-CP) | 100 ps | 10 ps | huge |
-| σ_servo_residual | 100 ps | 20 ps | comfortable |
-| σ_DO_above_BW | 200 ps | 10 ps (Isotemp OCXO) | huge |
-| σ_actuator_q | 50 ps | 4 ps (AD5781) | huge |
-| **RSS** | **354 ps** | **~25 ps** | **fits in 0.07× budget** |
+| σ_meas (TD-CP) | 100 ps | 10 ps | ~10 ps ✓ |
+| σ_servo_residual | 100 ps | 10-20 ps | **88-3500 ps at τ=100s** ✗ |
+| σ_DO_above_BW | 200 ps | 10 ps (OCXO) | ~10 ps ✓ |
+| σ_actuator_q (16-bit) | 50 ps | 18 ps | ~18 ps ✓ |
+| **RSS** | **354 ps** | **~25 ps (theory)** | **88-3500 ps (actual)** |
 
-**Verdict**: shared-antenna 1 ns @ 95% is comfortably reachable with
-**OCXO + 18-bit DAC + 1 Hz servo**.  The actual sub-ns floor of the
-chain in this configuration looks more like **~50-100 ps**, leaving
-ample margin for plant-model/loop imperfections.
+**Verdict revision (2026-06-01).**  Three of four terms are at or
+near their theoretical estimates; σ_servo_residual is **the
+binding term in practice** because the chi² hard gate rejects
+load-bearing phase observations during transients (see §3.2.1).
+The "~50-100 ps actual sub-ns floor" prediction from the original
+draft is **correct at τ=1 s** (we see 88 ps on PiFace, 148 ps on
+clkPoC3, 103 ps on MadHat) but breaks badly at τ=100 s on hosts
+where the gate rejects more than its lockout threshold.
 
 ### 4.3 Risks
 
+- **Gate-lockout pathology** (§3.2.1).  The current binding
+  constraint.  Mitigation: soft-gate + slow-integrator
+  architecture, observability prerequisite landing as PR #118.
 - **Plant-model error not caught**.  `innovControlMonitor-main`
-  closes this.
+  closes this — landed 2026-05-13, currently observer-only.
+  Architecture A (slow integrator from monitor's `norm_bias`)
+  would close the feedback loop.
 - **Servo oscillation / limit cycle**.  The clkPoC3 day0512 TDEV
-  hump at τ=128s (63.5 ns) is exactly this kind of signature.
-  Diagnostic on the table; not a fundamental limit.
+  hump at τ=128s (63.5 ns) — now identified as a milder version
+  of the same gate-lockout dynamics observed on 2026-06-01.
+- **Per-host calibration drift**.  PiFace has TICC + EXTINT bias
+  calibrated against otcBob1 (2026-05-06); MadHat and TimeHat
+  have none.  Uncalibrated bias on TICC means the servo drives
+  the DO to *path-asymmetry-zero*, not GPS-zero — see Bob's note
+  in this conversation thread.  EXTINT residual on MadHat is
+  −40 ns largely from this.
 - **Local TICC drift contaminating chA-alone TDEV measurement** —
   measurement-side artifact, not in σ_Δ.
 
 ### 4.4 Validation
 
-Two PiFace-class hosts (OCXO + DAC + same firmware) on the UFO1
-splitter, both running the disciplining loop.  Measure σ_Δ directly
-via TICC differential (chA-chB on a shared TICC, eliminating that
-TICC's own reference noise).  Expect σ_Δ ≤ 200 ps RMS, max
-excursion in 1 h ≤ 1 ns.
+**Original spec:** two PiFace-class hosts (OCXO + DAC + same
+firmware) on the UFO1 splitter, both running the disciplining
+loop.  Measure σ_Δ directly via TICC differential (chA-chB on a
+shared TICC, eliminating that TICC's own reference noise).  Expect
+σ_Δ ≤ 200 ps RMS, max excursion in 1 h ≤ 1 ns.
+
+**Current empirical result (2026-06-01, virtual-pair CDFs across
+the four-host moonshot fleet, ~9 h overlap window, hard chi² gate
+at K=100):**
+
+| Host pair | p50 | p95 | max | Status vs 1 ns @ 95% |
+|---|---|---|---|---|
+| PiFace ↔ MadHat | 2.5 ns | **6.9 ns** | 19.7 ns | 6.9× over |
+| PiFace ↔ clkPoC3 | 4.9 ns | 13.1 ns | 28.7 ns | 13× over |
+| clkPoC3 ↔ MadHat | 4.9 ns | 14.8 ns | 34.3 ns | 15× over |
+| (TimeHat-paired) | 15.6 ns | 45-49 ns | 1.85 µs* | TCXO, best-effort only |
+
+*TimeHat peak was a single 1.85 µs excursion attributable to the
+chi² lockout pathology in §3.2.1 (345 ns TICC step at 02:54 UTC →
+70 s of EKF coast → ~1.5 µs of open-loop DO drift → corrective
+snap).  Other TimeHat windows are at the 45-50 ns p95 floor of the
+TCXO.
+
+**Best pair (PiFace ↔ MadHat) is 6.9× over the 1 ns target.**  The
+2 × σ_Δ math from §4.2 says we need per-clock σ ≈ 354 ps; we're
+measuring per-clock σ ≈ 2.5 ns (back-derived from p95).  ~7×
+above budget, consistent with the §3.2.1 finding that σ_servo_
+residual is currently swallowing the budget.
+
+Acceptance test stays as defined; we are **not passing it** under
+the current hard-gate architecture.  Re-run after soft-gate or
+slow-integrator lands to verify the prediction that fixing
+σ_servo_residual recovers the budget headroom.
 
 ---
 
@@ -340,6 +487,15 @@ shared-antenna 1 ns still fits.
 
 **Inadequate:** TCXO at ADEV(1s) ≥ 1e-10 (includes i226 internal
 TCXO).  **Designated best-effort.** Not part of sync target.
+
+**Current fleet inventory (2026-06-01):**
+
+| Host | DO | Class | TDEV(1 s) measured | TDEV(100 s) measured | Notes |
+|---|---|---|---|---|---|
+| PiFace | CTI OSC5A2B02 | OCXO | 88 ps | 607 ps | Calibrated TICC + EXTINT bias against otcBob1 (2026-05-06).  Cleanest mid-tau of the fleet. |
+| clkPoC3 | OCXO (per state/dos/ocxo-clkpoc3-v2.json) | OCXO | 148 ps | 3537 ps | TICC bias calibrated transitively against PiFace; EXTINT wired (96.3% admit in 2026-06-01 steady-state, +9.17 ns persistent innov bias, uncalibrated).  Worst mid-tau bulge — gate-lockout pathology most pronounced. |
+| MadHat | IsoTemp OCXO-33 | OCXO | 103 ps | 1471 ps | No TICC bias calibrated.  EXTINT wired 2026-06-01, observed -40 ns innov bias (uncalibrated).  Mid-tau between PiFace and clkPoC3. |
+| TimeHat | i226 internal TCXO | TCXO | 2.7 ns | 15.2 ns | Designated best-effort.  Not graded against budget. |
 
 ### 6.2 Actuator resolution
 
@@ -453,45 +609,138 @@ into the lab via surplus.
 
 ## 8. Path forward (work items)
 
-1. **Land `innovControlMonitor-main`** — closes the load-bearing
-   diagnostic for plant-model error.  Tells us empirically whether
-   the current servo is actually hitting the per-clock budget
-   above, regardless of theoretical analysis here.
+**Revised 2026-06-01.**  Original ordering pre-dated mid-tau data
+showing that σ_servo_residual under hard chi² gating is the
+binding constraint, not the actuator term.  Re-ordered: gate
+architecture before DAC upgrade.
 
-2. **Land `dacPpbSignClean-main`** — eliminates the most-likely
-   source of plant-model error.  Pair with #1's monitor as the
-   validation gate.
+### 8.1 Gate-rejection architecture (current binding constraint)
 
-3. **Upgrade clkPoC3 + PiFace + (one more) to 18-bit DAC
-   architecture.**  AD5781 + LTC6655.  Lab-host hardware work, not
+1. **Land PR #118 `pullAttributionLog`** — per-arm K, would_pull,
+   chi² columns in arm-state.csv.  Observability prerequisite for
+   any architectural fix; the schema reveals exactly which arm's
+   information is being lost on each host.  Status: draft PR open,
+   deployed and validated on clkPoC3 + MadHat overnight.
+
+2. **Land soft-gate (R-inflation) on TICC arm.**  Replace the
+   binary `chi2 > _CHI2_GATE_THRESHOLD → skip update` path with
+   `R_effective = R · max(1, (innov / (K·√S))²)`.  Admits all
+   samples; the EKF's variance weighting handles outliers
+   proportionally.  Single-host A/B run validates: TDEV(100s) on
+   clkPoC3 should drop from 3.5 ns toward PiFace's 0.6 ns.
+
+   **Observability-override required.**  R-inflation IS de-weighting,
+   which collides with the `sole_observer_cannot_be_deweighted`
+   finding (memory item, 2026-05-29): on a host where one arm is the
+   sole observer of a state dimension, de-weighting that arm
+   starves the state.  Soft-gate must inherit the observability
+   floor that #95's OCXO physical gate already enforces: when an arm
+   is the only one observing a state, R-inflation must be bounded
+   so the arm continues to update the state (the gate-vs-noise
+   trade-off becomes "admit with bounded weight" instead of "admit
+   with arbitrarily inflated R").  The current fleet has multiple
+   x[2] observers on all OCXO hosts (TICC + EXTINT both wired on
+   PiFace, clkPoC3, and MadHat as of 2026-06-01) so the sole-observer
+   case is not currently triggered, but the override must be in the
+   implementation before any future host or arm-disable scenario can
+   regress.
+
+   **Step-2/step-3 ordering is host-dependent.**  On a sole-observer
+   host, slow-integrator (#3, adds information) or bias calibration
+   (#4) is the safer first move; soft-gate alone could under-correct
+   while waiting for the slow path to engage.  On multi-observer
+   hosts, either ordering works.  The clkPoC3 prediction in #2 is
+   itself the test: if soft-gate doesn't drop clkPoC3's TDEV(100s),
+   sole-observer de-weighting is the most likely cause and #3 needs
+   to land alongside.
+
+3. **Land slow innovation-mean integrator (Architecture A).**
+   Feed `mean(innov/√S)` from the existing
+   `InnovControlMonitor` rolling window back into a slow
+   `x[1]`/`x[2]` correction term with gain β tuned empirically.
+   Captures the long-term mean of rejected samples — the
+   information that the gate currently throws away.  Complementary
+   to #2; either alone may close the budget but both together is
+   the design Bob and main converged on this morning.
+
+   Per the host-dependent ordering note in #2: on sole-observer
+   hosts, land this BEFORE soft-gate.  On multi-observer hosts,
+   either order; the validation gate is the same.
+
+4. **Per-host TICC + EXTINT bias calibration.**  PiFace was
+   calibrated against otcBob1 PPS on 2026-05-06 (1131 samples,
+   20 min, σ_about_bias=2.35 ns).  MadHat needs the same against
+   the same reference.  TimeHat too once it's a sync candidate
+   (today: best-effort only).  Tool exists at
+   `scripts/calibrate_timestampers.py`; procedure in
+   `docs/dofreq-est-measurement-ladder.md`.
+
+### 8.2 Plant model (next-highest leverage)
+
+5. **`innovControlMonitor-main` — already landed** (2026-05-13).
+   Currently observer-only.  Closing the feedback loop is step 3
+   above.
+
+6. **`dacPpbSignClean-main`** — eliminate the most-likely source
+   of plant-model error.  Pair with #5 as the validation gate.
+
+### 8.3 Hardware (post-gate-fix, secondary)
+
+7. **Upgrade to 18-bit DAC architecture.**  AD5781 + LTC6655.
+   Re-prioritized after gate-fix lands: at 18 ps quantization
+   noise, this term is ~5× below the soft-gate-fixed σ_servo_
+   residual estimate (~100 ps), so the DAC upgrade buys margin
+   but isn't the limiting term.  Lab-host hardware work, not
    software; file as `hw:`-labeled item once electronics ordered.
-   Validation: σ_Δ measurement vs 16-bit AD5693R baseline.
 
-4. **Run shared-antenna two-clock σ_Δ measurement** as the
-   moonshot's primary acceptance test.  Pair of OCXO+18-bit-DAC
-   hosts on UFO1 splitter, TICC differential, 24h run, statistical
-   summary.
-
-5. **(Stretch) Two-site separate-antenna run** — needs Bob's other
-   antenna site to be production-ready.  PR run with PPP-AR + same
+8. **(Stretch) Two-site separate-antenna run** — needs Bob's
+   second antenna site to be production-ready.  PPP-AR + same
    SSR mount.
 
-6. **(Optional experiment) SiT5358 eval-board pair** — characterize
-   native-digital-OCXO architecture as an alternative path.
+9. **(Optional experiment) SiT5358 eval-board pair** —
+   characterize native-digital-OCXO architecture as an
+   alternative path.
+
+### 8.4 Validation
+
+10. **Re-run §4.4 shared-antenna acceptance test** after items
+    #1-3 land.  Same fleet, same SSR mount, same wall-clock window.
+    Pass criterion: p95 ≤ 1 ns across all OCXO-host pairs.
+    Current: p95 = 6.9 ns (PiFace ↔ MadHat best).
 
 ---
 
 ## 9. Open questions
 
-- **Empirical TDEV slope** for our current OCXO+AD5693R hosts at
-  τ=1-100s — is it actually WFM (slope −1/2) or closer to FFM
-  (slope 0)?  Re-analysis of clean day0512 PiFace data can answer.
-  Matters for whether the 95%-excursion math is conservative or
-  optimistic.
+- **~~Empirical TDEV slope~~** for our current OCXO+AD5693R hosts
+  at τ=1-100s — is it actually WFM (slope −1/2) or closer to FFM
+  (slope 0)?  ~~Re-analysis of clean day0512 PiFace data can
+  answer.~~  **Answered 2026-06-01.**  The observed slope on
+  clkPoC3 between τ=10 s and τ=100 s is approximately **τ¹·¹** —
+  *positive* — between WFM (−1/2) and the budget-failure regime
+  of RWFM (+1/2).  This is the gate-rejection signature (§3.2.1),
+  not intrinsic DO or atmospheric noise.  PiFace shows a gentler
+  positive slope (~τ⁰·²) in the same window, consistent with
+  occasional gate-rejection events rather than sustained lockout.
+  The 95%-excursion math in §2 turns out to be **optimistic under
+  the current architecture** — it presumed bounded servo
+  residuals that don't hold during gate lockouts.  Math becomes
+  conservative again once §8.1 fixes land.
 
 - **Loop dynamics** at servo BW — is the LQR gain critically damped
   in practice?  The clkPoC3 day0512 hump at τ=128s suggests
-  maybe not.  Innov monitor will help.
+  maybe not.  Innov monitor (landed) confirms periodic
+  control-vs-innov correlation excursions; PR #118 lets us
+  attribute them per-arm.
+
+- **Per-arm Q-tuning from DO ADEV characterization.**  Current
+  Q[1,1] (clock-rate process noise) is hand-tuned per host.  The
+  textbook Kalman result says Q should derive from
+  `σ_y²(τ_loop) · τ_loop` for the specific DO.  Per-DO Q reads
+  out of `state/dos/<do_label>.json` once the characterization
+  process is complete (`committedDoCharacterization` dayplan
+  thread, in flight).  Likely improvement on hosts where the
+  current Q is mis-set.
 
 - **Differential atmospheric model fidelity** for our specific
   lab/rooftop site pair — needs empirical data from a parallel run
@@ -516,3 +765,6 @@ into the lab via surplus.
 ---
 
 *Drafted: 2026-05-13 (main).  Acks pending bravo + charlie.*
+*Revised: 2026-06-01 (main) — empirical mid-tau data, gate-lockout
+finding, work-item re-ordering, fleet inventory.  See conversation
+thread in this session for the data and analysis path.*
