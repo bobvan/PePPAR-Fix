@@ -448,14 +448,21 @@ class ClosedLoopSim:
             list(cfg.induced_synthetic_requests),
             key=lambda r: float(r[0]))
 
-    # ── reset path (matches engine's _request_servo_reset semantics) ──
+    # ── reset path (the sim's funnel; semantics overlap with the engine's
+    # `_request_servo_reset` on the ENABLED branch only — see docstring) ──
     def _request_servo_reset(self, t_s: float, reason: str) -> str:
-        """Funnel for every in-process reset.  When the budget is
-        disabled, takes the legacy direct-reset path (preserves v1
-        binary-layer A/B byte-identically when callers don't opt in).
-        When enabled, consults `ResetBudget`: within budget → reset +
-        log "reset" event; over budget → log "exit5" event + set
-        `self.exit5_at` so the run loop stops at this epoch.
+        """Funnel for every in-process reset.
+
+        The ENABLED branch matches the engine's `_request_servo_reset`:
+        within budget → reset + 'reset' event; over budget → 'exit5'
+        event + set `self.exit5_at` so the run loop stops at this epoch.
+
+        The DISABLED branch is the **#111 direct-reset baseline** —
+        unconditional `ekf.reset()` + 'reset' event — NOT the engine
+        helper's disabled→exit5 path (which serves the cascade callers
+        the sim doesn't model).  The sim's "disabled" is the v1 A/B
+        baseline that #111 tests assert against, not a model of the
+        engine's no-opt-in behavior.
         """
         if not self.reset_budget.enabled:
             self.ekf.reset()
