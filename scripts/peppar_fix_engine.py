@@ -7043,23 +7043,71 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     # longTauGnssCoupling coast-cap: derive the DO's freerun TDEV power
     # law from its characterization so the scheduler can bound the coast
     # by the DO's stochastic wander, not just the deterministic drift.
+    # Also extracts sigma_freerun_short_ns = TDEV(1s) for the
+    # schedulerNoiseFloorCadence transient detector (independent of
+    # --coast-cap; engages whenever DO characterization is available).
     _coast_tdev = None
-    if getattr(args, 'coast_cap', False) and do_uid_local is not None:
+    _sigma_freerun_short_ns = None
+    if do_uid_local is not None:
         try:
             from peppar_fix.do_state import derive_coast_tdev_from_char
             _ds_cc = load_do_state(do_uid_local)
             if _ds_cc and _ds_cc.get('characterization'):
                 _coast_tdev = derive_coast_tdev_from_char(
                     _ds_cc['characterization'])
-            if _coast_tdev is not None:
-                log.info("coast-cap: DO freerun TDEV(1s)=%.4f ns, slope=%+.3f",
-                         _coast_tdev[0], _coast_tdev[1])
-            else:
-                log.warning("coast-cap requested but no usable TDEV curve in "
-                            "characterization for %s — TDEV cap disabled "
-                            "(P22 cap still active)", do_uid_local)
+                if _coast_tdev is not None:
+                    # derive_coast_tdev_from_char fits tau_ref=1.0, so
+                    # tdev_ref_ns IS TDEV(1s) by construction.  This is
+                    # the per-DO σ_freerun the noise-floor cadence
+                    # heuristic compares |err| against.
+                    _sigma_freerun_short_ns = float(_coast_tdev[0])
+                    log.info(
+                        "scheduler: DO freerun σ(1s)=%.4f ns (slope=%+.3f) "
+                        "— noise-floor cadence active",
+                        _coast_tdev[0], _coast_tdev[1])
+                else:
+                    log.info("scheduler: no usable TDEV curve in "
+                             "characterization for %s — falling back to "
+                             "legacy d_physical cadence (pull-magnitude-"
+                             "dependent)", do_uid_local)
         except Exception as e:
-            log.warning("coast-cap: could not derive TDEV params: %s", e)
+            log.warning("scheduler: could not derive freerun TDEV params: "
+                        "%s — falling back to legacy d_physical cadence", e)
+    if getattr(args, 'coast_cap', False) and _coast_tdev is None:
+        log.warning("coast-cap requested but no usable TDEV curve in "
+                    "characterization for %s — TDEV cap disabled "
+                    "(P22 cap still active)", do_uid_local)
+
+    # schedulerGoldilocksBreakeven: σ_actuator_q for the quiet-regime
+    # breakeven formula τ = (σ_q / (k · σ_DO(1s)))^(1/slope).  For DAC
+    # actuators this is the LSB phase quantum integrated over 1 s of
+    # coast: 1 ppb of frequency offset = 1 ns of phase per second, so
+    # σ_q (ns) = |dac_ppb_per_code|.  For PHC actuators adjfine's LSB
+    # (2^-16 ppm ≈ 1.5e-5 ppb) is effectively zero — leave σ_q=None and
+    # the scheduler falls back to max_interval-bounded coasting.
+    _sigma_actuator_q_ns = None
+    _ppb_per_code = getattr(args, 'dac_ppb_per_code', None)
+    if _ppb_per_code is not None and _ppb_per_code != 0.0:
+        _sigma_actuator_q_ns = abs(float(_ppb_per_code))
+        log.info("scheduler: DAC σ_actuator_q=%.4f ns/LSB "
+                 "(from --dac-ppb-per-code=%.6f)",
+                 _sigma_actuator_q_ns, _ppb_per_code)
+        if _coast_tdev is not None:
+            # Log the predicted Goldilocks cadence as a sanity check;
+            # actual scheduler decision happens at runtime via the
+            # quiet branch of compute_adaptive_interval.
+            tdev_1s, slope, _ = _coast_tdev
+            k = float(getattr(args, 'coast_cap_k_sigma', 1.0))
+            if slope > 0 and tdev_1s > 0:
+                ratio = _sigma_actuator_q_ns / (k * tdev_1s)
+                try:
+                    _goldilocks_tau = ratio ** (1.0 / slope)
+                    log.info("scheduler: predicted Goldilocks τ=%.3fs "
+                             "(σ_q=%.4f ns, k·σ_DO(1s)=%.4f ns, slope=%.2f)",
+                             _goldilocks_tau, _sigma_actuator_q_ns,
+                             k * tdev_1s, slope)
+                except (ValueError, OverflowError):
+                    pass
 
     # Charlie's #93 sim caveat: --coast-cap fails silently open when
     # t_budget is too loose vs the natural √P22(max_tau) AND TDEV(max_tau)
@@ -7174,6 +7222,8 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         phase_error_budget_ns=args.phase_error_budget_ns,
         coast_tdev=_coast_tdev,
         coast_cap_k_sigma=getattr(args, 'coast_cap_k_sigma', 1.0),
+        sigma_freerun_short_ns=_sigma_freerun_short_ns,
+        sigma_actuator_q_ns=_sigma_actuator_q_ns,
     )
 
     # disciplineModeFsm increment #1: the single derived continuous
@@ -7544,6 +7594,8 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         'cm_phase_source': cm_phase_source,
         'servo': servo,
         'scheduler': scheduler,
+        'sigma_freerun_short_ns': _sigma_freerun_short_ns,
+        'sigma_actuator_q_ns': _sigma_actuator_q_ns,
         'qerr_store': qerr_store,
         'extint_store': extint_store,
         'bias_extint_ns': _load_timestamper_bias(args, "extint:default"),
@@ -7706,6 +7758,11 @@ def _enter_obs_holdover(ctx, args, reason_code, detail):
         settle_window=args.scheduler_settle_window,
         unconverge_factor=args.scheduler_unconverge_factor,
         phase_error_budget_ns=args.phase_error_budget_ns,
+        # schedulerNoiseFloorCadence: preserve across re-init.  Stashed
+        # on ctx at engine startup; None when DO uncharacterized (legacy
+        # d_physical path).
+        sigma_freerun_short_ns=ctx.get('sigma_freerun_short_ns'),
+        sigma_actuator_q_ns=ctx.get('sigma_actuator_q_ns'),
     )
     ctx['phase'] = 'tracking'
     ctx['tracking_large_error_count'] = 0

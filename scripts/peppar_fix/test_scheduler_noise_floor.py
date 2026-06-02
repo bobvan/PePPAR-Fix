@@ -153,5 +153,99 @@ class AdaptiveIntervalTests(unittest.TestCase):
                          f"big-pull={t_big}, small-pull={t_sml}")
 
 
+class QuietCoastBreakevenTests(unittest.TestCase):
+    """The Goldilocks formula: coast as long as DO drift < actuator quantization."""
+
+    def _sched(self, **kw):
+        defaults = dict(
+            adaptive=True, base_interval=1, max_interval=120,
+            sigma_freerun_short_ns=0.018,        # 18 ps σ_DO(1s)
+            transient_k_sigma=3.0,
+            sigma_actuator_q_ns=0.018,           # 18 ps σ_q (16-bit DAC)
+            coast_tdev=(0.018, 0.5, 1.0),        # TDEV(τ)=18 ps · τ^0.5
+            coast_cap_k_sigma=1.0,
+        )
+        defaults.update(kw)
+        return DisciplineScheduler(**defaults)
+
+    def test_typical_ocxo_16bit_dac_lands_at_1s(self):
+        """σ_q ≈ σ_DO(1s) ≈ 18 ps, slope 0.5  ⇒ τ_breakeven = 1s."""
+        s = self._sched()
+        tau = s._quiet_coast_breakeven_seconds()
+        self.assertAlmostEqual(tau, 1.0, places=2)
+
+    def test_quieter_do_coasts_longer(self):
+        """σ_DO(1s) = 1 ps, σ_q = 18 ps, slope 0.5 ⇒ τ = (18/1)^2 = 324 s."""
+        s = self._sched(
+            sigma_freerun_short_ns=0.001,         # Rb-class
+            coast_tdev=(0.001, 0.5, 1.0),
+        )
+        tau = s._quiet_coast_breakeven_seconds()
+        # τ = (0.018 / 0.001)^(1/0.5) = 18^2 = 324s
+        self.assertAlmostEqual(tau, 324.0, places=0)
+
+    def test_noisier_do_fires_faster(self):
+        """σ_DO(1s) = 100 ps ≫ σ_q = 18 ps; τ < 1s (clamped at min by caller)."""
+        s = self._sched(
+            sigma_freerun_short_ns=0.100,         # TCXO-class
+            coast_tdev=(0.100, 0.5, 1.0),
+        )
+        tau = s._quiet_coast_breakeven_seconds()
+        # τ = (18/100)^(1/0.5) = 0.18^2 = 0.0324s
+        self.assertLess(tau, 1.0)
+        self.assertGreater(tau, 0.0)
+
+    def test_unset_actuator_q_falls_back_to_max_interval(self):
+        s = self._sched(sigma_actuator_q_ns=None)
+        self.assertEqual(s._quiet_coast_breakeven_seconds(), 120.0)
+
+    def test_unset_coast_tdev_falls_back_to_max_interval(self):
+        s = self._sched(coast_tdev=None)
+        self.assertEqual(s._quiet_coast_breakeven_seconds(), 120.0)
+
+    def test_actuator_q_exceeds_do_floor_at_tau_ref(self):
+        """If σ_q ≫ k·σ_DO(τ_ref), formula returns a very long τ.
+        Upper-bound clamping (to max_interval) is the caller's job; the
+        breakeven function returns the raw principled answer."""
+        s = self._sched(
+            sigma_actuator_q_ns=1.0,              # noisy actuator
+            sigma_freerun_short_ns=0.018,
+            coast_tdev=(0.018, 0.5, 1.0),
+        )
+        # τ = (1.0 / 0.018)^(1/0.5) = (55.56)^2 ≈ 3086 s
+        tau = s._quiet_coast_breakeven_seconds()
+        self.assertGreater(tau, 120.0)
+
+
+class GoldilocksCadenceIntegrationTests(unittest.TestCase):
+    """End-to-end: with the breakeven formula, compute_adaptive_interval()
+    returns the Goldilocks cadence in the quiet regime."""
+
+    def test_ocxo_16bit_quiet_gives_1_second(self):
+        s = DisciplineScheduler(
+            adaptive=True, base_interval=1, max_interval=120,
+            sigma_freerun_short_ns=0.018, transient_k_sigma=3.0,
+            sigma_actuator_q_ns=0.018,
+            coast_tdev=(0.018, 0.5, 1.0),
+        )
+        s.accumulate(0.001, 0.01, 'TEST')   # below threshold = quiet
+        tau = s.compute_adaptive_interval(distance_to_lock=0.0)
+        # Quiet → breakeven → 1s.  Clamped to min(min_interval, max_interval).
+        self.assertEqual(tau, 1)
+
+    def test_rb_class_quiet_gives_long_coast(self):
+        s = DisciplineScheduler(
+            adaptive=True, base_interval=1, max_interval=600,
+            sigma_freerun_short_ns=0.001, transient_k_sigma=3.0,
+            sigma_actuator_q_ns=0.018,
+            coast_tdev=(0.001, 0.5, 1.0),
+        )
+        s.accumulate(0.0001, 0.01, 'TEST')   # well below threshold
+        tau = s.compute_adaptive_interval(distance_to_lock=0.0)
+        # τ = 324s, well below max_interval=600
+        self.assertGreater(tau, 100)
+        self.assertLess(tau, 600)
+
+
 if __name__ == "__main__":
     unittest.main()
