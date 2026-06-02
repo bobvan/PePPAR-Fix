@@ -20,6 +20,15 @@ class ResetBudgetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ResetBudget(window_s=-1)
 
+    def test_disabled_budget_always_denies(self):
+        # The contract holds even if a caller reaches request() directly
+        # (bypassing the engine funnel).  enabled=False → always deny.
+        b = ResetBudget(max_resets=3, window_s=300.0, enabled=False)
+        self.assertFalse(b.request("ekf_outlier", now=1000.0))
+        self.assertFalse(b.request("ekf_outlier", now=1010.0))
+        self.assertEqual(b.total_allowed, 0)
+        self.assertEqual(b.total_denied, 2)
+
     def test_sub_budget_all_allowed(self):
         b = ResetBudget(max_resets=3, window_s=300.0, enabled=True)
         # N requests inside the window → all allowed.

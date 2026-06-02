@@ -67,7 +67,15 @@ class ResetBudget:
         A denied request is NOT recorded as an allowed reset — only
         accepted resets count toward the window, so a storm of denied
         requests can't itself keep the window saturated forever.
+
+        A disabled budget always denies — the contract holds even if a
+        caller reaches ``request()`` directly instead of through the
+        engine's ``_request_servo_reset`` funnel (which also
+        short-circuits on ``enabled``).
         """
+        if not self.enabled:
+            self.total_denied += 1
+            return False
         cutoff = now - self.window_s
         while self._allowed_ts and self._allowed_ts[0] < cutoff:
             self._allowed_ts.popleft()

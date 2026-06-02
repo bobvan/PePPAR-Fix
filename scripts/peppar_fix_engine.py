@@ -8346,9 +8346,18 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         if ctx['tracking_large_error_count'] >= 3:
             # exitFiveToServoReset site D (PHC-error-restep cascade):
             # try in-process reset before exit-5.  Within budget → reset
-            # the EKF, clear the counter, keep coasting.
+            # the EKF, clear the counter, and skip the rest of this epoch
+            # (return "outlier", as sites B/C do) so NO servo correction
+            # is computed on the freshly-bootstrapped filter below; the
+            # loop re-acquires next epoch.  (The pre-budget code always
+            # exited here, so the post-reset fall-through is a new path
+            # — skipping it keeps D consistent with B/C.  D's block is
+            # gated on `not args.freerun`, so the freerun auto-stop
+            # below is unreachable from here anyway.)  Over budget →
+            # the legacy exit-5 path.
             if _request_servo_reset(ctx, 'phc_restep') == "reset":
                 ctx['tracking_large_error_count'] = 0
+                return "outlier"
             else:
                 log.error(
                     "PHC error above %.0fns for %d consecutive epochs — "
