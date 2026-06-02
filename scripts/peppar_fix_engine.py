@@ -4495,6 +4495,36 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                         'innov_ticc',   's_ticc',
                         'ocxo_gate_reject', 'ocxo_gate_reason',
                         'ticc_route',
+                        # Schema v3 (pullAttributionLog): per-arm pull
+                        # attribution.  chi2_X = innov²/S (gate
+                        # proximity, regardless of admit/reject).
+                        # would_pull_X_xN = K[N] · innov, i.e. the
+                        # signed state-delta on x[N] this arm would
+                        # apply *if admitted*.  Empty when arm did not
+                        # fire this epoch.  Post-hoc derivations:
+                        #   admitted_pull_X = would_pull_X * arm_X_used
+                        #   rejected_info_X = would_pull_X * (1 - used)
+                        #   K[N]            = would_pull_X_xN / innov_X
+                        # State dims: x0=phi_rx, x1=f_rx,
+                        # x2=phi_do, x3=f_do (x2/x3 zero on PHC hosts).
+                        'chi2_ppp',
+                        'would_pull_ppp_x0',    'would_pull_ppp_x1',
+                        'would_pull_ppp_x2',    'would_pull_ppp_x3',
+                        'chi2_qerr',
+                        'would_pull_qerr_x0',   'would_pull_qerr_x1',
+                        'would_pull_qerr_x2',   'would_pull_qerr_x3',
+                        'chi2_tdcp',
+                        'would_pull_tdcp_x0',   'would_pull_tdcp_x1',
+                        'would_pull_tdcp_x2',   'would_pull_tdcp_x3',
+                        'chi2_extint',
+                        'would_pull_extint_x0', 'would_pull_extint_x1',
+                        'would_pull_extint_x2', 'would_pull_extint_x3',
+                        'chi2_pseudo',
+                        'would_pull_pseudo_x0', 'would_pull_pseudo_x1',
+                        'would_pull_pseudo_x2', 'would_pull_pseudo_x3',
+                        'chi2_ticc',
+                        'would_pull_ticc_x0',   'would_pull_ticc_x1',
+                        'would_pull_ticc_x2',   'would_pull_ticc_x3',
                     ])
                     _arm_f.flush()
                 _arm_w = StridedWriter(
@@ -8535,10 +8565,29 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                 _P = servo.P
                 _innov = getattr(servo, 'last_arm_innov', None) or {}
                 _S_dict = getattr(servo, 'last_arm_S', None) or {}
+                _pull = getattr(servo, 'last_arm_would_pull', None) or {}
+                _chi2 = getattr(servo, 'last_arm_chi2', None) or {}
 
                 def _fmt(v: float | None, fmt: str = '.6e') -> str:
                     """Empty string when arm didn't fire; formatted float otherwise."""
                     return format(v, fmt) if v is not None else ''
+
+                def _fmt_pull(name: str) -> tuple[str, str, str, str, str]:
+                    """Format (chi2, pull_x0, pull_x1, pull_x2, pull_x3) for one arm.
+
+                    Empty fields when the arm didn't fire this epoch.
+                    The pull vector is always length-4 on populated
+                    arms (x2/x3 are zero on PHC hosts, real on DAC).
+                    """
+                    pull = _pull.get(name)
+                    chi2 = _chi2.get(name)
+                    if pull is None:
+                        return ('', '', '', '', '')
+                    return (
+                        format(chi2, '.6e') if chi2 is not None else '',
+                        format(pull[0], '.6e'), format(pull[1], '.6e'),
+                        format(pull[2], '.6e'), format(pull[3], '.6e'),
+                    )
 
                 _ocxo_rej = getattr(servo, 'last_ocxo_gate_rejected', False)
                 _ocxo_rsn = getattr(servo, 'last_ocxo_gate_reason', '')
@@ -8565,6 +8614,13 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                     1 if _ocxo_rej else 0,
                     _ocxo_rsn,
                     getattr(servo, 'last_ticc_route', ''),
+                    # Schema v3: per-arm pull attribution (5 cols × 6 arms)
+                    *_fmt_pull('ppp'),
+                    *_fmt_pull('qerr'),
+                    *_fmt_pull('tdcp'),
+                    *_fmt_pull('extint'),
+                    *_fmt_pull('pseudo'),
+                    *_fmt_pull('ticc'),
                 ])
                 if _arm_f is not None:
                     _arm_f.flush()
