@@ -129,13 +129,42 @@ Three changes to `DOFreqEst`:
    Replace with `self.innov_monitors = {arm: InnovControlMonitor()
    for arm in ['ppp', 'qerr', 'tdcp', 'extint', 'pseudo', 'ticc']}`.
 
-2. **Feed each monitor from its arm's `_kalman_linear_update` call
-   and the TICC inline path**.  The data needed (`u, innov, S`) is
-   already computed.  Today the existing single monitor is fed
-   only from the TICC arm; extend so each arm feeds its monitor.
+2. **Feed each monitor PRE-GATE from its arm's
+   `_kalman_linear_update` call and the TICC inline path.**  Today
+   the single monitor is fed only from the TICC arm, and only when
+   the chi² + OCXO gates accept (do_freq_est.py ~793, inside the
+   `if not (chi2_reject or ocxo_reject):` block).  The window
+   today therefore contains **only gate-accepted innovations** —
+   the opposite of what Arch A needs.  The whole architectural
+   premise is to recover the information the gate throws away;
+   averaging only the kept-information defeats the design.
+
+   **Relocate `observe()` to fire on every (u, innov, S) regardless
+   of gate decision** — the gate's choice belongs to the fast
+   update path, not the slow-path window.  Concretely: in
+   `_kalman_linear_update`, call `self.innov_monitors[arm_name].
+   observe(u, innov, S)` right where `last_arm_innov[arm_name]`
+   is populated (which is already pre-gate).  In the TICC inline
+   path, call the equivalent right where `last_arm_innov['ticc']`
+   is set (line ~749, also already pre-gate after PR #118 hoisted
+   the K computation).
+
+   With pre-gate feed, the slow-path window deliberately includes
+   the large innovations the gate rejects.  Signal-vs-noise then
+   matters: the architecture bets that **systematic per-arm bias
+   accumulates over 300 s while random outliers average out**.
+   Empirically supported for extint on clkPoC3 (SNR 57 on +9.17 ns
+   bias over n=2504) but not yet validated for the other arms.
+   The per-arm enable flag (§4.5) and the cascade clamp (§4.1) are
+   not nice-to-haves — they are load-bearing for correctness once
+   the window goes pre-gate.
+
+   `self.last_arm_K` is populated by PR #118 (already merged); the
+   slow path consumes it directly.
 
 3. **New `_apply_slow_corrections(self, dt)` method.**  Called
-   once per `update()` AFTER the fast measurement updates.
+   once per `update()` AFTER the fast measurement updates **but
+   gated by a rate counter** — see §3.1.1 below for cadence.
    Iterates each arm's monitor:
 
    ```python
@@ -160,6 +189,26 @@ Three changes to `DOFreqEst`:
    Called from `update()` after the per-arm measurement-update
    block, before the actuator computation (so the corrected state
    feeds the LQR's adjfine).
+
+#### 3.1.1 Cadence — pinning the rate of slow correction
+
+§1 says "applied every `N_slow` epochs"; the §3.1 code as
+originally drafted called `_apply_slow_corrections` every
+`update()` (1 Hz).  Difference matters: at β = 0.1 on a 9 ns
+bias, every-epoch firing gives 0.9 ns/epoch ≈ 270 ns/window of
+state nudging, vs once-per-window firing of 0.9 ns/window.
+
+**Pin: once per `N_slow` epochs**, default `N_slow = 300` (=
+the monitor's window).  The reasoning is that the monitor's
+window mean is a 300-sample statistic; applying the same statistic
+300 times per window is double-counting in time.  Once per window
+also gives the fast path a chance to integrate the result before
+the next slow correction fires.
+
+Implementation: a counter `self._slow_step_counter` incremented
+each `update()`; `_apply_slow_corrections` is called when
+`counter % N_slow == 0`.  The counter is reset on `reset()`
+alongside the other per-epoch dicts.
 
 ### 3.2 `scripts/peppar_fix/innov_control_monitor.py`
 
@@ -201,11 +250,10 @@ PR #118.  For each arm, four new state-dimension columns:
 slow_pull_X_x0, slow_pull_X_x1, slow_pull_X_x2, slow_pull_X_x3
 ```
 
-× 6 arms = 24 new columns.  Schema goes 62 → 86 cols, ~0.4 KB/row at
-1 Hz → ~33 MB/day extra per host.  Manageable.
-
-Plus one summary column per arm: `slow_bias_X` (the mean_innov fed
-in this epoch) for diagnostic visibility.
+× 6 arms = 24 new state-dim columns, **plus one `slow_bias_X` per
+arm** (the mean_innov fed in this epoch) for diagnostic visibility
+= 30 new columns total.  Schema goes 62 → 92 cols, ~0.5 KB/row at
+1 Hz → ~40 MB/day extra per host.  Manageable.
 
 Row-emit pattern mirrors PR #118's `_fmt_pull`.
 
@@ -239,6 +287,75 @@ when `rpt.status == "OK"`.  When the monitor itself raises
 silently disabled until the alarm clears.  This explicitly puts
 plant-model error in the diagnostic stack instead of trying to
 servo through it.
+
+### 4.2.1 Measurement-bias-as-calibration vs measurement-bias-as-state-error
+
+The slow integrator interprets a non-zero `mean(innov_arm)` as a
+state error to correct.  But a non-zero mean innovation can have
+**two distinct origins** that demand opposite responses:
+
+| Origin | Right response |
+|---|---|
+| **State error** — DO is genuinely off-truth (e.g., bias-cal drift, slow OCXO temperature trend, atmospheric residual) | Integrate → correct |
+| **Calibration offset** — fixed per-host hardware/cable delay (F9P internal EXTINT vs TIMEPULSE latency, TADD-2 output prop delay, TICC channel asymmetry) | Calibrate ONCE, do NOT integrate |
+
+extint's +9.17 ns persistent bias on clkPoC3 (σ = 2.71 ns, SNR 57
+over 8.6 hours) **looks like a calibration offset, not a state
+error.**  An integrator chasing it would command the DO physically
+off-truth — the servo would steer the OCXO to align the F9P's
+EXTINT capture with the EKF's belief of `x[2]`, while truth is
+elsewhere.  Cross-host PPS agreement remains fine **if all hosts
+have the same offset**; differential per-host offsets actively
+widen cross-host disagreement.
+
+**Defense: distinguish before integrating.**
+
+1. **First, calibrate** every arm against an external truth (otcBob1
+   PPS or a known-good cross-host TICC#4 differential).  Tool:
+   `scripts/calibrate_timestampers.py`.  Persist as a constant
+   `bias_ns` in `state/dos/<do_label>.json[timestampers]` (same
+   schema PiFace already uses).  The engine subtracts the bias
+   from raw innov before the EKF sees it.
+2. **Only then enable the slow integrator** to mop up the *residual
+   drift* — temperature-driven slow changes, atmospheric drift,
+   any time-varying bias the static calibration didn't capture.
+3. **Validation abort criterion** (§5.3): if cross-host CDF p95
+   *worsens* after the slow integrator engages, suspect
+   uncalibrated bias being chased; revert and calibrate first.
+
+This makes the slow integrator the **drift-tracker**, never the
+calibration-substitute.  Cross-links to `committedDoCharacterization`
+dayplan thread: β_per_arm + the slow-bias time series belong in
+tier-2 trend data, not tier-1 characteristic.
+
+### 4.2.2 Direct x-injection vs bias-state augmentation — P consistency
+
+`_apply_slow_corrections` does `self.x += dx` with no P update.
+The covariance never sees the externally injected nudge, so the
+fast filter becomes slightly overconfident relative to a state
+being pushed from outside.
+
+The textbook handling of a slowly-varying per-arm measurement bias
+is to **augment the state** with a per-arm bias term (Friedland
+bias separation): P stays consistent, the EKF optimally weights
+the bias estimate instead of a hand-tuned β, and the slow path
+and fast path don't fight over one K.
+
+**Why we don't use bias-state augmentation here:** the gate-lockout
+pathology starves both the fast update AND any augmented bias
+state — the augmented state has no observability path while the
+gate is locking out the arm.  An out-of-band integrator over
+PRE-gate innovations is the only path that sees the blocked
+information.  This is the architectural justification for direct
+injection; without it, bias-state augmentation would be the right
+shape.
+
+**Defense for the P-consistency concern: inflate P after each
+slow injection**.  Specifically, bump the corresponding diagonal
+elements of P by `(dx[i])²` after the state update — reflects the
+"the integrator did this, but we're not certain it was right" into
+the EKF's covariance.  Pin: do this in the implementation, verify
+in unit test.
 
 ### 4.3 Warm-up
 
@@ -305,14 +422,32 @@ Small relative to fast.
 
 Re-run a 2-hour overnight on clkPoC3 with extint+ticc slow
 integrator on; pull-attribution schema captures both `would_pull`
-and `slow_pull` per arm.  Pass criteria:
+and `slow_pull` per arm.
+
+**TDEV measured on chA alone** (the host's disciplined PPS,
+detrended), **not chA-chB** — per CLAUDE.md "TICC stability
+metric" section.  chA-chB measures how well the DO tracks GPS,
+not the quality of the output; chA alone is what a downstream
+consumer sees and is the metric the moonshot is graded against.
+
+Pass criteria:
 
 - **TDEV(τ=100s) drops** from 3.5 ns (current with cascades) or
   ~500 ps (steady-state only) toward PiFace's 607 ps or below.
+- **TDEV(τ<100s) unchanged** — short-tau guard.  A 300 s integrator
+  must not inject anything at τ < 100 s; the moonshot wants
+  short-tau DO noise unmolested.  Any rise at τ=1-10 s vs the
+  baseline run is a regression.
 - **Cross-host CDF p95 (PiFace ↔ clkPoC3)** improves from today's
   13.1 ns.
 - **No new failure modes**: no exit-5 cascades introduced by slow
   correction; `InnovControlMonitor` doesn't raise `ALARM_corr`.
+
+**Abort criterion** (from §4.2.1): if cross-host CDF p95 *worsens*
+relative to the same-config baseline (slow_arms empty), suspect
+the integrator is chasing uncalibrated measurement bias rather
+than a state error.  Disable, run TICC + EXTINT bias calibration
+against external truth first, then retry.
 
 If validation passes, raise β for ticc; consider extending to
 qerr if steady bias has accumulated.
