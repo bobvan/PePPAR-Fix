@@ -50,6 +50,7 @@ from typing import Optional
 import numpy as np
 
 from peppar_fix.binary_layer import BinaryLayer
+from peppar_fix.reset_budget import ResetBudget
 from peppar_fix.do_freq_est import DOFreqEst, _qerr
 from peppar_fix.discipline import (
     coast_cap_from_p22, graded_interval, normalized_distance_to_lock)
@@ -147,6 +148,35 @@ class SimConfig:
     binary_layer_consec_max_epochs: int = 60
     drop_measurements_window_s: Optional[tuple] = None
     in_holdover_window_s: Optional[tuple] = None
+
+    # exitFiveToServoReset (bravo PR #121) — shared windowed ResetBudget
+    # consumed by both the binary layer and any synthetic test-only
+    # reset requests.  When `reset_budget_enabled` is True, the sim
+    # constructs a ResetBudget and routes every reset request through
+    # it: within budget → ekf.reset() (actuator preserved); over budget
+    # → record "exit5" event + stop the run (matches the engine's
+    # exit-5 + wrapper-relaunch semantic — the sim shouldn't keep
+    # pumping the loop past the request).
+    # Defaults match the engine CLI defaults (`--reset-budget-max 3`,
+    # `--reset-budget-window-s 300`).  Default OFF preserves the v1
+    # binary-layer sim path byte-identically (#111 A/B unchanged).
+    reset_budget_enabled: bool = False
+    reset_budget_max: int = 3
+    reset_budget_window_s: float = 300.0
+    # Multiple back-to-back drop windows.  Each window induces the
+    # same sustained-d2l=1.0 pattern `drop_measurements_window_s`
+    # does; stacking them is how the budget-exhaustion + recovery
+    # tests provoke N reset requests in known time slots.  If both
+    # `induced_drop_windows` and the single `drop_measurements_window_s`
+    # are set, the single one is treated as the head of the list.
+    induced_drop_windows: list = field(default_factory=list)
+    # Synthetic direct reset requests at (t_s, reason).  Bypasses the
+    # binary-layer mechanism so the budget's shared-across-reasons
+    # property can be exercised with multiple `reason` strings without
+    # modeling the B/C/D outlier-cascade detectors in the sim.  The
+    # sim issues `_request_servo_reset(t, reason)` once when the loop
+    # crosses each tuple's t_s value.
+    induced_synthetic_requests: list = field(default_factory=list)
 
     # DO (disciplined oscillator) truth-noise model.
     #   do_wpm_ns:   white phase modulation, per-sample σ (ns).
@@ -394,6 +424,58 @@ class ClosedLoopSim:
         # Per-epoch gross-fault event log; populated only when the
         # binary layer fires.  Tests assert on the length + timestamps.
         self.gross_fault_events: list = []
+        # exitFiveToServoReset (#121) consumption: shared ResetBudget +
+        # the reset_events log.  When `reset_budget_enabled` is False
+        # the budget is still constructed (so the helper has a uniform
+        # interface) but the helper takes the legacy path — bare
+        # ekf.reset(), no exit5, no events.  This preserves the v1
+        # binary-layer A/B behavior byte-identically.
+        self.reset_budget = ResetBudget(
+            max_resets=cfg.reset_budget_max,
+            window_s=cfg.reset_budget_window_s,
+            enabled=cfg.reset_budget_enabled)
+        # Per-epoch reset events: (t_s, reason, outcome) where outcome
+        # is "reset" or "exit5".  Mirrors gross_fault_events in shape.
+        self.reset_events: list = []
+        # Set to the t_s of the first denied reset request; the sim
+        # stops the run at that epoch (mirrors the engine's exit-5 +
+        # wrapper-relaunch — keeping the loop running past a denied
+        # request would hide budget bugs).
+        self.exit5_at = None
+        # Pending synthetic requests, sorted by t_s; consumed when the
+        # loop crosses each tuple's time.
+        self._pending_synthetic = sorted(
+            list(cfg.induced_synthetic_requests),
+            key=lambda r: float(r[0]))
+
+    # ── reset path (the sim's funnel; semantics overlap with the engine's
+    # `_request_servo_reset` on the ENABLED branch only — see docstring) ──
+    def _request_servo_reset(self, t_s: float, reason: str) -> str:
+        """Funnel for every in-process reset.
+
+        The ENABLED branch matches the engine's `_request_servo_reset`:
+        within budget → reset + 'reset' event; over budget → 'exit5'
+        event + set `self.exit5_at` so the run loop stops at this epoch.
+
+        The DISABLED branch is the **#111 direct-reset baseline** —
+        unconditional `ekf.reset()` + 'reset' event — NOT the engine
+        helper's disabled→exit5 path (which serves the cascade callers
+        the sim doesn't model).  The sim's "disabled" is the v1 A/B
+        baseline that #111 tests assert against, not a model of the
+        engine's no-opt-in behavior.
+        """
+        if not self.reset_budget.enabled:
+            self.ekf.reset()
+            self.reset_events.append((float(t_s), reason, "reset"))
+            return "reset"
+        if not self.reset_budget.request(reason, float(t_s)):
+            self.reset_events.append((float(t_s), reason, "exit5"))
+            if self.exit5_at is None:
+                self.exit5_at = float(t_s)
+            return "exit5"
+        self.ekf.reset()
+        self.reset_events.append((float(t_s), reason, "reset"))
+        return "reset"
 
     # ── plant ──
     def _step_truth(self, dt: float, adjfine: float):
@@ -513,9 +595,14 @@ class ClosedLoopSim:
             else:
                 effective_every = target_every if converged else 1
             t_now = k * c.dt_s
-            in_drop_win = (c.drop_measurements_window_s is not None
-                           and c.drop_measurements_window_s[0]
-                           <= t_now <= c.drop_measurements_window_s[1])
+            # Stack the legacy single-tuple form ahead of the new list
+            # form so existing callers (#111 binary-layer A/B) keep
+            # working unchanged.
+            _drop_wins = []
+            if c.drop_measurements_window_s is not None:
+                _drop_wins.append(c.drop_measurements_window_s)
+            _drop_wins.extend(c.induced_drop_windows or [])
+            in_drop_win = any(w[0] <= t_now <= w[1] for w in _drop_wins)
             if (k - last_correction_k) >= effective_every or k == 0:
                 gap_s = max(c.dt_s, (k - last_correction_k) * c.dt_s)
                 if in_drop_win:
@@ -583,8 +670,38 @@ class ClosedLoopSim:
                 if self.binary_layer.evaluate(d2l, in_holdover) == "gross_fault":
                     self.gross_fault_events.append(
                         (float(t_s[k]), sqrt_p22))
-                    self.ekf.reset()
+                    # Route through the funnel: budget-disabled → bare
+                    # ekf.reset() exactly as before (preserves v1
+                    # behavior); budget-enabled → honor the cap.
+                    self._request_servo_reset(t_s[k], "binary_layer")
                     self.binary_layer.clear_after_reset()
+
+            # Fire any synthetic reset requests whose t has been
+            # reached.  Bypasses the binary-layer machinery so the
+            # shared-across-reasons budget property can be exercised
+            # without modeling multiple detector types.
+            while (self._pending_synthetic
+                   and float(self._pending_synthetic[0][0]) <= t_s[k]):
+                _t_req, _reason = self._pending_synthetic.pop(0)
+                self._request_servo_reset(t_s[k], str(_reason))
+
+            # Stop the run if the budget denied a request — the engine's
+            # exit-5 path tears down the process; the sim shouldn't
+            # keep pumping the loop past the denial.
+            if self.exit5_at is not None:
+                # Truncate the result arrays to data up through this
+                # epoch + return early.
+                t_s = t_s[: k + 1]
+                phi_do = phi_do[: k + 1]
+                phi_rx = phi_rx[: k + 1]
+                adj = adj[: k + 1]
+                est_phi = est_phi[: k + 1]
+                est_f = est_f[: k + 1]
+                innov = innov[: k + 1]
+                innov_s = innov_s[: k + 1]
+                rejected = rejected[: k + 1]
+                routes = routes[: k + 1]
+                break
 
         # Routed-qErr diagnostics: per-epoch S for chi² computation +
         # the per-epoch route selection ('ext'/'int'/'raw').  Attached to
