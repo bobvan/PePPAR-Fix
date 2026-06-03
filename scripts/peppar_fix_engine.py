@@ -4128,6 +4128,10 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     lat, lon, alt = ecef_to_lla(known_ecef[0], known_ecef[1], known_ecef[2])
     log.info(f"Position: {lat:.6f}, {lon:.6f}, {alt:.1f}m")
 
+    # Optional ambient/oven temp sensor.  Silent no-error when absent.
+    from peppar_fix.temp_sensor import TempSensor
+    _temp_sensor = TempSensor(bus_num=1)
+
     # Cache mount_sn for the [CONFIDENCE] periodic log line.  See
     # docs/position-state-and-monitoring.md.  Defaults to 0 when the
     # receiver state file is absent or missing the field.
@@ -5475,6 +5479,11 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 qvir = servo_ctx.get('qvir') if servo_ctx else None
                 log.info("[STATUS] %s", format_status(ape_sm, dfe_sm,
                          ticc_ok=ticc_ok, qvir=qvir))
+                if _temp_sensor is not None and _temp_sensor.available:
+                    _t_c = _temp_sensor.read_celsius()
+                    if _t_c is not None:
+                        log.info("[TEMP_C] sensor=%s addr=0x%02x t=%.3f",
+                                 _temp_sensor.label, _temp_sensor.addr, _t_c)
 
             # [CONFIDENCE_*] periodic log lines — see slice 9 of
             # docs/position-state-and-monitoring.md.  Three sibling
