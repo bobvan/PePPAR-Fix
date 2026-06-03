@@ -18,6 +18,9 @@ dependencies = [
     "pyubx2>=1.2.55",
     "pyserial",
     "pyrtcm>=1.1.0",
+    # geo_frames: NAD83(2011)<->ITRF2020 datum/epoch conversion.
+    # Needs the bundled PROJ >= 9.0 for ITRF2020 (pyproj 3.6+ ships it).
+    "pyproj>=3.6",
 ]
 
 [project.optional-dependencies]
