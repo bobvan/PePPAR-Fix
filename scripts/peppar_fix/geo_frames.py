@@ -9,11 +9,18 @@ single numeric routine).  Design: ``docs/coordinate-reference-frames.md``.
 Conversion is **pyproj / PROJ**-backed (PROJ >= 9.0 for ITRF2020).
 Validated against the OPUS UFO1 NAD83(2011)/ITRF2020 ground-truth pair:
 the NAD83(2011) -> ITRF2020 14-param time-dependent Helmert reproduces
-OPUS to ~5 cm (PROJ's HTDP realization vs OPUS's, plus OPUS's own ~cm
-sigma) and round-trips are self-consistent to << 1 mm.  Surveyed ARPs
-should therefore store the OPUS ITRF2020 value *directly* (exact); this
-transform is for coordinates not natively in ITRF — NAD83 CORS/RTK
-fixes, a NAD83 ``--known-pos`` paste.
+OPUS to ~5 cm and round-trips are self-consistent to << 1 mm.
+
+Why ~5 cm and not < 1 cm: this is *not* transform-math error.  PROJ
+ships HTDP-derived Helmert parameters via the EPSG database; OPUS
+realizes the same transform through NGS's NCAT/HTDP.  The two are
+different numerical realizations of the NAD83(2011)<->ITRF2020 tie and
+differ by a few cm, on top of OPUS's own ~cm survey sigma.  The residual
+is dominated by realization-vs-realization noise, not by this module —
+and it is ~35x smaller than the 1.71 m (1710 mm) datum error this module
+exists to kill.  Surveyed ARPs should therefore store the OPUS ITRF2020
+value *directly* (exact); this transform is for coordinates not natively
+in ITRF — NAD83 CORS/RTK fixes, a NAD83 ``--known-pos`` paste.
 """
 from __future__ import annotations
 

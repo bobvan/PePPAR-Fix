@@ -70,6 +70,20 @@ class ConversionTests(unittest.TestCase):
         self.assertLess(r, 60.0, f"NAD83->ITRF off by {r:.1f} mm vs OPUS")
         self.assertLess(_resid_mm(p.ecef, _ITRF) - r, 1710.0)  # corrected ≫ residual
 
+    def test_to_canonical_at_static_anchor_epoch(self):
+        """Boundary case: convert a NAD83(2011)@2010.0 point to ITRF2020 at
+        obs_epoch=2010.0 — PROJ propagates the time-dependent Helmert at
+        the static anchor's own reference year (the time-term -> 0 corner).
+        Pins this so a future PROJ update can't silently regress it."""
+        p = GeoPoint(_NAD83, Frame("NAD83(2011)", 2010.0))
+        c = to_canonical(p, 2010.0)
+        self.assertEqual(c.frame, Frame(CANONICAL_REALIZATION, 2010.0))
+        # The NAD83(2011)<->ITRF2020 datum offset is ~1.5 m even with the
+        # plate-motion time term zeroed at 2010.0 — this *is* the offset
+        # that, evaluated at the 2026.3 obs epoch, produced the 1.71 m
+        # read-NAD83-as-ITRF bug.  Pin it to a tight band around 1567 mm.
+        self.assertAlmostEqual(_resid_mm(c.ecef, _NAD83), 1567.0, delta=50.0)
+
     def test_roundtrip_self_consistent(self):
         itrf = GeoPoint(_ITRF, Frame("ITRF2020", _OBS_EPOCH))
         back = convert(convert(itrf, Frame("NAD83(2011)", 2010.0)),
