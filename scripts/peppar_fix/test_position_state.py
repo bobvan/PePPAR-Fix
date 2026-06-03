@@ -419,12 +419,16 @@ class TestSeedFromStateFiles(unittest.TestCase):
             self.uid,
             arp_label="choke1",
             antennas_path=ants,
+            obs_epoch=2026.42,
             positions_dir=self.pos_dir,
             receivers_dir=self.recv_dir)
         self.assertIsNotNone(out)
         self.assertEqual(out.kind, "survey")
         self.assertEqual(out.mount_sn, 3)  # inherited from current
-        self.assertAlmostEqual(out.ecef_m[0], 9.0)
+        # Selected candidate is converted to canonical ITRF2020 (ecef
+        # moved off the raw NAD83 9.0); sigma is preserved.
+        self.assertEqual(out.frame, Frame("ITRF2020", 2026.42))
+        self.assertGreater(abs(out.ecef_m[0] - 9.0), 0.5)
         self.assertAlmostEqual(out.sigma_m, 0.012)
 
     def test_antennas_json_loses_to_tighter_ppp(self):
@@ -1160,19 +1164,20 @@ class TestLoadArpFromAntennas(unittest.TestCase):
         self.assertIsNotNone(s)
         self.assertEqual(s.kind, "survey")
         self.assertEqual(s.mount_sn, 2)
-        self.assertAlmostEqual(s.ecef_m[0], 1000.111, places=4)
         self.assertAlmostEqual(s.sigma_m, 0.0125, places=6)
         self.assertIn("test_dict_ecef", s.source)
         self.assertIn("OPUS", s.source)
         self.assertEqual(s.extra.get("arp_label"), "test_dict_ecef")
         self.assertEqual(s.extra.get("antennas_method"),
                          "OPUS-Static, 6-day mean")
-        # The entry's NAD83(2011)@2010.0 frame is parsed and tagged
-        # honestly — but ecef_m is the verbatim NAD83 value, NOT yet
-        # converted to canonical ITRF (the 1.71 m correction is a
-        # later PR).  This is the latent mismatch made visible.
-        self.assertEqual(s.frame, Frame("NAD83(2011)", 2010.0))
-        self.assertAlmostEqual(s.ecef_m[0], 1000.111, places=4)
+        # The 1.71 m correction: the entry's NAD83(2011)@2010.0 ARP is
+        # converted to canonical ITRF2020 at load.  ecef_m has MOVED off
+        # the raw NAD83 value, and the result frame is ITRF2020.  The
+        # stored source frame is preserved in extra for provenance.
+        self.assertEqual(s.frame.realization, "ITRF2020")
+        self.assertEqual(s.extra.get("antennas_stored_frame"),
+                         "NAD83(2011)@2010.0000")
+        self.assertGreater(abs(s.ecef_m[0] - 1000.111), 0.5)  # converted
 
     def test_list_ecef_format_also_supported(self):
         """antennas.json's legacy format uses ecef_m as a list, not
@@ -1182,10 +1187,10 @@ class TestLoadArpFromAntennas(unittest.TestCase):
             "test_list_ecef", mount_sn=0,
             antennas_path=self.antennas_path)
         self.assertIsNotNone(s)
-        self.assertAlmostEqual(s.ecef_m[0], 1111.222, places=3)
-        # No `frame` field in this entry → documented NAD83(2011)@2010.0
-        # default (antennas.json is the lab NAD83 database).
-        self.assertEqual(s.frame, Frame("NAD83(2011)", 2010.0))
+        # No `frame` field → NAD83(2011)@2010.0 default, then converted
+        # to canonical ITRF2020 (ecef moved off the raw value).
+        self.assertEqual(s.frame.realization, "ITRF2020")
+        self.assertGreater(abs(s.ecef_m[0] - 1111.222), 0.5)
 
     def test_unknown_arp_label_returns_none(self):
         from peppar_fix.position_state import load_arp_from_antennas
@@ -1317,9 +1322,27 @@ class TestFrameThreading(unittest.TestCase):
         self.assertIsNone(parse_antennas_frame(None))
         self.assertIsNone(parse_antennas_frame("not a frame"))
 
-    def test_arp_loader_does_not_convert(self):
-        """The loader tags the NAD83 frame but must NOT move ecef_m —
-        conversion to canonical is the deferred 1.71 m correction."""
+    def test_arp_loader_converts_to_canonical(self):
+        """The loader converts the NAD83 ARP to canonical ITRF2020 — the
+        1.71 m correction (flips the step-2 does-not-convert pin).  The
+        stored source frame is preserved in extra for provenance."""
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            ap = os.path.join(d, "antennas.json")
+            with open(ap, "w") as f:
+                json.dump({"a": {"ecef_m": [10.0, 20.0, 30.0],
+                                 "sigma_m": 0.01,
+                                 "frame": "NAD_83(2011) EPOCH:2010.0000"}}, f)
+            s = load_arp_from_antennas("a", mount_sn=0, antennas_path=ap,
+                                       obs_epoch=2026.42)
+            self.assertEqual(s.frame, Frame("ITRF2020", 2026.42))
+            self.assertEqual(s.extra.get("antennas_stored_frame"),
+                             "NAD83(2011)@2010.0000")
+            self.assertNotEqual(s.ecef_m, (10.0, 20.0, 30.0))  # moved
+
+    def test_arp_loader_obs_epoch_defaults_to_now(self):
+        """obs_epoch=None → current decimal year; result is ITRF2020 at
+        roughly now (no GPS observation needed at seed time)."""
         import json
         with tempfile.TemporaryDirectory() as d:
             ap = os.path.join(d, "antennas.json")
@@ -1328,8 +1351,29 @@ class TestFrameThreading(unittest.TestCase):
                                  "sigma_m": 0.01,
                                  "frame": "NAD_83(2011) EPOCH:2010.0000"}}, f)
             s = load_arp_from_antennas("a", mount_sn=0, antennas_path=ap)
-            self.assertEqual(s.frame, Frame("NAD83(2011)", 2010.0))
-            self.assertEqual(s.ecef_m, (10.0, 20.0, 30.0))  # verbatim
+            self.assertEqual(s.frame.realization, "ITRF2020")
+            self.assertGreater(s.frame.epoch, 2025.0)
+
+    def test_arp_loader_conversion_failure_returns_none(self):
+        """If to_canonical raises (e.g. pyproj missing), log ERROR and
+        return None so the caller falls back rather than seeding a
+        wrong-frame ARP."""
+        import json
+        import peppar_fix.position_state as ps
+        with tempfile.TemporaryDirectory() as d:
+            ap = os.path.join(d, "antennas.json")
+            with open(ap, "w") as f:
+                json.dump({"a": {"ecef_m": [10.0, 20.0, 30.0],
+                                 "sigma_m": 0.01}}, f)
+            orig = ps.to_canonical
+            ps.to_canonical = lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError("pyproj boom"))
+            try:
+                s = ps.load_arp_from_antennas("a", mount_sn=0,
+                                              antennas_path=ap)
+            finally:
+                ps.to_canonical = orig
+            self.assertIsNone(s)
 
 
 if __name__ == "__main__":

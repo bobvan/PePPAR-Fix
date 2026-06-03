@@ -164,5 +164,24 @@ class TestEngineFlagWired(unittest.TestCase):
                       msg="engine --help should advertise --no-antposest")
 
 
+class TestKnownPosSourceFrame(unittest.TestCase):
+    """--known-pos-frame → source Frame for the canonical conversion."""
+
+    def test_bare_nad83_anchors_at_2010(self):
+        f = engine._known_pos_source_frame("NAD83(2011)")
+        self.assertEqual(f.realization, "NAD83(2011)")
+        self.assertEqual(f.epoch, 2010.0)
+
+    def test_bare_dynamic_uses_current_epoch(self):
+        f = engine._known_pos_source_frame("ITRF2020")
+        self.assertEqual(f.realization, "ITRF2020")
+        self.assertGreater(f.epoch, 2025.0)
+
+    def test_explicit_realization_at_epoch(self):
+        f = engine._known_pos_source_frame("ITRF2020@2024.5")
+        self.assertEqual(f.realization, "ITRF2020")
+        self.assertAlmostEqual(f.epoch, 2024.5)
+
+
 if __name__ == "__main__":
     unittest.main()
