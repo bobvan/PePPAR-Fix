@@ -1,9 +1,14 @@
 # Coordinate reference frames — design
 
-**Status:** design draft (Bravo, 2026-06-03).  Owner of dayplan item
+**Status:** design (Bravo, 2026-06-03).  Owner of dayplan item
 `coordFrameAudit`.  Companion: this is the "attach a reference system
 to all coordinates" design Bob asked for after the Onocoy signup forced
 an ITRS-vs-NAD83 choice and surfaced a latent frame ambiguity.
+**Revised 2026-06-03** after Main + Charlie APPROVEd the diagnosis and
+Bob set the constraint: *zero installed base, no legacy, four people —
+rip the bandaid off, do it once and right, no gradual transitions.*
+The migration below (§5) and the decisions (§7) reflect that: a single
+clean cut, required frames, hard failures, no back-compat shims.
 
 ## 1. Why — the bug this exists to kill
 
@@ -22,13 +27,27 @@ assumption is already wrong in at least one load-bearing place:
   reads `entry["ecef_m"]` **verbatim** into the engine's ITRF
   `ecef_m` — it never reads the `frame` field and never converts.
 
-NAD83(2011) and ITRF2020 differ by **~1.6 m** at the lab (OPUS UFO1:
-ΔX ≈ 1.0 m, ΔY ≈ 1.4 m).  So every host that seeds its ARP from
-`antennas.json` pins a position **~1.6 m off the orbit frame** —
-a constant geometric error that biases the clock solution and any
-cross-frame comparison.  This is almost certainly the *"1.6–2 m datum
-offset"* the 2026-05-20 filter-side position-bias investigation
-flagged ([[project_position_bias_filter_side_proven_20260520]]).
+NAD83(2011)@2010.0 and ITRF2020@2026.32 differ by **1.71 m** at the lab
+(OPUS UFO1, verified by Main: ΔX = +1.016 m, ΔY = −1.376 m,
+ΔZ = +0.095 m, ‖Δ‖ = 1.71 m — mostly horizontal).  So every host that
+seeds its ARP from `antennas.json` pins a position **1.71 m off the
+orbit frame** — a constant geometric error that biases the clock
+solution and any cross-frame comparison.
+
+This is the *"1.6–2 m datum offset"* the 2026-05-20 filter-side
+position-bias investigation flagged
+([[project_position_bias_filter_side_proven_20260520]]) — **and that
+investigation had the attribution backwards.**  The 1.6 m gap was
+read as a PRIDE error; it was actually PRIDE (real ITRF2020) vs
+`antennas.json` (NAD83 read as ITRF).  PRIDE was right; the engine's
+frame was wrong.  Why the lab's *cross-host* agreement still looked
+sub-cm for months (Main's point): every host seeds from the **same**
+`antennas.json` entry, so every host carries the **same** 1.71 m
+offset in the **same** direction — it cancels in host-vs-host
+residuals.  It only surfaces against frames that *don't* share the
+bias: PRIDE, broadcast/SSR orbits, and (ironically) F9P RTK against US
+CORS, which are real NAD83 and could carry their *own* ~1.7 m offset
+the other way.
 
 The fix is not a one-off coordinate edit — it's to make **every
 coordinate self-describe its frame**, validate frames at every
@@ -80,17 +99,24 @@ the *observation epoch* for processing.
 
 ### 4.1 The frame tag
 
-Every stored/transported coordinate gains an explicit frame
-descriptor: **`(realization, epoch)`**, e.g. `ITRF2020@2026.42` or
-`NAD83(2011)@2010.0`.  Concretely:
+No legacy → we go all the way: a **frame travels with every
+coordinate, as a type, not a tuple.**
 
-- Add `frame: str` (required) to the `PositionState` dataclass
-  alongside `ecef_m`.  No `PositionState` may be constructed without a
-  frame.  The docstring assumption ("WGS84/ITRF") becomes a typed,
-  validated field.
-- A small `Frame` value type (realization + epoch float) with parsing
-  (`"ITRF2020@2026.42"`), plus the constant `CANONICAL = ITRF2020 @
-  <obs-epoch>` resolved per run.
+- A frozen **`GeoPoint(ecef: (x,y,z), frame: Frame)`** value type is
+  the *only* way coordinates cross a module/file boundary.  Bare
+  `(X, Y, Z)` tuples are banned at boundaries (still fine as locals
+  inside a single numeric routine).
+- A **`Frame(realization, epoch)`** value type with parse/format
+  (`"ITRF2020@2026.42"`, `"NAD83(2011)@2010.0"`).  `GeoPoint` cannot
+  be constructed without a `Frame` — there is no default, no implicit
+  ITRF.
+- `CANONICAL` = `ITRF2020 @ <obs-epoch>`, resolved per run.
+- `PositionState` carries a `GeoPoint` (its `ecef_m` + a real `frame`
+  field) instead of a bare tuple + a docstring promise.
+
+Because there's no installed base, we rip-and-replace the bare-tuple
+signatures wholesale rather than adding a `GeoPoint` *alongside* the
+old ones — one type, enforced everywhere, from the first PR.
 
 ### 4.2 The conversion layer
 
@@ -123,9 +149,9 @@ without a frame.**  Enforced by:
 - **State-file schemas** gain a *required* `frame` field:
   `.ppp.toml`, `.survey.toml`, `receivers/*.json`.  Writers stamp it;
   readers validate it and convert to canonical on load.  A missing
-  `frame` on read → loud warning + a one-time backfill default (the
-  file's *true* frame, documented in the migration table), never a
-  silent ITRF assumption.
+  `frame` on read is a **hard error**, not a warning-plus-default —
+  because we rewrite every on-disk file with a frame up front (§5),
+  an untagged coordinate can only mean a bug, and we want it loud.
 - **`antennas.json` boundary fix (the bug):** `load_arp_from_antennas`
   reads the `frame` field and calls `to_canonical(...)` before
   returning the `PositionState`.  NAD83(2011) ARPs become ITRF at
@@ -140,30 +166,42 @@ without a frame.**  Enforced by:
   PATCH3 RTK cross-check and the Onocoy roadtrip pin; Onocoy itself is
   set to ITRS, which is canonical-compatible).
 
-## 5. Migration plan (phased — design → implement, gated on review)
+## 5. Migration — one clean cut (no phases, no shims)
 
-1. **`geo_frames.py` + tests** — the `Frame` type + `to_canonical` /
-   `convert`, validated against the OPUS ITRF/NAD83 pair (< 1 cm
-   round-trip).  Pure, no engine wiring.  Land first, independently.
-2. **Tag the central carrier** — add `frame` to `PositionState`;
-   thread it through readers/writers.  Default-tag existing on-disk
-   state by its *true* frame (engine `.ppp.toml`/`.survey.toml` →
-   ITRF2020; `antennas.json` → NAD83(2011)@2010.0).  No behavior
-   change yet (everything still resolves to the same numbers because
-   the default tags are honest).
-3. **Fix the `antennas.json` loader** — read `frame`, convert
-   NAD83→ITRF.  **This is the behavior change** (corrects the ~1.6 m
-   bias).  Coordinate with Main: it shifts every antennas.json-seeded
-   host's pinned ARP by ~1.6 m, so it needs lab validation (does the
-   filter-side position residual the 2026-05-20 work saw collapse?).
-4. **State-file schemas + `--known-pos-frame`** — required `frame`
-   field everywhere; validate-on-read; operator-frame flag.
-5. **Broad sweep** — the exhaustive every-site audit from §2 extended
-   to full coverage; tag/convert each remaining coordinate site; add a
-   lint/test that fails on a frame-less coordinate crossing a boundary.
+Zero installed base means there is nothing to be gradual *for*.  We do
+it in one tight change (one PR, or a short same-day stack — not a
+multi-week phased rollout):
 
-Steps 1–2 are safe (no behavior change).  Step 3 is the load-bearing
-correction and the one that needs Main + lab sign-off.
+1. **`geo_frames.py` + tests** — `Frame`, `GeoPoint`, `to_canonical`,
+   `convert` (pyproj, §7).  Validated against the OPUS UFO1 ITRF/NAD83
+   pair (< 1 cm round-trip).
+2. **Rip-and-replace the coordinate type** — `PositionState` carries a
+   `GeoPoint`; every loader/writer/signature in §2's table takes/returns
+   `GeoPoint`, not a bare tuple.  No alongside-the-old shim — the old
+   bare-tuple signatures are *deleted*.
+3. **Rewrite the on-disk data, once** — convert every stored
+   coordinate to a frame-tagged form in place:
+   - `antennas.json`: keep the surveyed values but make the **canonical
+     `ecef_m` the ITRF2020 one** (we already have it from OPUS) with an
+     explicit `frame`; retain the NAD83 values as clearly-secondary
+     provenance.  **This is the 1.71 m correction.**
+   - `state/positions/*.{ppp,survey}.toml`, `state/receivers/*.json`:
+     stamp the real frame (engine output → ITRF2020; PRIDE → ITRF2020)
+     and delete-and-regenerate where simplest (lab hosts will just
+     re-bootstrap).
+4. **Fix the loader + operator path together** — `load_arp_from_antennas`
+   reads `frame` and `to_canonical()`s it; `--known-pos` gains a
+   required/`ITRF2020`-default `--known-pos-frame`.
+5. **Hard enforcement from day one** — readers reject an untagged or
+   wrong-frame coordinate (no defaults); a test/lint fails on any bare
+   `(X,Y,Z)` crossing a boundary.
+
+The only thing that *isn't* code-gated is **confirmation**: the loader
+fix shifts every antennas.json-seeded ARP by 1.71 m, and Main does the
+lab read — does the 2026-05-20 filter-side residual collapse to the
+receiver-noise floor?  That's a *validation*, not a rollout phase: we
+ship the correct code and check the empirical payoff, rather than
+staging it behind a flag.
 
 ## 6. Validation
 
@@ -178,24 +216,28 @@ correction and the one that needs Main + lab sign-off.
   2026-05-20.  If the offset collapses to the receiver-noise floor,
   the bug is confirmed fixed.  Main's lab call.
 
-## 7. Open questions (for review)
+## 7. Decisions (resolved in review)
 
-- **`pyproj` dependency vs hand-rolled Helmert.**  pyproj is correct +
-  maintained (official PROJ transforms) but is a new runtime dep on
-  lab hosts.  Hand-rolled 14-param Helmert with NGS HTDP constants is
-  dependency-free but we own the correctness.  Lean pyproj; confirm.
-- **Storage epoch convention.**  Store at a *fixed* reference epoch
-  (e.g. ITRF2020@2020.0, stable numbers) and propagate to obs-epoch at
-  use, OR store at obs-epoch (numbers drift ~2 cm/yr)?  Recommend
-  fixed-epoch storage + propagate-on-use.
-- **How far to push the framed type.**  Minimal (add `frame` field to
-  `PositionState`) vs a pervasive `GeoPoint` type replacing bare
-  tuples everywhere.  Recommend minimal first (step 2), pervasive in
-  the step-5 sweep.
-- **Sub-cm vs the moonshot.**  The ~1.6 m datum fix is urgent.  The
-  ~2 cm/yr epoch term is sub-cm over lab timescales today but matters
-  for the separate-antenna 2-site budget eventually — fold into the
-  same machinery now so we don't revisit.
+- **Conversion backend: `pyproj`** (Main + Charlie both).  PROJ ships
+  the official EPSG/NGS-HTDP transforms with epoch handling baked in;
+  hand-rolling a plate-motion 14-param Helmert is ~50 lines where a
+  sign/epoch-direction slip looks plausible at cm but is wrong at mm.
+  **Pin PROJ ≥ 9.0** (Charlie — 8.x lacks ITRF2020).  pyproj is
+  already present on the lab hosts.
+- **Framed type: pervasive `GeoPoint` from the first PR** (Bob's
+  no-legacy mandate) — not "minimal field first, pervasive later."
+  We delete the bare-tuple signatures rather than adding alongside.
+- **Storage epoch convention: store the surveyed coordinate in
+  ITRF2020 with its true `(realization, epoch)`** (e.g. the OPUS
+  ITRF2020@2026.32 value), and **propagate to the observation epoch at
+  use**.  The antenna is stationary, so the ~2 cm/yr plate-motion term
+  is a clean linear propagation in `geo_frames`.  No fixed-reference-
+  epoch indirection.
+- **Epoch term folded in now, not deferred.**  The 1.71 m datum fix is
+  the urgent payoff; the ~2 cm/yr epoch propagation is sub-cm over
+  current lab timescales but is the same machinery and matters for the
+  separate-antenna 2-site budget, so it ships in `geo_frames` from the
+  start.
 
 ## 8. References
 
