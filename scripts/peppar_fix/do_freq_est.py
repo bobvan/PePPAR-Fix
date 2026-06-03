@@ -864,6 +864,13 @@ class DOFreqEst:
             return self.freq
         else:
             self._state_sanity_consec = 0
+            # Defense-in-depth (main's #126 review): clear the flag in
+            # the clean-epoch branch too so it can't go sticky if any
+            # path ever lands a clean epoch between threshold-crossing
+            # and the engine's poll.  Synchronous per-epoch polling
+            # today makes this unreachable, but the invariant is
+            # cheaper to maintain than to debug.
+            self._state_corrupted = False
 
         # ── LQR control ──
         # Only L[2] (φ_phc) and L[3] (f_phc) are nonzero.
