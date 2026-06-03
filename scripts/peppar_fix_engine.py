@@ -9205,6 +9205,25 @@ def _append_queue_history(history, qobj, timeout=0.5):
 
 # ── Main ──────────────────────────────────────────────────────────────── #
 
+
+def _known_pos_source_frame(spec: str):
+    """Build the source Frame for a ``--known-pos-frame`` spec.
+
+    Accepts an explicit ``REALIZATION@EPOCH`` (used verbatim) or a bare
+    realization name.  For a bare realization, the epoch is the natural
+    one: plate-fixed NAD83(2011) is anchored at 2010.0; a dynamic
+    realization (e.g. ITRF2020) is tagged at the current epoch.
+    """
+    from peppar_fix.geo_frames import Frame
+    from peppar_fix.position_state import decimal_year_now
+    spec = spec.strip()
+    if "@" in spec:
+        return Frame.parse(spec)
+    if spec == "NAD83(2011)":
+        return Frame(spec, 2010.0)
+    return Frame(spec, decimal_year_now())
+
+
 def run(args):
     """Main entry point: bootstrap → steady state."""
     stop_event = threading.Event()
@@ -9624,8 +9643,20 @@ def run(args):
     # 1. --known-pos operator override.
     if args.known_pos:
         lat, lon, alt = [float(v) for v in args.known_pos.split(',')]
-        known_ecef = lla_to_ecef(lat, lon, alt)
-        pos_source = "known_pos (config)"
+        raw_ecef = lla_to_ecef(lat, lon, alt)
+        # Convert the operator's coordinate to canonical ITRF2020.  The
+        # default source frame is NAD83(2011) — operators paste the OPUS
+        # PDF / US-CORS line, which is NAD83 — so an unframed paste is
+        # corrected, not silently used ~1.71 m off the orbit frame.
+        from peppar_fix.geo_frames import GeoPoint, to_canonical
+        from peppar_fix.position_state import decimal_year_now
+        kp_frame = _known_pos_source_frame(
+            getattr(args, 'known_pos_frame', None) or "NAD83(2011)")
+        obs_epoch = decimal_year_now()
+        known_ecef = np.array(to_canonical(
+            GeoPoint(tuple(raw_ecef), kp_frame), obs_epoch).ecef)
+        pos_source = (f"known_pos (config, {kp_frame} -> "
+                      f"canonical@{obs_epoch:.3f})")
         ape_sm.transition(AntPosEstState.VERIFYING, "known_pos from config")
         pos_sigma_m = 0.0
         # Persist to receiver state so the file's last-known position
@@ -10152,6 +10183,7 @@ def _apply_host_config(args):
         "pmc_uds":          ("pmc",              str),
         "pmc_domain":       ("pmc_domain",       int),
         "arp_label":        ("arp_label",        str),
+        "known_pos_frame":  ("known_pos_frame",  str),
         "antennas_json":    ("antennas_json",    str),
         "rinex_out":        ("rinex_out",        str),
         "rinex_decimate_s": ("rinex_decimate_s", float),
@@ -10204,6 +10236,12 @@ Two-phase operation:
     pos = ap.add_argument_group("Position")
     pos.add_argument("--known-pos",
                      help="Known position as lat,lon,alt (skips bootstrap)")
+    pos.add_argument("--known-pos-frame", default="NAD83(2011)",
+                     help="Reference frame of --known-pos (default "
+                          "NAD83(2011), the frame OPUS PDFs and US CORS "
+                          "report; converted to canonical ITRF2020).  "
+                          "Accepts a realization (NAD83(2011), ITRF2020) "
+                          "or an explicit REALIZATION@EPOCH.")
     pos.add_argument("--ignore-ppp", action="store_true",
                      help="Don't seed position from state/positions/<uid>.ppp.toml.  "
                           "Per docs/position-state-and-monitoring.md.")

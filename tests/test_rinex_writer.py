@@ -437,8 +437,13 @@ def test_make_writer_uses_arp_label_when_no_known_pos(tmp_path):
     )
     w = make_writer_from_args(args)
     assert w is not None
-    assert w._approx_xyz == pytest.approx(
-        (157470.222, -4756189.544, 4232767.952))
+    # Resolved from antennas.json (not (0,0,0)), converted NAD83(2011)→
+    # canonical ITRF2020 at load — a ~1.7 m datum shift, well within the
+    # "few km of truth" APPROX POSITION needs for PRIDE/OPUS.
+    raw = (157470.222, -4756189.544, 4232767.952)
+    assert w._approx_xyz != pytest.approx((0.0, 0.0, 0.0))
+    for got, want in zip(w._approx_xyz, raw):
+        assert abs(got - want) < 5.0  # converted, near the raw NAD83 value
     w.close()
 
 

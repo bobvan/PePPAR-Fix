@@ -39,7 +39,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from peppar_fix.geo_frames import CANONICAL_REALIZATION, Frame, GeoPoint
+from peppar_fix.geo_frames import (
+    CANONICAL_REALIZATION, Frame, GeoPoint, to_canonical)
 
 log = logging.getLogger(__name__)
 
@@ -57,13 +58,21 @@ SURVEY_TIE_BREAK_RATIO = 2.0
 #
 # These bridge the on-disk representations (ISO timestamps, MJDs, the
 # antennas.json free-text frame string) to the typed Frame the engine
-# carries.  They build Frames only — none of them calls geo_frames
-# convert()/to_canonical(), so this module stays pyproj-free and the
-# 1.71 m antennas.json correction (which IS a convert at load) remains
-# deferred to its own PR per docs/coordinate-reference-frames.md §5.
+# carries, and supply the observation epoch used to convert a loaded
+# coordinate to canonical ITRF2020.
 
 # NAD83(2011) is plate-fixed at this reference-convention epoch.
 _NAD83_2011_EPOCH = 2010.0
+
+
+def _decimal_year_from_dt(dt: datetime) -> float:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    year_start = datetime(dt.year, 1, 1, tzinfo=timezone.utc)
+    year_end = datetime(dt.year + 1, 1, 1, tzinfo=timezone.utc)
+    frac = (dt - year_start).total_seconds() / (
+        year_end - year_start).total_seconds()
+    return dt.year + frac
 
 
 def decimal_year_from_iso(iso: str) -> float:
@@ -76,13 +85,15 @@ def decimal_year_from_iso(iso: str) -> float:
     except ValueError:
         # Date-only or otherwise terse — fall back to the year integer.
         return float(s[:4])
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    year_start = datetime(dt.year, 1, 1, tzinfo=timezone.utc)
-    year_end = datetime(dt.year + 1, 1, 1, tzinfo=timezone.utc)
-    frac = (dt - year_start).total_seconds() / (
-        year_end - year_start).total_seconds()
-    return dt.year + frac
+    return _decimal_year_from_dt(dt)
+
+
+def decimal_year_now() -> float:
+    """Current UTC instant as a decimal year — the default observation
+    epoch for frame conversion at seed time.  Plate motion needs only
+    year-coarse precision (~2 cm/yr), so the system clock is more than
+    adequate and no GPS observation is required at seed time."""
+    return _decimal_year_from_dt(datetime.now(timezone.utc))
 
 
 def decimal_year_from_mjd(mjd: float) -> float:
@@ -377,9 +388,11 @@ def load_arp_from_antennas(
     mount_sn: int,
     *,
     antennas_path: Optional[str] = None,
+    obs_epoch: Optional[float] = None,
 ) -> Optional[PositionState]:
     """Read timelab/antennas.json, look up ``arp_label``, return a
-    survey-kind PositionState ready for the engine's seed picker.
+    survey-kind PositionState **converted to canonical ITRF2020** ready
+    for the engine's seed picker.
 
     **This is a pure in-memory read** — the result is never written
     to disk by the engine.  Only peppar-survey-class backends may
@@ -389,14 +402,25 @@ def load_arp_from_antennas(
     tagged kind="survey" and benefits from the picker's survey
     tie-break.
 
+    **Frame conversion (the 1.71 m correction):** antennas.json stores
+    ARPs in NAD83(2011)@2010.0; the engine processes against ITRF orbits.
+    The entry's coordinate is tagged with its stored frame and converted
+    to canonical ITRF2020 at ``obs_epoch`` (default: the current decimal
+    year — see ``decimal_year_now``).  This kills the ~1.71 m datum
+    offset that a verbatim NAD83-read-as-ITRF produced.  An entry already
+    stored in ITRF2020 converts as a small epoch-propagation only.  See
+    docs/coordinate-reference-frames.md.
+
     Returns None when:
       - ``arp_label`` is None/empty
       - antennas.json can't be found
       - the json doesn't contain ``arp_label`` as a key
       - the entry is malformed (missing ecef_m or sigma_m)
+      - frame conversion fails (e.g. pyproj/PROJ unavailable) — logged
+        at ERROR; caller falls back rather than seeding a wrong-frame ARP
 
-    All failures log a warning and return None — caller falls through
-    to its normal seed path (.ppp.toml / NAV2 / cold bootstrap).
+    All failures log and return None — caller falls through to its
+    normal seed path (.ppp.toml / NAV2 / cold bootstrap).
     """
     import json
     if not arp_label:
@@ -434,33 +458,47 @@ def load_arp_from_antennas(
                     "'%s' in %s: %s", arp_label, path, e)
         return None
     # Tag the frame the lab database actually stores.  antennas.json
-    # ARPs are NAD83(2011)@2010.0 (the `frame` field says so); honour
-    # it.  NOTE: ecef_m is returned VERBATIM, NOT converted to
-    # canonical ITRF — that conversion is the 1.71 m correction, a
-    # behaviour change gated on Main's lab validation, landing in the
-    # loader-fix PR (design §5 step 4).  Until then the frame tag makes
-    # the latent NAD83-read-as-ITRF mismatch visible in the data.
-    frame = parse_antennas_frame(entry.get("frame"))
-    if frame is None:
+    # ARPs are NAD83(2011)@2010.0 (the `frame` field says so); honour it.
+    stored_frame = parse_antennas_frame(entry.get("frame"))
+    if stored_frame is None:
         if entry.get("frame"):
             log.warning("load_arp_from_antennas: unparseable frame %r "
                         "for '%s'; defaulting to NAD83(2011)@%.1f",
                         entry.get("frame"), arp_label, _NAD83_2011_EPOCH)
-        frame = Frame("NAD83(2011)", _NAD83_2011_EPOCH)
+        stored_frame = Frame("NAD83(2011)", _NAD83_2011_EPOCH)
+    # Convert to canonical ITRF2020 at the observation epoch.  THIS is
+    # the 1.71 m datum correction: a NAD83(2011) ARP read verbatim into
+    # the engine's ITRF slot pinned ~1.71 m off the orbit frame.  Epoch
+    # precision needed is year-coarse (plate motion ~2 cm/yr), so the
+    # system clock suffices and no GPS observation is needed at seed
+    # time.  PositionState is frozen → construct fresh with the
+    # converted coordinate (no in-place mutation).
+    if obs_epoch is None:
+        obs_epoch = decimal_year_now()
+    try:
+        canon = to_canonical(GeoPoint(ecef_m, stored_frame), obs_epoch)
+    except Exception as e:  # pyproj/PROJ missing, transform failure, …
+        log.error("load_arp_from_antennas: frame conversion failed for "
+                  "'%s' (%s -> canonical@%.3f): %s.  Is pyproj installed "
+                  "(PROJ>=9)?  Falling back (not seeding a wrong-frame "
+                  "ARP).", arp_label, stored_frame, obs_epoch, e)
+        return None
     return PositionState(
         mount_sn=mount_sn,
-        ecef_m=ecef_m,
+        ecef_m=canon.ecef,
         sigma_m=sigma_m,
         updated=utc_now_iso(),
         source=(f"timelab/antennas.json:{arp_label}"
-                f" ({entry.get('method', 'method?')})"),
-        frame=frame,
+                f" ({entry.get('method', 'method?')};"
+                f" {stored_frame} -> {canon.frame})"),
+        frame=canon.frame,
         kind="survey",
         extra={
             "antennas_method": str(entry.get("method", "")),
             "antennas_updated": str(entry.get("updated", "")),
             "arp_label": arp_label,
             "antennas_source_path": path,
+            "antennas_stored_frame": str(stored_frame),
         },
     )
 
@@ -1055,6 +1093,7 @@ def seed_from_state_files(
     ignore_survey: bool = False,
     arp_label: Optional[str] = None,
     antennas_path: Optional[str] = None,
+    obs_epoch: Optional[float] = None,
     positions_dir: Optional[str] = None,
     receivers_dir: Optional[str] = None,
 ) -> Optional[PositionState]:
@@ -1087,6 +1126,10 @@ def seed_from_state_files(
             None disables the antennas.json candidate.
         antennas_path: override path to antennas.json (CLI / config
             override).  None uses the standard probe order.
+        obs_epoch: observation epoch (decimal year) for converting the
+            antennas.json ARP to canonical ITRF2020.  None → current
+            decimal year (year-coarse precision is all plate motion
+            needs; see load_arp_from_antennas).
         positions_dir: override DEFAULT_POSITIONS_DIR (for testing).
         receivers_dir: passed to load_current_mount_sn for mount_sn
             lookup (for testing).
@@ -1105,7 +1148,7 @@ def seed_from_state_files(
         if arp_label:
             candidates.append(load_arp_from_antennas(
                 arp_label, current_mount_sn,
-                antennas_path=antennas_path))
+                antennas_path=antennas_path, obs_epoch=obs_epoch))
     usable = filter_current_mount(candidates, current_mount_sn)
     return pick_most_confident(usable)
 
