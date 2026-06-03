@@ -46,9 +46,10 @@ from peppar_fix.arp_history import (
     DEFAULT_MAX_SIG0_M, DEFAULT_MIN_N_OBS, DEFAULT_N_DAYS, RunningArp,
     append_solution, apply_quality_filter, running_mean,
 )
+from peppar_fix.geo_frames import CANONICAL_REALIZATION, Frame
 from peppar_fix.position_state import (
     DEFAULT_POSITIONS_DIR, PositionState,
-    save_survey_state, utc_now_iso,
+    decimal_year_from_mjd, save_survey_state, utc_now_iso,
 )
 from peppar_fix.pride_pos_reader import PrideSolution
 
@@ -697,6 +698,10 @@ def write_survey_from_running(
         sigma_m=running.sigma_3d_m,
         updated=utc_now_iso(),
         source=source_label,
+        # RTKLIB PPP-static solves against IGS products → ITRF2020.
+        # Stamp the mid-window epoch the running mean is valid at.
+        frame=Frame(CANONICAL_REALIZATION, decimal_year_from_mjd(
+            0.5 * (running.oldest_mjd + running.newest_mjd))),
         kind="survey",
         extra={
             "rtklib_window_count": running.count,

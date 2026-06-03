@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 
+from peppar_fix.geo_frames import CANONICAL_REALIZATION, Frame
 from peppar_fix.position_state import (
     AntPosEstWatchdog,
     PositionState,
@@ -13,25 +14,34 @@ from peppar_fix.position_state import (
     _format_toml,
     bump_mount_sn,
     compute_horizontal_displacement,
+    decimal_year_from_iso,
+    decimal_year_from_mjd,
     filter_current_mount,
     invalidate_ppp_state,
+    load_arp_from_antennas,
     load_current_mount_sn,
     load_ppp_state,
     load_survey_state,
+    parse_antennas_frame,
     pick_most_confident,
     save_ppp_state,
     seed_from_state_files,
     utc_now_iso,
 )
 
+# A canonical frame for fixtures that don't care about the frame value.
+_TEST_FRAME = Frame(CANONICAL_REALIZATION, 2026.0)
 
-def _make_state(kind="ppp", mount_sn=0, sigma_m=0.05, source="test"):
+
+def _make_state(kind="ppp", mount_sn=0, sigma_m=0.05, source="test",
+                frame=_TEST_FRAME):
     return PositionState(
         mount_sn=mount_sn,
         ecef_m=(157469.3814, -4756189.0729, 4232768.5274),
         sigma_m=sigma_m,
         updated=utc_now_iso(),
         source=source,
+        frame=frame,
         kind=kind,
     )
 
@@ -59,6 +69,7 @@ class TestSaveLoadRoundTrip(unittest.TestCase):
                 sigma_m=0.01,
                 updated=utc_now_iso(),
                 source="test",
+                frame=_TEST_FRAME,
                 kind="ppp",
                 extra={"n_epochs": 14437, "filter": "PPP-AR"},
             )
@@ -216,6 +227,7 @@ class TestFormatToml(unittest.TestCase):
             sigma_m=0.05,
             updated="2026-05-18T00:00:00Z",
             source="test",
+            frame=Frame("ITRF2020", 2026.42),
         )
         out = _format_toml(s)
         self.assertIn("mount_sn = 3", out)
@@ -223,6 +235,7 @@ class TestFormatToml(unittest.TestCase):
         self.assertIn("sigma_m = 0.050000", out)
         self.assertIn('updated = "2026-05-18T00:00:00Z"', out)
         self.assertIn('source = "test"', out)
+        self.assertIn('frame = "ITRF2020@2026.4200"', out)
         self.assertTrue(out.endswith("\n"))
 
     def test_format_with_extras(self):
@@ -232,6 +245,7 @@ class TestFormatToml(unittest.TestCase):
             sigma_m=0.01,
             updated="x",
             source="y",
+            frame=_TEST_FRAME,
             extra={"n_epochs": 12, "active": True,
                    "method": "PPP-AR", "ratio": 1.7},
         )
@@ -300,6 +314,7 @@ class TestSeedFromStateFiles(unittest.TestCase):
             sigma_m=sigma_m,
             updated=utc_now_iso(),
             source=f"test-{kind}",
+            frame=_TEST_FRAME,
             kind="ppp" if kind == "ppp" else "ppp",  # save_ppp_state requires ppp
         )
         if kind == "ppp":
@@ -841,6 +856,7 @@ class TestInvalidatePppState(unittest.TestCase):
                 sigma_m=0.01,
                 updated=utc_now_iso(),
                 source="test",
+                frame=_TEST_FRAME,
             )
             save_ppp_state(s, "1", positions_dir=d)
             self.assertTrue(os.path.exists(os.path.join(d, "1.ppp.toml")))
@@ -1053,6 +1069,7 @@ class TestSaveSurveyState(unittest.TestCase):
                 sigma_m=0.0125,
                 updated=utc_now_iso(),
                 source="OPUS 6-day mean",
+                frame=Frame("ITRF2020", 2026.34),
                 kind="survey",
                 extra={"method": "OPUS-Static"},
             )
@@ -1063,6 +1080,8 @@ class TestSaveSurveyState(unittest.TestCase):
             self.assertEqual(loaded.mount_sn, 3)
             self.assertAlmostEqual(loaded.sigma_m, 0.0125, places=6)
             self.assertEqual(loaded.extra.get("method"), "OPUS-Static")
+            # frame survives the round-trip exactly.
+            self.assertEqual(loaded.frame, Frame("ITRF2020", 2026.34))
 
     def test_rejects_non_survey_kind(self):
         """Defensive: save_survey_state must refuse kind='ppp' to
@@ -1075,6 +1094,7 @@ class TestSaveSurveyState(unittest.TestCase):
                 sigma_m=0.01,
                 updated=utc_now_iso(),
                 source="test",
+                frame=_TEST_FRAME,
                 kind="ppp",
             )
             with self.assertRaises(ValueError):
@@ -1085,7 +1105,8 @@ class TestSaveSurveyState(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             s = PositionState(
                 mount_sn=0, ecef_m=(1.0, 2.0, 3.0), sigma_m=0.01,
-                updated=utc_now_iso(), source="test", kind="survey")
+                updated=utc_now_iso(), source="test", frame=_TEST_FRAME,
+                kind="survey")
             save_survey_state(s, "9", positions_dir=d)
             entries = os.listdir(d)
             self.assertIn("9.survey.toml", entries)
@@ -1116,6 +1137,7 @@ class TestLoadArpFromAntennas(unittest.TestCase):
                         "y": -2000.222,
                         "z": 3000.333,
                     },
+                    "frame": "NAD_83(2011) EPOCH:2010.0000",
                     "method": "OPUS-Static, 6-day mean",
                     "updated": "2026-05-12",
                 },
@@ -1145,6 +1167,12 @@ class TestLoadArpFromAntennas(unittest.TestCase):
         self.assertEqual(s.extra.get("arp_label"), "test_dict_ecef")
         self.assertEqual(s.extra.get("antennas_method"),
                          "OPUS-Static, 6-day mean")
+        # The entry's NAD83(2011)@2010.0 frame is parsed and tagged
+        # honestly — but ecef_m is the verbatim NAD83 value, NOT yet
+        # converted to canonical ITRF (the 1.71 m correction is a
+        # later PR).  This is the latent mismatch made visible.
+        self.assertEqual(s.frame, Frame("NAD83(2011)", 2010.0))
+        self.assertAlmostEqual(s.ecef_m[0], 1000.111, places=4)
 
     def test_list_ecef_format_also_supported(self):
         """antennas.json's legacy format uses ecef_m as a list, not
@@ -1155,6 +1183,9 @@ class TestLoadArpFromAntennas(unittest.TestCase):
             antennas_path=self.antennas_path)
         self.assertIsNotNone(s)
         self.assertAlmostEqual(s.ecef_m[0], 1111.222, places=3)
+        # No `frame` field in this entry → documented NAD83(2011)@2010.0
+        # default (antennas.json is the lab NAD83 database).
+        self.assertEqual(s.frame, Frame("NAD83(2011)", 2010.0))
 
     def test_unknown_arp_label_returns_none(self):
         from peppar_fix.position_state import load_arp_from_antennas
@@ -1219,6 +1250,86 @@ class TestFindAntennasJson(unittest.TestCase):
         # path; either way the call must not raise.
         result = find_antennas_json("/definitely/not/a/path")
         self.assertTrue(result is None or os.path.isfile(result))
+
+
+class TestFrameThreading(unittest.TestCase):
+    """Frame tag on PositionState + the epoch/frame helpers."""
+
+    def test_point_property_pairs_ecef_and_frame(self):
+        s = _make_state(frame=Frame("ITRF2020", 2026.5))
+        p = s.point
+        self.assertEqual(p.ecef, s.ecef_m)
+        self.assertEqual(p.frame, Frame("ITRF2020", 2026.5))
+
+    def test_ppp_write_stamps_canonical_frame(self):
+        """PppStateWriter stamps ITRF2020 at the write epoch."""
+        saved = {}
+        w = PppStateWriter("uid7", mount_sn=0, period_s=0.0,
+                           save_fn=lambda st, uid, positions_dir=None:
+                           saved.update(state=st),
+                           time_fn=lambda: 0.0)
+        self.assertTrue(w.maybe_write((1.0, 2.0, 3.0), 0.01, n_epochs=5))
+        self.assertEqual(saved["state"].frame.realization, "ITRF2020")
+        self.assertGreater(saved["state"].frame.epoch, 2020.0)
+
+    def test_legacy_untagged_file_gets_honest_default(self):
+        """A .ppp.toml written before the frame field existed (no
+        `frame =` line) loads as canonical ITRF2020 at the epoch
+        implied by its `updated` timestamp — no hard fail (yet)."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "leg.ppp.toml")
+            with open(path, "w") as f:
+                f.write('mount_sn = 0\n'
+                        'ecef_m = [1.0, 2.0, 3.0]\n'
+                        'sigma_m = 0.01\n'
+                        'updated = "2024-07-02T00:00:00Z"\n'
+                        'source = "legacy"\n')
+            loaded = load_ppp_state("leg", positions_dir=d)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.frame.realization, CANONICAL_REALIZATION)
+            # 2024-07-02 ≈ mid-2024.
+            self.assertAlmostEqual(loaded.frame.epoch, 2024.5, delta=0.05)
+
+    def test_decimal_year_from_iso(self):
+        self.assertAlmostEqual(decimal_year_from_iso("2020-01-01T00:00:00Z"),
+                               2020.0, delta=1e-6)
+        self.assertAlmostEqual(decimal_year_from_iso("2026-07-02"),
+                               2026.5, delta=0.01)
+
+    def test_decimal_year_from_mjd(self):
+        # MJD 51544.5 == J2000.0 == 2000.0.
+        self.assertAlmostEqual(decimal_year_from_mjd(51544.5), 2000.0,
+                               delta=1e-6)
+        # One year later.
+        self.assertAlmostEqual(decimal_year_from_mjd(51544.5 + 365.25),
+                               2001.0, delta=1e-6)
+
+    def test_parse_antennas_frame_freetext(self):
+        self.assertEqual(parse_antennas_frame("NAD_83(2011) EPOCH:2010.0000"),
+                         Frame("NAD83(2011)", 2010.0))
+
+    def test_parse_antennas_frame_canonical(self):
+        self.assertEqual(parse_antennas_frame("ITRF2020@2026.4200"),
+                         Frame("ITRF2020", 2026.42))
+
+    def test_parse_antennas_frame_unparseable_is_none(self):
+        self.assertIsNone(parse_antennas_frame(""))
+        self.assertIsNone(parse_antennas_frame(None))
+        self.assertIsNone(parse_antennas_frame("not a frame"))
+
+    def test_arp_loader_does_not_convert(self):
+        """The loader tags the NAD83 frame but must NOT move ecef_m —
+        conversion to canonical is the deferred 1.71 m correction."""
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            ap = os.path.join(d, "antennas.json")
+            with open(ap, "w") as f:
+                json.dump({"a": {"ecef_m": [10.0, 20.0, 30.0],
+                                 "sigma_m": 0.01,
+                                 "frame": "NAD_83(2011) EPOCH:2010.0000"}}, f)
+            s = load_arp_from_antennas("a", mount_sn=0, antennas_path=ap)
+            self.assertEqual(s.frame, Frame("NAD83(2011)", 2010.0))
+            self.assertEqual(s.ecef_m, (10.0, 20.0, 30.0))  # verbatim
 
 
 if __name__ == "__main__":

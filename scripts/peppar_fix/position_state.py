@@ -33,10 +33,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+
+from peppar_fix.geo_frames import CANONICAL_REALIZATION, Frame, GeoPoint
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +51,72 @@ DEFAULT_POSITIONS_DIR = os.path.join(_REPO_ROOT, "state", "positions")
 # factor of ppp's sigma.  Survey is "ground truth" with rigorous error
 # propagation; ppp can be optimistic under random-walk position state.
 SURVEY_TIE_BREAK_RATIO = 2.0
+
+
+# ── Frame / epoch helpers ─────────────────────────────────────────── #
+#
+# These bridge the on-disk representations (ISO timestamps, MJDs, the
+# antennas.json free-text frame string) to the typed Frame the engine
+# carries.  They build Frames only — none of them calls geo_frames
+# convert()/to_canonical(), so this module stays pyproj-free and the
+# 1.71 m antennas.json correction (which IS a convert at load) remains
+# deferred to its own PR per docs/coordinate-reference-frames.md §5.
+
+# NAD83(2011) is plate-fixed at this reference-convention epoch.
+_NAD83_2011_EPOCH = 2010.0
+
+
+def decimal_year_from_iso(iso: str) -> float:
+    """Decimal year from an ISO-8601 string (date or datetime, optional
+    trailing 'Z').  Used to give a legacy untagged position file an
+    honest observation epoch from its ``updated`` timestamp."""
+    s = iso.strip().rstrip("Zz")
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        # Date-only or otherwise terse — fall back to the year integer.
+        return float(s[:4])
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    year_start = datetime(dt.year, 1, 1, tzinfo=timezone.utc)
+    year_end = datetime(dt.year + 1, 1, 1, tzinfo=timezone.utc)
+    frac = (dt - year_start).total_seconds() / (
+        year_end - year_start).total_seconds()
+    return dt.year + frac
+
+
+def decimal_year_from_mjd(mjd: float) -> float:
+    """Decimal year from a Modified Julian Date.  MJD 51544.5 == J2000.0
+    == 2000.0; ~365.25 d/yr is accurate to well under a day, far below
+    the ~2 cm/yr plate-motion term."""
+    return 2000.0 + (float(mjd) - 51544.5) / 365.25
+
+
+def parse_antennas_frame(s: Optional[str]) -> Optional[Frame]:
+    """Parse the antennas.json ``frame`` free-text into a Frame.
+
+    The lab database stores it as e.g. ``"NAD_83(2011) EPOCH:2010.0000"``
+    (note the underscore, the space, and ``EPOCH:`` rather than ``@``).
+    Also accepts the canonical ``"REALIZATION@EPOCH"`` form.  Returns
+    None when ``s`` is empty/None or unparseable — the caller then
+    applies the documented NAD83(2011)@2010.0 default with a warning.
+    """
+    if not s:
+        return None
+    text = str(s).strip()
+    try:
+        return Frame.parse(text)  # canonical "REALIZATION@EPOCH"
+    except ValueError:
+        pass
+    # Free-text "NAD_83(2011) EPOCH:2010.0000" style.
+    m = re.match(r"\s*([A-Za-z0-9_()]+)\s*EPOCH[:=]?\s*([0-9.]+)\s*$", text)
+    if not m:
+        return None
+    realization = m.group(1).replace("NAD_83", "NAD83")
+    try:
+        return Frame(realization, float(m.group(2)))
+    except ValueError:
+        return None
 
 
 # ── Data type ─────────────────────────────────────────────────────── #
@@ -62,12 +131,18 @@ class PositionState:
             estimate is valid for.  Compared against the receiver's
             current mount_sn at read time; mismatched entries are
             discarded as stale.
-        ecef_m: (X, Y, Z) in meters, WGS84/ITRF.
+        ecef_m: (X, Y, Z) in meters, in ``frame``.
         sigma_m: 1-sigma uncertainty on the ECEF position.
         updated: ISO 8601 UTC timestamp of when this estimate was
             written.
         source: human-readable origin label.  Examples:
             "peppar_fix_engine PPP-AR", "PRIDE 6-day mean".
+        frame: the reference frame ``ecef_m`` is expressed in
+            (realization + epoch).  Required — there is no implicit
+            ITRF (docs/coordinate-reference-frames.md §4.1).  ``ecef_m``
+            is NOT yet auto-converted to canonical on load; that
+            conversion (the 1.71 m antennas.json correction) lands in
+            the loader-fix PR.  Use ``.point`` to get the framed value.
         kind: "ppp" or "survey" — set by the loader, not stored in
             the file.  Used for tie-break logic.
         extra: any additional file-specific keys preserved verbatim
@@ -78,8 +153,16 @@ class PositionState:
     sigma_m: float
     updated: str
     source: str
+    frame: Frame
     kind: str = "ppp"
     extra: dict = field(default_factory=dict)
+
+    @property
+    def point(self) -> GeoPoint:
+        """``ecef_m`` paired with its ``frame`` as the framed type that
+        crosses module/file boundaries (docs/coordinate-reference-
+        frames.md §4.1)."""
+        return GeoPoint(self.ecef_m, self.frame)
 
 
 # ── Paths ─────────────────────────────────────────────────────────── #
@@ -111,15 +194,27 @@ def _load_toml(path: str, kind: str) -> Optional[PositionState]:
         ecef = data["ecef_m"]
         if len(ecef) != 3:
             raise ValueError(f"ecef_m must be 3-tuple, got {len(ecef)}")
+        updated = str(data["updated"])
+        # Frame: stamped by writers post-migration.  A legacy file from
+        # before this field existed gets the honest default — both ppp
+        # (engine AntPosEst) and survey (PRIDE/RTKLIB) write canonical
+        # ITRF2020; epoch from `updated` is the best available obs epoch.
+        # (Hard-fail on a missing frame is deferred to the enforcement
+        # PR, after the on-disk rewrite — see design §4.3/§5.)
+        if "frame" in data:
+            frame = Frame.parse(str(data["frame"]))
+        else:
+            frame = Frame(CANONICAL_REALIZATION, decimal_year_from_iso(updated))
         # Extract known fields; preserve the rest in `extra`.
-        known = {"mount_sn", "ecef_m", "sigma_m", "updated", "source"}
+        known = {"mount_sn", "ecef_m", "sigma_m", "updated", "source", "frame"}
         extra = {k: v for k, v in data.items() if k not in known}
         return PositionState(
             mount_sn=int(data["mount_sn"]),
             ecef_m=(float(ecef[0]), float(ecef[1]), float(ecef[2])),
             sigma_m=float(data["sigma_m"]),
-            updated=str(data["updated"]),
+            updated=updated,
             source=str(data["source"]),
+            frame=frame,
             kind=kind,
             extra=extra,
         )
@@ -162,6 +257,7 @@ def _format_toml(state: PositionState) -> str:
         f"sigma_m = {state.sigma_m:.6f}",
         f"updated = \"{state.updated}\"",
         f"source = \"{state.source}\"",
+        f"frame = \"{state.frame}\"",
     ]
     for k, v in sorted(state.extra.items()):
         if isinstance(v, str):
@@ -337,6 +433,20 @@ def load_arp_from_antennas(
         log.warning("load_arp_from_antennas: malformed entry "
                     "'%s' in %s: %s", arp_label, path, e)
         return None
+    # Tag the frame the lab database actually stores.  antennas.json
+    # ARPs are NAD83(2011)@2010.0 (the `frame` field says so); honour
+    # it.  NOTE: ecef_m is returned VERBATIM, NOT converted to
+    # canonical ITRF — that conversion is the 1.71 m correction, a
+    # behaviour change gated on Main's lab validation, landing in the
+    # loader-fix PR (design §5 step 4).  Until then the frame tag makes
+    # the latent NAD83-read-as-ITRF mismatch visible in the data.
+    frame = parse_antennas_frame(entry.get("frame"))
+    if frame is None:
+        if entry.get("frame"):
+            log.warning("load_arp_from_antennas: unparseable frame %r "
+                        "for '%s'; defaulting to NAD83(2011)@%.1f",
+                        entry.get("frame"), arp_label, _NAD83_2011_EPOCH)
+        frame = Frame("NAD83(2011)", _NAD83_2011_EPOCH)
     return PositionState(
         mount_sn=mount_sn,
         ecef_m=ecef_m,
@@ -344,6 +454,7 @@ def load_arp_from_antennas(
         updated=utc_now_iso(),
         source=(f"timelab/antennas.json:{arp_label}"
                 f" ({entry.get('method', 'method?')})"),
+        frame=frame,
         kind="survey",
         extra={
             "antennas_method": str(entry.get("method", "")),
@@ -797,13 +908,17 @@ class PppStateWriter:
                 and now < self._next_write_t):
             self.n_skipped_throttle += 1
             return False
+        updated = utc_now_iso()
         state = PositionState(
             mount_sn=self.mount_sn,
             ecef_m=(float(pos_ecef[0]), float(pos_ecef[1]),
                     float(pos_ecef[2])),
             sigma_m=float(sigma_3d),
-            updated=utc_now_iso(),
+            updated=updated,
             source="peppar_fix_engine AntPosEst",
+            # AntPosEst runs in the engine's canonical ITRF2020 frame at
+            # the current observation epoch.
+            frame=Frame(CANONICAL_REALIZATION, decimal_year_from_iso(updated)),
             kind="ppp",
             extra={"n_epochs": int(n_epochs)},
         )
