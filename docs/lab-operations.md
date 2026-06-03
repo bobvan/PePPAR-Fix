@@ -182,6 +182,7 @@ cd ~/peppar-fix
 python3 -m venv venv
 source venv/bin/activate
 pip install pyubx2 pyserial
+pip install "pyproj>=3.6"  # NAD83(2011)↔ITRF2020 datum conversion (needs bundled PROJ ≥ 9.0)
 pip install smbus2  # only on hosts with I2C (otcBob1, ptBoat)
 
 # 3. Create runtime directories
@@ -230,6 +231,7 @@ Before starting a long run:
 - [ ] ntrip.conf present
 - [ ] data/ directory exists
 - [ ] `python3 -c "import pyubx2"` succeeds (in the right python)
+- [ ] `python3 -c "import pyproj"` succeeds (geo_frames datum conversion)
 - [ ] Timebeat stopped (on OTC hosts): `systemctl is-active timebeat`
 - [ ] System time daemon running and locked (see below)
 - [ ] PHC phase check (see below)

@@ -309,8 +309,10 @@ stacked on PR #48) auto-closed and reopened as PR #51.
 ### Common lab-host failures (in order of frequency)
 
 1. **Missing Python deps**: set up the venv first:
-   `cd ~/peppar-fix && python3 -m venv venv && venv/bin/pip install pyubx2 pyserial`
+   `cd ~/peppar-fix && python3 -m venv venv && venv/bin/pip install pyubx2 pyserial "pyproj>=3.6"`
    (add `smbus2` on I2C hosts). Never use `--break-system-packages`.
+   `pyproj>=3.6` is required for `geo_frames` (NAD83↔ITRF datum conversion);
+   it bundles PROJ ≥ 9.0 which has ITRF2020.
 2. **Missing directories**: `mkdir -p ~/peppar-fix/data`
 3. **Missing ntrip.conf**: `scp TimeHat:~/peppar-fix/ntrip.conf ~/peppar-fix/`
    (this is the *one* legitimate scp — credentials are not in the repo).
