@@ -195,7 +195,19 @@ class DOFreqEst:
         # the last applied u = initial_freq.
         self._last_u = initial_freq
 
+        # State-sanity guard (see update() for the per-epoch check).
+        # _state_corrupted is the "wrapper should reset me" signal the
+        # engine polls via is_state_corrupted().  It is set ONLY after
+        # _state_sanity_consec_threshold consecutive violations — a
+        # single-epoch outlier could be a transient the chi² gate would
+        # catch on its own, but sustained violations indicate the EKF
+        # has wandered into a region the gate alone can't pull back from
+        # (the day0602-pr125b-madhat 22:21 failure mode:
+        # ekfStateSanityNoRecovery).  Cleared by reset() and on any
+        # clean epoch.
         self._state_corrupted = False
+        self._state_sanity_consec = 0
+        self._state_sanity_consec_threshold = 3
 
         # OCXO-trusted observation gate.  If provided, Arm 4 (TICC)
         # innovations whose magnitude exceeds the DO's physically-
@@ -367,6 +379,17 @@ class DOFreqEst:
         self.last_ocxo_gate_rejected = False
         self.last_ocxo_gate_reason = ""
         self.last_ticc_route = "int"
+        # Clear the state-sanity guard: post-reset x is clean, so the
+        # consecutive-violations counter starts fresh and the
+        # _state_corrupted signal the engine polls drops back to False.
+        self._state_corrupted = False
+        self._state_sanity_consec = 0
+
+    def is_state_corrupted(self) -> bool:
+        """True iff sustained state-sanity violations have crossed the
+        consecutive-threshold and the engine should request a reset
+        through _request_servo_reset.  Cleared by reset()."""
+        return self._state_corrupted
 
     def project_p22_coast(self, max_tau_s):
         """Predict-only P[2,2] (ns²) for coasting 1..max_tau_s seconds.
@@ -801,17 +824,46 @@ class DOFreqEst:
         self.x = x_pred
         self.P = P_pred
 
-        # State-sanity guard (I-074400 defense #2): detect state
-        # corruption that the chi-squared gate didn't catch (e.g.,
-        # corruption through a non-TICC path or accumulated drift).
+        # State-sanity guard (I-074400 defense #2 + ekfStateSanityNoRecovery
+        # follow-up): detect state corruption that the chi-squared gate
+        # didn't catch (e.g., corruption through a non-TICC path or
+        # accumulated drift past what any single-epoch gate would catch).
+        #
+        # Sustained-violation counter: increments on any violation
+        # (any |x[i]| > bound), resets on a clean epoch.  Sets
+        # _state_corrupted = True only after consec_threshold violations
+        # in a row — distinguishes a transient single-epoch outlier
+        # (the chi² gate handles those) from sustained corruption (the
+        # engine polls is_state_corrupted() and routes to
+        # _request_servo_reset).  On any violation, ALSO short-circuit
+        # the LQR step and return self.freq unchanged — applying the
+        # LQR output of a corrupt state is exactly what cascaded the
+        # day0602-pr125b-madhat 22:21 runaway.
         _X_BOUNDS = (1e8, 1e4, 1e8, 1e6)  # ns, ppb, ns, ppb
+        _violated = False
         for _i, (_xi, _bound) in enumerate(zip(self.x, _X_BOUNDS)):
             if abs(_xi) > _bound:
                 log.error(
                     "[EKF] state-sanity: |x[%d]|=%.1f > %.0f — "
-                    "state corrupted", _i, abs(_xi), _bound)
-                self._state_corrupted = True
+                    "state corrupted (consec=%d/%d)",
+                    _i, abs(_xi), _bound,
+                    self._state_sanity_consec + 1,
+                    self._state_sanity_consec_threshold)
+                _violated = True
                 break
+        if _violated:
+            self._state_sanity_consec += 1
+            if (self._state_sanity_consec
+                    >= self._state_sanity_consec_threshold):
+                self._state_corrupted = True
+            # Skip LQR: applying the LQR output of a corrupt state
+            # cascades the runaway.  Hold the last commanded freq;
+            # the engine polls is_state_corrupted() and resets the
+            # filter (preserving self.freq) once the consecutive
+            # threshold is crossed.
+            return self.freq
+        else:
+            self._state_sanity_consec = 0
 
         # ── LQR control ──
         # Only L[2] (φ_phc) and L[3] (f_phc) are nonzero.

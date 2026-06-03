@@ -8723,6 +8723,34 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             distance_to_lock=_distance_for_gate,
             ticc_ext_correlated=_ticc_ext_correlated,
         )
+
+        # ekfStateSanityNoRecovery: route sustained state-sanity
+        # violations through the shared reset budget so the engine
+        # can recover from an EKF runaway instead of logging through
+        # it.  is_state_corrupted() returns True only after N
+        # consecutive |x[i]| > bound epochs (per do_freq_est.py); the
+        # corrupt-epoch updates have already short-circuited the LQR
+        # and held self.freq at the last sane value, so applying
+        # adjfine_ppb this epoch is safe.  Within budget → reset
+        # zeros the unbounded phase states + preserves the actuator
+        # command (initial_freq=self.freq); over budget → exit-5
+        # wrapper-relaunch.
+        if servo.is_state_corrupted():
+            if _request_servo_reset(ctx, 'state_sanity') == "reset":
+                # Continue this epoch — the held adjfine carries forward
+                # and the next servo.update() runs on the reset state.
+                adjfine_ppb = -servo.freq
+            else:
+                log.error(
+                    "  state-sanity sustained beyond reset budget — "
+                    "servo cannot recover in-process. Exiting for "
+                    "wrapper re-bootstrap (exit code 5).")
+                _dfe = ctx.get('dfe_sm')
+                if _dfe is not None:
+                    _dfe.transition(DOFreqEstState.HOLDOVER,
+                                    "state-sanity unrecoverable")
+                ctx['phc_diverged'] = True
+
         # ── --arm-state-log: post-update DOFreqEst state vector ─────
         _arm_w = ctx.get('arm_state_log_writer')
         _arm_f = ctx.get('arm_state_log_file')
