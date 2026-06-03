@@ -330,6 +330,7 @@ class TestSeedFromStateFiles(unittest.TestCase):
                     f'sigma_m = {sigma_m}\n'
                     f'updated = "{s.updated}"\n'
                     f'source = "test-survey"\n'
+                    f'frame = "{_TEST_FRAME}"\n'  # required since step 5
                 )
 
     def test_no_files_returns_none(self):
@@ -1277,10 +1278,11 @@ class TestFrameThreading(unittest.TestCase):
         self.assertEqual(saved["state"].frame.realization, "ITRF2020")
         self.assertGreater(saved["state"].frame.epoch, 2020.0)
 
-    def test_legacy_untagged_file_gets_honest_default(self):
-        """A .ppp.toml written before the frame field existed (no
-        `frame =` line) loads as canonical ITRF2020 at the epoch
-        implied by its `updated` timestamp — no hard fail (yet)."""
+    def test_legacy_untagged_file_is_rejected(self):
+        """Hard enforcement (step 5): a .ppp.toml without a `frame =`
+        line (pre-migration legacy) is REJECTED on load — None, no
+        silent implicit-ITRF default.  Caller falls back to another
+        seed source; the next engine write re-creates it with a frame."""
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "leg.ppp.toml")
             with open(path, "w") as f:
@@ -1289,11 +1291,21 @@ class TestFrameThreading(unittest.TestCase):
                         'sigma_m = 0.01\n'
                         'updated = "2024-07-02T00:00:00Z"\n'
                         'source = "legacy"\n')
-            loaded = load_ppp_state("leg", positions_dir=d)
-            self.assertIsNotNone(loaded)
-            self.assertEqual(loaded.frame.realization, CANONICAL_REALIZATION)
-            # 2024-07-02 ≈ mid-2024.
-            self.assertAlmostEqual(loaded.frame.epoch, 2024.5, delta=0.05)
+            self.assertIsNone(load_ppp_state("leg", positions_dir=d))
+
+    def test_unparseable_frame_is_rejected(self):
+        """A state file with a present-but-garbage `frame` is rejected
+        too (Frame.parse raises → None), not coerced to a default."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "bad.survey.toml")
+            with open(path, "w") as f:
+                f.write('mount_sn = 0\n'
+                        'ecef_m = [1.0, 2.0, 3.0]\n'
+                        'sigma_m = 0.01\n'
+                        'updated = "2024-07-02T00:00:00Z"\n'
+                        'source = "x"\n'
+                        'frame = "not a frame"\n')
+            self.assertIsNone(load_survey_state("bad", positions_dir=d))
 
     def test_decimal_year_from_iso(self):
         self.assertAlmostEqual(decimal_year_from_iso("2020-01-01T00:00:00Z"),

@@ -161,6 +161,7 @@ class LoadSnapshotTest(unittest.TestCase):
                 'sigma_m = 0.012\n'
                 'updated = "2026-05-22T15:00:00Z"\n'
                 'source = "peppar-survey --pride"\n'
+                'frame = "ITRF2020@2026.39"\n'  # required since step 5
             )
             r = load_current_snapshot(str(p))
             self.assertIsNotNone(r)

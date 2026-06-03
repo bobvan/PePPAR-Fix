@@ -206,16 +206,18 @@ def _load_toml(path: str, kind: str) -> Optional[PositionState]:
         if len(ecef) != 3:
             raise ValueError(f"ecef_m must be 3-tuple, got {len(ecef)}")
         updated = str(data["updated"])
-        # Frame: stamped by writers post-migration.  A legacy file from
-        # before this field existed gets the honest default — both ppp
-        # (engine AntPosEst) and survey (PRIDE/RTKLIB) write canonical
-        # ITRF2020; epoch from `updated` is the best available obs epoch.
-        # (Hard-fail on a missing frame is deferred to the enforcement
-        # PR, after the on-disk rewrite — see design §4.3/§5.)
-        if "frame" in data:
-            frame = Frame.parse(str(data["frame"]))
-        else:
-            frame = Frame(CANONICAL_REALIZATION, decimal_year_from_iso(updated))
+        # Frame is REQUIRED on read (design §4.3/§5 hard enforcement).
+        # All writers stamp it (since the step-2 migration), so a state
+        # file without a parseable `frame` can only be a pre-migration
+        # legacy file or a hand-corrupted one — reject it loudly rather
+        # than guessing.  The caller falls back to another seed source
+        # (antennas.json / NAV2 / cold bootstrap), and the next engine
+        # write re-creates the file *with* a frame — self-healing in one
+        # cycle.  No silent implicit-ITRF default.
+        if "frame" not in data:
+            raise ValueError("missing required 'frame' field (pre-migration "
+                             "or corrupt state file)")
+        frame = Frame.parse(str(data["frame"]))
         # Extract known fields; preserve the rest in `extra`.
         known = {"mount_sn", "ecef_m", "sigma_m", "updated", "source", "frame"}
         extra = {k: v for k, v in data.items() if k not in known}
