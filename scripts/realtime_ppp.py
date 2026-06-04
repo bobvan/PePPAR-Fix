@@ -539,6 +539,14 @@ class Nav2PositionStore:
             self._host_mono = time.monotonic()
             self._update_count += 1
 
+    def has_data(self):
+        """True once at least one PVT message has been ingested.  Lets a
+        seed waiter distinguish 'engine emitting PVT but not yet at seed
+        quality' (keep waiting) from 'no PVT at all' (give up fast and
+        fall back) — e.g. NAV2 disabled/NAK'd on non-timing firmware."""
+        with self._lock:
+            return self._update_count > 0
+
     def get_opinion(self, max_age_s=30.0):
         """Return a position opinion dict, or None if stale/unavailable.
 
@@ -1069,7 +1077,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                    raw_callback=None, nav2_store=None, rinex_writer=None,
                    extint_store=None, nav_sig_store=None,
                    nav_clock_store=None, nav_time_gps_store=None,
-                   ubx_log_file=None):
+                   nav_pvt_store=None, ubx_log_file=None):
     """Read UBX messages from a GNSS device.
 
     Puts (timestamp, observations_list) tuples onto obs_queue for each
@@ -1225,6 +1233,14 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
             # NAV2-PVT: secondary navigation engine position fix
             if msg_id == 'NAV2-PVT' and nav2_store is not None:
                 nav2_store.update(parsed)
+
+            # NAV-PVT: primary navigation engine position fix.  Captured
+            # into a parallel store as the seed fallback for receivers
+            # without NAV2 (non-timing u-blox firmware) or when NAV2
+            # isn't emitting.  Same message structure as NAV2-PVT, so the
+            # same store type consumes it.
+            if msg_id == 'NAV-PVT' and nav_pvt_store is not None:
+                nav_pvt_store.update(parsed)
 
             # NAV-SIG: per-(SV, signal) usage verdict from the receiver.
             # Updates Nav2SignalStore + emits structured per-epoch log line

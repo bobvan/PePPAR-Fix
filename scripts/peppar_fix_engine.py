@@ -1295,32 +1295,37 @@ def wait_for_ephemeris(beph, stop_event, systems=None, timeout_s=120):
 
 
 def wait_for_nav2_seed(nav2_store, stop_event, timeout_s=60.0,
-                       hacc_max_m=5.0, max_age_s=5.0):
-    """Wait for NAV2 to produce a usable position fix for filter seeding.
+                       hacc_max_m=5.0, max_age_s=5.0,
+                       source_label="NAV2", no_data_grace_s=8.0):
+    """Wait for a u-blox nav engine to produce a usable position fix
+    for filter seeding.
 
-    NAV2 (the F9T's secondary nav engine) computes a fresh position
-    every epoch independent of our PPP filter.  At cold start it
-    typically reaches fixType=3 within 30-60 s on clean sky.  This
-    helper polls Nav2PositionStore until the opinion meets the
-    quality bar (fixType=3, hAcc < hacc_max_m, age < max_age_s) or
-    the timeout expires.
+    Works for any Nav2PositionStore-backed PVT stream: NAV2-PVT (the
+    secondary engine — preferred, independent of the primary's
+    fixed-position mode) or NAV-PVT (the primary engine — the fallback
+    when NAV2 is unavailable, e.g. non-timing u-blox firmware that NAKs
+    CFG-NAV2, or any receiver not emitting NAV2-PVT).  Both messages
+    share the UBX-NAV-PVT structure, so the same store consumes either.
+
+    Polls the store until the opinion meets the quality bar (fixType=3,
+    hAcc < hacc_max_m, age < max_age_s) or the timeout expires.  If the
+    store emits *no* PVT at all within ``no_data_grace_s``, returns
+    early — the engine isn't producing this message, so there's no
+    point burning the full timeout before the caller tries the next
+    seed source.
 
     Returns:
         (ecef_ndarray, h_acc_m, num_sv) on success
-        None on timeout or if the store isn't available
-
-    Used by the engine's main loop in lieu of run_bootstrap when a
-    live receiver with NAV2 is present (the typical lab case).
-    Per I-024532-charlie #3: collapse the Phase 1/Phase 2 dichotomy
-    by using NAV2 as the seed and skipping the LS-init bootstrap +
-    CONVERGED ceremony.
+        None on timeout / fast give-up / store unavailable
     """
     if nav2_store is None:
         return None
-    log.info("Waiting for NAV2 seed (fixType=3, hAcc<%.0fm) up to %.0fs...",
-             hacc_max_m, timeout_s)
-    deadline = time.time() + timeout_s
+    log.info("Waiting for %s seed (fixType=3, hAcc<%.0fm) up to %.0fs...",
+             source_label, hacc_max_m, timeout_s)
+    start = time.time()
+    deadline = start + timeout_s
     last_log = 0.0
+    _has_data = getattr(nav2_store, "has_data", None)
     while time.time() < deadline:
         if stop_event.is_set():
             return None
@@ -1331,25 +1336,56 @@ def wait_for_nav2_seed(nav2_store, stop_event, timeout_s=60.0,
             if ftype == 3 and hacc is not None and hacc < hacc_max_m:
                 ecef = np.asarray(opinion['ecef'], dtype=float)
                 num_sv = opinion.get('num_sv', 0)
-                log.info("NAV2 seed acquired: fixType=3 hAcc=%.2fm "
+                log.info("%s seed acquired: fixType=3 hAcc=%.2fm "
                          "nSV=%d after %.1fs",
-                         hacc, num_sv, time.time() - (deadline - timeout_s))
+                         source_label, hacc, num_sv, time.time() - start)
                 return ecef, float(hacc), int(num_sv)
+        # Fast give-up: this PVT message isn't being emitted at all.
+        # (Real stores expose has_data(); mocks may not — absence means
+        # "assume present" so the regression harness is unaffected.)
+        if (_has_data is not None
+                and time.time() - start >= no_data_grace_s
+                and not _has_data()):
+            log.warning("%s emitting no PVT after %.0fs — not available on "
+                        "this receiver; falling through to next seed source.",
+                        source_label, no_data_grace_s)
+            return None
         if time.time() - last_log >= 10.0:
             if opinion is None:
-                log.info("  NAV2 not yet emitting NAV2-PVT...")
+                log.info("  %s not yet emitting a usable fix...", source_label)
             else:
-                log.info("  NAV2 fix=%s hAcc=%s — not yet at seed quality",
-                         opinion.get('fix_type'),
+                log.info("  %s fix=%s hAcc=%s — not yet at seed quality",
+                         source_label, opinion.get('fix_type'),
                          f"{opinion.get('h_acc_m'):.2f}m"
                          if opinion.get('h_acc_m') is not None else "?")
             last_log = time.time()
         time.sleep(1.0)
-    log.warning("NAV2 seed timed out after %.0fs — falling back to LS-init "
-                "bootstrap.  This is the regression-harness path; live "
-                "receivers should produce a NAV2 fix within ~30-60s.",
-                timeout_s)
+    log.warning("%s seed timed out after %.0fs — falling through to next "
+                "seed source.", source_label, timeout_s)
     return None
+
+
+def _apply_position_seed(seed, source_label, args, ape_sm):
+    """Common handling for a NAV2 / NAV-PVT position seed.
+
+    Returns (known_ecef, pos_sigma_m, pos_source).  Applies the optional
+    --nav2-seed-sigma-floor-m honest-σ floor and transitions AntPosEst
+    to VERIFYING.  Shared by the NAV2 and NAV-PVT seed paths so they
+    stay in lockstep.
+    """
+    ecef, h_acc, n_sv = seed
+    floor = getattr(args, 'nav2_seed_sigma_floor_m', 0.0)
+    if floor and h_acc < floor:
+        log.info("%s seed σ inflated: hAcc=%.2fm < floor=%.2fm",
+                 source_label, h_acc, floor)
+        sigma = float(floor)
+    else:
+        sigma = h_acc
+    source = (f"{source_label} (hAcc={h_acc:.2f}m → σ={sigma:.2f}m, "
+              f"nSV={n_sv})")
+    ape_sm.transition(AntPosEstState.VERIFYING,
+                      f"{source_label} seed @ σ={sigma:.2f}m")
+    return ecef, sigma, source
 
 
 def _build_ppp_filter(args):
@@ -9407,6 +9443,11 @@ def run(args):
     # NAV2 position store — captures the F9T secondary engine's fresh
     # position fix for the position-consensus watchdog.
     nav2_store = Nav2PositionStore()
+    # Parallel store for the primary engine's NAV-PVT, used as the seed
+    # fallback when NAV2 is unavailable (non-timing u-blox firmware that
+    # NAKs CFG-NAV2, or any receiver not emitting NAV2-PVT).  Same store
+    # type — NAV-PVT and NAV2-PVT share the UBX-NAV-PVT structure.
+    nav_pvt_store = Nav2PositionStore()
 
     # NAV-SIG store — per-(SV, signal) usage verdict from the receiver.
     # Consumed by slipDetectUnified-main Phase A logger + Charlie's
@@ -9576,7 +9617,8 @@ def run(args):
                 'extint_store': extint_store,
                 'nav_sig_store': nav_sig_store,
                 'nav_clock_store': nav_clock_store,
-                'nav_time_gps_store': nav_time_gps_store},
+                'nav_time_gps_store': nav_time_gps_store,
+                'nav_pvt_store': nav_pvt_store},
         daemon=True,
     )
     t_serial.start()
@@ -9698,32 +9740,32 @@ def run(args):
             log.info("Position from %s: source=%s updated=%s",
                      pos_source, picked.source, picked.updated)
 
-    # 3. NAV2 seed — the typical lab path.
+    # 3. NAV2 seed — preferred (secondary engine, independent of the
+    #    primary's fixed-position mode).  The honest-seed-σ floor
+    #    (--nav2-seed-sigma-floor-m) inflates the reported hAcc upward so
+    #    the PPP filter's initial covariance reflects actual uncertainty
+    #    vs truth — NAV2 SPP is systematically overconfident (1.5-4 m
+    #    bias on our lab receivers; see CLAUDE.md "NAV2 bias").  Applied
+    #    in _apply_position_seed.  wait_for_nav2_seed gives up fast if
+    #    NAV2-PVT isn't emitted at all (non-timing firmware NAKs CFG-NAV2).
     if known_ecef is None and nav2_store is not None:
         seed = wait_for_nav2_seed(nav2_store, stop_event,
-                                  timeout_s=60.0, hacc_max_m=5.0)
+                                  timeout_s=60.0, hacc_max_m=5.0,
+                                  source_label="NAV2")
         if seed is not None:
-            nav2_ecef, nav2_h_acc, nav2_n_sv = seed
-            known_ecef = nav2_ecef
-            # --nav2-seed-sigma-floor-m: NAV2 SPP is systematically
-            # overconfident relative to the surveyed ARP (1.5-4 m
-            # bias on our lab F9T/F10T; see CLAUDE.md "NAV2 bias").
-            # Honest-seed-σ floor inflates the reported h_acc_m
-            # upward so the PPP filter's initial position-state
-            # covariance reflects the *actual* uncertainty against
-            # truth.  Test variable for the "does bad seed doom
-            # the filter?" experiment (2026-05-18 nav2-seed-basin).
-            nav2_floor = getattr(args, 'nav2_seed_sigma_floor_m', 0.0)
-            if nav2_floor and nav2_h_acc < nav2_floor:
-                log.info("NAV2 seed σ inflated: hAcc=%.2fm < floor=%.2fm",
-                         nav2_h_acc, nav2_floor)
-                pos_sigma_m = float(nav2_floor)
-            else:
-                pos_sigma_m = nav2_h_acc
-            pos_source = (f"NAV2 (hAcc={nav2_h_acc:.2f}m → "
-                          f"σ={pos_sigma_m:.2f}m, nSV={nav2_n_sv})")
-            ape_sm.transition(AntPosEstState.VERIFYING,
-                              f"NAV2 seed @ σ={pos_sigma_m:.2f}m")
+            known_ecef, pos_sigma_m, pos_source = _apply_position_seed(
+                seed, "NAV2", args, ape_sm)
+    # 3b. NAV-PVT fallback — the primary engine's fix.  Always present
+    #     and fix-quality, so it seeds receivers that have no NAV2
+    #     (non-timing u-blox firmware) or whose NAV2 isn't emitting.
+    #     Shorter timeout: NAV-PVT is available within seconds if at all.
+    if known_ecef is None and nav_pvt_store is not None:
+        seed = wait_for_nav2_seed(nav_pvt_store, stop_event,
+                                  timeout_s=20.0, hacc_max_m=5.0,
+                                  source_label="NAV-PVT")
+        if seed is not None:
+            known_ecef, pos_sigma_m, pos_source = _apply_position_seed(
+                seed, "NAV-PVT", args, ape_sm)
     if known_ecef is not None:
         # --seed-pos-offset: apply (E,N,U) displacement in meters to
         # whatever known_ecef was loaded.  Used for seed-error
