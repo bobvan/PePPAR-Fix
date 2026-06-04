@@ -9329,28 +9329,37 @@ def run(args):
 
     # Load ANTEX for PCV correction (Phase 2 of obs-model plan).  We
     # parse at engine startup so the one-time cost (~1s on IGS14.atx)
-    # happens before any real-time observation processing.  Loading
-    # failures are warnings, not errors: the engine continues without
-    # PCV correction.
+    # happens before any real-time observation processing.
+    #
+    # Resolution order (see peppar_fix.antex_resolve for the full set
+    # of cases):
+    #   1. --antex-path / --receiver-antenna if explicitly passed.
+    #   2. antennas.json[arp_label].antenna for the receiver antenna,
+    #      canonicalized to the ANTEX 20-char TYPE field.
+    #   3. ./support/antex/<antenna>.atx or ./support/antex/ngs20.atx
+    #      for the ANTEX file.
+    # The launch lines on lab hosts pass neither flag, so steps 2-3
+    # are what actually enables PCV in production (I-121024-main).
+    from peppar_fix.antex_resolve import (
+        resolve_pcv_defaults, log_pcv_status,
+    )
+    _pcv = resolve_pcv_defaults(
+        arp_label=getattr(args, "arp_label", None),
+        antex_path_cli=getattr(args, "antex_path", None),
+        receiver_antenna_cli=getattr(args, "receiver_antenna", None),
+        pcv_flag=bool(getattr(args, "pcv", True)),
+        antennas_path=getattr(args, "antennas_json", None),
+    )
+    log_pcv_status(_pcv, logger=log)
+    args.antex_path = _pcv.antex_path
+    args.receiver_antenna = _pcv.receiver_antenna
     _ape_antex_parser = None
-    antex_path = getattr(args, "antex_path", None)
-    recv_ant = getattr(args, "receiver_antenna", None)
-    pcv_flag = bool(getattr(args, "pcv", True))
-    if pcv_flag and antex_path and recv_ant:
+    if _pcv.enabled:
         try:
-            _ape_antex_parser = ANTEXParser(antex_path)
-            log.info("ANTEX loaded from %s; receiver antenna = %r",
-                     antex_path, recv_ant)
+            _ape_antex_parser = ANTEXParser(_pcv.antex_path)
         except Exception as e:
             log.warning("ANTEX load failed (%s); continuing without PCV", e)
             _ape_antex_parser = None
-    elif pcv_flag and (antex_path or recv_ant):
-        log.warning(
-            "PCV correction needs both --antex-path and --receiver-antenna; "
-            "got antex=%s receiver=%s; continuing without PCV",
-            antex_path, recv_ant)
-    elif not pcv_flag:
-        log.info("PCV correction disabled via --no-pcv")
 
     def on_signal(signum, frame):
         log.info("Signal received, shutting down")
