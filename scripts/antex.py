@@ -520,3 +520,53 @@ def nadir_angle_deg(sat_pos_ecef: np.ndarray,
     cos_nadir = float(np.dot(body_z, los_hat))
     cos_nadir = max(-1.0, min(1.0, cos_nadir))
     return math.degrees(math.acos(cos_nadir))
+
+
+def canonicalize_antex_type(raw: Optional[str]) -> Optional[str]:
+    """Convert a compact antenna identifier to the ANTEX 1.4 20-char TYPE
+    field used in TYPE / SERIAL NO records.
+
+    The ANTEX layout is 16 chars for the antenna model (left-justified,
+    space-padded) followed by 4 chars for the radome.  So
+    ``SFESPK6618H NONE`` (the compact human-readable form stored in
+    timelab/antennas.json) canonicalizes to ``SFESPK6618H     NONE``
+    (11 + 5 spaces + 4 = 20).
+
+    Accepts:
+      - Already-canonical 20-char input (after right-strip); returned
+        right-padded to 20.
+      - Compact ``<MODEL> <RADOME>`` with a single whitespace gap.
+
+    Returns ``None`` when the input is free-text (parentheses, em-dashes,
+    multi-line, more than two whitespace-separated tokens) — the caller
+    must then fall back to requiring an explicit --receiver-antenna.
+    """
+    if raw is None:
+        return None
+    s = raw.rstrip()
+    if not s:
+        return None
+    # Reject anything that looks like a free-text description.  Punctuation
+    # characters that don't appear in real ANTEX TYPE fields are a clear
+    # signal the value is descriptive rather than canonical.
+    if any(c in s for c in "()[]{}/\\\n\t,;:\"'"):
+        return None
+    # em-dash and en-dash too
+    if "—" in s or "–" in s:
+        return None
+    # Already canonical?  ANTEX TYPE is exactly 20 chars (model 1-16,
+    # radome 17-20).  Accept anything <= 20 that's a single token-set
+    # with a recognizable radome in the trailing slot.
+    if len(s) >= 16:
+        head = s[:16].rstrip()
+        tail = s[16:].strip()
+        if head and tail and " " not in head and " " not in tail:
+            return head.ljust(16) + tail[:4].ljust(4)
+    # Compact form: split on whitespace, expect exactly model + radome.
+    parts = s.split()
+    if len(parts) != 2:
+        return None
+    model, radome = parts
+    if len(model) > 16 or len(radome) > 4:
+        return None
+    return model.ljust(16) + radome.ljust(4)
