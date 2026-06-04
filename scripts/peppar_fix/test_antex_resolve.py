@@ -170,12 +170,31 @@ class ResolvePCVDefaultsTest(unittest.TestCase):
         self.assertEqual(pcv.antenna_source, "antennas.json[ufo1]")
         self.assertEqual(pcv.antex_source, "auto-discovered")
 
-    def test_resolve_picks_per_antenna_file_over_combined(self):
-        # When both ngs20.atx and SFESPK6618H_NONE.atx exist, the per-
-        # antenna file is preferred (smaller, self-documenting).
+    def test_resolve_prefers_combined_catalog_over_per_antenna(self):
+        # When both ngs20.atx and SFESPK6618H_NONE.atx exist, the
+        # combined catalog is preferred — per-antenna extracts contain
+        # only the receiver block, so the engine's satellite-side
+        # lookups would miss and pcv=0/N at runtime.  (Lab-confirmed
+        # 2026-06-04 in the PR #135 validation pass.)
         self._antennas_json_path = _write_antennas_json(self.tmp, "ufo1")
         atx_dir = os.path.join(self.tmp, "support", "antex")
         _touch(os.path.join(atx_dir, "ngs20.atx"))
+        _touch(os.path.join(atx_dir, "SFESPK6618H_NONE.atx"))
+        pcv = resolve_pcv_defaults(
+            arp_label="ufo1",
+            antex_path_cli=None,
+            receiver_antenna_cli=None,
+            search_roots=self._search_roots(),
+        )
+        self.assertEqual(pcv.status, ENABLED_FROM_DEFAULTS)
+        self.assertTrue(pcv.antex_path.endswith("ngs20.atx"),
+                        f"expected combined catalog preferred, got {pcv.antex_path}")
+
+    def test_resolve_falls_back_to_per_antenna_when_no_combined(self):
+        # Last-resort fallback: per-antenna file is better than nothing
+        # (still enables receiver-side PCV awareness).
+        self._antennas_json_path = _write_antennas_json(self.tmp, "ufo1")
+        atx_dir = os.path.join(self.tmp, "support", "antex")
         _touch(os.path.join(atx_dir, "SFESPK6618H_NONE.atx"))
         pcv = resolve_pcv_defaults(
             arp_label="ufo1",
