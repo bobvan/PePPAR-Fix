@@ -1558,7 +1558,8 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
                 if (opinion is not None
                         and opinion.get('fix_type') == 3
                         and opinion.get('h_acc_m') is not None
-                        and opinion['h_acc_m'] < 5.0):
+                        and opinion['h_acc_m'] < getattr(
+                            args, 'seed_hacc_max_m', 5.0)):
                     init_pos = np.asarray(opinion['ecef'], dtype=float)
                     init_clk = 0.0
                     init_pos_sigma_m = float(opinion['h_acc_m'])
@@ -9748,9 +9749,10 @@ def run(args):
     #    bias on our lab receivers; see CLAUDE.md "NAV2 bias").  Applied
     #    in _apply_position_seed.  wait_for_nav2_seed gives up fast if
     #    NAV2-PVT isn't emitted at all (non-timing firmware NAKs CFG-NAV2).
+    _seed_hacc_max = getattr(args, 'seed_hacc_max_m', 5.0)
     if known_ecef is None and nav2_store is not None:
         seed = wait_for_nav2_seed(nav2_store, stop_event,
-                                  timeout_s=60.0, hacc_max_m=5.0,
+                                  timeout_s=60.0, hacc_max_m=_seed_hacc_max,
                                   source_label="NAV2")
         if seed is not None:
             known_ecef, pos_sigma_m, pos_source = _apply_position_seed(
@@ -9761,7 +9763,7 @@ def run(args):
     #     Shorter timeout: NAV-PVT is available within seconds if at all.
     if known_ecef is None and nav_pvt_store is not None:
         seed = wait_for_nav2_seed(nav_pvt_store, stop_event,
-                                  timeout_s=20.0, hacc_max_m=5.0,
+                                  timeout_s=20.0, hacc_max_m=_seed_hacc_max,
                                   source_label="NAV-PVT")
         if seed is not None:
             known_ecef, pos_sigma_m, pos_source = _apply_position_seed(
@@ -10226,6 +10228,7 @@ def _apply_host_config(args):
         "pmc_domain":       ("pmc_domain",       int),
         "arp_label":        ("arp_label",        str),
         "known_pos_frame":  ("known_pos_frame",  str),
+        "seed_hacc_max_m":  ("seed_hacc_max_m",  float),
         "antennas_json":    ("antennas_json",    str),
         "rinex_out":        ("rinex_out",        str),
         "rinex_decimate_s": ("rinex_decimate_s", float),
@@ -10394,6 +10397,18 @@ Two-phase operation:
                           "take 30-60 s.  Set to 0 to disable the wait "
                           "and use LS-init immediately when NAV2 isn't "
                           "ready on the first epoch.")
+    pos.add_argument("--seed-hacc-max-m", type=float, default=5.0,
+                     help="Max hAcc (m) a NAV2 / NAV-PVT fix may report "
+                          "and still be accepted as the cold-start "
+                          "position seed (default 5.0).  Raise it for "
+                          "limited-sky / portable deployments (e.g. an "
+                          "indoor window with ~6-8 SVs, where the "
+                          "receiver's best fix is ~10 m): the engine "
+                          "seeds from that coarser fix — with the seed σ "
+                          "set to the reported hAcc, so the PPP filter's "
+                          "initial covariance is honest — and refines "
+                          "from there, instead of stalling the seed "
+                          "cascade and dropping to LS-init.")
     pos.add_argument("--no-nav2-soft-anchor",
                      dest="nav2_soft_anchor",
                      action="store_false", default=True,

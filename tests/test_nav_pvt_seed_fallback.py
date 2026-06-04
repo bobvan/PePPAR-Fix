@@ -73,6 +73,21 @@ class TestWaitForSeed(unittest.TestCase):
         self.assertAlmostEqual(h_acc, 0.62, places=2)   # mm → m
         self.assertEqual(n_sv, 27)
 
+    def test_relaxed_hacc_bar_accepts_coarse_fix(self):
+        """A ~10 m fix (limited-sky window) is rejected at the default 5 m
+        seed bar but accepted when --seed-hacc-max-m is relaxed."""
+        store = Nav2PositionStore()
+        store.update(_pvt(hacc_mm=10000.0, num_sv=7))  # 10 m hAcc
+        # Default 5 m bar: never reaches quality → times out (None).
+        self.assertIsNone(engine.wait_for_nav2_seed(
+            store, threading.Event(), timeout_s=2.0, hacc_max_m=5.0,
+            no_data_grace_s=10.0))
+        # Relaxed 15 m bar: the coarse fix seeds.
+        out = engine.wait_for_nav2_seed(
+            store, threading.Event(), timeout_s=2.0, hacc_max_m=15.0)
+        self.assertIsNotNone(out)
+        self.assertAlmostEqual(out[1], 10.0, places=1)
+
     def test_stop_event_aborts(self):
         store = Nav2PositionStore()
         stop = threading.Event()
