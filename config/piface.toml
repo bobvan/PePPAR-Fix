@@ -7,7 +7,10 @@
 serial = "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:2:1.0"
 baud = 115200
 ubx_port = "USB"
-receiver = "f9t-l5"
+# Receiver swapped F9T-L5 -> ZED-F9P on PATCH3 2026-06-03 (roadtrip);
+# same physical USB port so the by-path serial above still resolves.
+# NOTE: F9P is L1/L2 (not L5) — L5/B2a-I SSR-AR assumptions differ.
+receiver = "f9p"
 # No ptp_dev — the engine does not use the CM4's PHC.
 # ts2phc disciplines bcm_phy_ptp from DO PPS on SYNC_IN independently.
 ntrip_conf = "ntrip.conf"
