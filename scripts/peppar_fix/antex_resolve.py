@@ -82,19 +82,34 @@ def _find_atx_file(
     search_roots: Sequence[str],
 ) -> tuple[Optional[str], list[str]]:
     """Return (path, tried) where path is the first existing ANTEX
-    file in any of the search roots, or None if none found."""
+    file in any of the search roots, or None if none found.
+
+    Combined catalogs (ngs20.atx / igs20.atx / igs14.atx) are preferred
+    over per-antenna extracts because compute_pcv_correction() needs
+    BOTH the receiver-side pattern AND the satellite-side pattern for
+    every observation it applies — a per-antenna file like
+    ``support/antex/SFESPK6618H_NONE.atx`` is just the receiver block
+    extracted from the composite catalog and has no satellite entries,
+    so every per-SV lookup misses and pcv=0/N at runtime.  Per-antenna
+    files remain in the search list as a last-resort fallback so PCV
+    is at least receiver-side-aware when no combined catalog is
+    deployed; that's still strictly better than silently-off.
+    """
     tried: list[str] = []
     candidates: list[str] = []
-    # Per-antenna files (e.g. ``SFESPK6618H_NONE.atx``) — tried first
-    # because they're smaller and self-documenting.
+    # Combined antex catalogs first (ngs20.atx / igs20.atx / igs14.atx).
+    # These cover both the receiver-side and the satellite-side patterns
+    # the engine needs at runtime.
+    for root in search_roots:
+        for name in ATX_SEARCH_NAMES:
+            candidates.append(os.path.join(root, name))
+    # Per-antenna files (e.g. ``SFESPK6618H_NONE.atx``) as last-resort
+    # fallback.  No satellite entries → pcv=0/N for IF-combined corrections;
+    # see docstring above.
     if canonical_antenna:
         per_antenna = _antenna_sanitized_filename(canonical_antenna)
         for root in search_roots:
             candidates.append(os.path.join(root, per_antenna))
-    # Combined antex catalogs (ngs20.atx / igs20.atx / igs14.atx).
-    for root in search_roots:
-        for name in ATX_SEARCH_NAMES:
-            candidates.append(os.path.join(root, name))
     for c in candidates:
         full = os.path.expanduser(c)
         tried.append(full)
