@@ -505,6 +505,93 @@ def load_arp_from_antennas(
     )
 
 
+# ── Receiver-antenna lookup (pcvDefaultOn / I-121024) ─────────────── #
+
+
+# Where to look for the ANTEX antenna calibration database.  ngs20.atx
+# (NGS-published) is shipped to every lab host's ~/peppar-fix root by
+# convention.  Gitignored (too large for the repo).
+ANTEX_CANDIDATE_PATHS = [
+    "/etc/peppar-fix/ngs20.atx",
+    "~/peppar-fix/ngs20.atx",
+    "./ngs20.atx",
+    os.path.join(_REPO_ROOT, "ngs20.atx"),
+]
+
+
+def find_antex_file(explicit_path: Optional[str] = None) -> Optional[str]:
+    """Resolve the path to a readable ANTEX file (ngs20.atx).
+
+    Probe order:
+      1. ``explicit_path`` if passed (``--antex-path`` CLI override)
+      2. ``$PEPPAR_ANTEX`` env var
+      3. Standard candidate paths (see ANTEX_CANDIDATE_PATHS)
+
+    Returns None if no readable file is found — caller emits a warning
+    and continues with PCV correction off (the documented default-off
+    fall-through).
+    """
+    candidates = []
+    if explicit_path:
+        candidates.append(explicit_path)
+    env = os.environ.get("PEPPAR_ANTEX")
+    if env:
+        candidates.append(env)
+    candidates.extend(ANTEX_CANDIDATE_PATHS)
+    for path in candidates:
+        full = os.path.expanduser(path)
+        if os.path.isfile(full):
+            return full
+    return None
+
+
+def load_receiver_antenna_from_antennas(
+    arp_label: str,
+    *,
+    antennas_path: Optional[str] = None,
+) -> Optional[str]:
+    """Return the 20-char ANTEX antenna type string for ``arp_label``,
+    read from timelab/antennas.json's ``antenna`` field.
+
+    Each antennas.json entry already stores the ANTEX-format antenna
+    name (e.g. ``"SFESPK6618H NONE"``); this resolves it the same way
+    ``load_arp_from_antennas`` resolves the ARP, so the engine can
+    default the receiver-antenna model from the lab inventory instead
+    of requiring ``--receiver-antenna`` on every invocation
+    (pcvDefaultOn / I-121024).
+
+    Returns None when:
+      - ``arp_label`` is None/empty
+      - antennas.json can't be found
+      - ``arp_label`` isn't a key in the file
+      - the entry has no ``antenna`` field
+
+    Pure read — same as ``load_arp_from_antennas``, this never writes.
+    """
+    import json
+    if not arp_label:
+        return None
+    path = find_antennas_json(antennas_path)
+    if path is None:
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("load_receiver_antenna_from_antennas: "
+                    "could not read %s: %s", path, e)
+        return None
+    if not isinstance(data, dict):
+        return None
+    entry = data.get(arp_label)
+    if not isinstance(entry, dict):
+        return None
+    antenna = entry.get("antenna")
+    if not isinstance(antenna, str) or not antenna.strip():
+        return None
+    return antenna.strip()
+
+
 # ── AntPosEst watchdog ────────────────────────────────────────────── #
 
 

@@ -9333,9 +9333,36 @@ def run(args):
     # failures are warnings, not errors: the engine continues without
     # PCV correction.
     _ape_antex_parser = None
-    antex_path = getattr(args, "antex_path", None)
-    recv_ant = getattr(args, "receiver_antenna", None)
     pcv_flag = bool(getattr(args, "pcv", True))
+    # pcvDefaultOn (I-121024-main): layered defaulting so PCV engages
+    # automatically when the data is on disk, no per-host CLI flags
+    # needed.
+    #
+    #   receiver_antenna:
+    #     1. --receiver-antenna CLI override (ad-hoc tests)
+    #     2. antennas.json[arp_label].antenna (lab default)
+    #     3. None → warn + PCV off
+    #
+    #   antex_path:
+    #     1. --antex-path CLI override
+    #     2. find_antex_file (standard candidate paths)
+    #     3. None → warn + PCV off
+    #
+    # The "antenna" field in antennas.json had been read by nothing —
+    # same anti-pattern the "frame" field had pre-#131.
+    from peppar_fix.position_state import (
+        find_antex_file, load_receiver_antenna_from_antennas)
+    antex_path = getattr(args, "antex_path", None)
+    if pcv_flag and antex_path is None:
+        antex_path = find_antex_file()
+    recv_ant = getattr(args, "receiver_antenna", None)
+    if pcv_flag and recv_ant is None:
+        recv_ant = load_receiver_antenna_from_antennas(
+            getattr(args, "arp_label", None),
+            antennas_path=getattr(args, "antennas_json", None))
+        if recv_ant:
+            log.info("Receiver antenna defaulted from antennas.json[%s]: %r",
+                     getattr(args, "arp_label", None), recv_ant)
     if pcv_flag and antex_path and recv_ant:
         try:
             _ape_antex_parser = ANTEXParser(antex_path)
@@ -9344,11 +9371,21 @@ def run(args):
         except Exception as e:
             log.warning("ANTEX load failed (%s); continuing without PCV", e)
             _ape_antex_parser = None
-    elif pcv_flag and (antex_path or recv_ant):
+    elif pcv_flag:
+        # Either or both unresolved.  Tell the operator EXACTLY which
+        # one is missing + how to fix it so a silent fall-through to
+        # PCV-off doesn't reproduce the I-121024 fleet-wide regression.
+        missing = []
+        if not antex_path:
+            missing.append("ANTEX file (--antex-path, $PEPPAR_ANTEX, or "
+                           "ngs20.atx in standard locations)")
+        if not recv_ant:
+            missing.append("receiver antenna (--receiver-antenna, or "
+                           "antennas.json[arp_label].antenna)")
         log.warning(
-            "PCV correction needs both --antex-path and --receiver-antenna; "
-            "got antex=%s receiver=%s; continuing without PCV",
-            antex_path, recv_ant)
+            "PCV correction OFF — missing %s.  Lab altitude drift / "
+            "float bias is typical when this is the case (I-121024).",
+            "; ".join(missing))
     elif not pcv_flag:
         log.info("PCV correction disabled via --no-pcv")
 
@@ -10015,7 +10052,10 @@ def run(args):
                 wl_only=bool(getattr(args, "wl_only", False)),
                 solid_tide=bool(getattr(args, "solid_tide", True)),
                 antex_parser=_ape_antex_parser,
-                receiver_antenna_type=getattr(args, "receiver_antenna", None),
+                # Use the auto-resolved recv_ant (pcvDefaultOn / I-121024):
+                # falls through to None when neither CLI nor antennas.json
+                # provides it, which downstream treats as PCV-off.
+                receiver_antenna_type=recv_ant,
                 pcv_enabled=bool(getattr(args, "pcv", True)),
                 clock_model=getattr(args, "clock_model", "random_walk"),
                 rx_tcxo_adev_1s=getattr(args, "rx_tcxo_adev_1s", None),

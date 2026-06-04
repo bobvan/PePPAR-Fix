@@ -1388,5 +1388,131 @@ class TestFrameThreading(unittest.TestCase):
             self.assertIsNone(s)
 
 
+class TestLoadReceiverAntennaFromAntennas(unittest.TestCase):
+    """pcvDefaultOn (I-121024): resolve the receiver antenna type from
+    antennas.json[arp_label].antenna.  Mirrors the load_arp_from_antennas
+    resolution chain so PCV correction can default-on without per-host
+    --receiver-antenna CLI flags."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.antennas_path = os.path.join(self.tmp, "antennas.json")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp)
+
+    def _write(self, payload):
+        import json
+        with open(self.antennas_path, "w") as f:
+            json.dump(payload, f)
+
+    def test_happy_path_returns_antenna_string(self):
+        from peppar_fix.position_state import (
+            load_receiver_antenna_from_antennas)
+        self._write({"ufo1": {"antenna": "SFESPK6618H NONE",
+                              "ecef_m": [1, 2, 3], "sigma_m": 0.01}})
+        self.assertEqual(
+            load_receiver_antenna_from_antennas(
+                "ufo1", antennas_path=self.antennas_path),
+            "SFESPK6618H NONE")
+
+    def test_missing_antenna_field_returns_none(self):
+        from peppar_fix.position_state import (
+            load_receiver_antenna_from_antennas)
+        self._write({"ufo1": {"ecef_m": [1, 2, 3], "sigma_m": 0.01}})
+        self.assertIsNone(load_receiver_antenna_from_antennas(
+            "ufo1", antennas_path=self.antennas_path))
+
+    def test_empty_or_whitespace_antenna_returns_none(self):
+        from peppar_fix.position_state import (
+            load_receiver_antenna_from_antennas)
+        self._write({"ufo1": {"antenna": "   ",
+                              "ecef_m": [1, 2, 3], "sigma_m": 0.01}})
+        self.assertIsNone(load_receiver_antenna_from_antennas(
+            "ufo1", antennas_path=self.antennas_path))
+
+    def test_empty_arp_label_returns_none(self):
+        from peppar_fix.position_state import (
+            load_receiver_antenna_from_antennas)
+        self.assertIsNone(load_receiver_antenna_from_antennas(
+            "", antennas_path=self.antennas_path))
+        self.assertIsNone(load_receiver_antenna_from_antennas(
+            None, antennas_path=self.antennas_path))
+
+    def test_unknown_arp_label_returns_none(self):
+        from peppar_fix.position_state import (
+            load_receiver_antenna_from_antennas)
+        self._write({"ufo1": {"antenna": "SFESPK6618H NONE",
+                              "ecef_m": [1, 2, 3], "sigma_m": 0.01}})
+        self.assertIsNone(load_receiver_antenna_from_antennas(
+            "unknown", antennas_path=self.antennas_path))
+
+    def test_malformed_json_returns_none(self):
+        from peppar_fix.position_state import (
+            load_receiver_antenna_from_antennas)
+        with open(self.antennas_path, "w") as f:
+            f.write("{not valid json")
+        self.assertIsNone(load_receiver_antenna_from_antennas(
+            "ufo1", antennas_path=self.antennas_path))
+
+    def test_returns_trimmed_string(self):
+        """Caller threads the value into ANTEX lookups, where leading/
+        trailing whitespace would silently break the 20-char match."""
+        from peppar_fix.position_state import (
+            load_receiver_antenna_from_antennas)
+        self._write({"ufo1": {"antenna": "  SFESPK6618H NONE  ",
+                              "ecef_m": [1, 2, 3], "sigma_m": 0.01}})
+        self.assertEqual(
+            load_receiver_antenna_from_antennas(
+                "ufo1", antennas_path=self.antennas_path),
+            "SFESPK6618H NONE")
+
+
+class TestFindAntexFile(unittest.TestCase):
+    """pcvDefaultOn: discover the ANTEX file via the same
+    explicit > env > standard-paths chain that find_antennas_json uses."""
+
+    def test_explicit_path_wins(self):
+        from peppar_fix.position_state import find_antex_file
+        with tempfile.NamedTemporaryFile(mode="w",
+                                         suffix=".atx",
+                                         delete=False) as f:
+            f.write("ANTEX placeholder")
+            path = f.name
+        try:
+            self.assertEqual(find_antex_file(path), path)
+        finally:
+            os.unlink(path)
+
+    def test_env_var_picked_up(self):
+        from peppar_fix.position_state import find_antex_file
+        with tempfile.NamedTemporaryFile(mode="w",
+                                         suffix=".atx",
+                                         delete=False) as f:
+            f.write("ANTEX placeholder")
+            path = f.name
+        try:
+            old = os.environ.get("PEPPAR_ANTEX")
+            os.environ["PEPPAR_ANTEX"] = path
+            try:
+                # Explicit None falls through to env.
+                self.assertEqual(find_antex_file(None), path)
+            finally:
+                if old is None:
+                    os.environ.pop("PEPPAR_ANTEX", None)
+                else:
+                    os.environ["PEPPAR_ANTEX"] = old
+        finally:
+            os.unlink(path)
+
+    def test_nonexistent_explicit_falls_through(self):
+        from peppar_fix.position_state import find_antex_file
+        # Either returns None (no ngs20.atx on this box) or an existing
+        # standard-path candidate; either way must not raise.
+        result = find_antex_file("/definitely/not/a/path")
+        self.assertTrue(result is None or os.path.isfile(result))
+
+
 if __name__ == "__main__":
     unittest.main()
