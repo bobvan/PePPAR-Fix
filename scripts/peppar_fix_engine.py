@@ -1763,8 +1763,9 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
                 o['sv']: o.get('ar_phase_bias_ok', True)
                 for o in observations
             }
-            nl_resolver.attempt(filt, mw_tracker, elevations=elevations,
-                                ar_phase_bias_ok=ar_phase_bias_ok)
+            if not getattr(args, 'no_ar', False):
+                nl_resolver.attempt(filt, mw_tracker, elevations=elevations,
+                                    ar_phase_bias_ok=ar_phase_bias_ok)
 
         if n_epochs % 5 == 0:
             log.info(
@@ -3334,8 +3335,9 @@ class AntPosEstThread(threading.Thread):
                     o['sv']: o.get('ar_phase_bias_ok', True)
                     for o in observations
                 }
-                nl.attempt(filt, mw, elevations=elevations,
-                           ar_phase_bias_ok=ar_phase_bias_ok)
+                if not getattr(self._args, 'no_ar', False):
+                    nl.attempt(filt, mw, elevations=elevations,
+                               ar_phase_bias_ok=ar_phase_bias_ok)
 
             # Per-SV state machine: stream PR residuals into the monitors
             # and the host RMS alarm.  Each monitor is stateless per-eval
@@ -10527,6 +10529,14 @@ Two-phase operation:
                           "(slip storms, ZTD-trip cascades, false-fix "
                           "lock-in) and FixedPosFilter's TD-CP design "
                           "make NL not load-bearing for clock transfer.")
+    pos.add_argument("--no-ar", action="store_true",
+                     help="Float-only diagnostic: skip ALL ambiguity "
+                          "resolution — no WL or NL integer constraints "
+                          "are applied to the position filter (gates "
+                          "every nl_resolver.attempt()).  Isolates the "
+                          "float (pos,ZTD,clk,amb)-null random walk from "
+                          "wrong-integer lock-in.  See I-222315-main "
+                          "seed-null-drift.")
     # Deprecated alias: --wl-only sets --ar-mode wl (suppressed help).
     pos.add_argument("--wl-only", dest="wl_only_legacy",
                      action="store_true",
