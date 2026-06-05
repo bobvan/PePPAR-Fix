@@ -422,10 +422,22 @@ class RepoRootSearchTest(unittest.TestCase):
                 old_cwd = os.getcwd()
                 try:
                     os.chdir(tmp)   # NOT the repo root
+                    # Hermetic: pass an explicit search_roots that ONLY
+                    # contains the new repo-root entry — the regression
+                    # target.  Per main's #137 review: with the default
+                    # ATX_SEARCH_ROOTS, a dev box that happens to have
+                    # ~/peppar-fix/support/antex/ngs20.atx would resolve
+                    # the combined catalog there (preferred over per-
+                    # antenna) and the startswith(_REPO_ROOT) check
+                    # below would fail.  Restricting to just the
+                    # _REPO_ROOT entry tests exactly the launch-CWD-
+                    # independence we care about, env-independent.
                     pcv = resolve_pcv_defaults(
                         arp_label="ufo1",
                         antex_path_cli=None,
-                        receiver_antenna_cli=None)
+                        receiver_antenna_cli=None,
+                        search_roots=[os.path.join(
+                            _REPO_ROOT, "support", "antex")])
                 finally:
                     os.chdir(old_cwd)
         self.assertEqual(pcv.status, ENABLED_FROM_DEFAULTS,
