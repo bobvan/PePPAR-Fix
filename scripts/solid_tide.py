@@ -10,9 +10,15 @@ Earth tide contributes ~42 mm to the position solution, 50× larger
 than ocean or pole tides.  See
 `project_to_main_pride_ablation_20260423`.
 
-Accuracy: ~1 mm horizontal, ~2 mm vertical at mid-latitudes when
-compared to IERS reference implementations.  Adequate for the
-meter-scale gap between our filter and PRIDE at 3 mm ceiling.
+Accuracy: ~5-8 mm vs the full IERS DEHANTTIDEINEL reference (verified
+2026-06-04 against all of its published test cases — see
+test_solid_tide.py::IersReferenceTest).  That residual is precisely
+the contribution of the Step-1 terms we deliberately omit below
+(degree-3, the out-of-phase/anelastic part, and the latitude-dependent
+correction), NOT a frame or ephemeris error: our Montenbruck-Gill
+sun/moon match ERFA to ~0.1 deg and our GMST matches to ~0.004 deg.
+Adequate for the meter-scale gap between our filter and PRIDE at the
+3 mm ceiling.
 
 Not implemented here (out of scope for the initial port):
 - IERS 2010 Step 2 frequency-dependent corrections (sub-mm)
@@ -188,8 +194,23 @@ def solid_tide_displacement(t: datetime, station_ecef: np.ndarray) -> np.ndarray
     gmst = _gmst_rad(jd)
     r_sun = _eci_to_ecef(_sun_pos_eci(jd), gmst)
     r_moon = _eci_to_ecef(_moon_pos_eci(jd), gmst)
-    r_sta = float(np.linalg.norm(station_ecef))
-    r_hat = station_ecef / r_sta
+    return _degree2_displacement(station_ecef, r_sun, r_moon)
+
+
+def _degree2_displacement(station: np.ndarray, r_sun: np.ndarray,
+                          r_moon: np.ndarray) -> np.ndarray:
+    """IERS 2010 Eq 7.5a degree-2 displacement for explicit body vectors.
+
+    Pure geometry: ``station``, ``r_sun`` and ``r_moon`` must all be in
+    the SAME geocentric frame (the result comes out in that frame).
+    This is the rotation-covariant core of the model, factored out so
+    it can be validated directly against the IERS DEHANTTIDEINEL test
+    cases (which publish station + sun + moon in a frame-consistent set)
+    without depending on our ephemeris.  See
+    test_solid_tide.py::IersReferenceTest.
+    """
+    r_sta = float(np.linalg.norm(station))
+    r_hat = station / r_sta
 
     disp = np.zeros(3)
     for gm_body, r_body_vec, h2, l2 in [(_GM_SUN, r_sun, _H2, _L2),
