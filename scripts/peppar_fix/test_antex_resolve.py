@@ -368,5 +368,85 @@ class LogPCVStatusTest(unittest.TestCase):
         self.assertTrue(any("PCV: DISABLED" in m for m in cm.output))
 
 
+class RepoRootSearchTest(unittest.TestCase):
+    """pcvSearchRootsRepoRootFallback (I-141542): the default
+    ATX_SEARCH_ROOTS includes an entry derived from this module's
+    filesystem location, so PCV resolution works regardless of the
+    engine's launch CWD.  Without this, an engine launched from
+    anywhere other than ``~/peppar-fix/`` silently fell through to
+    PCV-off — the I-121024 failure mode."""
+
+    def test_repo_root_is_in_search_list(self):
+        """The first ATX_SEARCH_ROOTS entry is an absolute path derived
+        from this module's location, NOT a CWD-relative path."""
+        from peppar_fix.antex_resolve import ATX_SEARCH_ROOTS, _REPO_ROOT
+        first = ATX_SEARCH_ROOTS[0]
+        self.assertTrue(os.path.isabs(first),
+                        f"first search root must be absolute, got {first!r}")
+        self.assertEqual(first, os.path.join(_REPO_ROOT, "support", "antex"))
+
+    def test_repo_root_points_at_actual_repo(self):
+        """_REPO_ROOT resolves to the repo where this test lives — the
+        sanity check that the 3-levels-up math is right."""
+        from peppar_fix.antex_resolve import _REPO_ROOT
+        # The repo root contains a pyproject.toml (load-bearing layout).
+        self.assertTrue(
+            os.path.isfile(os.path.join(_REPO_ROOT, "pyproject.toml")),
+            f"_REPO_ROOT {_REPO_ROOT!r} doesn't look like the repo root")
+
+    def test_resolve_works_from_non_repo_cwd(self):
+        """Run resolve_pcv_defaults() with CWD set to /tmp (NOT the
+        repo root) and the repo-tracked SFESPK6618H_NONE.atx in
+        support/antex/.  Without the I-141542 fix the search would
+        find nothing and PCV would silently disable; with it, the
+        absolute repo-root path resolves regardless of CWD."""
+        import tempfile
+        from peppar_fix.antex_resolve import (
+            _REPO_ROOT, resolve_pcv_defaults, ENABLED_FROM_DEFAULTS)
+        # The repo ships SFESPK6618H_NONE.atx — use it as the anchor.
+        per_antenna = os.path.join(
+            _REPO_ROOT, "support", "antex", "SFESPK6618H_NONE.atx")
+        if not os.path.isfile(per_antenna):
+            self.skipTest(f"repo missing {per_antenna} — test setup incomplete")
+        with tempfile.TemporaryDirectory() as tmp:
+            ap = os.path.join(tmp, "antennas.json")
+            with open(ap, "w") as f:
+                json.dump({"ufo1": {
+                    "ecef_m": [1.0, 2.0, 3.0],
+                    "sigma_m": 0.01,
+                    "antenna": "SFESPK6618H NONE"}}, f)
+            with mock.patch(
+                "peppar_fix.position_state.find_antennas_json",
+                side_effect=lambda p=None: ap if p is None or p == ap else None,
+            ):
+                old_cwd = os.getcwd()
+                try:
+                    os.chdir(tmp)   # NOT the repo root
+                    # Hermetic: pass an explicit search_roots that ONLY
+                    # contains the new repo-root entry — the regression
+                    # target.  Per main's #137 review: with the default
+                    # ATX_SEARCH_ROOTS, a dev box that happens to have
+                    # ~/peppar-fix/support/antex/ngs20.atx would resolve
+                    # the combined catalog there (preferred over per-
+                    # antenna) and the startswith(_REPO_ROOT) check
+                    # below would fail.  Restricting to just the
+                    # _REPO_ROOT entry tests exactly the launch-CWD-
+                    # independence we care about, env-independent.
+                    pcv = resolve_pcv_defaults(
+                        arp_label="ufo1",
+                        antex_path_cli=None,
+                        receiver_antenna_cli=None,
+                        search_roots=[os.path.join(
+                            _REPO_ROOT, "support", "antex")])
+                finally:
+                    os.chdir(old_cwd)
+        self.assertEqual(pcv.status, ENABLED_FROM_DEFAULTS,
+                         f"expected ENABLED_FROM_DEFAULTS, got {pcv.status}: "
+                         f"{pcv.detail}")
+        # The resolved antex_path is the repo-root absolute path (not a
+        # CWD-relative one), proving the launch-CWD-independent behavior.
+        self.assertTrue(pcv.antex_path.startswith(_REPO_ROOT))
+
+
 if __name__ == "__main__":
     unittest.main()
