@@ -10,7 +10,7 @@ DEFAULT ``--q-pos-converged``), then watch.  A null is a property of
   * Null-drift hypothesis -> seeded at truth, DRIFTS away anyway.
 
 They make opposite predictions, so one run falsifies the other.  This
-script parses the engine's ``[AntPosEst]`` log lines from one or two
+script parses the engine's ``[AntPosEst]`` log lines from one or more
 hosts (two on the SAME antenna for the common-mode check) and prints a
 prose verdict against the three-outcome decision tree.  Drift slope is
 the seed-independent signal and needs NO truth; pass ``--truth-alt-m``
@@ -165,16 +165,29 @@ def verdict(hosts: list[tuple[str, dict]]):
         consistent = len(signs) == 1
         print(f"  Drift detected: " + ", ".join(f"{lbl} {s*1000:+.0f} mm/h" for lbl, s in drifting))
         if len(slopes) >= 2:
-            # common-mode vs differential
-            sA, sB = slopes[0][1], slopes[1][1]
-            cm = 0.5 * (sA + sB)
-            diff = sA - sB
-            print(f"    common-mode slope = {cm*1000:+.0f} mm/h ; "
-                  f"differential = {diff*1000:+.0f} mm/h")
-            if abs(diff) < 0.5 * abs(cm):
-                print("    => COMMON-MODE drift (both hosts track together):")
+            # Common-mode vs differential, generalized to N hosts:
+            # common-mode = mean slope across all hosts; spread = the
+            # max per-host deviation from that mean.  Small spread vs
+            # |common-mode| => the hosts move together (shared cause);
+            # large spread => at least one host diverges (per-host cause).
+            vals = np.array([s for _, s in slopes])
+            # Consensus via MEDIAN (robust — one outlier can't drag it the
+            # way a mean would, which matters with 3 hosts where one diverges).
+            consensus = float(np.median(vals))
+            spread = float(np.max(np.abs(vals - consensus)))
+            tol = max(0.5 * abs(consensus), THR)  # also tolerate near-zero consensus
+            outliers = [lbl for lbl, s in slopes if abs(s - consensus) > tol]
+            print(f"    consensus (median) slope = {consensus*1000:+.0f} mm/h ; "
+                  f"max dev = {spread*1000:.0f} mm/h ({len(slopes)} hosts)")
+            for lbl, s in slopes:
+                flag = "  <-- outlier" if lbl in outliers else ""
+                print(f"      {lbl}: {s*1000:+.0f} mm/h  (dev {(s-consensus)*1000:+.0f}){flag}")
+            if not outliers:
+                print("    => COMMON-MODE drift (hosts track together): shared cause")
+                print("       (geometry / atmosphere / orbit-clock), receiver-independent.")
             else:
-                print("    => DIVERGENT drift (per-host): receiver/multipath/group-delay.")
+                print(f"    => DIVERGENT: {', '.join(outliers)} depart the consensus")
+                print("       => per-host cause (receiver / multipath / group-delay).")
         if consistent:
             print("  [ROW 3] Consistent one-directional drift from truth.")
             print("    => Seed-bias FALSIFIED. A real unmodeled SYSTEMATIC is forcing the")
@@ -211,7 +224,7 @@ def maybe_plot(hosts, png):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("logs", nargs="+", help="one or two engine log files")
+    ap.add_argument("logs", nargs="+", help="one or more engine log files (one per host)")
     ap.add_argument("--truth-alt-m", type=float, default=None,
                     help="surveyed ARP ellipsoidal height (m), for offset reporting")
     ap.add_argument("--labels", default=None, help="comma-sep host labels")
