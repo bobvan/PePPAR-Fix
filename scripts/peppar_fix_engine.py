@@ -335,13 +335,6 @@ from peppar_fix.states import (
 
 log = logging.getLogger("peppar-fix")
 
-# Engine exit codes.  5 is the only one the wrapper relaunches on (the
-# re-bootstrap path); every other code propagates and the wrapper exits.
-# EXIT_RECEIVER_TIME_INVALID is deliberately NOT 5 so a receiver with no
-# valid GPS time (weak sky / stuck after a config-restart) can't spin the
-# wrapper's relaunch loop — see dayplan coldStartValidTimeGate.
-EXIT_RECEIVER_TIME_INVALID = 6
-
 
 # Saved-position trust gate.  When loading state/receivers/<uid>.json
 # at startup, positions tagged with σ < this threshold are treated as
@@ -1393,75 +1386,6 @@ def _apply_position_seed(seed, source_label, args, ape_sm):
     ape_sm.transition(AntPosEstState.VERIFYING,
                       f"{source_label} seed @ σ={sigma:.2f}m")
     return ecef, sigma, source
-
-
-def wait_for_valid_receiver_time(nav_time_gps_store, stop_event,
-                                 timeout_s=120.0, max_age_s=5.0,
-                                 no_data_grace_s=8.0):
-    """Wait for the receiver to report valid GPS time before feeding
-    RXM-RAWX to the clock/position filters.
-
-    On a freshly-enumerated receiver the engine's signal/constellation
-    reconfig restarts the on-chip nav engine, transiently dropping
-    UBX-NAV-TIMEGPS validTow/validWeek to 0.  Feeding raw observations
-    with invalid receiver time produces gross (~100 ms) pseudorange
-    residuals → the catastrophic-reject cascade → exit-5 → wrapper
-    relaunch → reconfig → time drops again → doom loop (observed
-    2026-06-04, F9P at a Willis indoor window; dayplan
-    coldStartValidTimeGate).  This gate holds until time is valid —
-    seconds on strong sky, longer on weak — or the timeout expires.
-
-    Returns:
-        True  — valid time observed (towValid && weekValid), OR the
-                receiver emits no NAV-TIMEGPS at all (can't gate on a
-                message it doesn't send — proceed; the catastrophic
-                gate remains the backstop), OR no store (legacy/mock).
-        False — timed out with time still invalid, or stop requested.
-                Caller should NOT enter obs processing (it would
-                catastrophic-reject loop).
-
-    Caveat: the gate trusts the receiver's ``valid_tow``/``valid_week``
-    flags (the ``max_age_s`` check rejects a stale-fetched snapshot, but
-    a receiver that keeps emitting NAV-TIMEGPS with a valid flag set on
-    cached-yet-wrong time — a firmware bug — would still pass).  Detecting
-    that is out of scope here.
-    """
-    if nav_time_gps_store is None:
-        return True
-    log.info("Waiting for valid receiver GPS time (towValid+weekValid) "
-             "up to %.0fs...", timeout_s)
-    start = time.time()
-    last_log = 0.0
-    while time.time() - start < timeout_s:
-        if stop_event.is_set():
-            return False
-        snap = nav_time_gps_store.get()
-        if (snap is not None and snap.get('age_s', 1e9) <= max_age_s
-                and snap.get('valid_tow') and snap.get('valid_week')):
-            log.info("Receiver GPS time valid (tAcc=%sns) after %.1fs",
-                     snap.get('t_acc_ns'), time.time() - start)
-            return True
-        # Fast give-up: receiver isn't emitting NAV-TIMEGPS at all, so
-        # there's nothing to gate on — proceed and let the catastrophic
-        # gate backstop.  (Distinct from "emitting but not yet valid".)
-        if (time.time() - start >= no_data_grace_s
-                and (snap is None or snap.get('n_updates', 0) == 0)):
-            log.warning("No NAV-TIMEGPS after %.0fs — receiver may not emit "
-                        "it; proceeding without the valid-time gate.",
-                        no_data_grace_s)
-            return True
-        if time.time() - last_log >= 10.0:
-            if snap is None:
-                log.info("  no NAV-TIMEGPS yet...")
-            else:
-                log.info("  receiver time not valid yet "
-                         "(towValid=%s weekValid=%s tAcc=%sns) — likely "
-                         "re-acquiring after config restart",
-                         snap.get('valid_tow'), snap.get('valid_week'),
-                         snap.get('t_acc_ns'))
-            last_log = time.time()
-        time.sleep(1.0)
-    return False
 
 
 def _build_ppp_filter(args):
@@ -4231,8 +4155,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                      ar_position=None, ar_pos_lock=None,
                      extint_store=None,
                      pos_sigma_m=None, pos_source=None,
-                     survey_refresh_queue=None, arp_box=None,
-                     nav_time_gps_store=None):
+                     survey_refresh_queue=None, arp_box=None):
     """Run FixedPosFilter for clock estimation with optional servo.
 
     This is the steady-state phase: position is known, we estimate clock
@@ -5091,37 +5014,6 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 cat_limit = getattr(
                     filt, 'CATASTROPHIC_REJECT_LIMIT', 30)
                 if n_consec_cat >= cat_limit:
-                    # Time-aware exit (dayplan coldStartValidTimeGate): a
-                    # cascade while the receiver reports invalid GPS time
-                    # is NOT a corrupt obs stream to re-bootstrap — it's
-                    # bad receiver time (re-acquiring after a config
-                    # restart, or weak sky).  Re-bootstrapping (exit 5)
-                    # just reconfigs → drops time again → loops.  Exit
-                    # with the non-relaunch code instead so the wrapper
-                    # stops, and name the real cause.
-                    # (Future hardening: this evaluates validTow only at
-                    # the 30-reject limit, so ~30 bad-obs epochs are eaten
-                    # first; short-circuiting on the FIRST catastrophic
-                    # reject when validTow=0 would exit sooner.)
-                    _tg = (nav_time_gps_store.get()
-                           if nav_time_gps_store is not None else None)
-                    if _tg is not None and not _tg.get('valid_tow'):
-                        log.error(
-                            "  %d consecutive catastrophic rejects (>= "
-                            "limit %d) AND receiver GPS time invalid "
-                            "(towValid=0, tAcc=%sns) — bad receiver time, "
-                            "not a corrupt obs stream.  Check antenna/sky; "
-                            "exit code %d (no wrapper relaunch).",
-                            n_consec_cat, cat_limit, _tg.get('t_acc_ns'),
-                            EXIT_RECEIVER_TIME_INVALID)
-                        if dfe_sm is not None:
-                            dfe_sm.transition(
-                                DOFreqEstState.HOLDOVER,
-                                "catastrophic rejects + invalid receiver time")
-                        if servo_ctx is not None:
-                            _set_clock_class(servo_ctx, "freerun")
-                            servo_ctx['phc_diverged'] = True
-                        return EXIT_RECEIVER_TIME_INVALID
                     log.error(
                         "  %d consecutive catastrophic rejects "
                         "(>= limit %d) — F9T input stream lost "
@@ -9922,28 +9814,6 @@ def run(args):
         lat, lon, alt = ecef_to_lla(known_ecef[0], known_ecef[1], known_ecef[2])
         log.info(f"Position ({pos_source}): {lat:.6f}, {lon:.6f}, {alt:.1f}m")
 
-    # Cold-start valid-time gate (dayplan coldStartValidTimeGate).  The
-    # signal/constellation reconfig above restarts the receiver's nav
-    # engine, transiently dropping NAV-TIMEGPS validTow/validWeek.  Don't
-    # feed RXM-RAWX to the filters until receiver time is valid — invalid
-    # time yields ~100 ms pseudorange residuals → catastrophic-reject
-    # cascade → exit-5 doom loop (or AntPosEst starvation).  On timeout
-    # (weak sky / stuck post-reconfig) exit with a distinct, NON-relaunch
-    # code so the wrapper's exit-5 loop can't spin on it.
-    _vt_timeout = getattr(args, 'valid_time_timeout_s', 120.0)
-    if _vt_timeout > 0 and not wait_for_valid_receiver_time(
-            nav_time_gps_store, stop_event, timeout_s=_vt_timeout):
-        if stop_event.is_set():
-            return 0
-        log.error(
-            "Receiver GPS time still invalid after %.0fs (NAV-TIMEGPS "
-            "towValid=0) — weak sky-view or receiver stuck after config "
-            "restart.  Refusing to enter obs processing (would "
-            "catastrophic-reject loop).  Check the antenna/sky view; "
-            "exit code %d (no wrapper relaunch).",
-            _vt_timeout, EXIT_RECEIVER_TIME_INVALID)
-        return EXIT_RECEIVER_TIME_INVALID
-
     bootstrap_result = None  # Set by run_bootstrap, None on warm start
     try:
         if known_ecef is None:
@@ -10257,7 +10127,6 @@ def run(args):
             pos_source=pos_source,
             survey_refresh_queue=_survey_refresh_queue,
             arp_box=_arp_box,
-            nav_time_gps_store=nav_time_gps_store,
         )
         # run_steady_state returns an int exit code on error
         # (e.g. 5 for catastrophic-reject cascade) or a gate_stats
@@ -10369,7 +10238,6 @@ def _apply_host_config(args):
         "arp_label":        ("arp_label",        str),
         "known_pos_frame":  ("known_pos_frame",  str),
         "seed_hacc_max_m":  ("seed_hacc_max_m",  float),
-        "valid_time_timeout_s": ("valid_time_timeout_s", float),
         "antennas_json":    ("antennas_json",    str),
         "rinex_out":        ("rinex_out",        str),
         "rinex_decimate_s": ("rinex_decimate_s", float),
@@ -10550,17 +10418,6 @@ Two-phase operation:
                           "initial covariance is honest — and refines "
                           "from there, instead of stalling the seed "
                           "cascade and dropping to LS-init.")
-    pos.add_argument("--valid-time-timeout-s", type=float, default=120.0,
-                     help="Cold-start gate: wait up to this long for the "
-                          "receiver to report valid GPS time (NAV-TIMEGPS "
-                          "towValid+weekValid) before feeding RXM-RAWX to "
-                          "the filters (default 120).  The startup signal "
-                          "reconfig restarts the receiver's nav engine and "
-                          "transiently invalidates time; processing obs "
-                          "before it re-validates causes a catastrophic-"
-                          "reject doom loop.  On timeout (weak sky) the "
-                          "engine exits with a non-relaunch code rather "
-                          "than looping.  0 disables the gate.")
     pos.add_argument("--no-nav2-soft-anchor",
                      dest="nav2_soft_anchor",
                      action="store_false", default=True,
