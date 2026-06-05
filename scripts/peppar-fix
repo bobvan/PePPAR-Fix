@@ -107,7 +107,10 @@ fi
 # clean recovery path — fresh process, fresh subsystems, fresh state.
 #
 # All other exit codes (0=clean shutdown, 1=fatal config, 3=PPS/TICC
-# bring-up failure, etc.) propagate to the wrapper's caller unchanged.
+# bring-up failure, 6=receiver GPS time invalid/unavailable — weak sky
+# or stuck after a config restart, deliberately NOT relaunched so it
+# can't doom-loop; see coldStartValidTimeGate) propagate to the
+# wrapper's caller unchanged.
 #
 # Log files (--ticc-log / --extint-log / --qerr-log) open in append mode
 # in the engine, so prior session's data is preserved across re-launches.
