@@ -26,7 +26,7 @@ _SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from solid_tide import solid_tide_displacement  # noqa: E402
+from solid_tide import solid_tide_displacement, _degree2_displacement  # noqa: E402
 
 
 # A reasonable ECEF station — roughly ABMF (Guadeloupe), used in the
@@ -110,6 +110,57 @@ class RadialVsTransverseTest(unittest.TestCase):
         self.assertGreater(horiz_mag, 0.001,
                            f"horiz  {horiz_mag*1000:.1f} mm < 1 mm — "
                            f"transverse contribution seems missing")
+
+
+class IersReferenceTest(unittest.TestCase):
+    """Authoritative comparison against the published test cases in the
+    IERS Conventions (2010) DEHANTTIDEINEL.F reference routine.
+
+    Each case publishes station + Sun + Moon vectors in a single
+    self-consistent geocentric frame (the celestial/ECI frame — verified
+    2026-06-04: the body vectors match ERFA's geocentric Sun/Moon to
+    ~0.1 deg, and are 60-150 deg off ECEF by exactly the epoch's GMST).
+    Because the degree-2 displacement is rotation-covariant, feeding the
+    published vectors straight into ``_degree2_displacement`` reproduces
+    the published displacement in that same frame.
+
+    Tolerance is 10 mm: our implementation is degree-2 in-phase only,
+    while DEHANTTIDEINEL also includes the degree-3, out-of-phase
+    (anelastic), and latitude-dependent Step-1 terms.  Their combined
+    contribution is the ~4-8 mm residual seen here — it is NOT a frame
+    or ephemeris error (the earlier 'frame-rotation bug' hypothesis,
+    I-211101-main, was a comparison artifact from feeding these ECI
+    vectors into an ECEF-expecting pipeline).
+    """
+
+    # (station, sun, moon, expected DXTIDE) — all metres, frame-consistent.
+    CASES = [
+        (np.array([4075578.385, 931852.890, 4801570.154]),
+         np.array([137859926952.015, 54228127881.4350, 23509422341.6960]),
+         np.array([-179996231.920342, -312468450.131567, -169288918.592160]),
+         np.array([0.07700420357108125891, 0.06304056321824967613,
+                   0.05516568152597246810])),
+        (np.array([1112189.660, -4842955.026, 3985352.284]),
+         np.array([-54537460436.2357, 130244288385.279, 56463429031.5996]),
+         np.array([300396716.912, 243238281.451, 120548075.939]),
+         np.array([-0.2036831479592075833e-1, 0.5658254776225972449e-1,
+                   -0.7597679676871742227e-1])),
+        (np.array([1112200.5696, -4842957.8511, 3985345.9122]),
+         np.array([100210282451.6279, 103055630398.3160, 56855096480.4475]),
+         np.array([369817604.4348, 1897917.5258, 120804980.8284]),
+         np.array([.00509570869172363845, .0828663025983528700,
+                   -.0636634925404189617])),
+    ]
+
+    def test_degree2_core_matches_iers_reference(self):
+        for i, (sta, sun, moon, expected) in enumerate(self.CASES):
+            disp = _degree2_displacement(sta, sun, moon)
+            err = float(np.linalg.norm(disp - expected))
+            self.assertLess(
+                err, 0.010,
+                f"IERS DEHANTTIDEINEL case {i}: |ours - ref| = "
+                f"{err*1000:.2f} mm > 10 mm.  ours={np.round(disp*1000,2)} mm, "
+                f"ref={np.round(expected*1000,2)} mm")
 
 
 class InputValidationTest(unittest.TestCase):
