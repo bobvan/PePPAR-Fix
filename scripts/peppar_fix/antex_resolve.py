@@ -42,15 +42,36 @@ DISABLED_NO_ANTENNAS_JSON = "DISABLED_NO_ANTENNAS_JSON"
 DISABLED_BY_FLAG = "DISABLED_BY_FLAG"  # --no-pcv
 
 
-# Search list for the ANTEX file.  Order matters: repo-local copy first
-# (so dev runs find the tracked file in ``support/antex/`` without an
-# explicit flag), then the lab-host convention under ``~/peppar-fix/``,
-# then the legacy hardcoded location.
+# Search list for the ANTEX file.  Order matters: the repo-tracked
+# copy (under ``support/antex/`` resolved from this module's location)
+# wins first so resolution is independent of launch CWD — an engine
+# launched from ``~/peppar-fix/data/``, a CI runner, a debug session,
+# anywhere, still finds the tracked file.  This is the
+# pcvSearchRootsRepoRootFallback fix (I-141542-main, follow-up to PR
+# #135) — without it, a non-``~/peppar-fix/`` launch silently fell
+# through to PCV-off, exactly the I-121024 failure mode.
+#
+# Then the CWD-relative entry (preserves the lab-convention launch
+# from the repo root), the dedicated lab support dir under
+# ``~/peppar-fix/``, and finally the transitional bare
+# ``~/peppar-fix/`` entry — vestige of the pre-#135 era when
+# ngs20.atx was deployed manually at the home-dir root.  Leave the
+# vestigial entry until all lab hosts have been confirmed on the
+# repo-tracked ``support/antex/`` files (then drop it).
 ATX_SEARCH_NAMES = ("ngs20.atx", "igs20.atx", "igs14.atx")
+
+# Repo root derived from this module's filesystem location:
+# ``scripts/peppar_fix/antex_resolve.py`` → up 3 levels → repo root.
+# Used so the search resolves the same way regardless of the engine's
+# launch CWD.
+_REPO_ROOT = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), os.pardir, os.pardir))
+
 ATX_SEARCH_ROOTS = (
-    "./support/antex",
-    "~/peppar-fix/support/antex",
-    "~/peppar-fix",
+    os.path.join(_REPO_ROOT, "support", "antex"),  # repo-tracked, CWD-independent
+    "./support/antex",                              # lab-convention CWD-relative
+    "~/peppar-fix/support/antex",                   # lab-host explicit
+    "~/peppar-fix",                                 # transitional (pre-#135)
     ".",
 )
 
