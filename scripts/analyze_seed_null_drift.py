@@ -105,18 +105,37 @@ def _fit_slope(t: np.ndarray, y: np.ndarray):
     return float(a), float(b), rstd, sa
 
 
-def summarize_host(label: str, d: dict, truth_alt: float | None) -> dict:
+def summarize_host(label: str, d: dict, truth_alt: float | None,
+                   skip_hr: float = 0.0) -> dict:
     span_hr = np.ptp(d["t"]) if d["n"] > 1 else 0.0
-    a, b, rstd, sa = _fit_slope(d["t"], d["alt"])
-    za, zb, zrstd, zsa = _fit_slope(d["t"], d["ztd"])
+    # Drop the warmup window: the AntPosEst filter re-converges from the
+    # seed over the first ~10-20 min (Phase-1 bootstrap transient), during
+    # which worstσ can be 1000+ m and the position settles — neither is
+    # the steady-state drift we're measuring.  Also drops the per-relaunch
+    # transient if the wrapper relaunched mid-run.
+    keep = d["t"] >= skip_hr
+    n_kept = int(keep.sum())
+    if n_kept < 3:
+        keep = np.ones_like(d["t"], dtype=bool)  # too short — keep all
+        n_kept = int(keep.sum())
+    t, alt, ztd = d["t"][keep], d["alt"][keep], d["ztd"][keep]
+    worst, posig, tide = d["worst"][keep], d["posig"][keep], d["tide_up"][keep]
+
+    a, b, rstd, sa = _fit_slope(t, alt)
+    za, zb, zrstd, zsa = _fit_slope(t, ztd)
     # correlation alt vs ztd
-    ok = np.isfinite(d["alt"]) & np.isfinite(d["ztd"])
-    corr = (float(np.corrcoef(d["alt"][ok], d["ztd"][ok])[0, 1])
-            if ok.sum() > 3 else math.nan)
-    worst_max = float(np.nanmax(d["worst"])) if np.isfinite(d["worst"]).any() else math.nan
-    posig_max = float(np.nanmax(d["posig"])) if d["n"] else math.nan
-    tide_rng = (float(np.nanmax(d["tide_up"]) - np.nanmin(d["tide_up"]))
-                if np.isfinite(d["tide_up"]).any() else math.nan)
+    ok = np.isfinite(alt) & np.isfinite(ztd)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        corr = (float(np.corrcoef(alt[ok], ztd[ok])[0, 1])
+                if ok.sum() > 3 and np.std(ztd[ok]) > 0 and np.std(alt[ok]) > 0
+                else math.nan)
+    worst_max = float(np.nanmax(worst)) if np.isfinite(worst).any() else math.nan
+    posig_max = float(np.nanmax(posig)) if n_kept else math.nan
+    tide_rng = (float(np.nanmax(tide) - np.nanmin(tide))
+                if np.isfinite(tide).any() else math.nan)
+    # Rebind so the rest of the function reads the post-warmup series.
+    d = {**d, "t": t, "alt": alt, "ztd": ztd, "worst": worst,
+         "posig": posig, "tide_up": tide, "n": n_kept}
     # slope significance: |slope| vs 3-sigma
     sig = (abs(a) > 3 * sa) if (math.isfinite(a) and math.isfinite(sa) and sa > 0) else None
 
@@ -229,6 +248,9 @@ def main():
                     help="surveyed ARP ellipsoidal height (m), for offset reporting")
     ap.add_argument("--labels", default=None, help="comma-sep host labels")
     ap.add_argument("--png", default=None)
+    ap.add_argument("--skip-warmup-min", type=float, default=20.0,
+                    help="drop the first N minutes (filter re-convergence "
+                         "transient) before fitting (default 20)")
     args = ap.parse_args()
 
     labels = (args.labels.split(",") if args.labels
@@ -236,7 +258,8 @@ def main():
     hosts = []
     for lbl, path in zip(labels, args.logs):
         d = parse_log(path)
-        hosts.append((lbl, summarize_host(lbl, d, args.truth_alt_m)))
+        hosts.append((lbl, summarize_host(lbl, d, args.truth_alt_m,
+                                          skip_hr=args.skip_warmup_min / 60.0)))
     verdict(hosts)
     if args.png:
         maybe_plot(hosts, args.png)
