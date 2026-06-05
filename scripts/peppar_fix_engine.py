@@ -1419,6 +1419,12 @@ def wait_for_valid_receiver_time(nav_time_gps_store, stop_event,
         False — timed out with time still invalid, or stop requested.
                 Caller should NOT enter obs processing (it would
                 catastrophic-reject loop).
+
+    Caveat: the gate trusts the receiver's ``valid_tow``/``valid_week``
+    flags (the ``max_age_s`` check rejects a stale-fetched snapshot, but
+    a receiver that keeps emitting NAV-TIMEGPS with a valid flag set on
+    cached-yet-wrong time — a firmware bug — would still pass).  Detecting
+    that is out of scope here.
     """
     if nav_time_gps_store is None:
         return True
@@ -5093,6 +5099,10 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     # just reconfigs → drops time again → loops.  Exit
                     # with the non-relaunch code instead so the wrapper
                     # stops, and name the real cause.
+                    # (Future hardening: this evaluates validTow only at
+                    # the 30-reject limit, so ~30 bad-obs epochs are eaten
+                    # first; short-circuiting on the FIRST catastrophic
+                    # reject when validTow=0 would exit sooner.)
                     _tg = (nav_time_gps_store.get()
                            if nav_time_gps_store is not None else None)
                     if _tg is not None and not _tg.get('valid_tow'):
