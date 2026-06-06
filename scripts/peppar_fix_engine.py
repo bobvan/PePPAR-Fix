@@ -1407,6 +1407,10 @@ def _build_ppp_filter(args):
         adev = getattr(args, "rx_tcxo_adev_1s", None)
         if adev is not None:
             kwargs["rx_tcxo_adev_1s"] = float(adev)
+    # ZTD random-walk Q override for the PPPFilter (AntPosEst + bootstrap).
+    qztd = getattr(args, "q_ztd_antpos", None)
+    if qztd is not None:
+        kwargs["ztd_q_coef"] = float(qztd)
     # Phase B NAV-SIG L0 admission gate.  When --nav-sig-gate is set
     # AND main() stashed a nav_sig_store on args, forward both into
     # the filter so its per-obs loop can consult the receiver verdict.
@@ -10609,7 +10613,7 @@ Two-phase operation:
                           "for PCV correction; when absent, PCV is "
                           "skipped with a warning.")
     pos.add_argument("--clock-model", default="random_walk",
-                     choices=("random_walk", "calibrated_white"),
+                     choices=("random_walk", "calibrated_white", "wno"),
                      help="rx TCXO process-noise model in PPPFilter.  "
                           "random_walk (default) uses the legacy "
                           "Q_clk = 1e6·dt — IDX_CLK is effectively "
@@ -10621,7 +10625,22 @@ Two-phase operation:
                           "characterization; the default "
                           "--rx-tcxo-adev-1s is intentionally "
                           "pessimistic.  See "
-                          "docs/clock-state-modeling.md option (A).")
+                          "docs/clock-state-modeling.md option (A).  "
+                          "'wno' = PRIDE/RTKLIB-style white-noise rx "
+                          "clock (P[clk] reset wide-open each epoch).")
+    pos.add_argument("--q-ztd-antpos", type=float, default=None,
+                     metavar="M_PER_SQRT_S",
+                     help="ZTD random-walk process-noise coefficient "
+                          "(m/√s) for the PPPFilter (AntPosEst + "
+                          "bootstrap).  Default 1.29e-3 (1 cm²/min PSD). "
+                          "Tighter (e.g. 1e-4, RTKLIB-like) stiffens the "
+                          "ZTD axis.  NOTE (I-222315, 2026-06-06): part "
+                          "of the RTKLIB all-axes recipe (--clock-model "
+                          "wno + --q-pos-converged 1e-9 + this) that "
+                          "bounds free-position drift around truth; but "
+                          "tightening the ZTD *tie* (--ztd-tie-sigma-mm) "
+                          "on top BACKFIRES (relocates misfit to height) "
+                          "— keep the default loose tie.")
     pos.add_argument("--rx-tcxo-adev-1s", type=float, default=None,
                      help="Fractional-frequency Allan deviation at τ=1s "
                           "for the receiver's rx TCXO.  Consumed only "
