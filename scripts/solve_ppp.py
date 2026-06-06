@@ -307,6 +307,7 @@ class PPPFilter:
 
     def __init__(self, clock_model='random_walk',
                  rx_tcxo_adev_1s=F9T_TCXO_ADEV_1S_DEFAULT,
+                 ztd_q_coef=None,
                  nav_sig_store=None,
                  nav_sig_gate_enabled=False,
                  nav_sig_max_age_s=2.0):
@@ -344,6 +345,12 @@ class PPPFilter:
                 f"{clock_model!r}")
         self.clock_model = clock_model
         self.rx_tcxo_adev_1s = float(rx_tcxo_adev_1s)
+        # ZTD random-walk process-noise coefficient (m/√s).  Default
+        # 1.29e-3 = 1 cm²/min PSD (legacy, bit-exact).  Tighter (e.g.
+        # 1e-4, RTKLIB-like) stiffens the ZTD axis; set via
+        # --q-ztd-antpos.  See I-222315 / RTKLIB-recipe.
+        self._ztd_q_coef = (float(ztd_q_coef) if ztd_q_coef is not None
+                            else 1.29e-3)
         self.x = None
         self.P = None
         self.sv_to_idx = {}
@@ -503,8 +510,9 @@ class PPPFilter:
                 Q[IDX_ZTD, IDX_ZTD] = (1e-7)**2 * dt  # ~negligible
             self._ztd_window_elapsed = elapsed
         else:
-            # 1 cm² / min PSD = 1.67e-6 m²/s → (1.29e-3 m/√s)² · dt.
-            Q[IDX_ZTD, IDX_ZTD] = (1.29e-3)**2 * dt
+            # 1 cm² / min PSD = 1.67e-6 m²/s → (1.29e-3 m/√s)² · dt
+            # (default _ztd_q_coef; override via --q-ztd-antpos).
+            Q[IDX_ZTD, IDX_ZTD] = self._ztd_q_coef**2 * dt
         self.P = self.P + Q
 
     def _q_clk(self):
