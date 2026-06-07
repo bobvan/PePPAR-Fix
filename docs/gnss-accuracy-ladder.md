@@ -15,6 +15,23 @@ We assume a **warm start**: the receiver already knows the satellites'
 orbital details (ephemerides) from a recent session or from the
 internet.  It doesn't know where it is — you've moved since last time.
 
+## The picture at a glance
+
+![GNSS positioning regimes: observation time vs position+time accuracy](gnss-accuracy-blobs.png)
+
+Each blob is one method's working regime in the
+(observation-time × position-accuracy) plane.  Blobs overlap on
+purpose — the methods are continuous tradeoffs, not crisp tiers.  The
+secondary y-axis on the right shows the c-equivalent timing accuracy
+(1 m ≈ 3.33 ns); method-specific timing accuracy is annotated inside
+each blob, because some methods (the F9T-class timing receiver in
+particular) do better on time than the c-equivalent of their position
+would suggest.  The shaded band under 10 cm marks the regime that
+requires real-time corrections from the internet — receiver-only
+operation with broadcast ephemeris tops out around there.
+
+The levels below walk through each regime in detail.
+
 
 ## Level 0: Your phone (seconds, meters)
 
