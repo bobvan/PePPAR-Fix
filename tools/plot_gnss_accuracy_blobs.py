@@ -134,13 +134,31 @@ def main():
     ax.set_xlim(1, 1e6)
     ax.set_ylim(2e-3, 20)
 
-    # X ticks: human-readable observation times.
+    # X ticks: human-readable observation times (major).
     xticks = [1, 10, 60, 600, 3600, 86400, 604800]
     ax.set_xticks(xticks)
     ax.set_xticklabels([_fmt_time(s) for s in xticks])
+    # Y ticks: explicit decade labels in human-readable cm/m units.
+    yticks = [0.01, 0.10, 1.0, 10.0]
+    ytick_labels = ["1 cm", "10 cm", "1 m", "10 m"]
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(ytick_labels)
+    # Minor ticks: the in-decade subdivisions of the log scale (2, 3,
+    # ..., 9 × each decade) — drawn but unlabeled, so the eye can
+    # judge intermediate positions.
+    from matplotlib.ticker import LogLocator, NullFormatter
+    ax.yaxis.set_minor_locator(LogLocator(base=10, subs=range(2, 10)))
+    ax.yaxis.set_minor_formatter(NullFormatter())
+
     ax.set_xlabel("Observation time", fontsize=12)
-    ax.set_ylabel("Horizontal position accuracy (m, 1-σ)", fontsize=12)
-    ax.grid(True, which="both", alpha=0.3, linestyle=":")
+    ax.set_ylabel("Horizontal position accuracy (1-σ)", fontsize=12)
+    # Decade gridlines pronounced; in-decade subdivisions present but
+    # subtle so the decade structure reads at a glance.
+    ax.grid(True, which="major", alpha=0.55, linewidth=0.9,
+            linestyle="-", color="#94a3b8")
+    ax.grid(True, which="minor", alpha=0.18, linewidth=0.4,
+            linestyle=":", color="#94a3b8")
+    ax.set_axisbelow(True)
     ax.set_title("GNSS positioning: observation-time vs accuracy regimes",
                  fontsize=13.5, pad=14)
 
