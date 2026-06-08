@@ -194,14 +194,57 @@ in real time is a *corrections* problem, not a filter-smarts problem.
   [[rtklib-ppp-state-model]], [[position-accuracy-target-10cm]],
   [[ufo1-choke1-two-arps]].
 
-## Open threads
+## pickyEaterSSR — resolved (the source) + remaining (the engine gap)
 
-- **pickyEaterSSR** (I-210733): make a non-CNES AC free-solve → enable the
-  cross-AC test to confirm SSR-stream vs atmosphere as the common-mode
-  source; or analyze the CNES correction stream directly.
-- Get the real-time free position under ~10 cm: needs **better real-time
-  corrections** (rapid products / a better SSR stream), not a smarter filter.
-- The recipe is still ~10× overconfident (σ 8–58 mm while 0.26 m off) —
-  honest σ is its own acceptance requirement.
+Direct analysis of the live CNES stream (`scripts/diag_ssr_stream.py`,
+2026-06-07, 15-min capture of SSRA00CNE0 clock corrections) settled the
+"SSR-stream vs atmosphere" question:
+
+- **The CNES feed is healthy** — steady ~5 s clock cadence, no real
+  dropouts; the common-mode clock is stable (std 22 mm) and *benign*
+  (the receiver-clock state absorbs it, so it doesn't reach position).
+- **The position-relevant signal — the *de-meaned per-SV* clock (GPS+GAL)
+  — sits at the ~cm level** (median std 12 mm, worst 45 mm; occasional dm
+  jumps that are partly IOD / de-mean-set-change artifacts).
+- **That ~cm differential, amplified through the ill-conditioned
+  (pos, ZTD, clk) null, is the right magnitude to produce the dm-scale
+  position excursions.** So the driver is the **inherent real-time-SSR
+  product accuracy**, not a stream defect and not atmosphere — exactly
+  consistent with the PRIDE yardstick (real-time products of *any* AC →
+  dm floor). cm needs *final* products.
+
+Caveat: this is correlation-by-*magnitude*, not time-aligned to a position
+trajectory — the clean concurrent cross-AC correlation is still blocked by
+the engine's CNES-only-free-solve limitation. **What remains under
+pickyEaterSSR is therefore the *engine* gap**, not the science question:
+the correction handling (GAP_FILL allow-list, signal mapping, CNES+WHU
+dual-mount) is CNES-specific, so BKG/CAS/broadcast can't free-solve. That's
+a resilience gap (no AC failover) + blocks any future cross-AC test.
+
+## RTKLIB recipe — status & remaining work
+
+The recipe **knobs are implemented and committed** (PR #145):
+`--clock-model wno` + `--q-ztd-antpos` (default-preserving). The validated
+config is runnable today: `--clock-model wno --q-ztd-antpos 1e-4
+--q-pos-converged 1e-9 --no-ar` with the **default** ZTD tie.
+
+It is **not operationalized, and arguably shouldn't be** for the time
+mission: the fleet runs `--no-antposest` (position *pinned* at the
+PRIDE-final surveyed ARP), so AntPosEst — and thus the recipe — is off the
+operational path. The recipe's value is as the *best free-position config*
+(competitive with batch on equal products), for diagnostics or a future
+free-position use case. Remaining work, only if we pursue free-position to
+the ±10 cm bar:
+1. **Honest σ** — the recipe is ~10× overconfident (σ 8–58 mm while 0.26 m
+   off); false confidence is its own failure ([[position-accuracy-target-10cm]]).
+2. **Lower the residual** — products-limited, so it needs *better real-time
+   corrections* (rapid products / a better SSR stream), **not** a smarter
+   filter.
+3. Config/wrapper wiring + a tested recipe mode, *if* it becomes a used path.
+4. Housekeeping: reconcile the lab-local recipe edits still on MadHat
+   (revert to the committed flags) and stop the lingering keeper run.
+
+## Other open threads
+
 - timeHatFloatBias (I-053035), madhatF9pVerticalResidual (I-134212) remain
   as per-host residuals, secondary to the common-mode story.
