@@ -8,7 +8,8 @@ phase; TICC (~60 ps) is far more accurate than EXTINT (~5–10 ns), but TDCP
 question has a punchline: **if TDCP-discipline matches/beats a TICC, you
 may need only one *shared* TICC for validation, not one per clock.**
 
-Status: **design** — not yet run.
+Status: **design + first-overnight results** (2026-06-08, see Results
+below — preliminary/inconclusive on the noise floor; needs a redo).
 
 ## What each chain observes (the servo arms)
 
@@ -156,12 +157,76 @@ relevant to "building OCXO clocks").
       the observer even has to matter).
 - [ ] Analysis: `allantools` TDEV on chA detrended; reset/temperature logs.
 
+## Results — first overnight (2026-06-08)
+
+Run staggered 2 h arms × 4 windows on 3 OCXO hosts (03:38–11:56 UTC).
+Data: `gt:/home/bob/gt/peppar-fix-data/ticcexp-20260608/`. **The yield was
+heavily degraded — read the verdict with that in mind:**
+
+- **MadHat logged chB only** (DO PPS not wired to TICC chA) → no metric, and
+  its TICC arm (chA−chB) had no DO-phase input; all MadHat arms stuck at
+  `DOFreqEst=phase` (compounded by its range-starved OCXO). **Fully
+  excluded. ACTION: wire MadHat DO-PPS → TICC chA.**
+- **Single-observer arms cascaded** (exit-5 "servo lost control / 30
+  consecutive outliers", excluded): TICC-only on clkPoC3 (31×), TDCP on
+  clkPoC3 (7×) and PiFace (9×); clkPoC3-extint took 1 reset (phase-jump,
+  excluded). "both" never cascaded.
+- **PiFace TICC is on a free-running OCXO reference** → its long-τ TDEV is
+  ref-wander-dominated (relative-only; short τ usable).
+- **One run per arm per host, in different windows** → the long-τ arm
+  comparison is window/ref confounded.
+
+Net clean dataset: the PiFace τ=1 s triad (relative) + clkPoC3 "both"
+(absolute). TDEV of TICC chA (detrended), ns:
+
+| host (ref) | arm | τ=1 s | τ=10 s | τ=100 s |
+|---|---|---|---|---|
+| clkPoC3 (Rb, **absolute**) | both | **0.105** | 0.100 | 2.24 |
+| PiFace (OCXO, **relative**) | extint | **0.141** | 11.3* | 70* |
+| PiFace (OCXO, **relative**) | both | 0.341 | 16.4* | 51* |
+| PiFace (OCXO, **relative**) | ticc | 0.428 | 5.3* | 8.1* |
+
+\* long-τ ref-wander/window confounded — not a clean DO measure.
+
+**Reads:**
+- **clkPoC3 "both" is a clean, healthy disciplined-OCXO output**:
+  TDEV(1 s)=105 ps, flat to ~10 s, 2.2 ns @100 s (Rb-referenced, absolute).
+- **At τ=1 s (least ref-confounded): EXTINT (141 ps) ≤ both (341) ≤ TICC
+  (428).** Suggestive — and *opposite* the "better observer → better output"
+  prior — that the tight 60 ps TICC observer **over-actuates** and injects
+  more short-τ noise than the gentle ~ns EXTINT. Single-run, relative →
+  suggestive, not conclusive.
+- Long-τ ordering (ticc < both < extint) *hints* the tight observer tracks
+  GPS better at long τ, but it's ref/window-confounded — set aside.
+
+**Robustness — the strongest finding:** "both" (TICC+EXTINT fused) was the
+**only arm that stayed locked + clean on every host where the OCXO could
+lock.** Every single-observer arm cascaded somewhere. Redundant observation
+buys servo stability.
+
+**Preliminary verdict:** this run does **not** make the noise-floor case for
+a per-clock TICC — at the budget-relevant short τ, EXTINT is at least as
+good (likely better; TICC over-actuates), and the long-τ TICC edge is
+confounded. The robustness case favors **"both"**. So: **don't add a
+per-clock TICC on noise-floor grounds yet** — the fused/EXTINT path is
+competitive. A conclusive decision needs a redo with the fixes below.
+
+**Protocol fixes for a conclusive redo:**
+1. Wire MadHat DO-PPS → TICC chA (or drop MadHat).
+2. ≥2 repeats per arm per host (reproducibility + window de-confounding).
+3. Rb-referenced TICC on the comparison host(s) for clean long-τ (PiFace's
+   free OCXO ref destroys long τ).
+4. Fix/prevent the single-observer cascades (retune the exit-5 outlier gate)
+   so TICC-only and TDCP actually yield data.
+5. 4 h+ windows for solid τ ≥ 100 s.
+
 ## Open questions
 
 - Is τ ≥ 300 s worth longer runs (4–8 h) on a follow-up night, or is the
   1–100 s region (where the servo loop + DO floor live) sufficient for the
   build decision?
 - Does TDCP-discipline hold its short-τ advantage over a full 2 h without
-  the rx-clock holdover (Arm 6) degrading at gaps?
+  the rx-clock holdover (Arm 6) degrading at gaps? (NB: TDCP cascaded on 2/2
+  hosts that ran it this round — robustness first.)
 - Gold-plate: is a second independent TICC available to remove the
   metric/servo coupling in the TICC and both arms?
