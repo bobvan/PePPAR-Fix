@@ -251,6 +251,32 @@ F10T_SIGNAL_NAMES.update(F10_BDS_SIG_NAMES)
 F9P_SIGNAL_NAMES = dict(_GPS_GAL_SIG_NAMES)
 F9P_SIGNAL_NAMES.update(F10_BDS_SIG_NAMES)
 
+# Galileo E6 (gnssId=2, sigId=8) is new on the ZED-X20P / Generation 10 —
+# the F9/F10 families don't track E6.  E6 carries the Galileo HAS
+# corrections.  The exact code (E6-B data vs E6-C pilot) is pending the
+# X20 sigId re-survey; named at the band level for now.  Observed on
+# PiPuss 2026-06-08 (PROTVER 50.10) — see memory
+# reference_zed_x20p_pipuss_bringup.
+_X20_GAL_E6 = {
+    (2, 8): "GAL-E6",
+}
+
+# ZED-X20P signal-name map.  GPS/GAL sigIds match the F9/F10 table
+# (observed on PiPuss: GPS 0/3/4/7 = L1CA/L2CL/L2CM/L5Q, GAL 0/4 =
+# E1C/E5aQ) plus the new GAL E6 (sigId=8).
+#
+# BDS: the X20 (Gen 10) reports BDS-3 modernized signals under the F10
+# chipset convention (B1C/B2a/B3I), NOT the legacy F9T B1I/B2I numbering.
+# Observed X20 BDS sigIds on PiPuss: 4, 5, 7 (= B3I, B1Cp, B2ap under the
+# F10 table).  WARNING: the sigId->carrier mapping is NOT YET VERIFIED on
+# X20 hardware — a wrong carrier assignment biases cpMes-derived combos
+# (the class of bug behind the 2026-04-19 BDS 1500 ns ISB).  It MUST be
+# confirmed by the re-survey (dayplan zedX20pSupport step 3) before BDS is
+# admitted to `systems=`.  Until then X20PDriver defaults to GPS+GAL only.
+X20P_SIGNAL_NAMES = dict(_GPS_GAL_SIG_NAMES)
+X20P_SIGNAL_NAMES.update(_X20_GAL_E6)
+X20P_SIGNAL_NAMES.update(F10_BDS_SIG_NAMES)
+
 SYS_MAP = {
     0: "gps",
     2: "gal",
@@ -418,6 +444,41 @@ class F9PDriver(ReceiverDriver):
     )
 
 
+class X20PDriver(ReceiverDriver):
+    """u-blox ZED-X20P — Generation 10, quad-band (L1/L2/L5/E6) HPG.
+
+    First seen on PiPuss 2026-06-08: MOD=ZED-X20P, FWVER=HPG 2.02,
+    PROTVER=50.10.  Tri-band tracking confirmed (GPS+GAL+BDS+SBAS, no
+    GLONASS) at C/N0 47-53 dBHz on the lab UFO1 antenna.  See memory
+    reference_zed_x20p_pipuss_bringup and dayplan zedX20pSupport.
+
+    What's validated here (dev-box, pre-hardware):
+      - Signal-name dispatch for GPS/GAL (incl. the new GAL E6 sigId=8).
+      - SEC-UNIQID v2 (6-byte) identity, handled in parse_sec_uniqid().
+
+    What is NOT yet validated and is deliberately conservative:
+      - BDS sigId->carrier mapping (see X20P_SIGNAL_NAMES) — BDS stays
+        out of the default systems until the re-survey confirms it.
+      - signal_config: Generation 10 removes the legacy CFG message
+        types but the CFG_SIGNAL_* VALSET keys / NAK behavior on X20
+        firmware are unverified, so the auto-configure path
+        (ensure_receiver_ready) is still F9T-shaped and does not yet
+        select this driver.  Use --receiver x20p only once the config
+        path is wired (zedX20pSupport step 4).
+    """
+    name = "ZED-X20P"
+    protver = "50"
+    default_baud = 115200  # native USB CDC-ACM ignores baud
+    supports_timing_mode = False  # HPG positioning firmware, not TIM
+    supports_l5_health_override = False
+    signal_names = X20P_SIGNAL_NAMES
+    # GPS+GAL only by default — BDS carrier mapping unverified on X20.
+    if_pairs = (
+        ('GPS', 'GPS-L1CA', 'GPS-L5Q', 'G'),
+        ('GAL', 'GAL-E1C', 'GAL-E5aQ', 'E'),
+    )
+
+
 def get_driver(name):
     """Return the receiver driver for a CLI receiver name."""
     key = (name or "f9t").strip().lower()
@@ -431,6 +492,8 @@ def get_driver(name):
         return F10TDriver()
     if key == "f9p":
         return F9PDriver()
+    if key in {"x20p", "x20", "zed-x20p", "zed_x20p"}:
+        return X20PDriver()
     raise ValueError(f"Unknown receiver model: {name}")
 
 
@@ -496,6 +559,30 @@ def _poll_ubx(ser, ubr, cls, msg_id, target_identity, timeout=3.0):
     return None
 
 
+def parse_sec_uniqid(payload):
+    """Parse a UBX-SEC-UNIQID payload into (unique_id_int, unique_id_hex).
+
+    The payload is a 4-byte header (1-byte version + 3 reserved) followed
+    by the hardware-fused unique ID, whose length is version-dependent:
+
+      - version 0x01 (F9 family, e.g. ZED-F9T/F9P): 5-byte ID, total
+        payload length 9.
+      - version 0x02 (ZED-X20P / Generation 10): 6-byte ID, total payload
+        length 10.  Confirmed on PiPuss 2026-06-08 (ID 98f4d50f3e54) —
+        see memory reference_zed_x20p_pipuss_bringup.
+
+    The ID is taken as everything after the 4-byte header rather than a
+    hardcoded slice, so it is forward-compatible with any future version
+    that keeps the version+reserved header and just widens the ID.
+
+    Returns (None, None) if the payload is too short to contain an ID.
+    """
+    if len(payload) < 9:  # 4-byte header + at least a 5-byte (v1) ID
+        return None, None
+    uid_bytes = payload[4:]
+    return int.from_bytes(uid_bytes, "little"), uid_bytes.hex()
+
+
 def query_receiver_identity(port, baud=9600, ser=None, ubr=None,
                             timeout=3.0):
     """Query receiver unique ID and firmware version.
@@ -513,7 +600,8 @@ def query_receiver_identity(port, baud=9600, ser=None, ubr=None,
 
     Returns:
         dict with keys:
-            unique_id: int (SEC-UNIQID, 5 bytes as integer) or None
+            unique_id: int (SEC-UNIQID, 5 bytes on F9 / 6 bytes on
+                ZED-X20P, parsed little-endian) or None
             unique_id_hex: str (hex representation) or None
             module: str (e.g. "ZED-F9T") or "unknown"
             firmware: str (e.g. "TIM 2.20") or "unknown"
@@ -588,10 +676,10 @@ def query_receiver_identity(port, baud=9600, ser=None, ubr=None,
                     _msg_len = struct.unpack_from("<H", _buf, _idx + 4)[0]
                     if len(_buf) >= _idx + 6 + _msg_len + 2:
                         _payload = _buf[_idx + 6:_idx + 6 + _msg_len]
-                        if _msg_len >= 9:
-                            uid_bytes = _payload[4:9]
-                            result["unique_id"] = int.from_bytes(uid_bytes, "little")
-                            result["unique_id_hex"] = uid_bytes.hex()
+                        uid_int, uid_hex = parse_sec_uniqid(_payload)
+                        if uid_int is not None:
+                            result["unique_id"] = uid_int
+                            result["unique_id_hex"] = uid_hex
                         break
         if result["unique_id"] is None:
             log.warning("SEC-UNIQID timed out — receiver may not support it")
