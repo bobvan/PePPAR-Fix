@@ -8,8 +8,65 @@ phase; TICC (~60 ps) is far more accurate than EXTINT (~5–10 ns), but TDCP
 question has a punchline: **if TDCP-discipline matches/beats a TICC, you
 may need only one *shared* TICC for validation, not one per clock.**
 
-Status: **design + first-overnight results** (2026-06-08, see Results
-below — preliminary/inconclusive on the noise floor; needs a redo).
+Status: **design + 3 experiment rounds (2026-06-08/09)** — actionable
+verdict reached; a perfectly-clean multi-host table is gated on host
+reliability + [[soloObserverChiGate]] (details below).
+
+## State of the question (2026-06-09) — read this first
+
+**Actionable verdict: a per-clock TICC is not justified. Use EXTINT (the
+free F9T/PHC observer) as the workhorse; add the fused "both" where you
+want robustness margin; deploy a TICC as a *shared validation* instrument,
+not one-per-clock.**
+
+**Evidence (what's firm):**
+- **EXTINT ≤ both at short τ, on clkPoC3, reproduced.** Two independent
+  runs agree: 52 / 86 ps @1 s (overnight) and ratio 0.51 (same-time
+  concurrent). The first overnight pointed the same way on PiFace
+  (extint ≤ both ≤ ticc @1 s). The gentle EXTINT observer gives the
+  cleanest output; the tight TICC observer over-actuates.
+- **Robustness ranks: EXTINT (0 re-boots) = both (0) < TDCP (3) ≪
+  TICC-only (34).** The single TICC observer is the *least* robust — its
+  tiny σ makes the chi² gate reject the DO's own motion (see below). "both"
+  is the only consistently clean *and* robust arm.
+- **"both" locks clean across DO classes** — clkPoC3 OCXO (0.1 ns @1 s) and
+  TimeHat TCXO (1.9 ns @1 s; ~19× = the DO floor difference, as expected).
+
+**What is NOT cleanly answered, and why:**
+- **TICC-only's intrinsic noise floor is unmeasured.** It can't hold a
+  clean lock as a *sole* observer: the EKF chi² gate, sized to its ~60 ps
+  σ, rejects the DO's ns-scale motion as outliers → constant re-acquire →
+  step-contaminated TDEV (~seconds, not a real floor). EXTINT's loose
+  ~5–10 ns σ is exactly why it locks clean. Fix = [[soloObserverChiGate]].
+- **Multi-host breadth is thin.** Only clkPoC3 is dependably clean;
+  TimeHat and MadHat keep **dropping their TICC chA channel or drifting**
+  (madhatChaCable; TimeHat lost chA in the EXTINT run; MadHat drifted both
+  arms PiFace-like). So the head-to-head rests primarily on clkPoC3.
+
+**The journey (3 rounds) — what was fixed along the way:**
+1. **First overnight (2026-06-08):** single-observer arms *cascaded*
+   (exit-5 "servo lost control"). Root cause: an **outlier-gate doom
+   loop** — the gate skipped corrections above threshold, so a real ramp
+   ran away. Fixed (PR #151): re-acquire on a sustained same-sign ramp.
+2. **Second overnight (2026-06-09):** that fix *silently drifted* (a
+   regression) — `ramp_accept` let the measurement through into the chi²
+   gate, which rejected it. **Caught on the scope, not the metric** —
+   `DOFreqEst=tracking` and detrended-TDEV are both *blind to drift*.
+   Reworked to **re-acquire (servo reset), not let-through**; then found
+   the reset budget was **default-off**, so re-acquire fell to full
+   exit-5 re-bootstrap (sawtooth). Defaulted the budget on
+   ([[resetBudgetGentleReacquire]]). All three fixes are in `main`.
+3. **Cross-host same-time round:** confirmed clkPoC3 EXTINT ≤ both
+   concurrently; multi-host extension foiled by host chA/drift flakiness.
+
+**Method lesson (now permanent): verify lock by chA−chB drift, never by
+`DOFreqEst=tracking` or detrended-TDEV — both hide frequency drift.**
+
+**Open items:** [[soloObserverChiGate]] (clean TICC-only floor),
+pifaceAllArmDrift / MadHat-similar drift, madhatChaCable (+ TimeHat chA in
+EXTINT). The remaining blockers are **host reliability + the chi² gate** —
+*not* the servo (that's fixed). The verdict is solid enough to act on the
+build decision now; a perfectly-clean multi-host TDEV table needs those.
 
 ## What each chain observes (the servo arms)
 
