@@ -54,9 +54,17 @@ def _iter_ubx_file(path, idle_sleep=0.5, stop_after_s=None):
 
     Groups E6 (gnssId=2, sigId=8) RXM-SFRBX pages by integer wall-second
     so the decoder accumulates a full page set before its timeout.
+
+    Seeks to END of the file first: a live UBX file already holds a large
+    backlog the engine wrote before this bridge started, and reading it as
+    a burst stamps thousands of pages with one read-time wall-second — they
+    lump into a giant batch that the per-message decoder can't resolve (and
+    corrupts its accumulator).  Tailing only *new* (real-time-paced) data
+    gives correct ~1 Hz per-second batching, matching the offline path.
     """
     from pyubx2 import UBXReader
     f = open(path, "rb")
+    f.seek(0, os.SEEK_END)   # skip backlog; tail live pages only
     ubr = UBXReader(f, protfilter=2)
     t0 = time.monotonic()
     cur_sec, batch = None, []
