@@ -4,7 +4,7 @@ RTK-FIXED ECEF position.  For PATCH3 multi-caster cross-check
 (onocoy vs Wheaton vs Naperville).  Reuses configure_rover() from
 f9p_dual_cors_rover.py.  Raw-socket NTRIP (auth + optional GGA) so
 the roaming onocoy NRBY_ADV mount works."""
-import sys, time, socket, base64, threading, argparse, statistics
+import sys, time, socket, ssl, base64, threading, argparse, statistics
 import serial
 from pyubx2 import UBXReader
 sys.path.insert(0, "/home/bob/peppar-fix/scripts")
@@ -20,10 +20,12 @@ def make_gga(lat, lon, alt=199.0):
     for c in body: cs ^= ord(c)
     return f"${body}*{cs:02X}\r\n".encode()
 
-def feed(host, port, mount, user, pw, gga, ser, stop, st):
+def feed(host, port, mount, user, pw, gga, ser, stop, st, tls=False):
     auth = base64.b64encode(f"{user}:{pw}".encode()).decode() if user else None
     try:
         s = socket.create_connection((host, port), timeout=15)
+        if tls:  # TLS casters (e.g. clients.onocoy.com:2121) reset plain sockets
+            s = ssl.create_default_context().wrap_socket(s, server_hostname=host)
         req = (f"GET /{mount} HTTP/1.1\r\nHost: {host}:{port}\r\n"
                f"User-Agent: NTRIP f9p\r\nNtrip-Version: Ntrip/2.0\r\n")
         if auth: req += f"Authorization: Basic {auth}\r\n"
@@ -87,6 +89,7 @@ def main():
     ap.add_argument("--host", required=True); ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--mount", required=True)
     ap.add_argument("--user", default=None); ap.add_argument("--pw", default=None)
+    ap.add_argument("--tls", action="store_true", help="wrap NTRIP socket in TLS (e.g. clients.onocoy.com:2121)")
     ap.add_argument("--gga-lat", type=float, default=None); ap.add_argument("--gga-lon", type=float, default=None)
     ap.add_argument("--collect", type=int, default=45, help="seconds of FIXED to collect")
     ap.add_argument("--maxwait", type=int, default=240)
@@ -97,7 +100,7 @@ def main():
     configure_rover(ser); time.sleep(1)
     st = {'rtcm':0,'soln':{},'fixed':[],'last':None,'ttff':None,'ntrip':'','err':'','t0':time.monotonic()}
     stop = threading.Event()
-    tf = threading.Thread(target=feed, args=(a.host,a.port,a.mount,a.user,a.pw,gga,ser,stop,st), daemon=True)
+    tf = threading.Thread(target=feed, args=(a.host,a.port,a.mount,a.user,a.pw,gga,ser,stop,st,a.tls), daemon=True)
     tm = threading.Thread(target=monitor, args=(ser,stop,st), daemon=True)
     tf.start(); tm.start()
     t0 = time.monotonic(); fixed_start = None
