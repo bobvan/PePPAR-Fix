@@ -9,6 +9,24 @@
 # do_*/dac_* actuator block, and no ticc_port.  The engine runs its PPP
 # position filter (seeded at the UFO1 survey ARP) and archives RINEX; it
 # does not discipline a clock here.
+#
+# RECEIVER-COMPARISON / TDCP COLLECTION (X20 vs F9T vs F9P):
+# The receiver-clock short-τ noise floor is measured by TDCP (time-
+# differenced carrier phase) straight off RXM-RAWX — it needs NO DO and
+# NO TICC, so a receiver-only host is the ideal place to run it.  The
+# tdcp_log field below makes the engine emit a per-epoch TDCP CSV.  Launch
+# this host pinned at the surveyed ARP and without a servo:
+#
+#     peppar-fix --no-antposest
+#
+# (--no-antposest pins FixedPosFilter at the ufo1 ARP so the TDCP
+# estimator has a clean fixed known_ecef; no --servo because there is no
+# DO.)  Offline TDEV: integrate c_dt_rx_m to phase (cumsum / c), detrend,
+# allantools.tdev — short-τ is the receiver-clock floor.  Because all lab
+# F9T/F9P/X20 hosts share the same UFO1 RF via the GUS splitter, the
+# comparison is sky/multipath-common — differences are receiver-side.
+# See docs/receiver-comparison-2026-06-01.md for the prior F9P/F10T/F9T
+# round and memory rxtcxo_inherent_vs_thermal_20260524.
 
 # The ZED-X20P shares the generic u-blox USB descriptor (VID:PID
 # 1546:01ab, no unique serial number), so /dev/ttyACMx is fragile —
@@ -52,3 +70,9 @@ arp_label = "ufo1"
 # RAWX at 1 Hz for its own filter (decimation is writer-side only).
 rinex_out = "data/rinex/{host}-{date}.obs"
 rinex_decimate_s = 30.0
+
+# TDCP receiver-clock noise-floor capture (see the role block above).
+# Per-epoch CSV at full 1 Hz rate; {host}/{date} expand once at open.
+# This is the headline metric for the X20-vs-F9T-vs-F9P timing
+# comparison and runs with no DO/servo.
+tdcp_log = "data/tdcp/{host}-{date}.csv"

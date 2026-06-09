@@ -4273,9 +4273,13 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     # See docs/tdcp-servo-integration.md.
     tdcp_arm5_active = (getattr(args, 'servo_input', 'default') == 'tdcp'
                         and not getattr(args, 'no_tdcp_arm', False))
+    tdcp_log_path = getattr(args, 'tdcp_log', None)
     tdcp_est = None
     tdcp_gate = None
-    if getattr(args, 'print_tdcp', False) or tdcp_arm5_active:
+    tdcp_log_fh = None
+    tdcp_log_writer = None
+    if (getattr(args, 'print_tdcp', False) or tdcp_arm5_active
+            or tdcp_log_path):
         from peppar_fix.tdcp_estimator import TdcpEstimator
         tdcp_est = TdcpEstimator(beph, known_ecef)
         if tdcp_arm5_active:
@@ -4290,7 +4294,30 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                      int(getattr(args, 'tdcp_gate_window', 30)),
                      float(getattr(args, 'tdcp_gate_nsigma', 5.0)))
         else:
-            log.info("TDCP estimator running read-only (--print-tdcp)")
+            log.info("TDCP estimator running read-only (%s)",
+                     "--tdcp-log" if tdcp_log_path else "--print-tdcp")
+        # Open the CSV sink (receiver-clock noise-floor capture).  Append
+        # mode so a wrapper relaunch continues the same file; header only
+        # when the file is new/empty.  {host}/{date} expand once at open.
+        if tdcp_log_path:
+            import csv as _csv
+            import socket as _socket
+            _host = _socket.gethostname().split('.')[0]
+            _date = datetime.now(timezone.utc).strftime('%Y%j')
+            _path = tdcp_log_path.format(host=_host, date=_date)
+            _dir = os.path.dirname(_path)
+            if _dir:
+                os.makedirs(_dir, exist_ok=True)
+            _fresh = (not os.path.exists(_path)
+                      or os.path.getsize(_path) == 0)
+            tdcp_log_fh = open(_path, 'a', newline='')
+            tdcp_log_writer = _csv.writer(tdcp_log_fh)
+            if _fresh:
+                tdcp_log_writer.writerow(
+                    ['gps_time', 'n_used', 'n_total', 'c_dt_rx_m', 'df_f',
+                     'median_r_m', 'mad_r_m', 'dt_s'])
+                tdcp_log_fh.flush()
+            log.info("TDCP CSV log → %s", _path)
 
     # σ_pin: time filter's uncertainty about its pinned ARP, used by
     # the σ-weighted Bayesian position-blend (I-125649 Stage 2/3).
@@ -4902,6 +4929,15 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     tdcp_r.n_used, tdcp_r.n_total, tdcp_r.c_dt_rx_m,
                     tdcp_r.df_f, tdcp_r.mad_r_m, tdcp_r.dt_s,
                 )
+                if tdcp_log_writer is not None:
+                    tdcp_log_writer.writerow([
+                        tdcp_r.t_dt.isoformat(),
+                        tdcp_r.n_used, tdcp_r.n_total,
+                        f"{tdcp_r.c_dt_rx_m:.6f}", f"{tdcp_r.df_f:.6e}",
+                        f"{tdcp_r.median_r_m:.6f}", f"{tdcp_r.mad_r_m:.6f}",
+                        f"{tdcp_r.dt_s:.3f}",
+                    ])
+                    tdcp_log_fh.flush()
                 if tdcp_arm5_active and servo_ctx is not None \
                         and not math.isnan(tdcp_r.df_f):
                     # df_f is dimensionless (Δdt_rx / Δt); ppb = 1e9.
@@ -10247,6 +10283,7 @@ def _apply_host_config(args):
         "antennas_json":    ("antennas_json",    str),
         "rinex_out":        ("rinex_out",        str),
         "rinex_decimate_s": ("rinex_decimate_s", float),
+        "tdcp_log":         ("tdcp_log",         str),
         "r_calibration":    ("r_calibration",    str),
         "q_clk_step":       ("q_clk_step",       float),
         "q_clk_rate_step":  ("q_clk_rate_step",  float),
@@ -11532,6 +11569,18 @@ Two-phase operation:
                           "and emit a [TDCP] log line per epoch.  No "
                           "servo impact; off by default.  Phase A scaffold "
                           "for docs/tdcp-servo-integration.md.")
+    out.add_argument("--tdcp-log", default=None,
+                     help="Write per-epoch TDCP estimator output to this CSV "
+                          "(columns: gps_time,n_used,n_total,c_dt_rx_m,df_f,"
+                          "median_r_m,mad_r_m,dt_s).  This is the "
+                          "receiver-clock noise-floor metric for the "
+                          "receiver-comparison study — it needs NO DO/servo, "
+                          "so it runs on a receiver-only host (e.g. PiPuss).  "
+                          "Implies the read-only TDCP estimator.  c_dt_rx_m is "
+                          "the per-epoch increment c·Δdt_rx; offline TDEV "
+                          "integrates it to phase (cumsum/c) then detrends.  "
+                          "Path supports {host} and {date} (UTC YYYYDDD), "
+                          "expanded once at open.  Append mode (relaunch-safe).")
     out.add_argument("--rinex-out", default=None,
                      help="Optional path to write a RINEX 3.04 OBS file "
                           "of the observations the engine processed.  "
