@@ -342,6 +342,38 @@ TDEV of `dt_rx_arm − dt_rx_broadcast` (ps), one row per band-run:
 **Actionable: to run HAS on the X20, configure GAL E1+E5a + GPS L1+L2CL
 (NOT the X20PDriver default L1+L5, which diverges the HAS arm).**
 
+## What these numbers are — and are NOT (read before quoting them)
+
+The per-arm TDEV values above are the **pairwise DIFFERENCE** `dt_rx_arm −
+dt_rx_broadcast`, which deliberately cancels the rx-TCXO.  They are **not**
+the receiver-clock stability.  The **absolute** clock TDEV (rx-TCXO floor,
+DO-less host) is:
+
+| τ | 1 s | 16 s | 64 s | 256 s |
+|---|---:|---:|---:|---:|
+| absolute TDEV(dt_rx) | **65 ps** | 2.9 ns | 22 ns | 139 ns |
+
+65 ps at 1 s matches the X20 TDCP floor (~68 ps); it rises as the
+free-running rx-TCXO wanders.  The few-ps difference numbers are **below
+this floor** — only the differencing (identical obs → common rx-TCXO)
+makes the inter-source correction differential visible at all.
+
+Consequences:
+- **The difference RANKS the sources but is not clock stability.**  Quote
+  "65 ps @1 s rising to ns" for the clock; quote the differential only as
+  "how much each source perturbs the smoothed clock vs broadcast."
+- **Refined reading of GAL:** broadcast ≈ BKG ≈ CNES to ~3 ps — Galileo
+  *broadcast* clocks are already excellent at these τ and the precise
+  corrections barely move the smoothed clock.  HAS deviates ~100 ps from
+  that consensus, so on GAL **HAS is the least accurate of the four** (its
+  ~100 ps is correction noise, arguably worse than broadcast), though
+  still within budget.
+- **On a DO-less host the source choice is moot for the delivered clock**
+  (rx-TCXO dominates).  It matters only with a DO good enough to discipline
+  below the satellite-error floor — the timing mission's case — so this
+  differential ranking is the relevant *preview* for DO hosts, not
+  something PiPuss itself would feel.
+
 ## Bottom line
 
 Galileo HAS on the X20 is **free, no-internet, and good enough** for the

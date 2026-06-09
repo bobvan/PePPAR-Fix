@@ -34,8 +34,32 @@ def main():
 
     import allantools
     taus = [1, 2, 4, 8, 16, 32, 64, 128, 256]
-    print("\nΔ vs %s: mean (ns, =datum offset) and TDEV of detrended Δ (ps):"
-          % args.ref)
+
+    def _tdev_ps(series):
+        x = np.arange(len(series))
+        s = series - np.polyval(np.polyfit(x, series, 1), x)
+        t2, td, _e, _n = allantools.tdev(s * 1e-9, rate=args.rate,
+                                         data_type="phase", taus=taus)
+        return {round(t): v for t, v in zip(t2, td)}
+
+    # ABSOLUTE TDEV of the reference arm — the actual receiver-clock
+    # stability (rx-TCXO-dominated on a DO-less host).  Printed first so the
+    # tiny DIFFERENCE numbers below are read in context: they are NOT clock
+    # stability — the pairwise difference cancels this rx-TCXO floor to
+    # expose the (much smaller) inter-source correction differential.
+    try:
+        absc = _tdev_ps(d[args.ref])
+        print("\nABSOLUTE TDEV(dt_rx_%s) — the real clock, rx-TCXO floor (ps):"
+              % args.ref)
+        print("  %-9s %9s" % ("", "") + "".join("%9d" % t for t in taus))
+        print("  %-9s %9s" % ("clock", "") +
+              "".join("%9.0f" % (absc.get(t, float('nan')) * 1e12) for t in taus))
+    except Exception:
+        pass
+
+    print("\nΔ vs %s: mean (ns, =datum offset) and TDEV of detrended Δ (ps)"
+          "  [below the rx-TCXO floor above — inter-source differential, not"
+          " clock stability]:" % args.ref)
     hdr = "  %-9s %9s" % ("arm", "mean_ns") + "".join("%9d" % t for t in taus)
     print(hdr)
     for a in arms:
@@ -43,13 +67,9 @@ def main():
             continue
         diff = d[a] - d[args.ref]
         mean = diff.mean()
-        # detrend linear (removes datum offset + any slow common ramp)
-        x = np.arange(len(diff))
-        diff = diff - np.polyval(np.polyfit(x, diff, 1), x)
+        # _tdev_ps detrends linear (removes datum offset + slow common ramp)
         try:
-            t2, td, _e, _n = allantools.tdev(diff * 1e-9, rate=args.rate,
-                                             data_type="phase", taus=taus)
-            cells = {round(t): v for t, v in zip(t2, td)}
+            cells = _tdev_ps(diff)
         except Exception:
             cells = {}
         row = "  %-9s %+9.3f" % (a, mean)
