@@ -7319,15 +7319,25 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
 
     # exitFiveToServoReset: shared windowed budget for ALL in-process
     # resets — the binary layer's gross fault AND the B/C/D outlier/
-    # restep cascades draw from one window (decision (c)).  Enabled
-    # whenever --gross-fault-reset is on; bounds in-process recovery so
-    # a genuinely-broken host falls through to exit-5 + wrapper
-    # re-bootstrap rather than resetting forever.
+    # restep/ramp cascades draw from one window (decision (c)).
+    # ENABLED BY DEFAULT (resetBudgetGentleReacquire, 2026-06-09).  The
+    # in-process EKF re-acquire (DOFreqEst.reset, actuator preserved) is
+    # the GENTLE recovery for a sustained outlier ramp.  Previously the
+    # budget was enabled only with --gross-fault-reset, so by default
+    # every ramp/outlier re-acquire fell through to a full exit-5
+    # re-bootstrap — which keeps the DO locked but SAWTOOTHING (the
+    # phase-steps contaminate TDEV; observed 2026-06-09 clkPoC3
+    # TICC-only: 34 exit-5/2h, reacq=0).  Decoupled here: only the
+    # budget's enablement is default-on; the binary-layer gross-fault
+    # path above stays opt-in via --gross-fault-reset.  The budget still
+    # bounds recovery — a genuinely-broken host that needs reset after
+    # reset exhausts the window and falls through to exit-5 + wrapper
+    # re-bootstrap.  --no-servo-reset-budget restores legacy exit-5-only.
     from peppar_fix.reset_budget import ResetBudget
     _reset_budget = ResetBudget(
-        max_resets=getattr(args, 'reset_budget_max', 3),
+        max_resets=getattr(args, 'reset_budget_max', 6),
         window_s=getattr(args, 'reset_budget_window_s', 300.0),
-        enabled=bool(getattr(args, 'gross_fault_reset', False)),
+        enabled=bool(getattr(args, 'servo_reset_budget', True)),
     )
     if _reset_budget.enabled:
         log.info("Reset budget ENABLED: ≤ %d in-process servo resets per "
@@ -11103,13 +11113,25 @@ Two-phase operation:
                             "--gross-fault-reset fires.  Default 60 (60 s at "
                             "1 Hz cadence).  Lower = more aggressive resets; "
                             "higher = more tolerance of transient divergence.")
-    servo.add_argument("--reset-budget-max", type=int, default=3,
+    servo.add_argument("--no-servo-reset-budget", dest="servo_reset_budget",
+                       action="store_false", default=True,
+                       help="resetBudgetGentleReacquire: DISABLE the default-"
+                            "on in-process servo reset budget, restoring "
+                            "legacy exit-5-only recovery (every sustained "
+                            "outlier ramp → full re-bootstrap sawtooth).  The "
+                            "budget (default ON) lets the servo re-acquire "
+                            "GENTLY in-process (EKF reset, actuator preserved) "
+                            "for transient faults, bounded by --reset-budget-"
+                            "max / --reset-budget-window-s before falling "
+                            "through to exit-5.")
+    servo.add_argument("--reset-budget-max", type=int, default=6,
                        help="exitFiveToServoReset: max in-process servo "
                             "resets allowed per --reset-budget-window-s, "
                             "SHARED across the binary layer and the outlier/"
-                            "restep cascades.  Over budget → fall through to "
-                            "exit-5 + wrapper re-bootstrap.  Only consulted "
-                            "when --gross-fault-reset is on.  Default 3.")
+                            "restep/ramp cascades.  Over budget → fall through "
+                            "to exit-5 + wrapper re-bootstrap.  Budget is "
+                            "default-on (--no-servo-reset-budget disables).  "
+                            "Default 6.")
     servo.add_argument("--reset-budget-window-s", type=float, default=300.0,
                        help="exitFiveToServoReset: rolling window (s) for "
                             "--reset-budget-max.  Default 300 (5 min).  A "

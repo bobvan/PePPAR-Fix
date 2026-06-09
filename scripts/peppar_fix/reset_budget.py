@@ -38,9 +38,9 @@ class ResetBudget:
             window.  Must be ≥ 1.
         window_s: Rolling-window length in seconds.  Must be > 0.
         enabled: When False, :meth:`request` always denies — the
-            engine keeps its legacy exit-5 behavior.  The budget is
-            only consulted when in-process reset is opted in (via
-            ``--gross-fault-reset``).
+            engine keeps its legacy exit-5 behavior.  Default-on at the
+            engine (resetBudgetGentleReacquire, 2026-06-09);
+            ``--no-servo-reset-budget`` constructs it disabled.
     """
 
     def __init__(self, *, max_resets: int = 3, window_s: float = 300.0,
