@@ -77,6 +77,15 @@ def _iter_ubx_file(path, idle_sleep=0.5, stop_after_s=None):
             if batch:
                 yield cur_sec, batch
                 cur_sec, batch = None, []
+            # in-place truncation (engine restart): resume from new start so
+            # we don't hold a stale offset past EOF and read nothing.  File
+            # *rotation* (new inode at same path) is NOT handled — restart
+            # the bridge if the engine rotates rather than truncates.
+            try:
+                if os.fstat(f.fileno()).st_size < f.tell():
+                    f.seek(0)
+            except OSError:
+                pass
             if stop_after_s and time.monotonic() - t0 > stop_after_s:
                 return
             time.sleep(idle_sleep)

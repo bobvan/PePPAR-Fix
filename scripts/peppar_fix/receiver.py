@@ -534,6 +534,11 @@ def driver_for_module(module):
     containing "X20"): the X20 drops the legacy CFG message types and its
     CFG_SIGNAL_*/L5-health/warm-restart sequence is F9-specific, so it
     takes the no-signal-reconfigure readiness path instead.
+
+    NB: the "X20" substring match would also dispatch a hypothetical future
+    variant (e.g. "ZED-X20-V2").  u-blox naming has been stable on the X20
+    line, so this is fine today; revisit this match if u-blox ever ships an
+    X20 variant whose readiness path should differ.
     """
     if not module:
         return None
