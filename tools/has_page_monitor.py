@@ -100,7 +100,15 @@ def main():
                     help="write collected operational message bodies "
                          "(keyed by MID -> {PID: body_hex}) for downstream "
                          "Reed-Solomon decode")
+    ap.add_argument("--raw-pages", default=None,
+                    help="also write every raw E6 page as "
+                         "'<epoch_sec> <svId> <page_hex>' lines, for the "
+                         "CSSRlib RS+SSR decoder (tools/has_decode_cssr.py). "
+                         "page_hex is the SFRBX dwrds big-endian; the HAS "
+                         "header is at bit 14 (CSSRlib's i=14).")
     args = ap.parse_args()
+
+    raw_fh = open(args.raw_pages, "w") if args.raw_pages else None
 
     # mid -> {ms, pages{pid: body_int}, total_seen}
     msgs = collections.defaultdict(
@@ -109,6 +117,10 @@ def main():
 
     for sv, val, nbits in _iter_e6_pages(args.port, args.baud, args.seconds):
         n_total += 1
+        if raw_fh is not None:
+            raw_fh.write("%d %d %s\n"
+                         % (int(time.time()), sv,
+                            format(val, "0%dx" % (nbits // 4))))
         h = parse_header(val, nbits)
         if not is_operational(h):
             n_dummy += 1
@@ -145,6 +157,10 @@ def main():
             json.dump(out, f, indent=1)
         print("wrote %d complete message(s) to %s for RS decode"
               % (len(out), args.dump_json))
+
+    if raw_fh is not None:
+        raw_fh.close()
+        print("wrote raw pages to %s" % args.raw_pages)
 
 
 if __name__ == "__main__":
