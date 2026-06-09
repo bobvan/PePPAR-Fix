@@ -1,11 +1,29 @@
-# u-blox ZED-F9 Firmware Capability Matrix
+# u-blox Receiver Capability Matrix
 
-Experimentally determined via CFG-VALSET probing on lab receivers
-sharing a common antenna/splitter:
-  - F9T variants: 2026-04-14 (factory reset on F9T-TOP, running
-    state on F9T-BOT), follow-up on ptpmon 2026-04-18.
-  - F9P variants: 2026-04-30 (per-key probe via /tmp/f9p_probe.py
-    on clkPoC3, F9P-1 idle after the rawx-log overnight).
+Cross-family capability matrix for every u-blox receiver in the lab,
+all sharing a common antenna/splitter (UFO1 via the GUS splitter, so
+RF is common-mode across units).  Two characterization methods feed it:
+
+  - **CFG-VALSET per-key probing** (which signal/message keys ACK vs
+    NAK) — the F9 family:
+    - F9T variants: 2026-04-14 (factory reset on F9T-TOP, running
+      state on F9T-BOT), follow-up on ptpmon 2026-04-18.
+    - F9P variants: 2026-04-30 (per-key probe via /tmp/f9p_probe.py
+      on clkPoC3, F9P-1 idle after the rawx-log overnight).
+  - **Observed tracking** (NAV-SIG / RXM-RAWX: which signals the
+    receiver actually outputs, with C/N0 + carrier-phase) plus
+    CFG-MSGOUT probing — the Gen-10 parts, whose signals are enabled
+    by the factory profile so per-signal-key CFG probing isn't the
+    natural method:
+    - NEO-F10T: 2026-05-12 on MadHat — full detail in the companion
+      [`docs/f10t-firmware-capabilities.md`](f10t-firmware-capabilities.md).
+    - ZED-X20P: 2026-06-08 on PiPuss — sigId survey + cpMes-scaling +
+      CFG-MSGOUT validation; see memory `reference_zed_x20p_pipuss_bringup`
+      and dayplan `zedX20pSupport`.
+
+Where a cell is from observed tracking rather than a CFG ACK/NAK probe
+it is marked *(obs)*.  The signal **capability** is what matters for
+the comparison regardless of how it was determined.
 
 ## Test receivers
 
@@ -16,6 +34,19 @@ sharing a common antenna/splitter:
 | F9T-PTP | ZED-F9T | TIM 2.20 | 29.20 | 675836739647 | ptpmon | **0** |
 | F9P-1 | ZED-F9P (HPG 1.51) | EXT CORE 1.00 | 27.50 | 904584649306 | clkPoC3 | (n/a) |
 | F9P-2 | ZED-F9P (HPG 1.51) | EXT CORE 1.00 | 27.50 | 914202187869 | clkPoC3 | (n/a) |
+| F10T | NEO-F10T-00B-01 | TIM 3.01 | 42.01 | (none — FTDI serial) | MadHat | (n/a) |
+| X20P | ZED-X20P | HPG 2.02 | **50.10** | 98f4d50f3e54 *(v2/6-byte)* | PiPuss | (n/a) |
+
+The **SEC-UNIQID format differs by generation**: F9 returns a
+version-0x01 payload with a 5-byte ID; the **X20P returns version-0x02
+with a 6-byte ID** (`98f4d50f3e54`); the F10T (on the ArduSimple board)
+doesn't expose one over USB, so identity falls back to the FTDI serial.
+`peppar_fix.receiver.parse_sec_uniqid` handles both ID widths.
+
+`vpManager_07` is the L5-RF discriminator **for the F9T family only** —
+it is not applicable to F9P (different module family) or to the Gen-10
+F10T/X20P (different RF architecture; both have the 1176.45 MHz band
+unconditionally).
 
 `vpManager_07` is bit 7 of the virtual-pin manager bitmap returned by
 UBX-MON-HW3.  On the tested F9T receivers it correlates perfectly
@@ -33,21 +64,39 @@ key — the hardware front-end isn't there.
 Tested by sending CFG-VALSET (RAM layer) for each key individually.
 ACK = accepted, NAK = rejected by firmware.
 
-| Capability | CFG key | ZED-F9T (2.20, L5-hw) | ZED-F9T (2.20, L2-only hw) | ZED-F9T-20B (2.25) | ZED-F9P-15 (HPG 1.51) |
-|---|---|---|---|---|---|
-| GPS L1 C/A | CFG_SIGNAL_GPS_L1CA_ENA | ACK | ACK | ACK | ACK |
-| GPS L2C | CFG_SIGNAL_GPS_L2C_ENA | **ACK** | **ACK** | **NAK** | **ACK** |
-| GPS L5 | CFG_SIGNAL_GPS_L5_ENA | **ACK** | **NAK** | ACK | **NAK** |
-| GPS L5 health override | 0x10320001 | **ACK** | **ACK** | ACK | (not tested) |
-| GAL E1 | CFG_SIGNAL_GAL_E1_ENA | ACK | ACK | ACK | ACK |
-| GAL E5a | CFG_SIGNAL_GAL_E5A_ENA | ACK | **NAK** | ACK | **NAK** |
-| GAL E5b | CFG_SIGNAL_GAL_E5B_ENA | **NAK** | **ACK** | **NAK** | **ACK** |
-| GLONASS L1 | CFG_SIGNAL_GLO_L1_ENA | **NAK** | **NAK** | **NAK** | **ACK** |
-| GLONASS L2 | CFG_SIGNAL_GLO_L2_ENA | **NAK** | **NAK** | **NAK** | **ACK** |
-| NavIC | CFG_SIGNAL_NAVIC_ENA | **NAK** | (not tested) | **ACK** | (not tested) |
-| BeiDou B1 | CFG_SIGNAL_BDS_B1_ENA | ACK | ACK | ACK | ACK |
-| BeiDou B2 (B2I) | CFG_SIGNAL_BDS_B2_ENA | (not tested) | **ACK** | (not tested) | **ACK** |
-| BeiDou B2a | CFG_SIGNAL_BDS_B2A_ENA | (not tested) | **NAK** | (not tested) | **NAK** |
+F9 columns are CFG-VALSET ACK/NAK probes; F10T/X20P columns are
+observed tracking (Yes = output with carrier phase; No = not tracked;
+— = not applicable / not observed).
+
+| Capability | CFG key | ZED-F9T (2.20, L5-hw) | ZED-F9T (2.20, L2-only hw) | ZED-F9T-20B (2.25) | ZED-F9P-15 (HPG 1.51) | NEO-F10T *(obs)* | ZED-X20P *(obs)* |
+|---|---|---|---|---|---|---|---|
+| GPS L1 C/A | CFG_SIGNAL_GPS_L1CA_ENA | ACK | ACK | ACK | ACK | Yes | Yes |
+| GPS L2C (L2CL) | CFG_SIGNAL_GPS_L2C_ENA | **ACK** | **ACK** | **NAK** | **ACK** | No | **Yes** |
+| GPS L5 (L5Q) | CFG_SIGNAL_GPS_L5_ENA | **ACK** | **NAK** | ACK | **NAK** | Yes | Yes |
+| GPS L5 health override | 0x10320001 | **ACK** | **ACK** | ACK | (not tested) | No¹ | n/a¹ |
+| GAL E1 | CFG_SIGNAL_GAL_E1_ENA | ACK | ACK | ACK | ACK | Yes | Yes |
+| GAL E5a | CFG_SIGNAL_GAL_E5A_ENA | ACK | **NAK** | ACK | **NAK** | Yes | Yes |
+| GAL E5b | CFG_SIGNAL_GAL_E5B_ENA | **NAK** | **ACK** | **NAK** | **ACK** | No | — |
+| GAL E6 (HAS) | (no F9 key) | — | — | — | — | No | **Yes** |
+| GLONASS L1 | CFG_SIGNAL_GLO_L1_ENA | **NAK** | **NAK** | **NAK** | **ACK** | No | **No** |
+| GLONASS L2 | CFG_SIGNAL_GLO_L2_ENA | **NAK** | **NAK** | **NAK** | **ACK** | No | **No** |
+| NavIC | CFG_SIGNAL_NAVIC_ENA | **NAK** | (not tested) | **ACK** | (not tested) | — | adv² |
+| BeiDou B1I (legacy) | CFG_SIGNAL_BDS_B1_ENA | ACK | ACK | ACK | ACK | No | No |
+| BeiDou B2I (legacy) | CFG_SIGNAL_BDS_B2_ENA | (not tested) | **ACK** | (not tested) | **ACK** | No | No |
+| BeiDou B1C (modern) | (Gen-10 only) | — | — | — | — | Yes | **Yes** |
+| BeiDou B2a (modern) | CFG_SIGNAL_BDS_B2A_ENA | (not tested) | **NAK** | (not tested) | **NAK** | Yes | Yes |
+| BeiDou B3I (modern) | (Gen-10 only) | — | — | — | — | No | **Yes** |
+| SBAS L1 C/A | CFG_SIGNAL_SBAS_ENA | — | — | — | — | — | Yes |
+
+¹ F10T rejects the 0x10320001 L5-health override (`supports_l5_health_override=False`).  The X20P tracks L5 out of the box with no override step.
+² The X20P's MON-VER advertises NavIC, but no NavIC SVs were in view during the 2026-06-08 survey, so its tracking is unconfirmed.
+
+**The X20P is multi-band, not two-band-limited.**  Every F9T discussion
+below turns on the "two frequency bands maximum" RF-chain limit (L2 *or*
+L5, never both).  The X20P breaks that: the 2026-06-08 survey saw GPS
+**L1 C/A + L2CL + L5Q all tracked with carrier phase simultaneously**,
+plus GAL E1+E5a+E6 and BDS B1C+B2a+B3I.  So the L2-vs-L5 either/or
+choice that shapes the F9T profiles does not apply to the X20P.
 
 ## NAK semantics
 
@@ -59,6 +108,66 @@ software-visible discriminator for the L5-capable vs L2-only
 F9T physical variants that share `MOD=ZED-F9T, FWVER=TIM 2.20,
 PROTVER=29.20`.  See the taxonomy doc for the idempotent and
 rate-cap categories observed on sibling F10T hardware.
+
+## Control, message-output, and transport matrix
+
+Beyond which signals exist, the families differ in how they're driven.
+
+| Attribute | ZED-F9T (TIM 2.20/2.25) | ZED-F9P-15 | NEO-F10T | ZED-X20P |
+|---|---|---|---|---|
+| PROTVER | 29.x | 27.50 | 42.01 | **50.10** |
+| Concurrent bands | 2 max (L2 **or** L5) | 2 (L1+L2) | 2 (L1+L5) | **3+ (L1+L2+L5, +E6)** |
+| Transport | USB / UART / I2C / SPI | USB | **UART1 only** (no USB; FTDI bridge) | **native USB (CDC-ACM)** |
+| MSGOUT suffix used | `_USB` | `_USB` | `_UART1` | `_USB` |
+| Legacy CFG msg types | yes | yes | removed | **removed (Gen-10)** |
+| NAV2 (`CFG_NAV2_OUT_ENABLED`) | ACK | ACK | **NAK (idempotent; flows)** | **ACK** |
+| NAV-TIMEGPS rate=5 | ACK | ACK | **NAK (rate-cap; flows @1)** | **ACK** |
+| Survey-In / fixed-pos TMODE | **yes** | yes | **no** | no³ |
+| L5 health override key | yes | (n/a) | no | not needed |
+| Default baud | 115200 / 460800 | 38400 | 38400 | 115200 (USB ignores) |
+| BDS B2a cpMes reference | **L1-ref on 2.25**⁴ | native | native | **native** (verified) |
+| pyubx2 minimum | any | any | any | **≥1.2.57**⁵ |
+| Driver class | `F9T*Driver` | `F9PDriver` | `F10TDriver` | `X20PDriver` |
+
+³ X20P TMODE not probed; `X20PDriver` sets `supports_timing_mode=False`
+(HPG positioning firmware, not a TIM timing part).
+⁴ The ZED-F9T-20B (TIM 2.25) reports BDS-3 B2a cpMes in **L1-reference
+cycles** — the 2026-04-19 "1500 ns ISB" bug; the engine multiplies by
+λ_L1/λ_native at ingest (`F9TDriver.bds_l1_ref_cycles`).  The X20P does
+**not** have this quirk: Δcp/Doppler ratio = 1.000 for B2a/B3I/E6
+(verified 2026-06-08), so `X20PDriver.bds_l1_ref_cycles` is empty.
+⁵ pyubx2 < 1.2.57 misframes the PROTVER-50.10 stream and `UBXReader.read()`
+hangs for minutes holding the port; 1.2.57 added the X20P NAV payload defs.
+
+## ZED-X20P (Generation 10) — key findings
+
+The X20P is a different animal from the F9/F10 timing parts — a
+quad-band (L1/L2/L5/E6) high-precision positioning module (HPG 2.02,
+PROTVER 50.10).  Characterized on PiPuss 2026-06-08 (full facts in
+memory `reference_zed_x20p_pipuss_bringup`).
+
+- **Multi-band, not two-band.**  Tracks GPS L1+L2+L5 concurrently
+  (plus GAL E1+E5a+E6, BDS B1C+B2a+B3I) — the L2-vs-L5 either/or that
+  defines the F9T profiles doesn't apply.
+- **Galileo E6 (HAS).**  Only receiver in the fleet that tracks E6
+  (1278.75 MHz, sigId 8) — the Galileo High-Accuracy Service carrier.
+- **BeiDou uses the Gen-10 (F10) sigId convention**, not the legacy
+  F9T B1I/B2I numbering: sigIds 4/5/7 = B3I / B1Cp / B2ap.  sigId 4 =
+  **B3I (1268.52 MHz) is genuinely new** — no F9/F10 lab unit tracks it.
+- **cpMes is native** for every signal (no F9T-2.25 B2a L1-ref quirk).
+- **No GLONASS** (advertised-but-absent, like the F9T family; only F9P
+  does GLONASS).  NavIC advertised but unconfirmed (none in view).
+- **Configures out of the box.**  Signals are enabled by the factory
+  profile, so `ensure_receiver_ready` takes a no-signal-reconfigure
+  path (`driver_for_module` → `X20PDriver`): it only enables output
+  messages.  Every `CFG_MSGOUT_*`/`CFG_RATE` key ACK'd with zero NAKs
+  — including NAV2 and NAV-TIMEGPS=5, where the F10T NAKs both.
+- **Ships RTCM3 on USB by default** (0xD3 frames in the stream) —
+  harmless to the UBX-only reader; disable for cleanliness.
+- **BDS is held out of `systems=`** despite all of B1C/B2a/B3I being
+  available with native cpMes — on SSR-phase-bias grounds (no AC
+  publishes BDS B2a-I phase biases; `docs/bds-b2a-phase-bias-survey-2026-05-09.md`),
+  the same policy as the L5-tracking F9T hosts.
 
 ## Key findings
 
@@ -230,25 +339,35 @@ dropout difference between firmware versions.
 
 ## Summary: what each variant can actually do
 
-| Feature | ZED-F9T 2.20 (L5-hw) | ZED-F9T 2.20 (L2-only hw) | ZED-F9T-20B (2.25) | ZED-F9P-15 (HPG 1.51) |
-|---|---|---|---|---|
-| L1 + L2C | Yes | Yes | **No** | Yes |
-| L1 + L5 | **Yes** | **No** | Yes | **No** |
-| L5 health override CFG key | Yes | Yes (but no effect) | Yes | (n/a) |
-| GLONASS L1 + L2 | No | No | No | **Yes** |
-| NavIC | No | (untested) | **Yes** | (untested) |
-| GAL E5a | Yes | **No** | Yes | **No** |
-| GAL E5b | **No** | **Yes** | No | **Yes** |
-| BDS B2I | (untested) | Yes | (untested) | Yes |
-| BDS B2a | (untested, expect Yes) | **No** | (untested) | **No** |
-| Match for WUM PPP-AR phase biases | **Yes** (L5/E5a/B2a-I) | No | **Yes** (L5/E5a/B2a-I) | No |
+| Feature | ZED-F9T 2.20 (L5-hw) | ZED-F9T 2.20 (L2-only hw) | ZED-F9T-20B (2.25) | ZED-F9P-15 (HPG 1.51) | NEO-F10T | ZED-X20P |
+|---|---|---|---|---|---|---|
+| L1 + L2C | Yes | Yes | **No** | Yes | No | **Yes** |
+| L1 + L5 | **Yes** | **No** | Yes | **No** | Yes | Yes |
+| L1+L2+L5 concurrent | No | No | No | No | No | **Yes** |
+| L5 health override CFG key | Yes | Yes (but no effect) | Yes | (n/a) | No | not needed |
+| GLONASS L1 + L2 | No | No | No | **Yes** | No | No |
+| NavIC | No | (untested) | **Yes** | (untested) | — | advertised |
+| GAL E5a | Yes | **No** | Yes | **No** | Yes | Yes |
+| GAL E5b | **No** | **Yes** | No | **Yes** | No | — |
+| GAL E6 (HAS) | No | No | No | No | No | **Yes** |
+| BDS B1I/B2I (legacy) | Yes | Yes | Yes | Yes | **No** | **No** |
+| BDS B1C/B2a (modern) | partial | No | partial | No | **Yes** | **Yes** |
+| BDS B3I (modern) | No | No | No | No | No | **Yes** |
+| Match for WUM PPP-AR phase biases | **Yes** (L5/E5a/B2a-I) | No | **Yes** (L5/E5a/B2a-I) | No | **Yes** (L5/E5a/B2a-I) | **Yes** (L5/E5a/B2a-I) |
 
-The L5-hardware ZED-F9T (TIM 2.20) is the most capable: can run
-either L2 or L5, GAL dual-band via E5a.  The classic L2-only
+The L5-hardware ZED-F9T (TIM 2.20) is the most capable F9T variant: can
+run either L2 or L5, GAL dual-band via E5a.  The classic L2-only
 ZED-F9T (TIM 2.20) is locked to L2, GAL dual-band via E5b.  The
 -20B is locked to L5, GAL dual-band via E5a, and adds NavIC.  The
 -20B's NavIC support is not useful for PPP-AR (no SSR corrections
-available for NavIC).
+available for NavIC).  The **NEO-F10T** is the single-port (UART-only)
+Gen-10 timing part — L1/L5 + GAL E1/E5a + BDS B1C/B2a, no L2; its raw
+PPS is ~2× noisier at short τ than F9T/F9P (see
+[`docs/receiver-comparison-2026-06-01.md`](receiver-comparison-2026-06-01.md)).
+The **ZED-X20P** is in a class of its own on capability — the only
+multi-band part (L1+L2+L5 concurrent), the only one with Galileo E6/HAS
+and BeiDou B3I — though it's a positioning (HPG) module, not a timing
+part, and PiPuss runs it DO-less for receiver-clock (TDCP) comparison.
 
 ## Why L5 is preferred for PPP-AR
 

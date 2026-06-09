@@ -5,6 +5,12 @@ single F10T receiver after the 2026-05-12 swap from F9T to F10T on
 MadHat.  Companion to `docs/f9t-firmware-capabilities.md`; same
 methodology, different chipset family.
 
+> **Cross-family comparison:** the F10T's signal/control/transport
+> columns are folded into the unified
+> [`docs/f9t-firmware-capabilities.md`](f9t-firmware-capabilities.md)
+> ("u-blox Receiver Capability Matrix") alongside the F9T variants,
+> F9P, and X20P.  This doc keeps the full per-key F10T detail.
+
 ## Test receiver
 
 | Name | Module | Firmware | PROTVER | Host | Interface |
