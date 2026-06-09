@@ -182,6 +182,46 @@ the `dt_rx` *difference* is purely the correction contribution.  That
 needs a UBX→pty replay harness (the engine's `run_replay` only does
 SP3/CLK files, not our SSRState path) — the recommended next build.
 
+## Multi-arm harness (built + validated 2026-06-09) — supersedes replay
+
+Rather than the replay route (which needs eph+SSR capture/replay synced to
+obs — eph comes from NTRIP, not the receiver — plus an engine file-replay
+mode), the clean comparison is **one engine, N parallel clock filters on
+identical observations** (`tools/has_multiarm_compare.py`): the X20 is read
+once; each arm gets its own `SSRState` fed by a different source; pairwise
+`dt_rx` differences cancel the common rx-TCXO drift.  Analyzer:
+`tools/multiarm_tdev.py` (TDEV of `dt_rx_arm − dt_rx_broadcast`, detrended).
+
+**Five-way bracket, all in one run:** broadcast · HAS (E6 SIS) · BKG
+`SSRA00BKG0` · CAS `SSRA01CAS1` · CNES `SSRA00CNE0`.  Eph+BKG+CAS share the
+Australian caster (`ntrip.conf`); CNES via `ntrip-cnes.conf`
+(products.igs-ip.net, chunked — verified 97 SVs).  HAS arm: the external
+bridge tails the comparator's `--ubx-out` → records → `--ssr-records-file`.
+
+**Validation (5-min run): the difference method cancels rx-TCXO.** All 5
+arms produced `dt_rx` on identical epochs; the std of (arm − broadcast)
+was **3–47 ps**, vs the **~4000 ps** absolute TDEV of the confounded
+sequential first look — a ~1000× drop confirming rx-TCXO cancellation.
+Means are the inter-source clock-datum offsets (HAS +0.6, BKG −3.9, CAS
+−1.6, CNES −5.2 ns).  First pairwise-difference TDEV over the HAS-engaged
+portion (~3 min, indicative only):
+
+| arm | TDEV(1s) | TDEV(16s) | TDEV(32s) |
+|---|---:|---:|---:|
+| HAS | 19 ps | 57 ps | 64 ps |
+| BKG | 4.5 ps | 7.5 ps | 5.6 ps |
+| CAS | 7 ps | 15 ps | 11 ps |
+| CNES | 5 ps | 9.5 ps | 24 ps |
+
+**Read with care:** this is a 3-min window with the HAS arm only just
+engaged (still settling), so HAS's higher short-τ number is not yet
+meaningful.  And TDEV(arm − broadcast) measures inter-source *agreement /
+correction noise*, not absolute accuracy vs GPS time (no truth reference
+here — the precise streams are assumed to cluster near truth).  The
+**definitive bracket needs a long run** (HAS engaged from the start,
+30–60 min) for TDEV out to τ ≈ 1000 s, plus HAS-vs-each-precise-stream
+differences.  The harness and analyzer are ready for it.
+
 ## Success criteria
 
 - **Primary:** HAS reduces TDEV(dt_rx) at τ ≥ 100 s by a clear margin
