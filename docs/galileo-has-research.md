@@ -208,8 +208,20 @@ HAS IDD (NTRIP, any host) ──────────────────
 - **Decode**: re-assemble E6-B pages from RXM-SFRBX (or read IDD NTRIP),
   decode with [HASlib](https://github.com/nlsfi/HASlib) or CSSRlib to
   orbit/clock/code-bias SSR.
-- **Ingest**: adapt into `SSRState`; our filter already consumes
-  orbit/clock/code-bias.  No phase-bias path needed yet (Phase 1).
+- **Ingest** (DONE 2026-06-08): `tools/has_ssr_adapter.py` extracts
+  decoder-neutral records from the CSSRlib decode and feeds them to the
+  new `SSRState.update_from_records()` — the same store the engine's
+  RealtimeCorrections reads.  End-to-end on the live X20 capture: 15 HAS
+  messages → SSRState holding orbit + clock + code-bias for 53 SVs
+  (e.g. E03 clock −0.168 m, orbit (0.235,−0.352,−0.176) m, cbias
+  C1C/C5Q/C7Q/C6C), read back through `get_orbit`/`get_clock`/
+  `get_code_bias`.  CSSRlib normalizes HAS to the RTCM/IGS-SSR convention
+  (it negates HAS orbit and applies the clock multiplier), so values map
+  directly.  No phase-bias path needed yet (Phase 1).
+  **Validation gate before production:** cross-check HAS vs BKG SSR clock
+  corrections for the same SVs — they must track with slope +1 (off by
+  only a per-constellation datum constant); a slope of −1 would mean a
+  convention flip is needed in `cssr_to_records`.
 - **Validate**: `ssr.summary()` shows non-zero HAS orbit/clock counts;
   compare HAS-corrected float-PPP dt_rx long-τ TDEV vs broadcast-only,
   and vs the BKG SSR path, on the same X20 RAWX.
