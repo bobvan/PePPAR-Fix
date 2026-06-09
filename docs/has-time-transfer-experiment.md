@@ -222,6 +222,52 @@ here — the precise streams are assumed to cluster near truth).  The
 30–60 min) for TDEV out to τ ≈ 1000 s, plus HAS-vs-each-precise-stream
 differences.  The harness and analyzer are ready for it.
 
+## Coverage intersection (why the run is GAL-only)
+
+The arms cover different SV/signal sets, and the comparison must account
+for it.  **Two axes:**
+
+**1. Constellation/SV coverage** (which SVs get orbit+clock):
+
+| stream | constellations | ~SVs |
+|---|---|---|
+| broadcast | all the X20 tracks | all in view |
+| **HAS (Phase 1)** | **GPS + GAL only** | 25 GPS + 24 GAL |
+| BKG SSRA00BKG0 | GPS+GLO+GAL+BDS | ~74 |
+| CNES SSRA00CNE0 | GPS+GAL(+BDS) | ~97 |
+| CAS SSRA01CAS1 | GPS+GAL+BDS | broad |
+
+The X20 tracks GPS+GAL+BDS (no GLONASS).  **HAS can't touch the X20's
+BDS** (a coverage disadvantage vs the precise streams); GLONASS is moot.
+
+**2. Per-SV signal coverage** (which signals get a code bias — needed for
+the IF combination the engine forms).  The X20PDriver IF pairs are GPS
+**L1CA+L5Q** and GAL **E1C+E5aQ**.  Decoded HAS code-bias signals:
+
+| | HAS code biases | covers X20 IF? |
+|---|---|---|
+| GPS | C1C, C2L, C2P (**L1/L2, no L5**) | **NO** — X20 uses L1+**L5**; HAS has no GPS L5 bias |
+| GAL | C1C, C5Q, C6C, C7Q (E1/E5a/E6/E5b) | **YES** — matches E1C+E5aQ |
+
+HAS's GPS corrections are L1/L2-centric (geodetic L2W-style); an L5-band
+receiver gets no GPS L5 code bias — the same class as the documented CNES
+L2W-vs-L2CL / L5I-vs-L5Q mismatches (docs/f9t-firmware-capabilities.md).
+The precise streams (CNES L5I→L5Q etc.) do cover GPS L5, so a GPS
+HAS-vs-CNES comparison is confounded by L5 coverage (HAS-vs-broadcast is
+not — L5 is uncorrected in both, so it cancels in the difference).
+
+**How the engine handles a gap:** missing orbit/clock → broadcast fallback
+for that SV; missing code bias → the signal's hardware delay stays in the
+obs and lands in the IF/clock (contamination).
+
+**Conclusion → GAL-only is the fair quality comparison.**  Galileo is the
+one constellation where *all four* correction streams fully cover the
+X20's tracked IF signals (E1+E5a).  The definitive run uses `--systems gal`
+so every arm corrects the same SVs with the same signals — isolating
+correction *quality* from coverage.  HAS's GPS-L5 gap and BDS gap are
+documented coverage findings (a real-world cost of HAS on an L5 receiver),
+not things to demonstrate via a confounded run.
+
 ## Success criteria
 
 - **Primary:** HAS reduces TDEV(dt_rx) at τ ≥ 100 s by a clear margin
