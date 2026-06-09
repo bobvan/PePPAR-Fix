@@ -98,10 +98,31 @@ it ourselves.
 - Latency: ~ a few seconds (E6-B page cadence; HAS messages are
   assembled over several pages).
 - Cost / registration: **none**.
-- Caveat: the E6-B C/NAV bits in RXM-SFRBX must be re-assembled into HAS
-  pages and decoded (HASlib / a galileo-has decoder) — **needs
-  validation** that the X20-00B's SFRBX bit-packing feeds the decoder
-  cleanly.  This is the one open integration risk on this path.
+
+**Page decode validated on PiPuss 2026-06-08** (`tools/has_page_monitor.py`).
+The X20-00B's RXM-SFRBX feeds the HAS decoder cleanly — the open risk is
+closed at the page level:
+
+- Each E6-B page arrives as **16 big-endian dwrds** (492-bit C/NAV page).
+- The **HAS page header** sits at a **14-bit lead-in offset**, then the
+  standard 24-bit layout: `HASS(2) rsv(2) MT(2) MID(5) MS(5) PID(8)`
+  (determined by offset-scan; the false alignment at off=10 gave
+  all-even MS and too few PIDs — discarded).
+- **Real HAS pages: HASS=1 (Operational), MT=1**; in a 90 s capture, 450
+  of 540 pages were operational.  Dummy pages are HASS=2 / MT=3 and
+  byte-identical across satellites (easy to filter).
+- **Complete, RS-decodable message sets are collected within seconds** —
+  e.g. MID 14 (MS=11, 45 distinct Page-IDs), MID 20 (MS=11, 141 PIDs),
+  MID 26 (MS=10, 110 PIDs).  Different satellites broadcast different
+  Page-IDs of the same MID (E03/E16/E25 → PID 47/167/215 of MID 14) —
+  the HAS Reed-Solomon page-diversity scheme, working as designed.
+
+**Remaining step (not the risk — the work):** High-Parity Vertical
+Reed-Solomon decode of a complete page set's 424-bit bodies into the HAS
+message, then parse the mask/orbit/clock/code-bias blocks into SSR.  This
+is a solved problem in **CSSRlib** (galois-based GF(256) RS) and
+**borioda/HAS-decoding**; `tools/has_page_monitor.py --dump-json` emits
+the collected bodies keyed by (MID, PID) ready to feed one of those.
 
 ### B. Internet Data Distribution (IDD) — NTRIP, receiver-independent
 
