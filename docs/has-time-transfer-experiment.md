@@ -140,6 +140,48 @@ Two execution options:
   both arms run on **identical** observations, removing sky/epoch
   variation between arms.
 
+## First result (2026-06-09) — indicative, confounded
+
+Both arms ran on PiPuss (X20, no DO).  Broadcast arm 09:04–09:34 (60
+`dt_rx` samples, SSR off, `[broadcast]`).  HAS arm ~10:02–10:17 (~12–27
+usable samples once HAS engaged, `[SSR]`, rms ~0.8 m — comparable to BKG's
+0.94 m, confirming the corrections apply cleanly after the bridge fix).
+
+TDEV of linearly-detrended `dt_rx`:
+
+| τ (s) | broadcast | HAS | HAS/bcast |
+|---|---:|---:|---:|
+| 30 | 4.0 ns | 3.0 ns | 0.75 |
+| 60 | 11.9 ns | 4.2 ns | 0.35 |
+| 120 | 23 ns | (too short) | — |
+| 480 | 67 ns | — | — |
+
+**Reading:** HAS `dt_rx` TDEV is lower, and the advantage grows with τ
+(0.75 → 0.35) — directionally consistent with the hypothesis (HAS corrects
+the satellite-clock errors that dominate broadcast at longer τ).
+
+**But this is not a clean result — two dominant confounds:**
+
+1. **The arms ran in different wall-clock windows (~1 h apart) on one USB
+   port.**  On an *undisciplined* receiver clock, the detrended `dt_rx`
+   TDEV is **dominated by the free-running rx-TCXO frequency wander**
+   (hence the ns-level, steeply-rising values — the ~0.1–0.2 ns
+   satellite-correction contribution that HAS improves is *swamped* by it).
+   Different windows ⇒ different rx-TCXO drift, so the ratio could reflect
+   a quieter 10:00 window as much as HAS itself.
+2. **The HAS segment is short** (~6 min usable ⇒ TDEV only to τ ≈ 60 s,
+   few points ⇒ noisy).
+
+**Conclusion:** the harness works end-to-end and the first look favors
+HAS, but the sequential-different-window design **cannot cleanly attribute
+the improvement to HAS** — the rx-TCXO drift confound is dominant, not
+minor.  The clean experiment is the **identical-observations replay**:
+capture the X20 `--ubx-out` once, then reprocess the *same* bytes twice
+(broadcast vs bridge-fed HAS).  With identical obs the rx-TCXO cancels and
+the `dt_rx` *difference* is purely the correction contribution.  That
+needs a UBX→pty replay harness (the engine's `run_replay` only does
+SP3/CLK files, not our SSRState path) — the recommended next build.
+
 ## Success criteria
 
 - **Primary:** HAS reduces TDEV(dt_rx) at τ ≥ 100 s by a clear margin
