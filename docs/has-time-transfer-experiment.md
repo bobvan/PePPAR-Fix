@@ -314,6 +314,44 @@ run is fair to the services covering that band — GAL E1+E5a (all),
 GPS L1+L2CL (HAS covers; CNES L2W won't match L2CL), GPS L1+L5 (CNES
 covers via L5I→L5Q; HAS has no L5).  Together they map the coverage space.
 
+## Complete coverage-space map (GAL + GPS per-band, 2026-06-09)
+
+TDEV of `dt_rx_arm − dt_rx_broadcast` (ps), one row per band-run:
+
+| arm | GAL E1+E5a 16s / 256s | GPS L1+L2CL 16s / 256s | GPS L1+L5 16s / 256s |
+|---|---|---|---|
+| **BKG** | 4 / 3 | 5 / 27 | 3 / 32 |
+| **CNES** | 5 / 3 | 9 / 97 | 6 / 50 |
+| **CAS** | 23 / 30 | 6 / 19 | 7 / 56 |
+| **HAS** | 67 / 94 | 35 / 136 | **diverged (nan, 53% of epochs)** |
+
+**Findings:**
+- **The mature precise streams (BKG, CNES) are excellent and self-consistent
+  everywhere they cover** — sub-ps to few-ps at short τ on every band;
+  they agree with each other to ~1–3 ps.  CAS is the intermediate single-AC.
+- **HAS is the noisiest option where it works** (GAL ~100 ps, GPS-L2CL
+  12–136 ps) but stays within the moonshot per-clock budget (≤ 350 ps).
+- **HAS *cannot* do GPS L1+L5** — with no GPS L5 code bias, the IF
+  combination (α≈2.26) amplifies the uncorrected L5 delay and the filter
+  diverges (`nan` for 53% of epochs; the precise arms stayed finite 100%).
+  **HAS's only viable GPS band on the X20 is L1+L2CL.**
+- GPS long-τ TDEV rises for all arms (vs flat GAL) — GPS Rb/Cs clocks are
+  harder than Galileo PHM, and the L2W-vs-L2CL mode mismatch leaks in as
+  the GPS SV set changes.
+
+**Actionable: to run HAS on the X20, configure GAL E1+E5a + GPS L1+L2CL
+(NOT the X20PDriver default L1+L5, which diverges the HAS arm).**
+
+## Bottom line
+
+Galileo HAS on the X20 is **free, no-internet, and good enough** for the
+timing mission (within budget on GAL and GPS-L2), but **measurably
+noisier (~20–30×) than internet-delivered precise SSR** (BKG/CNES) and
+**unusable for GPS L1+L5**.  The precise streams win decisively on
+quality; HAS wins decisively on operational cost.  Choose by which
+constraint binds: connectivity/cost → HAS; last factor of ~30 in clock
+stability → BKG/CNES.
+
 ## Success criteria
 
 - **Primary:** HAS reduces TDEV(dt_rx) at τ ≥ 100 s by a clear margin
