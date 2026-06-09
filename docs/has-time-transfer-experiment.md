@@ -69,9 +69,22 @@ engine's UBX file.  The `--ssr-records-file` hook is source-agnostic
 
 ## Metric
 
-The FixedPosFilter receiver-clock estimate `dt_rx(t)`, logged per epoch
-(`--servo-log`).  Compute **TDEV(dt_rx)** (and ADEV) on the linearly-
-detrended series, per arm, with `allantools`.  Compare across τ:
+The FixedPosFilter receiver-clock estimate `dt_rx(t)`.  Compute
+**TDEV(dt_rx)** on the linearly-detrended series, per arm, with
+`allantools`, and compare across τ.
+
+**Where dt_rx comes from on a DO-less host (lesson learned 2026-06-09):**
+`--servo-log` and `--dt-rx-log` are both wired into the servo subsystem
+(`servo_ctx`) and produce **no file when there's no `--servo`** — which
+is always the case on PiPuss.  Use instead the engine's
+`[FIXEDPOS_ZTD] ... dt_rx=±N ns` log line, emitted **every 30 epochs
+(~30 s)** unconditionally — parse `dt_rx` from the engine log.  30 s
+cadence is fine for the long-τ region this experiment targets (τ ≥ 100 s);
+it gives TDEV from τ ≈ 60 s up.  (A clean 1 Hz `--clock-log` that works
+without a servo is a small worthwhile engine add for a future refined run,
+but isn't needed for the headline long-τ result.)
+
+Compare across τ:
 
 - **Short τ (≤ few s):** expect ~no difference — rx-TCXO-limited, below
   HAS clock noise.
@@ -89,10 +102,23 @@ Sign convention of the HAS corrections is already validated against BKG
 1. **Capture-free live run** is fine — both arms run live; no offline
    replay needed.  Run each arm ≥ 1 h (longer is better for τ ≥ 1000 s);
    ideally back-to-back or same overnight window for comparable sky.
-   - broadcast: `peppar-fix --no-antposest --servo-log data/tt_bcast.csv`
-   - HAS: start `has_ssr_bridge.py`, then `peppar-fix --no-antposest
-     --ubx-out /tmp/x20.ubx --ssr-records-file /tmp/has_records.json
-     --servo-log data/tt_has.csv`
+   - **Disabling BKG SSR for the broadcast arm:** `ntrip.conf` carries
+     `mount = SSRA00BKG0`, which the engine auto-loads as `ssr_mount` —
+     so a plain run is actually the *BKG-SSR* arm, not broadcast.  Run
+     with an `ntrip.conf` that has the `mount` line stripped (eph still
+     comes from `eph_mount = BCEP00BKG0` in the host config):
+     `grep -vi '^mount' ntrip.conf > /tmp/ntrip_nossr.conf`.  Confirm
+     `SSR: 0 orbit, 0 clock` and clock tagged `[broadcast]` in the log.
+   - broadcast: `peppar-fix --no-antposest --ntrip-conf /tmp/ntrip_nossr.conf`
+   - HAS: start `has_ssr_bridge.py` (PiPuss has the minimal CSSRlib
+     stack), then `peppar-fix --no-antposest --ntrip-conf
+     /tmp/ntrip_nossr.conf --ubx-out /tmp/x20.ubx --ssr-records-file
+     /tmp/has_records.json`
+   - metric for both: parse `[FIXEDPOS_ZTD] ... dt_rx=` from the engine log
+   - **serial conflict:** one X20 USB port → the arms run **sequentially**,
+     not concurrently; a first-look comparison has a sky/time confound.
+     The clean identical-obs version needs a UBX-replay harness (feed the
+     captured `--ubx-out` back through the engine via a pty) — deferred.
 2. Pull the servo-logs to gt; extract `dt_rx`; `allantools.tdev` per arm.
 3. Compare TDEV(τ) curves; the headline number is the long-τ ratio
    (HAS/broadcast) and the τ where they diverge.
