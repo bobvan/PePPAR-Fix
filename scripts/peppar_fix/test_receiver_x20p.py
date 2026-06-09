@@ -5,14 +5,18 @@ Covers the dev-box-completable parts of dayplan zedX20pSupport:
   - get_driver() dispatch for the x20p aliases.
   - X20PDriver signal-name dispatch (GPS/GAL incl. the new GAL E6).
 
-Hardware-gated parts (signal-config NAK behavior, BDS carrier re-survey,
-auto-detect wiring) are validated separately on PiPuss.
+Hardware-gated parts (signal-config NAK behavior, BDS carrier re-survey)
+are validated separately on PiPuss.
 """
 
 import unittest
+from unittest import mock
 
 from peppar_fix.receiver import (
+    F9TL5Driver,
     X20PDriver,
+    driver_for_module,
+    ensure_receiver_ready,
     get_driver,
     parse_sec_uniqid,
 )
@@ -118,6 +122,62 @@ class TestX20PDriverSignals(unittest.TestCase):
         # default IF pairs until the hardware re-survey.
         systems = {pair[0] for pair in self.drv.if_pairs}
         self.assertEqual(systems, {"GPS", "GAL"})
+
+
+class TestDriverForModule(unittest.TestCase):
+
+    def test_x20_module_strings(self):
+        for m in ("ZED-X20P", "zed-x20p", "ZED-X20P-00B", "X20"):
+            with self.subTest(m=m):
+                self.assertIsInstance(driver_for_module(m), X20PDriver)
+
+    def test_f9_f10_and_empty_return_none(self):
+        for m in ("ZED-F9T", "ZED-F9P", "NEO-F10T", "", None, "unknown"):
+            with self.subTest(m=m):
+                self.assertIsNone(driver_for_module(m))
+
+
+class TestEnsureReceiverReadyDispatch(unittest.TestCase):
+    """ensure_receiver_ready routes an X20 identity to the no-reconfigure
+    path and never runs the F9T signal-config dance on it."""
+
+    def _patches(self, module):
+        identity = {"module": module, "unique_id": 1, "unique_id_hex": "01",
+                    "firmware": "x", "protver": "y"}
+        return (
+            mock.patch("peppar_fix.receiver.query_receiver_identity",
+                       return_value=identity),
+            mock.patch("peppar_fix.receiver_state.check_receiver_change",
+                       return_value=(None, "new")),
+            mock.patch("peppar_fix.receiver_state.new_receiver_state",
+                       return_value={}),
+            mock.patch("peppar_fix.receiver_state.save_receiver_state"),
+        )
+
+    def test_x20_identity_takes_no_reconfigure_path(self):
+        p_id, p_chg, p_new, p_save = self._patches("ZED-X20P")
+        with p_id, p_chg, p_new, p_save, \
+                mock.patch("peppar_fix.receiver._ready_no_signal_reconfigure",
+                           side_effect=lambda port, baud, driver, *a, **k: driver) as nrc, \
+                mock.patch("peppar_fix.receiver.configure_signals") as sig:
+            driver, ident = ensure_receiver_ready("/dev/x", 115200,
+                                                  port_type="USB")
+        self.assertIsInstance(driver, X20PDriver)
+        self.assertEqual(ident["module"], "ZED-X20P")
+        nrc.assert_called_once()
+        sig.assert_not_called()  # F9T signal-config path never entered
+
+    def test_f9t_identity_does_not_take_no_reconfigure_path(self):
+        p_id, p_chg, p_new, p_save = self._patches("ZED-F9T")
+        with p_id, p_chg, p_new, p_save, \
+                mock.patch("peppar_fix.receiver._ready_no_signal_reconfigure") as nrc, \
+                mock.patch("peppar_fix.receiver._check_dual_freq",
+                           return_value=(6, 10, set())), \
+                mock.patch("peppar_fix.receiver._detect_second_freq",
+                           return_value="l5"):
+            driver, _ = ensure_receiver_ready("/dev/x", 115200, port_type="USB")
+        self.assertIsInstance(driver, F9TL5Driver)
+        nrc.assert_not_called()
 
 
 if __name__ == "__main__":

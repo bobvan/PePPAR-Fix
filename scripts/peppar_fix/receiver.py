@@ -522,6 +522,26 @@ def get_driver(name):
     raise ValueError(f"Unknown receiver model: {name}")
 
 
+def driver_for_module(module):
+    """Map a MON-VER MOD= module string to a driver, or None.
+
+    Used by ensure_receiver_ready() to dispatch by identity for receivers
+    whose readiness path differs from the F9T family.  Only such receivers
+    get an entry here — F9T-class modules return None and fall through to
+    the existing L5/L2 auto-detect + F9-style reconfigure logic.
+
+    Currently the only entry is the Gen-10 ZED-X20P (any module string
+    containing "X20"): the X20 drops the legacy CFG message types and its
+    CFG_SIGNAL_*/L5-health/warm-restart sequence is F9-specific, so it
+    takes the no-signal-reconfigure readiness path instead.
+    """
+    if not module:
+        return None
+    if "X20" in module.strip().upper():
+        return X20PDriver()
+    return None
+
+
 # ── Low-level UBX helpers ──────────────────────────────────────────────────── #
 
 def probe_baud(port):
@@ -1575,6 +1595,47 @@ def _detect_second_freq(sig_ids_seen):
     return None
 
 
+def _ready_no_signal_reconfigure(port, baud, driver, port_type, systems,
+                                 sfrbx_rate=1, measurement_rate_ms=1000,
+                                 timeout_s=10):
+    """Ready a non-F9T receiver WITHOUT touching signal config.
+
+    For receivers (currently the Gen-10 ZED-X20P) whose signals are
+    already enabled by the factory profile and whose F9-style
+    CFG_SIGNAL_* / GPS-L5-health / warm-restart sequence is inapplicable
+    or unverified.  Enables only the required OUTPUT messages + measurement
+    rate via CFG_MSGOUT_*/CFG_RATE (the X20 ACKs CFG_MSGOUT_UBX_RXM_RAWX —
+    verified on PiPuss 2026-06-08; any individual key that NAKs is logged
+    per-key by send_cfg and is non-fatal), then verifies dual-frequency
+    observations.
+
+    Always returns `driver`.  There is no reconfigure fallback for these
+    receivers, so a low dual-freq count is logged but still returns the
+    correct driver — better than the None -> default-F9T fallback, which
+    would attach the wrong signal map to an X20.
+    """
+    _ensure_imports()
+    port_id = {"UART": 1, "UART2": 2, "USB": 3, "SPI": 4, "I2C": 0}
+    pid = port_id.get(port_type, 3)
+    ser, ubr = open_receiver(port, baud)
+    try:
+        configure_rate_ms(ser, ubr, measurement_rate_ms)
+        configure_messages(ser, ubr, pid, sfrbx_rate=sfrbx_rate, driver=driver)
+        configure_nmea_off(ser, ubr, pid)
+    finally:
+        ser.close()
+    dual, total, _sigs = _check_dual_freq(port, baud, driver, systems,
+                                          timeout_s=timeout_s)
+    if dual >= 4:
+        log.info("%s ready: %d/%d SVs dual-freq (no signal reconfigure)",
+                 driver.name, dual, total)
+    else:
+        log.warning("%s: only %d/%d SVs dual-freq — returning driver anyway "
+                    "(no F9-style reconfigure path for this receiver)",
+                    driver.name, dual, total)
+    return driver
+
+
 def ensure_receiver_ready(port, baud, port_type="USB", systems=None,
                           timeout_s=10, sfrbx_rate=1,
                           measurement_rate_ms=1000,
@@ -1650,6 +1711,28 @@ def ensure_receiver_ready(port, baud, port_type="USB", systems=None,
     else:
         log.warning("Could not identify receiver on %s — state persistence disabled",
                     port)
+
+    # Identity-based dispatch for Generation-10 receivers (ZED-X20P),
+    # ahead of the F9T-shaped paths below.  The X20 drops the legacy CFG
+    # message types and its CFG_SIGNAL_*/L5-health/warm-restart sequence is
+    # F9-specific — running that path on an X20 would NAK and could wedge
+    # it.  Triggers when forced to x20p (--receiver x20p) OR when MON-VER
+    # identifies an X20 and no driver was forced.  An explicit non-X20
+    # force (e.g. --receiver f9t for diagnostics) still wins and falls
+    # through.  The X20 tracks dual-freq GPS+GAL out of the box, so this
+    # path only enables output messages — see _ready_no_signal_reconfigure.
+    id_module = identity.get("module") if identity else None
+    x20_driver = (forced_driver if isinstance(forced_driver, X20PDriver)
+                  else (driver_for_module(id_module)
+                        if forced_driver is None else None))
+    if x20_driver is not None:
+        log.info("Identity dispatch: %s (module=%s) — no-signal-reconfigure path",
+                 x20_driver.name, id_module)
+        drv = _ready_no_signal_reconfigure(
+            port, baud, x20_driver, port_type, systems,
+            sfrbx_rate=sfrbx_rate, measurement_rate_ms=measurement_rate_ms,
+            timeout_s=timeout_s)
+        return drv, identity
 
     # Forced driver: skip auto-detection, configure the specified driver.
     # Used for diagnostics (e.g. --receiver f9t to force L2 on TimeHat).
