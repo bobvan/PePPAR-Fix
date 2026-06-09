@@ -8063,9 +8063,14 @@ def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
                               its free-running frequency offset, so the error
                               ramps unbounded → 30-consecutive exit-5 cascade
                               (servoOutlierDoomLoop, diagnosed 2026-06-08).
-                              Caller should treat this like ``ok`` — LET THE
-                              EKF UPDATE PROCEED so the filter absorbs the
-                              error and arrests the ramp.  Counters reset.
+                              Caller should RE-ACQUIRE (servo reset) so the
+                              filter re-locks.  NOTE (reworked 2026-06-09):
+                              do NOT just let the EKF update through — the
+                              large innovation is rejected by the EKF chi²
+                              gate and the DO drifts (the regression that
+                              replaced the exit-5 re-bootstrap re-lock with a
+                              let-through).  Catching it early (small error)
+                              keeps the re-acquire gentle.  Counters reset.
       ``("outlier", False)`` — single/short outlier (spike), cascade counter
                               incremented but below exit-5 limit.  Caller
                               should log + skip the EKF update.
@@ -8444,13 +8449,32 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         ramp_accept_n=getattr(args, 'outlier_ramp_accept_n', 5),
     )
     if _decision == "ramp_accept":
-        # servoOutlierDoomLoop fix: sustained same-sign ramp = real
-        # divergence, not a spike.  Fall through to the EKF update (do NOT
-        # skip) so the filter absorbs the error and arrests the ramp.
-        log.warning(
-            "  Sustained same-sign outlier ramp (pps_err=%+.0fns) — letting "
-            "EKF absorb to arrest the ramp instead of skipping "
-            "(servoOutlierDoomLoop)", outlier_observable_ns)
+        # servoOutlierDoomLoop fix (REWORKED 2026-06-09): a sustained
+        # same-sign ramp is a REAL divergence.  RE-ACQUIRE via a servo
+        # reset so the filter re-locks.  Do NOT let the measurement through
+        # (the original 2026-06-08 attempt): its large innovation is then
+        # rejected by the EKF chi² gate, so no correction is applied and
+        # the DO drifts — that let-through silently broke frequency lock
+        # (caught 2026-06-09 by chA-chB drift on the scope, hidden from the
+        # detrended-TDEV metric).  Catching the ramp at ramp_accept_n epochs
+        # (small error) keeps the re-acquire gentle; budget exhausted falls
+        # back to exit-5 (full re-bootstrap, which also re-locks).
+        if _request_servo_reset(ctx, 'ramp_reacquire') == "reset":
+            ctx['consecutive_outliers'] = 0
+            log.warning(
+                "  Sustained same-sign outlier ramp (pps_err=%+.0fns) — "
+                "servo re-acquire to re-lock (servoOutlierDoomLoop)",
+                outlier_observable_ns)
+            return "outlier"
+        log.error(
+            "  Sustained same-sign outlier ramp (pps_err=%+.0fns) + reset "
+            "budget exhausted — exiting for re-bootstrap (exit code 5)",
+            outlier_observable_ns)
+        _dfe = ctx.get('dfe_sm')
+        if _dfe is not None:
+            _dfe.transition(DOFreqEstState.HOLDOVER, "sustained outlier ramp")
+        ctx['phc_diverged'] = True
+        return "outlier"
     if _decision == "outlier":
         if _exit5:
             # exitFiveToServoReset site B (PHC/EKF outlier cascade):
