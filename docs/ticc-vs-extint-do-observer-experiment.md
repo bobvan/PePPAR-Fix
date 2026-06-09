@@ -32,12 +32,32 @@ not one-per-clock.**
 - **"both" locks clean across DO classes** — clkPoC3 OCXO (0.1 ns @1 s) and
   TimeHat TCXO (1.9 ns @1 s; ~19× = the DO floor difference, as expected).
 
-**What is NOT cleanly answered, and why:**
-- **TICC-only's intrinsic noise floor is unmeasured.** It can't hold a
-  clean lock as a *sole* observer: the EKF chi² gate, sized to its ~60 ps
-  σ, rejects the DO's ns-scale motion as outliers → constant re-acquire →
-  step-contaminated TDEV (~seconds, not a real floor). EXTINT's loose
-  ~5–10 ns σ is exactly why it locks clean. Fix = [[soloObserverChiGate]].
+**TICC-only floor — now MEASURED (2026-06-09, [[soloObserverChiGate]]):**
+TICC-only previously couldn't hold a clean lock as a *sole* observer — the
+EKF chi² gate, sized to its ~60 ps σ, rejected the DO's ns-scale motion as
+outliers → constant re-acquire → step-contaminated TDEV. The
+soloObserverChiGate fix (bypass the chi² reject when TICC is the sole
+DO-phase observer) cured it: chi²-rejects 231→0, re-acquire cycle gone,
+chA−chB ±10 ns, 0 drift. **Clean clkPoC3 noise floor, identical method:**
+
+| arm | τ=1 s | τ=10 s | τ=100 s |
+|---|---|---|---|
+| **EXTINT** | **51 ps** | 36 ps | 0.82 ns |
+| TICC-only | 79 ps | 74 ps | 0.73 ns |
+| both | 84 ps | 121 ps | 2.21 ns |
+
+**Ranking @1 s: EXTINT (51) < TICC-only (79) < both (84).** Even with its
+tight σ properly used, **TICC-only does not beat the free EXTINT** at the
+budget-relevant short τ; all three are the same order (~50–84 ps). The fix
+also *equalized robustness* (TICC-only now locks as cleanly as the others,
+where it was the least robust). So the decision rests on floor (EXTINT
+marginally best) + cost (TICC = hardware) → **per-clock TICC not justified**,
+now backed by a real measurement, not just TICC-only's former instability.
+(Caveat: TICC-only run is cross-time vs EXTINT/both, single host clkPoC3 —
+but the EXTINT-cleanest direction is consistent across 3 clkPoC3 runs + the
+first-overnight PiFace.)
+
+**What is still NOT cleanly answered:**
 - **Multi-host breadth is thin.** Only clkPoC3 is dependably clean;
   TimeHat and MadHat keep **dropping their TICC chA channel or drifting**
   (madhatChaCable; TimeHat lost chA in the EXTINT run; MadHat drifted both
