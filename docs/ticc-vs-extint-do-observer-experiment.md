@@ -220,6 +220,64 @@ competitive. A conclusive decision needs a redo with the fixes below.
    so TICC-only and TDCP actually yield data.
 5. 4 h+ windows for solid τ ≥ 100 s.
 
+## Results — second overnight (2026-06-09, after the servo fix)
+
+Re-run after fixing the outlier doom loop (`servoOutlierDoomLoop` →
+re-acquire on a sustained ramp, not let-through; main `0af1a3e`). Data:
+`gt:/home/bob/gt/peppar-fix-data/ticcexp3-20260609/`. **Caveats:** clkPoC3
+was the only host with a usable metric — MadHat's DO-PPS→TICC-chA cable was
+dead all night (chA=0 every window), and PiFace drifted on *every* arm
+(−2.5 to −14.7 ppb, host-specific, excluded). W4 was truncated to ~64 min
+(operator killed it ~56 min early); τ ≤ 100 s still valid there.
+
+**Crucial method fix:** verify lock by **chA−chB drift**, not
+`DOFreqEst=tracking` — the buggy let-through (the first version of the doom-
+loop fix) drifted silently because the filter state *and* the detrended-TDEV
+metric are both blind to frequency drift. Caught on the scope.
+
+clkPoC3 4-arm (Rb-ref, absolute), TDEV of chA detrended (ns):
+
+| arm | re-boots (exit-5) | τ=1 s | τ=10 s | τ=100 s | status |
+|---|---|---|---|---|---|
+| **EXTINT-only** | **0** | **0.052** | 0.037 | 0.91 | clean, locked |
+| **both** | **0** | 0.086 | 0.121 | 2.09 | clean, locked |
+| TDCP | 3 | — | — | — | light sawtooth (TDEV step-contaminated) |
+| TICC-only | 34 | — | — | — | heavy sawtooth (TDEV step-contaminated) |
+
+**Findings:**
+- **Drift regression fixed:** all four arms now *lock* (chA−chB drift ≈ 0),
+  vs the buggy let-through's silent drift.
+- **Robustness (re-bootstrap count): EXTINT (0) = both (0) < TDCP (3) ≪
+  TICC-only (34).** The single TICC observer is the *least* robust (its
+  large innovations are chi²-gated hardest, forcing constant re-acquire);
+  EXTINT-only is as robust as the fused "both".
+- **Noise floor (clean, 0-re-boot arms): EXTINT-only (52 ps @1 s) < both
+  (86 ps @1 s) at every τ.** The gentle single observer gives the cleanest
+  output; the second observer ("both") adds robustness margin at a small
+  TDEV cost. Consistent with the first overnight (extint ≤ both ≤ ticc at
+  τ=1 s). The "tight TICC observer over-actuates" reading now holds on two
+  hosts/receivers.
+- TICC-only and TDCP TDEV are **step-contaminated** by their re-bootstraps,
+  so their *intrinsic* noise floor is still not measured — the in-process
+  re-acquire never engaged (reset budget exhausted → full re-bootstrap each
+  time). A fair TICC-only floor needs the reset budget loosened.
+
+**Verdict (strengthened, with one caveat):** a **per-clock TICC is not
+justified** by this data — EXTINT (free) is the cleanest at short τ *and*
+as robust as "both", while TICC-only is the least stable arm. Favor
+**EXTINT, or "both" when you want robustness margin**; a TICC is better
+deployed as a *shared validation* instrument than one-per-clock. Caveat:
+TICC-only's true floor is unmeasured (the reset-budget bug makes it
+sawtooth), so the head-to-head isn't fully apples-to-apples until that's
+fixed.
+
+**Blockers for a fully clean head-to-head (next attempt):**
+1. **Reset budget** — let the in-process re-acquire engage so single-
+   observer arms lock *gently* (no re-bootstrap steps) → clean TICC-only /
+   TDCP TDEV.
+2. **PiFace** host-specific drift (drifts on every arm; not the doom loop).
+3. **MadHat** DO-PPS→TICC-chA cable (dead all night → no metric).
+
 ## Open questions
 
 - Is τ ≥ 300 s worth longer runs (4–8 h) on a follow-up night, or is the
