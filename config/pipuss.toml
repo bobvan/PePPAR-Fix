@@ -1,9 +1,54 @@
 [peppar]
-serial = "/dev/gnss-top"
-baud = 9600
+# PiPuss — u-blox ZED-X20P (Generation 10) on the lab common UFO1
+# antenna via the GUS splitter.  Receiver bring-up 2026-06-08; engine
+# support landed on branch bravo/zed-x20p-support (dayplan zedX20pSupport).
+# See memory reference_zed_x20p_pipuss_bringup for the full bring-up facts.
+#
+# Role: receiver characterization / RINEX archival / reference.  There is
+# NO disciplined oscillator and NO TICC on PiPuss — hence no ptp_dev, no
+# do_*/dac_* actuator block, and no ticc_port.  The engine runs its PPP
+# position filter (seeded at the UFO1 survey ARP) and archives RINEX; it
+# does not discipline a clock here.
+
+# The ZED-X20P shares the generic u-blox USB descriptor (VID:PID
+# 1546:01ab, no unique serial number), so /dev/ttyACMx is fragile —
+# enumeration shifts when any USB device is added/removed, and a second
+# u-blox (PiPuss was historically a dual-F9T host) would make by-id
+# ambiguous.  Bind to the physical USB port via /dev/serial/by-path;
+# only breaks if the receiver's USB cable is moved to a different port.
+# See docs/lab-operations.md §12.  Native USB CDC-ACM ignores baud.
+serial = "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:2:1.0"
+baud = 115200
 ubx_port = "USB"
-receiver = "f9t-l5"
+
+# ZED-X20P driver (Gen 10, PROTVER 50.10, HPG 2.02).  ensure_receiver_ready
+# auto-detects this from MON-VER MOD=ZED-X20P, so "receiver" here is mostly
+# documentation / a force for the rare diagnostic case.
+receiver = "x20p"
+
 ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
+
+# GPS+GAL only.  The X20 also tracks BDS (B1C/B2a/B3I) and GAL E6, all
+# verified native-cpMes 2026-06-08, but BDS is held out for the same
+# reason as the L5-tracking F9T hosts: no AC publishes BDS B2a-I phase
+# biases (docs/bds-b2a-phase-bias-survey-2026-05-09.md).  Matches
+# X20PDriver's default IF pairs.
 systems = "gps,gal"
-# No ptp_dev — PiPuss is for position/caster testing, not PHC discipline
+
+# Operational ARP — engine reads timelab/antennas.json[ufo1] at startup
+# as an in-memory survey-class seed candidate so the PPP filter seeds at
+# survey truth (σ ≈ 9 mm OPUS) instead of NAV2 (~1-2 m biased).  The
+# antennas.json read is in-memory only; only peppar-survey writes
+# state/positions/<uid>.survey.toml.  Single source of truth:
+# timelab/antennas.json.  UFO1 is the current lab antenna (see
+# antennas.json[ufo1]; reference_ufo1_choke1_two_arps).
+arp_label = "ufo1"
+
+# RINEX archival for offline PRIDE comparison + peppar-survey --pride —
+# the core of PiPuss's reference role.  Path templates {date} (UTC
+# YYYYDDD, triggers UTC-midnight rotation) and {host}.  Decimation to
+# 30 s matches PRIDE/RTKLIB standard input; the engine still consumes
+# RAWX at 1 Hz for its own filter (decimation is writer-side only).
+rinex_out = "data/rinex/{host}-{date}.obs"
+rinex_decimate_s = 30.0
