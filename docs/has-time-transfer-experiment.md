@@ -268,6 +268,52 @@ correction *quality* from coverage.  HAS's GPS-L5 gap and BDS gap are
 documented coverage findings (a real-world cost of HAS on an L5 receiver),
 not things to demonstrate via a confounded run.
 
+## DEFINITIVE RESULT — GAL-only LCD, 60 min (2026-06-09)
+
+3601 epochs on identical GAL obs (16 SVs), rx-TCXO cancelled by the
+pairwise difference.  TDEV of `dt_rx_arm − dt_rx_broadcast` (ps):
+
+| arm | 1 s | 16 s | 32 s | 256 s |
+|---|---:|---:|---:|---:|
+| **BKG** SSRA00BKG0 | 14 | 4.4 | 3.5 | 3.2 |
+| **CNES** SSRA00CNE0 | 16 | 4.9 | 4.3 | 3.3 |
+| **CAS** SSRA01CAS1 | 18 | 23 | 26 | 30 |
+| **HAS** (E6 SIS) | 24 | 67 | 106 | 94 |
+
+BKG and CNES **agree to ~1–3 ps** at long τ (the mature precise cluster).
+**HAS is ~25–30× noisier (~100 ps) and CAS ~3× (~30 ps)** at the
+timing-relevant τ (16–256 s).  Crucially, **HAS's ~100 ps stays well
+within the moonshot per-clock budget (≤ 350 ps)** — so HAS is *usable*
+for the timing mission, just measurably less precise than internet-
+delivered precise SSR.  Given HAS is free and needs no internet (E6 SIS),
+that's the tradeoff: ~100 ps clock-correction noise for zero
+connectivity/cost.  (Datum offsets: HAS +1.0, CAS +0.5, BKG/CNES ~0 ns.)
+
+## X20 GPS L5 config state (queried 2026-06-09)
+
+- `CFG_SIGNAL_GPS_L5_ENA`: RAM=1, **Default=1**, Flash/BBR unset → GPS L5
+  tracking is on by **factory default** (no flash override, none from us).
+- `CFG_SIGNAL_HEALTH_L5` (0x10320001): RAM=0, Default=0 → L5 **health
+  override OFF** → the X20 respects broadcast L5 health (tracks healthy
+  L5 SVs, skips unhealthy).  We have not forced unhealthy L5.
+
+So the X20 ships L5-enabled (contra the old F9-era "factory disables L5"
+assumption), and our integration sends no signal/health config at all.
+
+## Best-effort (Philosophy 1): per-band runs, not per-arm IF
+
+A single run with each service on its *own* GPS band (HAS→L1+L2CL,
+CNES→L1+L5) is architecturally blocked: `serial_reader` forms the IF
+combination **once** (one driver's `if_pairs`) before the obs reach the
+filters, so all arms share one IF band.  Per-arm IF would need an
+obs-pipeline refactor (emit raw per-signal obs, form per-arm IF with
+per-arm code biases).  The realizable form is **per-band runs**: hold the
+global IF band, run the comparison on each band (`--gps-band`):
+`IF_PAIR_PARAMS` has both GPS-L1CA+L2CL and GPS-L1CA+L5Q.  Each single-band
+run is fair to the services covering that band — GAL E1+E5a (all),
+GPS L1+L2CL (HAS covers; CNES L2W won't match L2CL), GPS L1+L5 (CNES
+covers via L5I→L5Q; HAS has no L5).  Together they map the coverage space.
+
 ## Success criteria
 
 - **Primary:** HAS reduces TDEV(dt_rx) at τ ≥ 100 s by a clear margin

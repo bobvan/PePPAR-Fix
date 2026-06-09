@@ -74,6 +74,11 @@ def main():
     ap.add_argument("--duration", type=float, default=1800)
     ap.add_argument("--eph-mount", default="BCEP00BKG0")
     ap.add_argument("--arms", default="broadcast,has,bkg,cas,cnes")
+    ap.add_argument("--gps-band", choices=("L5", "L2"), default="L5",
+                    help="GPS IF band (best-effort per-band runs): L5 = "
+                         "L1CA+L5Q (CNES covers, HAS has no L5); L2 = "
+                         "L1CA+L2CL (HAS covers).  Only used when 'gps' is "
+                         "in --systems.")
     ap.add_argument("--systems", default="gps,gal",
                     help="constellations admitted to ALL arms.  Default "
                          "gps,gal = the set Galileo HAS Phase 1 covers, so "
@@ -93,7 +98,16 @@ def main():
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     arp = _load_arp(args.arp_label)
-    print("ARP %s = %s; arms = %s" % (args.arp_label, arp, arms))
+    # Per-band best-effort (Philosophy 1): the IF band is set ONCE here (one
+    # driver -> one serial_reader -> shared IF obs), so run separate bands to
+    # map the coverage space.  --gps-band L2 uses GPS L1CA+L2CL (which HAS
+    # covers); L5 (default) uses L1CA+L5Q (which CNES covers, HAS does not).
+    driver = get_driver("x20p")
+    if args.gps_band == "L2":
+        driver.if_pairs = (("GPS", "GPS-L1CA", "GPS-L2CL", "G"),
+                           ("GAL", "GAL-E1C", "GAL-E5aQ", "E"))
+    print("ARP %s = %s; arms = %s; gps_band = %s (IF pairs %s)"
+          % (args.arp_label, arp, arms, args.gps_band, driver.if_pairs))
 
     beph = BroadcastEphemeris()
     ssr = {a: SSRState() for a in arms}   # broadcast's stays empty
@@ -106,7 +120,7 @@ def main():
     systems = set(s.strip() for s in args.systems.split(",") if s.strip())
     threads.append(threading.Thread(target=serial_reader, args=(
         args.serial, args.baud, obs_q, stop, beph), kwargs={
-        "systems": systems, "driver": get_driver("x20p"),
+        "systems": systems, "driver": driver,
         "ubx_log_file": ubx_f}, daemon=True))
 
     # broadcast eph stream (shared beph) — use a throwaway SSRState sink
