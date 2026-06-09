@@ -1963,6 +1963,62 @@ def ntrip_reader(stream, beph, ssr, stop_event, label="NTRIP",
              f"Types: {dict(msg_counts)}")
 
 
+def load_ssr_records(path):
+    """Parse an external SSR-records JSON file written by an out-of-process
+    correction source (e.g. the Galileo HAS bridge, tools/has_ssr_bridge.py).
+
+    Schema (see docs/has-time-transfer-experiment.md):
+        {"epoch_s": float,
+         "records": [{prn, iode, orbit:[r,a,c], clock, code_bias:{code:bias}}]}
+
+    Returns (epoch_s, records) or (None, None) on missing/empty/garbled file
+    (a half-written file just gets skipped until the next poll).
+    """
+    import json
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None, None
+    recs = d.get("records")
+    if not recs:
+        return None, None
+    return float(d.get("epoch_s", 0.0)), recs
+
+
+def ssr_records_reader(path, ssr, stop_event, label="SSR-RECORDS",
+                       poll_s=1.0):
+    """Feed SSRState from an external records JSON, mirroring ntrip_reader.
+
+    Source-agnostic external SSR ingestion: re-reads ``path`` whenever its
+    mtime changes and applies the records via SSRState.update_from_records,
+    stamping the read time as rx_mono (freshness).  Used for Galileo HAS
+    decoded out-of-process; works for any producer of the schema.
+    """
+    n = 0
+    last_mtime = None
+    while not stop_event.is_set():
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+        if mtime is not None and mtime != last_mtime:
+            last_mtime = mtime
+            epoch_s, recs = load_ssr_records(path)
+            if recs:
+                try:
+                    counts = ssr.update_from_records(
+                        recs, epoch_s, rx_mono=time.monotonic(),
+                        src_mount=label)
+                    n += 1
+                    if n % 30 == 1:
+                        log.info("[%s] ingested SSR records: %s", label, counts)
+                except Exception as e:
+                    log.warning("[%s] records ingest failed: %s", label, e)
+        stop_event.wait(poll_s)
+    log.info("[%s] Stopped after %d ingests.", label, n)
+
+
 # ── File-based replay mode ──────────────────────────────────────────────────── #
 
 def run_replay(args):

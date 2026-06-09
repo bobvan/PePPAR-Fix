@@ -15,7 +15,18 @@ authors = [
 
 dependencies = [
     "numpy",
-    "pyubx2>=1.2.55",
+    # scipy: hard import-time dependency of the engine via ppp_ar.py /
+    # lambda_ar.py (AR / LAMBDA) and peppar_fix.kalman_servo.  Was
+    # undeclared — a fresh `pip install -e .` produced an engine that
+    # ImportError'd on `from scipy.stats import norm` (caught provisioning
+    # PiPuss 2026-06-08).
+    "scipy",
+    # >=1.2.57 required for ZED-X20P (PROTVER 50.x): 1.2.57 added the
+    # X20P HPG 2.00 NAV payload definitions (NAV-PVT/SAT/SIG/TIMEGPS).
+    # Earlier releases (1.2.52/1.2.55) misframe the newer messages and
+    # UBXReader.read() HANGS for minutes on an X20P stream, holding the
+    # serial port — see memory reference_zed_x20p_pipuss_bringup.
+    "pyubx2>=1.2.57",
     "pyserial",
     "pyrtcm>=1.1.0",
     # geo_frames: NAD83(2011)<->ITRF2020 datum/epoch conversion.

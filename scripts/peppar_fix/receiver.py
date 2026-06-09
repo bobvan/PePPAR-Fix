@@ -251,6 +251,46 @@ F10T_SIGNAL_NAMES.update(F10_BDS_SIG_NAMES)
 F9P_SIGNAL_NAMES = dict(_GPS_GAL_SIG_NAMES)
 F9P_SIGNAL_NAMES.update(F10_BDS_SIG_NAMES)
 
+# Galileo E6 (gnssId=2, sigId=8) is new on the ZED-X20P / Generation 10 —
+# the F9/F10 families don't track E6.  E6 (1278.75 MHz) carries the
+# Galileo HAS corrections.  Confirmed tracked with carrier phase on PiPuss
+# 2026-06-08 (NAV-SIG C/N0 50, qualityInd 7; cpMes present in RXM-RAWX).
+# The code (E6-B data vs E6-C pilot) is not distinguished by sigId here;
+# named at the band level.
+_X20_GAL_E6 = {
+    (2, 8): "GAL-E6",
+}
+
+# SBAS L1 C/A (gnssId=1, sigId=0).  The X20 tracks SBAS (observed on
+# PiPuss 2026-06-08, C/N0 45) but the engine doesn't process it — SYS_MAP
+# has no gnssId=1 entry — so this is documentary only (keeps the signal
+# from showing as "unmapped" in surveys).
+_X20_SBAS = {
+    (1, 0): "SBAS-L1CA",
+}
+
+# ZED-X20P signal-name map.  All entries were confirmed against the live
+# receiver on PiPuss 2026-06-08 via NAV-SIG + RXM-RAWX (PROTVER 50.10) —
+# see memory reference_zed_x20p_pipuss_bringup.
+#
+# GPS/GAL sigIds match the F9/F10 table (survey: GPS 0/3/4/7 =
+# L1CA/L2CL/L2CM/L5Q, GAL 0/4 = E1C/E5aQ) plus the new GAL E6 (sigId=8).
+#
+# BDS: the survey resolved sigIds 4/5/7 as B3I / B1Cp / B2ap under the F10
+# chipset convention — confirming the X20 (Gen 10) uses the F10 BDS
+# numbering, NOT the legacy F9T B1I/B2I numbering (sigId 4 = B3I is new;
+# the F9T family never tracks B3I).  cpMes SCALING VERIFIED native on the
+# X20 2026-06-08 (Δcp/Δt vs Doppler ratio = 1.000 for B2a/B3I/E6, with
+# GPS-L5Q at the same 1176.45 MHz as a 1.000 control) — the F9T B2a
+# L1-reference-cycle quirk (the 2026-04-19 BDS 1500 ns ISB class of bug)
+# does NOT exist here.  BDS is still kept out of X20PDriver's default IF
+# pairs, but on SSR-phase-bias grounds (no AC publishes BDS B2a-I biases),
+# not cpMes scaling.
+X20P_SIGNAL_NAMES = dict(_GPS_GAL_SIG_NAMES)
+X20P_SIGNAL_NAMES.update(_X20_GAL_E6)
+X20P_SIGNAL_NAMES.update(_X20_SBAS)
+X20P_SIGNAL_NAMES.update(F10_BDS_SIG_NAMES)
+
 SYS_MAP = {
     0: "gps",
     2: "gal",
@@ -418,6 +458,52 @@ class F9PDriver(ReceiverDriver):
     )
 
 
+class X20PDriver(ReceiverDriver):
+    """u-blox ZED-X20P — Generation 10, quad-band (L1/L2/L5/E6) HPG.
+
+    First seen on PiPuss 2026-06-08: MOD=ZED-X20P, FWVER=HPG 2.02,
+    PROTVER=50.10.  Tri-band tracking confirmed (GPS+GAL+BDS+SBAS, no
+    GLONASS) at C/N0 47-53 dBHz on the lab UFO1 antenna.  See memory
+    reference_zed_x20p_pipuss_bringup and dayplan zedX20pSupport.
+
+    Hardware-validated on PiPuss 2026-06-08:
+      - Signal-name dispatch for GPS/GAL/BDS/SBAS (NAV-SIG survey), incl.
+        the new GAL E6 (sigId=8) and the F10-convention BDS numbering.
+      - SEC-UNIQID v2 (6-byte) identity, handled in parse_sec_uniqid().
+      - cpMes is in NATIVE carrier cycles for every signal (Δcp/Δt vs
+        Doppler ratio = 1.000 for B2a/B3I/E6) — the F9T B2a L1-reference
+        quirk does NOT exist here, so bds_l1_ref_cycles stays empty.
+
+    What is NOT yet wired and keeps this driver conservative:
+      - BDS stays out of the default IF pairs — not for a cpMes reason
+        (that's cleared) but because no AC publishes BDS B2a-I phase
+        biases (docs/bds-b2a-phase-bias-survey-2026-05-09.md), the same
+        policy as the L5-tracking F9T hosts.  GPS+GAL is the default.
+      - signal_config: Generation 10 removes the legacy CFG message
+        types but the CFG_SIGNAL_* VALSET keys / NAK behavior on X20
+        firmware are unverified, so the auto-configure path
+        (ensure_receiver_ready) is still F9T-shaped and does not yet
+        select this driver.  Use --receiver x20p only once the config
+        path is wired (zedX20pSupport step 4).
+    """
+    name = "ZED-X20P"
+    protver = "50"
+    default_baud = 115200  # native USB CDC-ACM ignores baud
+    supports_timing_mode = False  # HPG positioning firmware, not TIM
+    supports_l5_health_override = False
+    signal_names = X20P_SIGNAL_NAMES
+    # Empty is CORRECT (not a placeholder): verified on PiPuss 2026-06-08
+    # that the X20 reports BDS B1C/B2a/B3I and GAL E6 cpMes in native
+    # cycles — no L1-reference-cycle correction needed.
+    bds_l1_ref_cycles = frozenset()
+    # GPS+GAL only by default — BDS held back on SSR-phase-bias grounds,
+    # not cpMes scaling (which is verified native).  See class docstring.
+    if_pairs = (
+        ('GPS', 'GPS-L1CA', 'GPS-L5Q', 'G'),
+        ('GAL', 'GAL-E1C', 'GAL-E5aQ', 'E'),
+    )
+
+
 def get_driver(name):
     """Return the receiver driver for a CLI receiver name."""
     key = (name or "f9t").strip().lower()
@@ -431,7 +517,34 @@ def get_driver(name):
         return F10TDriver()
     if key == "f9p":
         return F9PDriver()
+    if key in {"x20p", "x20", "zed-x20p", "zed_x20p"}:
+        return X20PDriver()
     raise ValueError(f"Unknown receiver model: {name}")
+
+
+def driver_for_module(module):
+    """Map a MON-VER MOD= module string to a driver, or None.
+
+    Used by ensure_receiver_ready() to dispatch by identity for receivers
+    whose readiness path differs from the F9T family.  Only such receivers
+    get an entry here — F9T-class modules return None and fall through to
+    the existing L5/L2 auto-detect + F9-style reconfigure logic.
+
+    Currently the only entry is the Gen-10 ZED-X20P (any module string
+    containing "X20"): the X20 drops the legacy CFG message types and its
+    CFG_SIGNAL_*/L5-health/warm-restart sequence is F9-specific, so it
+    takes the no-signal-reconfigure readiness path instead.
+
+    NB: the "X20" substring match would also dispatch a hypothetical future
+    variant (e.g. "ZED-X20-V2").  u-blox naming has been stable on the X20
+    line, so this is fine today; revisit this match if u-blox ever ships an
+    X20 variant whose readiness path should differ.
+    """
+    if not module:
+        return None
+    if "X20" in module.strip().upper():
+        return X20PDriver()
+    return None
 
 
 # ── Low-level UBX helpers ──────────────────────────────────────────────────── #
@@ -496,6 +609,30 @@ def _poll_ubx(ser, ubr, cls, msg_id, target_identity, timeout=3.0):
     return None
 
 
+def parse_sec_uniqid(payload):
+    """Parse a UBX-SEC-UNIQID payload into (unique_id_int, unique_id_hex).
+
+    The payload is a 4-byte header (1-byte version + 3 reserved) followed
+    by the hardware-fused unique ID, whose length is version-dependent:
+
+      - version 0x01 (F9 family, e.g. ZED-F9T/F9P): 5-byte ID, total
+        payload length 9.
+      - version 0x02 (ZED-X20P / Generation 10): 6-byte ID, total payload
+        length 10.  Confirmed on PiPuss 2026-06-08 (ID 98f4d50f3e54) —
+        see memory reference_zed_x20p_pipuss_bringup.
+
+    The ID is taken as everything after the 4-byte header rather than a
+    hardcoded slice, so it is forward-compatible with any future version
+    that keeps the version+reserved header and just widens the ID.
+
+    Returns (None, None) if the payload is too short to contain an ID.
+    """
+    if len(payload) < 9:  # 4-byte header + at least a 5-byte (v1) ID
+        return None, None
+    uid_bytes = payload[4:]
+    return int.from_bytes(uid_bytes, "little"), uid_bytes.hex()
+
+
 def query_receiver_identity(port, baud=9600, ser=None, ubr=None,
                             timeout=3.0):
     """Query receiver unique ID and firmware version.
@@ -513,7 +650,8 @@ def query_receiver_identity(port, baud=9600, ser=None, ubr=None,
 
     Returns:
         dict with keys:
-            unique_id: int (SEC-UNIQID, 5 bytes as integer) or None
+            unique_id: int (SEC-UNIQID, 5 bytes on F9 / 6 bytes on
+                ZED-X20P, parsed little-endian) or None
             unique_id_hex: str (hex representation) or None
             module: str (e.g. "ZED-F9T") or "unknown"
             firmware: str (e.g. "TIM 2.20") or "unknown"
@@ -588,10 +726,10 @@ def query_receiver_identity(port, baud=9600, ser=None, ubr=None,
                     _msg_len = struct.unpack_from("<H", _buf, _idx + 4)[0]
                     if len(_buf) >= _idx + 6 + _msg_len + 2:
                         _payload = _buf[_idx + 6:_idx + 6 + _msg_len]
-                        if _msg_len >= 9:
-                            uid_bytes = _payload[4:9]
-                            result["unique_id"] = int.from_bytes(uid_bytes, "little")
-                            result["unique_id_hex"] = uid_bytes.hex()
+                        uid_int, uid_hex = parse_sec_uniqid(_payload)
+                        if uid_int is not None:
+                            result["unique_id"] = uid_int
+                            result["unique_id_hex"] = uid_hex
                         break
         if result["unique_id"] is None:
             log.warning("SEC-UNIQID timed out — receiver may not support it")
@@ -1462,6 +1600,47 @@ def _detect_second_freq(sig_ids_seen):
     return None
 
 
+def _ready_no_signal_reconfigure(port, baud, driver, port_type, systems,
+                                 sfrbx_rate=1, measurement_rate_ms=1000,
+                                 timeout_s=10):
+    """Ready a non-F9T receiver WITHOUT touching signal config.
+
+    For receivers (currently the Gen-10 ZED-X20P) whose signals are
+    already enabled by the factory profile and whose F9-style
+    CFG_SIGNAL_* / GPS-L5-health / warm-restart sequence is inapplicable
+    or unverified.  Enables only the required OUTPUT messages + measurement
+    rate via CFG_MSGOUT_*/CFG_RATE (the X20 ACKs CFG_MSGOUT_UBX_RXM_RAWX —
+    verified on PiPuss 2026-06-08; any individual key that NAKs is logged
+    per-key by send_cfg and is non-fatal), then verifies dual-frequency
+    observations.
+
+    Always returns `driver`.  There is no reconfigure fallback for these
+    receivers, so a low dual-freq count is logged but still returns the
+    correct driver — better than the None -> default-F9T fallback, which
+    would attach the wrong signal map to an X20.
+    """
+    _ensure_imports()
+    port_id = {"UART": 1, "UART2": 2, "USB": 3, "SPI": 4, "I2C": 0}
+    pid = port_id.get(port_type, 3)
+    ser, ubr = open_receiver(port, baud)
+    try:
+        configure_rate_ms(ser, ubr, measurement_rate_ms)
+        configure_messages(ser, ubr, pid, sfrbx_rate=sfrbx_rate, driver=driver)
+        configure_nmea_off(ser, ubr, pid)
+    finally:
+        ser.close()
+    dual, total, _sigs = _check_dual_freq(port, baud, driver, systems,
+                                          timeout_s=timeout_s)
+    if dual >= 4:
+        log.info("%s ready: %d/%d SVs dual-freq (no signal reconfigure)",
+                 driver.name, dual, total)
+    else:
+        log.warning("%s: only %d/%d SVs dual-freq — returning driver anyway "
+                    "(no F9-style reconfigure path for this receiver)",
+                    driver.name, dual, total)
+    return driver
+
+
 def ensure_receiver_ready(port, baud, port_type="USB", systems=None,
                           timeout_s=10, sfrbx_rate=1,
                           measurement_rate_ms=1000,
@@ -1537,6 +1716,28 @@ def ensure_receiver_ready(port, baud, port_type="USB", systems=None,
     else:
         log.warning("Could not identify receiver on %s — state persistence disabled",
                     port)
+
+    # Identity-based dispatch for Generation-10 receivers (ZED-X20P),
+    # ahead of the F9T-shaped paths below.  The X20 drops the legacy CFG
+    # message types and its CFG_SIGNAL_*/L5-health/warm-restart sequence is
+    # F9-specific — running that path on an X20 would NAK and could wedge
+    # it.  Triggers when forced to x20p (--receiver x20p) OR when MON-VER
+    # identifies an X20 and no driver was forced.  An explicit non-X20
+    # force (e.g. --receiver f9t for diagnostics) still wins and falls
+    # through.  The X20 tracks dual-freq GPS+GAL out of the box, so this
+    # path only enables output messages — see _ready_no_signal_reconfigure.
+    id_module = identity.get("module") if identity else None
+    x20_driver = (forced_driver if isinstance(forced_driver, X20PDriver)
+                  else (driver_for_module(id_module)
+                        if forced_driver is None else None))
+    if x20_driver is not None:
+        log.info("Identity dispatch: %s (module=%s) — no-signal-reconfigure path",
+                 x20_driver.name, id_module)
+        drv = _ready_no_signal_reconfigure(
+            port, baud, x20_driver, port_type, systems,
+            sfrbx_rate=sfrbx_rate, measurement_rate_ms=measurement_rate_ms,
+            timeout_s=timeout_s)
+        return drv, identity
 
     # Forced driver: skip auto-detection, configure the specified driver.
     # Used for diagnostics (e.g. --receiver f9t to force L2 on TimeHat).

@@ -929,6 +929,62 @@ class SSRState:
         )
         return 1
 
+    def update_from_records(self, records, epoch_s, rx_mono=None,
+                            src_mount=None):
+        """Ingest SSR corrections from a decoder-neutral record list.
+
+        A transport-independent companion to ``update_from_rtcm`` for SSR
+        sources that aren't RTCM on the wire — e.g. Galileo HAS decoded
+        off the E6 signal-in-space (see ``tools/has_ssr_adapter.py``).
+        The records carry the same quantities and conventions as the RTCM
+        path: orbit radial/along/cross and clock c0 in **metres**, in the
+        RTCM/IGS-SSR sign convention; code biases in metres keyed by the
+        C-prefix RINEX observable (e.g. ``"C1C"``, ``"C5Q"``).
+
+        Args:
+            records: iterable of dicts, one per satellite, with keys:
+                ``prn`` (e.g. ``"G01"`` / ``"E03"``) — required;
+                ``iode`` (int, default 0);
+                ``orbit`` (radial, along, cross) tuple in metres — optional;
+                ``clock`` c0 in metres — optional;
+                ``code_bias`` {rinex_code: bias_m} in metres — optional.
+            epoch_s: SSR epoch (GNSS seconds) stamped on each correction.
+
+        Returns dict of counts {'orbit', 'clock', 'code_bias'}.
+        """
+        n_orb = n_clk = n_cb = 0
+        for rec in records:
+            prn = rec.get('prn')
+            if not prn:
+                continue
+            orbit = rec.get('orbit')
+            if orbit is not None:
+                r, a, c = (float(orbit[0]), float(orbit[1]), float(orbit[2]))
+                self._orbit[prn] = OrbitCorrection(
+                    iod=int(rec.get('iode', 0)), epoch_s=epoch_s,
+                    radial=r, along=a, cross=c, rx_mono=rx_mono)
+                n_orb += 1
+            clock = rec.get('clock')
+            if clock is not None:
+                self._clock[prn] = ClockCorrection(
+                    epoch_s=epoch_s, c0=float(clock), rx_mono=rx_mono)
+                n_clk += 1
+            for code, bias_m in (rec.get('code_bias') or {}).items():
+                self._code_bias[prn][code] = BiasCorrection(
+                    signal_code=code, bias_m=float(bias_m), is_phase=False,
+                    rx_mono=rx_mono, src_mount=src_mount)
+                n_cb += 1
+        now_mono = rx_mono if rx_mono is not None else time.monotonic()
+        if n_orb:
+            self._last_orbit_update_mono = now_mono
+        if n_clk:
+            self._last_clock_update_mono = now_mono
+        if n_cb:
+            self._last_bias_update_mono = now_mono
+        if n_orb or n_clk or n_cb:
+            self._last_update_mono = now_mono
+        return {'orbit': n_orb, 'clock': n_clk, 'code_bias': n_cb}
+
     def get_orbit(self, prn):
         """Return OrbitCorrection for a satellite, or None if stale/missing."""
         oc = self._orbit.get(prn)
