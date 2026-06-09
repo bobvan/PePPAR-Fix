@@ -74,6 +74,14 @@ def main():
     ap.add_argument("--duration", type=float, default=1800)
     ap.add_argument("--eph-mount", default="BCEP00BKG0")
     ap.add_argument("--arms", default="broadcast,has,bkg,cas,cnes")
+    ap.add_argument("--systems", default="gps,gal",
+                    help="constellations admitted to ALL arms.  Default "
+                         "gps,gal = the set Galileo HAS Phase 1 covers, so "
+                         "every arm corrects the same SVs (fair quality "
+                         "comparison).  Adding bds lets the precise streams "
+                         "correct BDS while HAS falls back to broadcast for "
+                         "it (shows HAS's coverage gap, but confounds the "
+                         "quality comparison).")
     args = ap.parse_args()
 
     from broadcast_eph import BroadcastEphemeris
@@ -95,9 +103,11 @@ def main():
 
     # serial: obs -> queue, SFRBX -> beph, raw UBX -> file (for the bridge)
     ubx_f = open(args.ubx_out, "ab")
+    systems = set(s.strip() for s in args.systems.split(",") if s.strip())
     threads.append(threading.Thread(target=serial_reader, args=(
         args.serial, args.baud, obs_q, stop, beph), kwargs={
-        "driver": get_driver("x20p"), "ubx_log_file": ubx_f}, daemon=True))
+        "systems": systems, "driver": get_driver("x20p"),
+        "ubx_log_file": ubx_f}, daemon=True))
 
     # broadcast eph stream (shared beph) — use a throwaway SSRState sink
     eph_stream = _ntrip(args.ntrip_conf, args.eph_mount, NtripStream)
