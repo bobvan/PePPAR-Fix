@@ -95,6 +95,18 @@ class TestX20PDriverSignals(unittest.TestCase):
         # GAL sigId=8 is new on the X20 and missing from the F9/F10 maps.
         self.assertEqual(self.drv.signal_name(2, 8), "GAL-E6")
 
+    def test_survey_confirmed_bds_uses_f10_numbering(self):
+        # PiPuss 2026-06-08 survey: BDS sigIds 4/5/7 resolve under the F10
+        # convention, NOT the legacy F9T B1I/B2I numbering.
+        self.assertEqual(self.drv.signal_name(3, 4), "BDS-B3I")
+        self.assertEqual(self.drv.signal_name(3, 5), "BDS-B1CP")
+        self.assertEqual(self.drv.signal_name(3, 7), "BDS-B2aP")
+
+    def test_sbas_mapped(self):
+        # SBAS L1CA is tracked on the X20 (survey) — mapped for honesty
+        # even though the engine doesn't process SBAS.
+        self.assertEqual(self.drv.signal_name(1, 0), "SBAS-L1CA")
+
     def test_default_if_pairs_are_gps_gal_only(self):
         # BDS carrier mapping is unverified on X20 — kept out of the
         # default IF pairs until the hardware re-survey.

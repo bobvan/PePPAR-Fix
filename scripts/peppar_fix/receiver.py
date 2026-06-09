@@ -252,29 +252,42 @@ F9P_SIGNAL_NAMES = dict(_GPS_GAL_SIG_NAMES)
 F9P_SIGNAL_NAMES.update(F10_BDS_SIG_NAMES)
 
 # Galileo E6 (gnssId=2, sigId=8) is new on the ZED-X20P / Generation 10 —
-# the F9/F10 families don't track E6.  E6 carries the Galileo HAS
-# corrections.  The exact code (E6-B data vs E6-C pilot) is pending the
-# X20 sigId re-survey; named at the band level for now.  Observed on
-# PiPuss 2026-06-08 (PROTVER 50.10) — see memory
-# reference_zed_x20p_pipuss_bringup.
+# the F9/F10 families don't track E6.  E6 (1278.75 MHz) carries the
+# Galileo HAS corrections.  Confirmed tracked with carrier phase on PiPuss
+# 2026-06-08 (NAV-SIG C/N0 50, qualityInd 7; cpMes present in RXM-RAWX).
+# The code (E6-B data vs E6-C pilot) is not distinguished by sigId here;
+# named at the band level.
 _X20_GAL_E6 = {
     (2, 8): "GAL-E6",
 }
 
-# ZED-X20P signal-name map.  GPS/GAL sigIds match the F9/F10 table
-# (observed on PiPuss: GPS 0/3/4/7 = L1CA/L2CL/L2CM/L5Q, GAL 0/4 =
-# E1C/E5aQ) plus the new GAL E6 (sigId=8).
+# SBAS L1 C/A (gnssId=1, sigId=0).  The X20 tracks SBAS (observed on
+# PiPuss 2026-06-08, C/N0 45) but the engine doesn't process it — SYS_MAP
+# has no gnssId=1 entry — so this is documentary only (keeps the signal
+# from showing as "unmapped" in surveys).
+_X20_SBAS = {
+    (1, 0): "SBAS-L1CA",
+}
+
+# ZED-X20P signal-name map.  All entries were confirmed against the live
+# receiver on PiPuss 2026-06-08 via NAV-SIG + RXM-RAWX (PROTVER 50.10) —
+# see memory reference_zed_x20p_pipuss_bringup.
 #
-# BDS: the X20 (Gen 10) reports BDS-3 modernized signals under the F10
-# chipset convention (B1C/B2a/B3I), NOT the legacy F9T B1I/B2I numbering.
-# Observed X20 BDS sigIds on PiPuss: 4, 5, 7 (= B3I, B1Cp, B2ap under the
-# F10 table).  WARNING: the sigId->carrier mapping is NOT YET VERIFIED on
-# X20 hardware — a wrong carrier assignment biases cpMes-derived combos
-# (the class of bug behind the 2026-04-19 BDS 1500 ns ISB).  It MUST be
-# confirmed by the re-survey (dayplan zedX20pSupport step 3) before BDS is
-# admitted to `systems=`.  Until then X20PDriver defaults to GPS+GAL only.
+# GPS/GAL sigIds match the F9/F10 table (survey: GPS 0/3/4/7 =
+# L1CA/L2CL/L2CM/L5Q, GAL 0/4 = E1C/E5aQ) plus the new GAL E6 (sigId=8).
+#
+# BDS: the survey resolved sigIds 4/5/7 as B3I / B1Cp / B2ap under the F10
+# chipset convention — confirming the X20 (Gen 10) uses the F10 BDS
+# numbering, NOT the legacy F9T B1I/B2I numbering (sigId 4 = B3I is new;
+# the F9T family never tracks B3I).  CAVEAT: the survey confirms the
+# sigId->signal LABELS, not that cpMes is reported in native carrier
+# cycles — the F9T B2a L1-reference-cycle quirk (the 2026-04-19 BDS
+# 1500 ns ISB class of bug) has NOT been ruled out for the X20 via GF/MW
+# residual analysis.  So BDS stays out of X20PDriver's default IF pairs
+# (GPS+GAL only) until that scaling check passes.
 X20P_SIGNAL_NAMES = dict(_GPS_GAL_SIG_NAMES)
 X20P_SIGNAL_NAMES.update(_X20_GAL_E6)
+X20P_SIGNAL_NAMES.update(_X20_SBAS)
 X20P_SIGNAL_NAMES.update(F10_BDS_SIG_NAMES)
 
 SYS_MAP = {
