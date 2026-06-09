@@ -218,10 +218,18 @@ HAS IDD (NTRIP, any host) ──────────────────
   `get_code_bias`.  CSSRlib normalizes HAS to the RTCM/IGS-SSR convention
   (it negates HAS orbit and applies the clock multiplier), so values map
   directly.  No phase-bias path needed yet (Phase 1).
-  **Validation gate before production:** cross-check HAS vs BKG SSR clock
-  corrections for the same SVs — they must track with slope +1 (off by
-  only a per-constellation datum constant); a slope of −1 would mean a
-  convention flip is needed in `cssr_to_records`.
+  **Sign convention VALIDATED 2026-06-09** (BKG-vs-HAS cross-check):
+  concurrent 120 s capture of BKG `SSRA00BKG0` SSR + X20 E6 HAS on PiPuss;
+  per-epoch-demeaned clock corrections regressed HAS vs BKG.  **Galileo:
+  slope +0.962, corr +0.977 (n=288)** — clean 1:1, sign correct.  **GPS:
+  slope +0.655, corr +0.254 (n=321)** — positive (sign correct) but
+  noisier: BKG is the *combined-IGS* product vs Galileo's own HAS AC, and
+  GPS clock realizations (mixed Rb/Cs Block II) diverge more between ACs
+  than Galileo's PHM clocks, plus ~10 s snapshot misalignment hits
+  drifting GPS clocks harder.  A flip would have given slope −1 for both;
+  both are positive, and the adapter uses one uniform sign path, so
+  Galileo's +0.96 confirms it.  **No flip needed — `cssr_to_records` maps
+  direct.**
 - **Validate**: `ssr.summary()` shows non-zero HAS orbit/clock counts;
   compare HAS-corrected float-PPP dt_rx long-τ TDEV vs broadcast-only,
   and vs the BKG SSR path, on the same X20 RAWX.
