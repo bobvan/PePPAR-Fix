@@ -22,17 +22,35 @@ def _baseline(**kw):
 class TestChi2Gate(unittest.TestCase):
 
     def test_huge_innov_rejected_when_P_tight(self):
-        """After P converges, a 1M ns innovation is rejected."""
+        """After P converges, a 1M ns TICC innovation is rejected — WHEN a
+        redundant DO-phase observer (EXTINT) is present to fall back on.
+        (soloObserverChiGate: with no redundancy the sole TICC is accepted
+        instead — see test_sole_ticc_huge_innov_accepted.)"""
         f = _baseline()
         f._need_phc_seed = False
         f.x = np.array([0.0, 0.0, 0.0, 0.0])
         # Tighten P to simulate converged filter
         f.P = np.diag([1.0, 0.01, 1.0, 0.01])
         x2_before = f.x[2]
-        f.update(dt=1.0, ticc_diff_ns=1e6, ticc_sigma_ns=0.060)
+        f.update(dt=1.0, ticc_diff_ns=1e6, ticc_sigma_ns=0.060,
+                 extint_phase_ns=0.0, extint_sigma_ns=10.0)
         self.assertAlmostEqual(f.x[2], x2_before, delta=10.0,
-                               msg="State should barely move when gate rejects")
+                               msg="TICC rejected when EXTINT redundancy present")
         self.assertIsNotNone(f.last_arm_innov.get('ticc'))
+
+    def test_sole_ticc_huge_innov_accepted(self):
+        """soloObserverChiGate: with NO EXTINT (TICC is the SOLE DO-phase
+        observer), a large innovation that WOULD chi²-reject is instead
+        ACCEPTED — rejecting the sole observer starves x[2] (drift →
+        re-acquire cycle → contaminated TDEV)."""
+        f = _baseline()
+        f._need_phc_seed = False
+        f.x = np.array([0.0, 0.0, 0.0, 0.0])
+        f.P = np.diag([1.0, 0.01, 1.0, 0.01])  # tight → would chi²-reject
+        x2_before = f.x[2]
+        f.update(dt=1.0, ticc_diff_ns=1000.0, ticc_sigma_ns=0.060)  # no extint
+        self.assertNotAlmostEqual(f.x[2], x2_before, places=0,
+                                  msg="sole TICC must be accepted, not starved")
 
     def test_large_innov_accepted_when_P_large(self):
         """During bootstrap (P large), even 500 ns innovation passes."""
@@ -61,7 +79,9 @@ class TestChi2Gate(unittest.TestCase):
         f.x = np.array([0.0, 0.0, 0.0, 0.0])
         f.P = np.diag([1.0, 0.01, 1.0, 0.01])
         n_before = len(f.innov_monitor._innov)
-        f.update(dt=1.0, ticc_diff_ns=1e6, ticc_sigma_ns=0.060)
+        # redundant EXTINT present → TICC chi²-rejected → monitor not fed
+        f.update(dt=1.0, ticc_diff_ns=1e6, ticc_sigma_ns=0.060,
+                 extint_phase_ns=0.0, extint_sigma_ns=10.0)
         self.assertEqual(len(f.innov_monitor._innov), n_before)
 
     def test_convergence_from_500ns_error(self):

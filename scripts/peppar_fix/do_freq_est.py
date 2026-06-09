@@ -787,6 +787,28 @@ class DOFreqEst:
             _chi2 = innov_ticc ** 2 / S if S > 0 else 0.0
             self.last_arm_chi2['ticc'] = _chi2
             chi2_reject = _chi2 > _CHI2_GATE_THRESHOLD
+            # soloObserverChiGate (2026-06-09): the chi² gate rejects an
+            # outlier only when there's a REDUNDANT DO-phase observer to
+            # fall back on.  When EXTINT (Arm 3) is absent this epoch the
+            # TICC is the SOLE observer of x[2] (DO phase) — and rejecting
+            # the sole observer STARVES the state (no other arm corrects
+            # it → drift → re-acquire cycle → step-contaminated TDEV; the
+            # recurring single-observer failure, e.g. clkPoC3 TICC-only).
+            # Bound the gate by OBSERVABILITY, not magnitude
+            # ([[sole-observer-arm-cannot-be-deweighted]]): with no
+            # fallback, accept the TICC update even on a large innovation —
+            # it IS the truth about x[2].  A sustained real divergence is
+            # still caught upstream by the outlier-ramp re-acquire, and the
+            # OCXO physical gate below keeps its own sole-carrier override.
+            ticc_sole_do_observer = extint_phase_ns is None
+            if chi2_reject and ticc_sole_do_observer:
+                log.warning(
+                    "[EKF] Arm 4 chi² (χ²=%.0f, |innov|=%.1f ns, √S=%.1f ns) "
+                    "would reject, but TICC is the SOLE DO-phase observer "
+                    "this epoch — accepting to avoid starving x[2] "
+                    "(soloObserverChiGate)",
+                    _chi2, abs(innov_ticc), math.sqrt(S))
+                chi2_reject = False
             # OCXO-trusted physical gate.  Anchored on the DO's
             # characterized freerun short-τ noise (not on √S), so it
             # rejects observations that imply physically impossible
