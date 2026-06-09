@@ -8047,7 +8047,7 @@ def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
 
 
 def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
-                            converging, gap_recovery):
+                            converging, gap_recovery, ramp_accept_n=5):
     """Pure decision: does the servo PPS-side outlier check trip this epoch?
 
     Returns one of:
@@ -8055,10 +8055,22 @@ def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
                               threshold disabled, OR gap_recovery is
                               active (post-gap measurement let through
                               so the EKF can absorb the offset).
-      ``("outlier", False)`` — single outlier, cascade counter incremented
-                              but below exit-5 limit.  Caller should log
-                              + skip the EKF update.
-      ``("outlier", True)``  — cascade limit reached.  Caller should log
+      ``("ramp_accept", None)`` — a SUSTAINED SAME-SIGN outlier ramp
+                              (>= ``ramp_accept_n`` consecutive outliers all
+                              the same sign).  This is a REAL DO divergence,
+                              not a measurement spike: skipping it (the
+                              ``outlier`` path) would leave the DO coasting at
+                              its free-running frequency offset, so the error
+                              ramps unbounded → 30-consecutive exit-5 cascade
+                              (servoOutlierDoomLoop, diagnosed 2026-06-08).
+                              Caller should treat this like ``ok`` — LET THE
+                              EKF UPDATE PROCEED so the filter absorbs the
+                              error and arrests the ramp.  Counters reset.
+      ``("outlier", False)`` — single/short outlier (spike), cascade counter
+                              incremented but below exit-5 limit.  Caller
+                              should log + skip the EKF update.
+      ``("outlier", True)``  — cascade limit reached (sign-flipping chaos that
+                              never formed a clean ramp).  Caller should log
                               the exit-5 error and unwind.
 
     Mutates ``ctx['consecutive_outliers']``: resets to 0 in the ok branch
@@ -8077,6 +8089,7 @@ def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
     """
     if gap_recovery:
         ctx['consecutive_outliers'] = 0
+        ctx['_outlier_ramp'] = 0
         return ("ok", None)
     if track_outlier_ns is None:
         return ("ok", None)
@@ -8091,11 +8104,30 @@ def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
         # exit instead of starting fresh.  Caught by bravo's #109
         # review.
         ctx['consecutive_outliers'] = 0
+        ctx['_outlier_ramp'] = 0
         return ("ok", None)
     if abs(outlier_observable_ns) <= track_outlier_ns:
         ctx['consecutive_outliers'] = 0
+        ctx['_outlier_ramp'] = 0
         return ("ok", None)
     ctx['consecutive_outliers'] += 1
+    # Sustained same-sign ramp detection (servoOutlierDoomLoop fix,
+    # 2026-06-08).  A real DO divergence keeps the error growing in ONE
+    # direction (the DO coasting at its free-running frequency offset);
+    # an isolated measurement spike is one-off / sign-random.  Track a
+    # signed run length: same sign extends it, a sign flip restarts it.
+    sign = 1 if outlier_observable_ns > 0 else -1
+    run = ctx.get('_outlier_ramp', 0)
+    run = run + sign if run * sign > 0 else sign
+    ctx['_outlier_ramp'] = run
+    if ramp_accept_n and abs(run) >= ramp_accept_n:
+        # Real, sustained divergence — stop skipping (which lets it run
+        # away to the exit-5 cascade) and let the EKF absorb it to arrest
+        # the ramp.  Catching it early (at ramp_accept_n epochs, a small
+        # error) is itself slew-limiting: the correction stays small.
+        ctx['consecutive_outliers'] = 0
+        ctx['_outlier_ramp'] = 0
+        return ("ramp_accept", None)
     if ctx['consecutive_outliers'] >= 30:
         return ("outlier", True)
     return ("outlier", False)
@@ -8409,7 +8441,16 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         track_outlier_ns=TRACK_OUTLIER_NS,
         converging=scheduler._converging,
         gap_recovery=gap_recovery,
+        ramp_accept_n=getattr(args, 'outlier_ramp_accept_n', 5),
     )
+    if _decision == "ramp_accept":
+        # servoOutlierDoomLoop fix: sustained same-sign ramp = real
+        # divergence, not a spike.  Fall through to the EKF update (do NOT
+        # skip) so the filter absorbs the error and arrests the ramp.
+        log.warning(
+            "  Sustained same-sign outlier ramp (pps_err=%+.0fns) — letting "
+            "EKF absorb to arrest the ramp instead of skipping "
+            "(servoOutlierDoomLoop)", outlier_observable_ns)
     if _decision == "outlier":
         if _exit5:
             # exitFiveToServoReset site B (PHC/EKF outlier cascade):
@@ -11056,6 +11097,13 @@ Two-phase operation:
                        help="Clamp tracking corrections to this ppb magnitude")
     servo.add_argument("--track-outlier-ns", type=float, default=None,
                        help="Skip tracking updates above this error magnitude when settled")
+    servo.add_argument("--outlier-ramp-accept-n", type=int, default=5,
+                       help="servoOutlierDoomLoop fix: after N consecutive "
+                            "SAME-SIGN tracking outliers (a real DO divergence "
+                            "ramp, not a spike), let the EKF absorb the error "
+                            "to arrest the ramp instead of skipping toward the "
+                            "exit-5 cascade.  0 disables (legacy skip-only).  "
+                            "Default 5.")
     servo.add_argument("--track-restep-ns", type=float, default=None,
                        help="Re-enter step if |tracking error| exceeds this for 3 epochs")
     servo.add_argument("--phase-step-bias-ns", type=float, default=None,
