@@ -15,6 +15,12 @@ authors = [
 
 dependencies = [
     "numpy",
+    # scipy: hard import-time dependency of the engine via ppp_ar.py /
+    # lambda_ar.py (AR / LAMBDA) and peppar_fix.kalman_servo.  Was
+    # undeclared — a fresh `pip install -e .` produced an engine that
+    # ImportError'd on `from scipy.stats import norm` (caught provisioning
+    # PiPuss 2026-06-08).
+    "scipy",
     # >=1.2.57 required for ZED-X20P (PROTVER 50.x): 1.2.57 added the
     # X20P HPG 2.00 NAV payload definitions (NAV-PVT/SAT/SIG/TIMEGPS).
     # Earlier releases (1.2.52/1.2.55) misframe the newer messages and
