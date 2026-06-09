@@ -66,5 +66,48 @@ class UpdateFromRecordsTest(unittest.TestCase):
         self.assertEqual(ssr.n_orbit, 0)
 
 
+class LoadSsrRecordsFileTest(unittest.TestCase):
+    """The external records-file loader (realtime_ppp.load_ssr_records) +
+    round-trip through update_from_records — the --ssr-records-file path
+    used to feed Galileo HAS into the live engine."""
+
+    def _write(self, obj):
+        import json
+        import tempfile
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(obj, f)
+        f.close()
+        return f.name
+
+    def test_load_and_apply_roundtrip(self):
+        from realtime_ppp import load_ssr_records
+        path = self._write({
+            "epoch_s": 1217.0,
+            "records": [{"prn": "E03", "iode": 53,
+                         "orbit": [0.235, -0.352, -0.176], "clock": -0.168,
+                         "code_bias": {"C1C": -0.92, "C5Q": -1.64}}]})
+        epoch_s, recs = load_ssr_records(path)
+        self.assertEqual(epoch_s, 1217.0)
+        ssr = SSRState()
+        counts = ssr.update_from_records(recs, epoch_s)
+        self.assertEqual(counts, {"orbit": 1, "clock": 1, "code_bias": 2})
+        self.assertAlmostEqual(ssr.get_clock("E03").c0, -0.168)
+        self.assertAlmostEqual(ssr.get_code_bias("E03", "C5Q"), -1.64)
+
+    def test_missing_or_empty_file_returns_none(self):
+        from realtime_ppp import load_ssr_records
+        self.assertEqual(load_ssr_records("/nonexistent/xyz.json"), (None, None))
+        self.assertEqual(load_ssr_records(self._write({"records": []})),
+                         (None, None))
+
+    def test_garbled_file_returns_none(self):
+        from realtime_ppp import load_ssr_records
+        import tempfile
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        f.write('{"records": [half written')   # truncated JSON
+        f.close()
+        self.assertEqual(load_ssr_records(f.name), (None, None))
+
+
 if __name__ == "__main__":
     unittest.main()

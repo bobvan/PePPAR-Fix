@@ -306,8 +306,8 @@ def _compute_sv_ipp_szas(filt, azimuths, elevations, gps_time):
     return out
 from ntrip_client import NtripStream
 from realtime_ppp import (
-    serial_reader, ntrip_reader, QErrStore, Nav2PositionStore,
-    Nav2SignalStore, NavClockStore, NavTimeGpsStore,
+    serial_reader, ntrip_reader, ssr_records_reader, QErrStore,
+    Nav2PositionStore, Nav2SignalStore, NavClockStore, NavTimeGpsStore,
 )
 from peppar_fix.extint_reader import TimTm2Store
 from ticc import Ticc
@@ -1267,6 +1267,21 @@ def start_ntrip_threads(args, beph, ssr, stop_event):
         threads.append(t)
         log.info(f"SSR bias stream (code+phase bias only): "
                  f"{bias_host}:{bias_p}/{ssr_bias_mount}")
+
+    # External SSR records file (e.g. Galileo HAS decoded out-of-process by
+    # tools/has_ssr_bridge.py).  Source-agnostic: any producer of the
+    # records schema can feed SSRState this way.  See
+    # docs/has-time-transfer-experiment.md.
+    records_file = getattr(args, 'ssr_records_file', None)
+    if records_file:
+        t = threading.Thread(
+            target=ssr_records_reader,
+            args=(records_file, ssr, stop_event, "SSR-RECORDS"),
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+        log.info(f"External SSR records: {records_file}")
 
     return threads
 
@@ -10895,6 +10910,12 @@ Two-phase operation:
     ntrip.add_argument("--ntrip-tls", action="store_true")
     ntrip.add_argument("--eph-mount", help="Broadcast ephemeris mountpoint")
     ntrip.add_argument("--ssr-mount", help="SSR corrections mountpoint")
+    ntrip.add_argument("--ssr-records-file", default=None,
+                       help="Ingest SSR corrections from an external records "
+                            "JSON file (orbit/clock/code-bias), polled live. "
+                            "Source-agnostic; used for Galileo HAS decoded "
+                            "out-of-process by tools/has_ssr_bridge.py. See "
+                            "docs/has-time-transfer-experiment.md.")
     ntrip.add_argument("--ssr-caster", help="SSR caster hostname (default: same as --ntrip-caster)")
     ntrip.add_argument("--ssr-port", type=int, help="SSR caster port (default: same as --ntrip-port)")
     ntrip.add_argument("--ssr-user", help="SSR caster username (default: same as --ntrip-user)")
