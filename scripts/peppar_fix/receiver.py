@@ -279,12 +279,13 @@ _X20_SBAS = {
 # BDS: the survey resolved sigIds 4/5/7 as B3I / B1Cp / B2ap under the F10
 # chipset convention — confirming the X20 (Gen 10) uses the F10 BDS
 # numbering, NOT the legacy F9T B1I/B2I numbering (sigId 4 = B3I is new;
-# the F9T family never tracks B3I).  CAVEAT: the survey confirms the
-# sigId->signal LABELS, not that cpMes is reported in native carrier
-# cycles — the F9T B2a L1-reference-cycle quirk (the 2026-04-19 BDS
-# 1500 ns ISB class of bug) has NOT been ruled out for the X20 via GF/MW
-# residual analysis.  So BDS stays out of X20PDriver's default IF pairs
-# (GPS+GAL only) until that scaling check passes.
+# the F9T family never tracks B3I).  cpMes SCALING VERIFIED native on the
+# X20 2026-06-08 (Δcp/Δt vs Doppler ratio = 1.000 for B2a/B3I/E6, with
+# GPS-L5Q at the same 1176.45 MHz as a 1.000 control) — the F9T B2a
+# L1-reference-cycle quirk (the 2026-04-19 BDS 1500 ns ISB class of bug)
+# does NOT exist here.  BDS is still kept out of X20PDriver's default IF
+# pairs, but on SSR-phase-bias grounds (no AC publishes BDS B2a-I biases),
+# not cpMes scaling.
 X20P_SIGNAL_NAMES = dict(_GPS_GAL_SIG_NAMES)
 X20P_SIGNAL_NAMES.update(_X20_GAL_E6)
 X20P_SIGNAL_NAMES.update(_X20_SBAS)
@@ -465,13 +466,19 @@ class X20PDriver(ReceiverDriver):
     GLONASS) at C/N0 47-53 dBHz on the lab UFO1 antenna.  See memory
     reference_zed_x20p_pipuss_bringup and dayplan zedX20pSupport.
 
-    What's validated here (dev-box, pre-hardware):
-      - Signal-name dispatch for GPS/GAL (incl. the new GAL E6 sigId=8).
+    Hardware-validated on PiPuss 2026-06-08:
+      - Signal-name dispatch for GPS/GAL/BDS/SBAS (NAV-SIG survey), incl.
+        the new GAL E6 (sigId=8) and the F10-convention BDS numbering.
       - SEC-UNIQID v2 (6-byte) identity, handled in parse_sec_uniqid().
+      - cpMes is in NATIVE carrier cycles for every signal (Δcp/Δt vs
+        Doppler ratio = 1.000 for B2a/B3I/E6) — the F9T B2a L1-reference
+        quirk does NOT exist here, so bds_l1_ref_cycles stays empty.
 
-    What is NOT yet validated and is deliberately conservative:
-      - BDS sigId->carrier mapping (see X20P_SIGNAL_NAMES) — BDS stays
-        out of the default systems until the re-survey confirms it.
+    What is NOT yet wired and keeps this driver conservative:
+      - BDS stays out of the default IF pairs — not for a cpMes reason
+        (that's cleared) but because no AC publishes BDS B2a-I phase
+        biases (docs/bds-b2a-phase-bias-survey-2026-05-09.md), the same
+        policy as the L5-tracking F9T hosts.  GPS+GAL is the default.
       - signal_config: Generation 10 removes the legacy CFG message
         types but the CFG_SIGNAL_* VALSET keys / NAK behavior on X20
         firmware are unverified, so the auto-configure path
@@ -485,7 +492,12 @@ class X20PDriver(ReceiverDriver):
     supports_timing_mode = False  # HPG positioning firmware, not TIM
     supports_l5_health_override = False
     signal_names = X20P_SIGNAL_NAMES
-    # GPS+GAL only by default — BDS carrier mapping unverified on X20.
+    # Empty is CORRECT (not a placeholder): verified on PiPuss 2026-06-08
+    # that the X20 reports BDS B1C/B2a/B3I and GAL E6 cpMes in native
+    # cycles — no L1-reference-cycle correction needed.
+    bds_l1_ref_cycles = frozenset()
+    # GPS+GAL only by default — BDS held back on SSR-phase-bias grounds,
+    # not cpMes scaling (which is verified native).  See class docstring.
     if_pairs = (
         ('GPS', 'GPS-L1CA', 'GPS-L5Q', 'G'),
         ('GAL', 'GAL-E1C', 'GAL-E5aQ', 'E'),

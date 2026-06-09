@@ -107,6 +107,12 @@ class TestX20PDriverSignals(unittest.TestCase):
         # even though the engine doesn't process SBAS.
         self.assertEqual(self.drv.signal_name(1, 0), "SBAS-L1CA")
 
+    def test_cpmes_native_no_l1_ref_correction(self):
+        # PiPuss 2026-06-08: X20 cpMes verified native for all signals
+        # (incl. BDS B2a/B3I) — NOT the F9T B2a L1-reference quirk — so
+        # no signals need the L1-ref-cycle correction.
+        self.assertEqual(self.drv.bds_l1_ref_cycles, frozenset())
+
     def test_default_if_pairs_are_gps_gal_only(self):
         # BDS carrier mapping is unverified on X20 — kept out of the
         # default IF pairs until the hardware re-survey.
