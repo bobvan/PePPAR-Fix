@@ -117,12 +117,31 @@ closed at the page level:
   Page-IDs of the same MID (E03/E16/E25 → PID 47/167/215 of MID 14) —
   the HAS Reed-Solomon page-diversity scheme, working as designed.
 
-**Remaining step (not the risk — the work):** High-Parity Vertical
-Reed-Solomon decode of a complete page set's 424-bit bodies into the HAS
-message, then parse the mask/orbit/clock/code-bias blocks into SSR.  This
-is a solved problem in **CSSRlib** (galois-based GF(256) RS) and
-**borioda/HAS-decoding**; `tools/has_page_monitor.py --dump-json` emits
-the collected bodies keyed by (MID, PID) ready to feed one of those.
+**Full RS + SSR decode DONE 2026-06-08** (`tools/has_decode_cssr.py`,
+CSSRlib).  The X20's E6 pages decode end-to-end to real corrections:
+
+```
+X20 E6 ─→ RXM-SFRBX ─→ page reassembly ─→ HPVRS Reed-Solomon ─→ SSR
+```
+
+- CSSRlib's `cnav_msg.decode_cnav` **independently confirms the framing**
+  reverse-engineered above — it also reads the HAS header at **bit 14**.
+- gMat = HAS SIS ICD Annex B generator matrix (255×32, GF(256)),
+  vendored at `support/has/has_gmat.csv`.
+- Toolchain self-tested against the ICD's own Annex D worked example
+  (decodes to 53 sats, orbit/clock/cbias/pbias), then run on a live
+  120 s X20 capture (787 pages → 8 HAS messages decoded):
+  **orbit + clock + code-bias for 53 SVs (26 GPS + 27 Galileo)**, e.g.
+  G01 dclk +0.010 m, G02 −1.225 m, G03 +1.478 m, with sub-meter-to-few-
+  meter orbit corrections — physically sensible SSR magnitudes.
+- **No phase-bias block** appears — exactly consistent with HAS Phase 1
+  (orbit/clock/code-bias only).  The decoder handles pbias when present
+  (Phase 2 / the ICD example) but the live service doesn't send it yet.
+
+Pipeline: `tools/has_page_monitor.py --raw-pages <file>` (Pi side, pyubx2)
+→ `tools/has_decode_cssr.py <file>` (dev box, CSSRlib).  The collected
+corrections are ready to adapt into our `SSRState` for the HAS-vs-broadcast
+float-PPP time-transfer comparison.
 
 ### B. Internet Data Distribution (IDD) — NTRIP, receiver-independent
 
