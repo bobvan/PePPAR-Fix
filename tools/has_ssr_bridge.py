@@ -115,7 +115,13 @@ def main():
     else:
         batches = _iter_ubx_file(args.ubx_file, stop_after_s=args.seconds)
 
+    # HAS sends orbit/code-bias and clock in SEPARATE messages, so a single
+    # message's records are partial.  Merge the latest field of each kind
+    # per SV across messages, and only publish records that are COMPLETE
+    # (orbit AND clock) — otherwise the engine applies an orbit shift
+    # without the matching clock and pseudorange residuals blow up.
     n_msg = n_write = 0
+    merged = {}
     for epoch, batch in batches:
         try:
             m = cnav.decode_cnav(epoch, [{"nav": h} for h in batch])
@@ -125,12 +131,18 @@ def main():
             continue
         n_msg += 1
         dec.decode_cssr(bytes(m))
-        recs = cssr_to_records(dec)
-        if recs:
-            _write_records(args.out, float(getattr(dec, "toh", 0.0)), recs)
+        for rec in cssr_to_records(dec):
+            slot = merged.setdefault(rec["prn"], {"prn": rec["prn"]})
+            for k, v in rec.items():
+                if k != "prn":
+                    slot[k] = v
+        complete = [r for r in merged.values()
+                    if "orbit" in r and "clock" in r]
+        if len(complete) >= 8:
+            _write_records(args.out, float(getattr(dec, "toh", 0.0)), complete)
             n_write += 1
-    print("HAS bridge: decoded %d messages, wrote %d records updates to %s"
-          % (n_msg, n_write, args.out))
+    print("HAS bridge: decoded %d messages, wrote %d complete-records updates "
+          "to %s" % (n_msg, n_write, args.out))
 
 
 if __name__ == "__main__":
