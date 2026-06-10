@@ -10400,6 +10400,32 @@ def _apply_host_config(args):
 
 # ── CLI ──────────────────────────────────────────────────────────────── #
 
+def _check_tdcp_phase_reference(args):
+    """phaseReferenceRequired — refuse TDCP with no phase reference.
+
+    TDCP (Arm 5) is a frequency-only observation: it measures rx-clock
+    frequency vs the SV-clock ensemble (state x[1]) and carries NO phase
+    information.  It can hold the DO's frequency but cannot anchor its
+    absolute phase, so it REQUIRES at least one real phase reference —
+    EXTINT (Arm 3) or TICC (Arm 4) — for startup acquisition and ongoing
+    phase tracking.  ``--servo-input tdcp --no-extint --no-ticc`` leaves
+    the loop with no phase anchor (it falls back to the open-loop synthetic
+    holdover pseudo-obs, which is not a true reference and lets DO phase
+    random-walk).  That config is a mistake, not a mode — fail fast.
+
+    Raises ``SystemExit`` on the offending config.
+    """
+    if (getattr(args, 'servo_input', 'default') == 'tdcp'
+            and not getattr(args, 'no_tdcp_arm', False)
+            and getattr(args, 'no_extint', False)
+            and getattr(args, 'no_ticc', False)):
+        raise SystemExit(
+            "--servo-input tdcp requires a phase reference: TDCP (Arm 5) "
+            "observes rx-clock FREQUENCY only and cannot anchor DO phase. "
+            "Enable EXTINT or TICC (drop --no-extint and/or --no-ticc), or "
+            "drop --servo-input tdcp.")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Unified peppar-fix: GNSS position bootstrap + clock discipline",
@@ -11795,6 +11821,11 @@ Two-phase operation:
     args.wl_only = (args.ar_mode == "wl")
 
     _apply_host_config(args)
+
+    # phaseReferenceRequired: catch TDCP-without-a-phase-reference (a config
+    # error) at startup, after host config so host-set flags are caught too.
+    _check_tdcp_phase_reference(args)
+
     # Apply defaults for args that are None after CLI + host config.
     # These were made nullable so host config can override them.
     if args.baud is None:
