@@ -79,6 +79,51 @@ against an RTCM base.  The engine's PPP-AR depends on the SSR analysis
 center publishing phase biases on the X20's exact RINEX codes, which only
 CNES does (GAL only).
 
+## Why the X20 GAL WL confidence (p_wl_ib) is so low — root cause
+
+`p_wl_ib` (`MelbourneWubbenaTracker.wl_bootstrap_success_rate`) is
+Geng et al. 2010's integer-bootstrap success rate, `∏ (2·Φ(0.5/σ_i) − 1)`.
+The σ it feeds in is **`resid_std_cyc`** — but that is a **fixed 60-epoch
+rolling std of the RAW per-epoch MW residual** (`mw_raw − mw_avg`,
+`_RESID_WIN=60`).  It is deliberately kept *raw* so the slip detector's
+jump threshold scales to per-epoch PR noise (code comment, ppp_ar.py:211).
+It does **not** shrink with averaging.
+
+But the WL *fix* uses the **EMA-smoothed mean** `mw_avg` (τ≈100 epochs),
+whose uncertainty is ≈ `raw_σ/√τ`.  So `p_wl_ib` is computed from the
+wrong σ:
+
+| σ source | value | p_wl_ib (7 GAL SVs) |
+|---|---|---|
+| raw per-epoch (`resid_std_cyc`, what the code uses) | 0.3–0.6 cyc | **0.02–0.36** |
+| averaged-mean (`raw_σ/√τ`, what Geng intends) | ~0.03–0.06 cyc | **≈1.0** |
+
+**This flaw is masked on a clean F9T** (raw σ 0.05–0.20 cyc → p_wl_ib ≈ 1
+anyway) **and exposed on the X20**, whose raw GAL code noise is ~2–3×
+higher (`resid_std_cyc` 0.3–0.6 cyc, `resid_pr_rms` ~4–5 m GAL-only).
+
+**The X20's elevated code noise is real but secondary** — not weak signal
+(C/N0 42–49) and not slips (6 GF-steps in 40 min).  It's **code multipath
+/ X20 code-tracking** at UFO1 (the carrier is clean — RTK got 23 mm).
+Some SVs show biased WL means (frac 0.3–0.5, e.g. E04/E12) consistent with
+code multipath; those won't fix regardless of the metric.
+
+**Net:** the low `p_wl_ib` is **mostly a metric artifact** (raw per-epoch σ
+instead of averaged-mean σ), amplified by genuinely noisier X20 code.  The
+AR-readiness gate is therefore overly pessimistic on the X20 and
+contributes to NL screening collapsing to `n=1`.  The smoothed WL means
+*do* converge and SVs *do* fix WL — the gate just doesn't believe it.
+
+**Proposed fix (testable):** in `wl_bootstrap_success_rate`, use the
+**averaged-mean ambiguity σ** (uncertainty of `mw_avg` ≈ `resid_std_cyc /
+√N_eff`, or track `mw_avg`'s own variance) rather than the raw per-epoch
+`resid_std_cyc`.  That matches Geng's definition (formal ambiguity σ, not
+measurement noise).  Caveat: do it frac-aware — a naive `raw_σ/√τ` assumes
+white noise; the X20's multipath SVs (frac 0.3–0.5) should still score
+low.  Validate by re-running CNES GAL-only and checking whether NL
+screening rises above `n=1` and NL fixes take hold.  This is a fleet-wide
+AR-gate change, so test on the X20 branch before touching other hosts.
+
 ## Open threads (not filed — for discussion)
 
 - **Why are X20 GAL WL fixes so low-confidence (p_wl_ib≈0.02) and
