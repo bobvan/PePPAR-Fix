@@ -528,6 +528,37 @@ designated best-effort anyway).  Lower priority than DAC upgrade.
 **No upgrade needed** for the target.  The measurement chain is
 not the limiter.
 
+**DO-PPS observer — per-clock TICC vs free EXTINT (2026-06-10).**
+A related measurement-chain *cost* question: to discipline the DO, is
+a per-clock TICC (~60 ps, but a board + serial port + the DTR-reset
+gotcha each) worth it over the **free** EXTINT phase the receiver
+already provides (F9T TIM-TM2 / PHC EXTTS, ~5–10 ns)?
+A controlled interleaved A/B on clkPoC3 (both/extint ×3, same
+conditions, all locked, 0 re-acquire / 0 exit-5) says **no**:
+EXTINT-only TDEV(1 s) = **52 ps** (runs 51/53/52) *beat* the fused
+"both" = **92 ps** (90/117/90) at every τ.  The gentle EXTINT observer
+disciplines cleaner; the tight TICC over-actuates.  So for the moonshot
+budget a **per-clock TICC is not justified** — σ_meas is not the limiter
+either way (§6.4 above) — and a TICC is better deployed as a *shared
+validation* instrument than one-per-clock.  Full study:
+[ticc-vs-extint-do-observer-experiment.md](ticc-vs-extint-do-observer-experiment.md).
+Prerequisite: [[soloObserverChiGate]] (§3.2.1 / §8.1) removed the
+chi²-gate lockout that had made a *sole* TICC observer unmeasurable, so
+the comparison is now fair.
+
+> **Skepticism — not yet proven.**  This verdict rests almost entirely
+> on **one host (clkPoC3, OCXO)**.  Cross-host replication has been
+> repeatedly foiled by host-reliability faults (PiFace drifts on every
+> arm; MadHat ms-offset + intermittent chA; TimeHat chA-channel drops —
+> tracked in `multiHostReliability`).  Supporting but weak: the first
+> moonshot overnight pointed the same way on PiFace (extint ≤ both ≤
+> ticc @1 s), and a one-off run that showed the *opposite* (xh3 extint
+> 397 ps) proved non-reproducible.  Until **EXTINT < both is replicated
+> cleanly on ≥2 independent DO hosts** (ideally an OCXO *and* a
+> different DO class), treat "per-clock TICC not justified" as
+> **strongly indicated, not established** — a single OCXO's actuator/loop
+> realization could be flattering EXTINT.
+
 ---
 
 ## 7. Digital OCXO (DC-OCXO) survey
