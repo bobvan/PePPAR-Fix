@@ -389,15 +389,33 @@ class MelbourneWubbenaTracker:
         p = 1.0
         n = 0
         for sv, s in self._state.items():
-            if s.get('n_epochs', 0) < min_epochs:
+            n_ep = int(s.get('n_epochs', 0))
+            if n_ep < min_epochs:
                 continue
-            sigma_wl = s.get('resid_std_cyc')
-            if sigma_wl is None:
+            sigma_raw = s.get('resid_std_cyc')
+            if sigma_raw is None:
                 continue
-            # Floor σ at sigma_floor_cyc — a quiet window can otherwise
-            # report unrealistically tight σ that inflates P_IB.
-            sigma_wl = max(float(sigma_wl), float(sigma_floor_cyc))
-            p_i = 2.0 * norm.cdf(0.5 / sigma_wl) - 1.0
+            # Geng's P_IB wants the σ of the FLOAT AMBIGUITY ESTIMATE — here
+            # the EMA-smoothed mean mw_avg that the WL fix actually rounds —
+            # NOT the raw per-epoch MW residual std.  resid_std_cyc is a
+            # fixed-window (60-epoch) std of the RAW residual, kept raw for
+            # the slip detector's jump threshold (see update()).  Using it
+            # directly makes P_IB track per-epoch CODE noise (~0.4 cyc on a
+            # noisy host) instead of the averaged-mean uncertainty, which is
+            # smaller by ~√N_eff.  The EMA averages ~tau_s epochs, so the
+            # mean's σ ≈ raw / √min(n_epochs, tau_s).  (Masked on a quiet
+            # F9T where raw σ ~0.05-0.20 cyc; exposed on noisier receivers.)
+            n_eff = min(n_ep, int(self.tau_s))
+            sigma_mean = float(sigma_raw) / math.sqrt(max(1, n_eff))
+            # Frac-aware floor: a mean sitting `frac` cycles from the nearest
+            # integer is ambiguous about the correct integer regardless of
+            # statistical σ (e.g. code-multipath bias), so the effective σ
+            # is at least ~frac.  Keeps multipath-biased SVs honestly low.
+            lambda_wl = C / (s['f1'] - s['f2'])
+            frac = abs(s['mw_avg'] / lambda_wl
+                       - round(s['mw_avg'] / lambda_wl))
+            sigma_eff = max(sigma_mean, float(frac), float(sigma_floor_cyc))
+            p_i = 2.0 * norm.cdf(0.5 / sigma_eff) - 1.0
             if p_i <= 0:
                 return 0.0, n + 1
             p *= p_i
