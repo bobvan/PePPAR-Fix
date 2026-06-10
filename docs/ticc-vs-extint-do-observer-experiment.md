@@ -20,11 +20,15 @@ want robustness margin; deploy a TICC as a *shared validation* instrument,
 not one-per-clock.**
 
 **Evidence (what's firm):**
-- **EXTINT ≤ both at short τ, on clkPoC3, reproduced.** Two independent
-  runs agree: 52 / 86 ps @1 s (overnight) and ratio 0.51 (same-time
-  concurrent). The first overnight pointed the same way on PiFace
-  (extint ≤ both ≤ ticc @1 s). The gentle EXTINT observer gives the
-  cleanest output; the tight TICC observer over-actuates.
+- **EXTINT < both at short τ, on clkPoC3 — confirmed by an interleaved
+  A/B (2026-06-10).** Six same-conditions runs, both/extint ×3 alternating
+  (all locked, 0 re-acquire, 0 exit5): **EXTINT median 52 ps (range 51–53)
+  < both median 92 ps (range 90–117) @1 s**, and at every τ — tight and
+  reproducible. (An earlier one-off, xh3 extint 397 ps, was a
+  non-reproducible anomaly from a messy multi-host session; this controlled
+  A/B settles it.) The gentle EXTINT observer gives the cleanest output;
+  the tight TICC observer over-actuates. The first overnight pointed the
+  same way on PiFace (extint ≤ both ≤ ticc @1 s).
 - **Robustness ranks: EXTINT (0 re-boots) = both (0) < TDCP (3) ≪
   TICC-only (34).** The single TICC observer is the *least* robust — its
   tiny σ makes the chi² gate reject the DO's own motion (see below). "both"
