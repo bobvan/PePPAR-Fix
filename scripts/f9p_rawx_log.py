@@ -63,48 +63,77 @@ log = logging.getLogger("f9p_rawx_log")
 # ---------- F9P configuration --------------------------------------------
 
 
-def configure_for_rawx(ser: serial.Serial, rate_hz: float = 1.0) -> None:
-    """Configure the F9P to emit RXM-RAWX + RXM-SFRBX + NAV-PVT at the
-    requested measurement rate, on USB, UBX protocol only.
+def configure_for_rawx(ser: serial.Serial, rate_hz: float = 1.0,
+                       iface: str = "USB") -> None:
+    """Configure the receiver to emit RXM-RAWX + RXM-SFRBX + NAV-PVT at the
+    requested measurement rate, on the named iface, UBX protocol only.
+
+    iface is "USB", "UART1", or "UART2" — selects which CFG keys get
+    written.  USB is the F9P/X20P default; UART1 is used when the
+    receiver is wired to a host serial port (e.g. F9T on Pi GPIO UART).
 
     1 Hz is the standard PRIDE-PPP rate.  Higher rates (5 Hz, 10 Hz)
     are supported by HPG firmware but multiply file size and offer no
     benefit for a daily ARP fix.
 
     Disables NMEA + RTCM output to keep the UBX byte stream clean
-    and minimise USB-side bandwidth contention with RAWX (which can
-    be ~1.5 KB/epoch with all four constellations active).
+    and minimise bandwidth contention with RAWX (which can be
+    ~1.5 KB/epoch with all four constellations active).
     """
+    iface = iface.upper()
+    if iface not in ("USB", "UART1", "UART2"):
+        raise ValueError(f"unsupported iface {iface!r}; use USB/UART1/UART2")
     rate_ms = max(50, int(round(1000.0 / rate_hz)))
-    cfg = [
-        # Measurement + nav rates.
+
+    # Essential set — must all ACK as one atomic VALSET.  These are the
+    # keys every supported receiver (F9P, F9T-TIM, X20P) accepts.
+    essential = [
         ("CFG_RATE_MEAS", rate_ms),
-        ("CFG_RATE_NAV", 1),  # one nav epoch per measurement epoch
-        # USB I/O protocols: UBX only.
-        ("CFG_USBOUTPROT_UBX", 1),
-        ("CFG_USBOUTPROT_NMEA", 0),
-        ("CFG_USBOUTPROT_RTCM3X", 0),
-        ("CFG_USBINPROT_UBX", 1),
-        ("CFG_USBINPROT_RTCM3X", 0),
-        # Pure rover (no fixed-position TMODE).
+        ("CFG_RATE_NAV", 1),
+        (f"CFG_{iface}OUTPROT_UBX", 1),
+        (f"CFG_{iface}OUTPROT_NMEA", 0),
+        (f"CFG_{iface}OUTPROT_RTCM3X", 0),
+        (f"CFG_{iface}INPROT_UBX", 1),
+        (f"CFG_{iface}INPROT_RTCM3X", 0),
         ("CFG_TMODE_MODE", 0),
-        # Output messages: RAWX + SFRBX + PVT every epoch.
-        ("CFG_MSGOUT_UBX_RXM_RAWX_USB", 1),
-        ("CFG_MSGOUT_UBX_RXM_SFRBX_USB", 1),
-        ("CFG_MSGOUT_UBX_NAV_PVT_USB", 1),
-        # Disable any leftover noisy outputs from a prior run.
-        ("CFG_MSGOUT_UBX_NAV_RELPOSNED_USB", 0),
-        ("CFG_MSGOUT_UBX_NAV_HPPOSECEF_USB", 0),
-        ("CFG_MSGOUT_UBX_NAV_HPPOSLLH_USB", 0),
-        ("CFG_MSGOUT_RTCM_3X_TYPE1005_USB", 0),
-        ("CFG_MSGOUT_RTCM_3X_TYPE1077_USB", 0),
-        ("CFG_MSGOUT_RTCM_3X_TYPE1087_USB", 0),
-        ("CFG_MSGOUT_RTCM_3X_TYPE1097_USB", 0),
-        ("CFG_MSGOUT_RTCM_3X_TYPE1127_USB", 0),
-        ("CFG_MSGOUT_RTCM_3X_TYPE1230_USB", 0),
+        (f"CFG_MSGOUT_UBX_RXM_RAWX_{iface}", 1),
+        (f"CFG_MSGOUT_UBX_RXM_SFRBX_{iface}", 1),
+        (f"CFG_MSGOUT_UBX_NAV_PVT_{iface}", 1),
     ]
-    msg = UBXMessage.config_set(SET_LAYER_RAM, TXN_NONE, cfg)
+    msg = UBXMessage.config_set(SET_LAYER_RAM, TXN_NONE, essential)
     ser.write(msg.serialize())
+
+    # Best-effort cleanup — disable possibly-noisy outputs left from a
+    # prior run.  Some keys (e.g. NAV-RELPOSNED, HPPOSECEF/HPPOSLLH) are
+    # RTK-only and NAK on F9T TIM firmware, so send each individually
+    # and ignore NAKs.
+    cleanup = [
+        f"CFG_MSGOUT_UBX_NAV_RELPOSNED_{iface}",
+        f"CFG_MSGOUT_UBX_NAV_HPPOSECEF_{iface}",
+        f"CFG_MSGOUT_UBX_NAV_HPPOSLLH_{iface}",
+        f"CFG_MSGOUT_RTCM_3X_TYPE1005_{iface}",
+        f"CFG_MSGOUT_RTCM_3X_TYPE1077_{iface}",
+        f"CFG_MSGOUT_RTCM_3X_TYPE1087_{iface}",
+        f"CFG_MSGOUT_RTCM_3X_TYPE1097_{iface}",
+        f"CFG_MSGOUT_RTCM_3X_TYPE1127_{iface}",
+        f"CFG_MSGOUT_RTCM_3X_TYPE1230_{iface}",
+    ]
+    for key in cleanup:
+        try:
+            m = UBXMessage.config_set(SET_LAYER_RAM, TXN_NONE, [(key, 0)])
+            ser.write(m.serialize())
+        except Exception:
+            pass  # key not in pyubx2 db — receiver wouldn't accept it either
+
+
+def _iface_for_port(port: str) -> str:
+    """Auto-detect the receiver iface that maps to a host serial port."""
+    base = os.path.basename(port)
+    if base.startswith("ttyACM"):
+        return "USB"
+    if base.startswith("ttyAMA") or base.startswith("ttyS"):
+        return "UART1"
+    return "USB"  # safest default
 
 
 # ---------- Logging thread -----------------------------------------------
@@ -221,6 +250,10 @@ def main() -> int:
                     help="rover 2 serial port (omit to log only one F9P)")
     ap.add_argument("--r2-tag", default="F9P2")
     ap.add_argument("--baud", type=int, default=38400)
+    ap.add_argument("--iface", default="auto",
+                    choices=("auto", "USB", "UART1", "UART2"),
+                    help="receiver iface for CFG keys (default: auto from "
+                    "port path — ttyACM*=USB, ttyAMA*/ttyS*=UART1)")
     ap.add_argument("--rate-hz", type=float, default=1.0,
                     help="measurement rate (default 1 Hz, the PRIDE-PPP "
                     "standard)")
@@ -256,9 +289,10 @@ def main() -> int:
         ser = serial.Serial(port, args.baud, timeout=0.1)
         time.sleep(0.2)
         ser.reset_input_buffer()
-        log.info("Configuring %s for RAWX/SFRBX @ %.1f Hz",
-                 tag, args.rate_hz)
-        configure_for_rawx(ser, rate_hz=args.rate_hz)
+        iface = _iface_for_port(port) if args.iface == "auto" else args.iface
+        log.info("Configuring %s for RAWX/SFRBX @ %.1f Hz on %s",
+                 tag, args.rate_hz, iface)
+        configure_for_rawx(ser, rate_hz=args.rate_hz, iface=iface)
         time.sleep(0.5)
         ser.reset_input_buffer()
         st = {
