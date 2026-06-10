@@ -124,6 +124,37 @@ low.  Validate by re-running CNES GAL-only and checking whether NL
 screening rises above `n=1` and NL fixes take hold.  This is a fleet-wide
 AR-gate change, so test on the X20 branch before touching other hosts.
 
+## Validation (2026-06-09 20:34, patched metric + `--nl-diag`)
+
+Implemented the averaged-mean σ in `wl_bootstrap_success_rate`
+(`74055c4`, frac-aware) and re-ran CNES GAL-only with `--nl-diag`.
+
+- **Metric fix confirmed:** `p_wl_ib` now climbs to **0.654** (vs the old
+  ~0.02 from raw per-epoch σ).  But it is **diagnostic-only** — it gates
+  nothing — so it did *not* change AR behaviour.
+- **The earlier "X20 can't NL-fix" was geometry/time, not a hard limit.**
+  This run (3 h later, better GAL geometry) reached **n=9 screened**,
+  LAMBDA attempted **177×**, **16 clean NL fixes, 0 PFR/false-fix.**  The
+  17:37 runs that showed `n=1`/0-NL just had poor GAL geometry at that
+  hour.  So the X20 **does** do clean GAL-only NL AR when the geometry is
+  there.
+- **`--nl-diag` shows the real gate** (`NlResolver` pre-screen
+  `n1_frac<0.25 & sigma_n1<1.0` on the *filter* ambiguity):
+  `SKIP_ELEV` (25° AR mask), `SKIP_NO_WL` (not yet WL-fixed),
+  `SKIP_PRESCREEN frac=0.42 sigma=0.18` (ambiguity not near integer) and
+  `frac=0.067 sigma=917` (just-acquired SV, filter σ not yet converged).
+  This — not `p_wl_ib` — is what governs NL screening.
+- **Still no cm *arm*.**  Despite the NL fixes, position held ~5 cm float
+  `unarmed` — the GAL-only fixed set is too thin/transient (16 fixes over
+  20 min, not a sustained multi-SV lock) to pull pos_sigma to the arm
+  threshold.  GPS would thicken it, but is L5-blocked.
+
+**Corrected takeaway:** the X20 GAL-only with CNES does clean NL AR when
+geometry permits (no false fixes), but doesn't reach a *sustained armed cm
+lock* — GAL-only is geometry-limited, and GPS is unavailable (L5 wall).
+The `p_wl_ib` metric fix is correct and worth keeping (honest readiness
+reporting; matters once gating lands), but it is not the NL lever.
+
 ## Open threads (not filed — for discussion)
 
 - **Why are X20 GAL WL fixes so low-confidence (p_wl_ib≈0.02) and
