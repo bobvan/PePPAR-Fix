@@ -553,11 +553,23 @@ the comparison is now fair.
 > tracked in `multiHostReliability`).  Supporting but weak: the first
 > moonshot overnight pointed the same way on PiFace (extint ≤ both ≤
 > ticc @1 s), and a one-off run that showed the *opposite* (xh3 extint
-> 397 ps) proved non-reproducible.  Until **EXTINT < both is replicated
-> cleanly on ≥2 independent DO hosts** (ideally an OCXO *and* a
-> different DO class), treat "per-clock TICC not justified" as
-> **strongly indicated, not established** — a single OCXO's actuator/loop
-> realization could be flattering EXTINT.
+> 397 ps) proved non-reproducible.
+>
+> **Replication attempt #1 (PiFace, 2nd OCXO, 2026-06-10): inconclusive.**
+> A matched interleaved A/B on PiFace was too noisy to call — EXTINT
+> drifted on 2 of 3 runs (+62/+132 ppb, likely the F9P TIM-TM2 / EXTINT
+> path, not the OCXO), "both" wandered at long τ on 2 of 3 (28–35 ns @10 s,
+> chA following a noisier F9P/GPS reference), and the extint-vs-both
+> ordering @1 s flipped with aggregation (medians agree, cleanest-run-each
+> disagrees). It neither confirmed nor refuted. PiFace's OCXO *does* lock
+> clean on its good runs (both-r1: −0.008 ppb, 295 ps @1 s) — the host's
+> measurement/EXTINT chain is the limiter, not the DO.
+>
+> Until **EXTINT < both is replicated cleanly on ≥2 independent DO hosts**
+> (ideally an OCXO *and* a different DO class), treat "per-clock TICC not
+> justified" as **strongly indicated, not established** — a single OCXO's
+> actuator/loop realization could be flattering EXTINT.  TimeHat (TCXO,
+> different DO class) is the next replication candidate once its chA holds.
 
 ---
 
