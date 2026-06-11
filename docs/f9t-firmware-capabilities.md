@@ -68,28 +68,31 @@ F9 columns are CFG-VALSET ACK/NAK probes; F10T/X20P columns are
 observed tracking (Yes = output with carrier phase; No = not tracked;
 — = not applicable / not observed).
 
-| Capability | CFG key | ZED-F9T (2.20, L5-hw) | ZED-F9T (2.20, L2-only hw) | ZED-F9T-20B (2.25) | ZED-F9P-15 (HPG 1.51) | NEO-F10T *(obs)* | ZED-X20P *(obs)* |
-|---|---|---|---|---|---|---|---|
-| GPS L1 C/A | CFG_SIGNAL_GPS_L1CA_ENA | ACK | ACK | ACK | ACK | Yes | Yes |
-| GPS L2C (L2CL) | CFG_SIGNAL_GPS_L2C_ENA | **ACK** | **ACK** | **NAK** | **ACK** | No | **Yes** |
-| GPS L5 (L5Q) | CFG_SIGNAL_GPS_L5_ENA | **ACK** | **NAK** | ACK | **NAK** | Yes | Yes |
-| GPS L5 health override | 0x10320001 | **ACK** | **ACK** | ACK | (not tested) | No¹ | n/a¹ |
-| GAL E1 | CFG_SIGNAL_GAL_E1_ENA | ACK | ACK | ACK | ACK | Yes | Yes |
-| GAL E5a | CFG_SIGNAL_GAL_E5A_ENA | ACK | **NAK** | ACK | **NAK** | Yes | Yes |
-| GAL E5b | CFG_SIGNAL_GAL_E5B_ENA | **NAK** | **ACK** | **NAK** | **ACK** | No | — |
-| GAL E6 (HAS) | (no F9 key) | — | — | — | — | No | **Yes** |
-| GLONASS L1 | CFG_SIGNAL_GLO_L1_ENA | **NAK** | **NAK** | **NAK** | **ACK** | No | **No** |
-| GLONASS L2 | CFG_SIGNAL_GLO_L2_ENA | **NAK** | **NAK** | **NAK** | **ACK** | No | **No** |
-| NavIC | CFG_SIGNAL_NAVIC_ENA | **NAK** | (not tested) | **ACK** | (not tested) | — | adv² |
-| BeiDou B1I (legacy) | CFG_SIGNAL_BDS_B1_ENA | ACK | ACK | ACK | ACK | No | No |
-| BeiDou B2I (legacy) | CFG_SIGNAL_BDS_B2_ENA | (not tested) | **ACK** | (not tested) | **ACK** | No | No |
-| BeiDou B1C (modern) | (Gen-10 only) | — | — | — | — | Yes | **Yes** |
-| BeiDou B2a (modern) | CFG_SIGNAL_BDS_B2A_ENA | (not tested) | **NAK** | (not tested) | **NAK** | Yes | Yes |
-| BeiDou B3I (modern) | (Gen-10 only) | — | — | — | — | No | **Yes** |
-| SBAS L1 C/A | CFG_SIGNAL_SBAS_ENA | — | — | — | — | — | Yes |
+| Capability | CFG key | ZED-F9T (2.20, L5-hw) | ZED-F9T (2.20, L2-only hw) | ZED-F9T-20B (2.25) | ZED-F9P-15 (HPG 1.51) | NEO-F10T *(obs)* | ZED-X20P *(obs)* | LEA-F9T-11B *(obs)* |
+|---|---|---|---|---|---|---|---|---|
+| GPS L1 C/A | CFG_SIGNAL_GPS_L1CA_ENA | ACK | ACK | ACK | ACK | Yes | Yes | Yes |
+| GPS L2C (L2CL) | CFG_SIGNAL_GPS_L2C_ENA | **ACK** | **ACK** | **NAK** | **ACK** | No | **Yes** | **NAK**⁶ |
+| GPS L5 (L5Q) | CFG_SIGNAL_GPS_L5_ENA | **ACK** | **NAK** | ACK | **NAK** | Yes | Yes | Yes⁶ |
+| GPS L5 health override | 0x10320001 | **ACK** | **ACK** | ACK | (not tested) | No¹ | n/a¹ | (not tested) |
+| GAL E1 | CFG_SIGNAL_GAL_E1_ENA | ACK | ACK | ACK | ACK | Yes | Yes | Yes |
+| GAL E5a | CFG_SIGNAL_GAL_E5A_ENA | ACK | **NAK** | ACK | **NAK** | Yes | Yes | Yes |
+| GAL E5b | CFG_SIGNAL_GAL_E5B_ENA | **NAK** | **ACK** | **NAK** | **ACK** | No | — | **NAK**⁶ |
+| GAL E6 (HAS) | (no F9 key) | — | — | — | — | No | **Yes** | — |
+| GLONASS L1 | CFG_SIGNAL_GLO_L1_ENA | **NAK** | **NAK** | **NAK** | **ACK** | No | **No** | —⁷ |
+| GLONASS L2 | CFG_SIGNAL_GLO_L2_ENA | **NAK** | **NAK** | **NAK** | **ACK** | No | **No** | —⁷ |
+| NavIC | CFG_SIGNAL_NAVIC_ENA | **NAK** | (not tested) | **ACK** | (not tested) | — | adv² | Yes⁸ |
+| BeiDou B1I (legacy) | CFG_SIGNAL_BDS_B1_ENA | ACK | ACK | ACK | ACK | No | No | Yes⁸ |
+| BeiDou B2I (legacy) | CFG_SIGNAL_BDS_B2_ENA | (not tested) | **ACK** | (not tested) | **ACK** | No | No | (not tested)⁸ |
+| BeiDou B1C (modern) | (Gen-10 only) | — | — | — | — | Yes | **Yes** | Yes⁸ |
+| BeiDou B2a (modern) | CFG_SIGNAL_BDS_B2A_ENA | (not tested) | **NAK** | (not tested) | **NAK** | Yes | Yes | Yes⁸ |
+| BeiDou B3I (modern) | (Gen-10 only) | — | — | — | — | No | **Yes** | — |
+| SBAS L1 C/A | CFG_SIGNAL_SBAS_ENA | — | — | — | — | — | Yes | (not tested) |
 
 ¹ F10T rejects the 0x10320001 L5-health override (`supports_l5_health_override=False`).  The X20P tracks L5 out of the box with no override step.
 ² The X20P's MON-VER advertises NavIC, but no NavIC SVs were in view during the 2026-06-08 survey, so its tracking is unconfirmed.
+⁶ **The LEA-F9T-11B is a firmware-NAK, not hardware-NAK, case.**  Its MON-SPAN shows the L2 band *is* in the front-end (RF block 2 center 1191.5 MHz, 128 MHz span ≈ 1127–1255 MHz, which covers L5/E5a, E5b/B2I, **and** L2/L2C).  Yet the firmware NAKs `CFG_SIGNAL_GPS_L2C_ENA` and `CFG_SIGNAL_GAL_E5B_ENA` — so spectrum coverage ≠ decode capability.  The Timebeat datasheet also *lists* GPS L2C and *omits* GPS L5, which is backwards from reality: the unit NAKs L2C and tracks L5.  Net usable profile is **L1 + L5/E5a only** — effectively the same as the ZED-F9T-20B.  Verified on the London "open-time-appliance" unit 2026-06-11.
+⁷ Timebeat's -11B signal datasheet omits GLONASS; not probed.
+⁸ From Timebeat's -11B datasheet (B1I/B1C/B2a, NavIC L5).  Only GPS L1C/A+L5 and GAL E1+E5a (tracked), plus L2C/E5b (NAK), were independently verified on-unit; the rest is datasheet-claimed, not CFG-probed.
 
 **The X20P is multi-band, not two-band-limited.**  Every F9T discussion
 below turns on the "two frequency bands maximum" RF-chain limit (L2 *or*
@@ -108,6 +111,13 @@ software-visible discriminator for the L5-capable vs L2-only
 F9T physical variants that share `MOD=ZED-F9T, FWVER=TIM 2.20,
 PROTVER=29.20`.  See the taxonomy doc for the idempotent and
 rate-cap categories observed on sibling F10T hardware.
+
+**Exception — the LEA-F9T-11B (see ⁶).**  Its L2C/E5b NAKs are *not*
+RF absence: MON-SPAN proves the L2 band is in the front-end.  This is a
+**firmware / product-segmentation NAK** — the silicon could decode L2,
+but the firmware refuses.  So an RF-presence discriminator (à la
+`vpManager_07`) would *mis*-predict L2 capability for this part.  Trust
+the CFG-VALSET ACK/NAK probe, not the spectrum or the datasheet.
 
 ## Control, message-output, and transport matrix
 
