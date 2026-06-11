@@ -85,16 +85,29 @@ restarts timebeat).
 
 ## Phase 2 — Bring the data to gt
 
-Raw capture files are *data, not repo code*, so rsync is the right tool (the
-no-scp-repo-code rule does not apply to capture artifacts):
+Raw capture files are *data, not repo code*, so file copy is the right tool
+(the no-scp-repo-code rule does not apply to capture artifacts).
+
+**First, strip timing-only messages** — important when the path to gt is slow
+or multi-hop. A time-appliance F9T emits NAV-SIG / NAV2-SIG / TIM-TP /
+MON-SPAN / TIM-SVIN / NAV2-POSECEF alongside the RAWX/SFRBX/PVT we need (≈ half
+the bytes). `scripts/ubx_filter.py` drops them without touching the receiver or
+timebeat (validated 2026-06-11: ~56% smaller, RAWX/SFRBX/PVT byte-identical,
+convbin RINEX unchanged):
+
+```bash
+python3 scripts/ubx_filter.py raw.ubx raw.min.ubx     # keeps rawx,sfrbx,pvt
+```
+
+Then copy the filtered file(s) to gt under `~/gt/...` (RAIDZ-3 + offsite) by
+whatever path works — direct rsync if the host can reach gt, otherwise hop it:
 
 ```bash
 rsync -a london-mini:peppar-survey-data/raw/london-24h-<DATE>/ \
          ~/gt/peppar-survey-data/raw/london-24h-<DATE>/
 ```
 
-Land it under `~/gt/...` (RAIDZ-3 + offsite). Nothing else from the Mini is
-needed for analysis.
+Nothing else from the Mini is needed for analysis.
 
 ---
 
