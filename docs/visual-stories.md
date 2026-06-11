@@ -268,3 +268,77 @@ Freerun data (Plots 2, 3) must be linearly detrended to remove the
 oscillator's frequency offset before computing TDEV.  Disciplined
 data (Plots 1, 4) should not be detrended — the servo's residual
 frequency error is part of what we're measuring.
+
+
+## Plot 6: SSR Corrections — Magnitude and Timescale
+
+A different *class* of visual from Plots 1–5: not a TDEV plot, but a
+time series of the SSR corrections themselves.  Time on the x-axis,
+correction magnitude on the y-axis **in nanoseconds** — because the
+audience cares about time, and ns is the common currency that lets
+orbit, clock, code bias, and phase bias be compared on one scale
+(`1 m = 3.3356 ns`; `value_ns = value_m / c * 1e9`).
+
+All SVs × all signals would be a solid band of spaghetti, so we
+cherry-pick a newer-generation SV or two per constellation.
+
+### Story A — component contrast (magnitude × timescale)
+
+The strongest narrative, and it explains real stream engineering: the
+four components separate cleanly by *how fast they move*, not just by
+size.
+
+| Component | Magnitude (LOS) | Natural timescale | Trace shape |
+|---|---|---|---|
+| **Clock** | 1–10 ns (peaks ~20) | seconds–minutes | the busy one — all the high-frequency content |
+| **Orbit** (radial) | ~1–3 ns | orbital period (~12–14 h) + 2-h ephemeris steps | slow sinusoid on a sawtooth |
+| **Code bias** | ~1–5 ns | days–weeks | flat horizontal offsets |
+| **Phase bias** | 0–0.6 ns (fraction of an L1 cycle = 0.635 ns) | hours, rare cycle steps | nearly flat with occasional integer jumps |
+
+Punchline: **clock is the only fast-moving correction.**  That is *why*
+real-time SSR streams update clock every ~5 s, orbit every ~60 s, and
+biases rarely — the plot makes the stream-design rationale visible.
+The 2-hourly ephemeris-update discontinuities (orbit + clock both step
+when a new IODE is issued) are a secondary feature worth calling out.
+
+### Story B — constellation contrast (clock-oscillator)
+
+The clock panel, one SV-pair per constellation, ranks visually by the
+onboard frequency standard: **Galileo PHM (passive H-maser) smooth and
+quiet ≪ GPS Rb (wander, ~12-h periodic signature on IIF) < GLONASS Cs
+(jumpiest, plus FDMA-driven code-bias spread).**  Block-IIF-vs-III GPS
+SVs give a within-GPS generational sub-story.
+
+### Per-component windowing — there is no single window
+
+Each component lives on a different timescale, so plot each in a window
+matched to it and **decimate/low-pass to the feature being shown**
+(this is what avoids the solid-noise-band problem):
+
+| Component | Window (a few cycles) | Sample/decimate to |
+|---|---|---|
+| Clock — overview | 24–48 h | ~1 min (running mean) |
+| Clock — zoom inset | 10–30 min | native (5–30 s) |
+| Orbit | 48–72 h | ~5 min |
+| Code bias | 1–7 days | ~hourly |
+| Phase bias | ~24 h | ~1–5 min |
+
+Don't try to show seconds and 48 h on one axis — the clock gets a
+multi-day overview *plus* a minutes-scale zoom inset.
+
+### Data source and tooling
+
+- **Source:** CNES `SSRA00CNE0` (`products.igs-ip.net:443`) — carries
+  all four components including **phase bias**.  Note the operational
+  `SSRA00BKG0` stream has **phase bias = 0**, so the phase-bias trace
+  needs a CNES/WHU capture.
+- **Logger:** `scripts/log_ssr_corrections.py` reuses the engine's
+  `NtripStream` + `SSRState` to snapshot all four components per SV into
+  a long-format CSV (metres + ns) every `--interval` seconds.
+- **Plotter:** `scripts/plot_ssr_corrections.py` renders two figures:
+  `ssr_components.png` (4 stacked ns panels + clock zoom inset) and
+  `ssr_constellation_clock.png` (clock by constellation).
+- **Cherry-picked SVs:** GPS `G24` (IIF) vs `G04` (III); Galileo `E26`,
+  `E36` (FOC); GLONASS `R02`, `R20`; BeiDou-3 MEO `C21`, `C36`.  The
+  component figure uses one representative per constellation
+  (`G04/E26/R02/C21`); the constellation figure uses all eight.
