@@ -29,18 +29,24 @@ receiver = "f9p"
 # Characterization: state/dos/isotemp-ocxo-33-madhat.json
 # 2026-05-28 saturation-aware cal (linear region [5000, 40000]);
 # operating override to code_max=42000 reaches GPS-rate 0-crossing
-# at ~code 41000 (knee mildly nonlinear, EKF under-steps safely).
-do_label = "isotemp-ocxo-33-madhat"
+# Recharacterized 2026-06-12 after rebuild with a new Isotemp OCXO131-100
+# (10 MHz) + new AD5693R DAC.  Linear across the full 0..65535 sweep (RMS
+# 6.4 ppb, no saturation knee); slope sign FLIPPED vs the old OCXO-33 (+ not
+# -), and range-starvation gone (±100 -> ±725 ppb).  Pull-up-over-load
+# gotcha: the temp sensor's I2C pull-ups had to be removed from i2c-1 to stop
+# the DAC dropping off the bus (Errno 121) mid-write (parallel pull-ups too
+# low -> marginal VOL -> the AD5693R's weaker SDA driver failed its ACK).
+do_label = "isotemp-ocxo131-100-madhat"
 do_type = "vcocxo"
 dac_bus = 1
 dac_addr = "0x4C"
 dac_bits = 16
 dac_type = "ad5693r"
 dac_gain = 1
-dac_ppb_per_code = "-0.01111"
-dac_max_ppb = 100.0
-dac_code_min = 5000
-dac_code_max = 42000
+dac_ppb_per_code = "0.02569"
+dac_max_ppb = 725.3
+dac_code_min = 0
+dac_code_max = 61000
 # TADD-2 Mini divider: ARM on GPIO 16, syncs 5 MHz -> 1 PPS.
 tadd_gpio = 16
 ntrip_conf = "ntrip.conf"
