@@ -222,9 +222,39 @@ Same TDCP-arm config, X20 + VCOCXO, before vs after the decoder:
 The 22 ms GIL hold *was* the whole causal chain — remove it and the obs-epoch
 stalls, the `gate_wait_obs` waits, and the TDCP dropouts all vanish together.
 Confirms the dropouts were a scheduling-jitter symptom of one long GIL hold,
-not a correlation-gate design limit. Residual pyubx2 cost (28 %, spread over
-NAV-SIG/SFRBX/NAV-* — none individually long enough to stall) is now the next
-target if more headroom is wanted, but it is not causing dropouts.
+not a correlation-gate design limit.
+
+### NAV-SIG gets the same treatment (the other long GIL hold)
+
+After RAWX, the residual ~28 % parse was dominated by **NAV-SIG** — also a
+big repeating-group message (**~104 signals/epoch** on the X20, **29.4 ms**
+of pyubx2 parse, *bigger* than RAWX). `peppar_fix/nav_sig_decode.py` gives
+it the same `np.frombuffer` 16-byte-block decode (**~7 µs, 4041×**, parity
+bit-exact). `Nav2SignalStore` factored into a shared `_ingest(rows)`;
+`update_decoded(epoch)` is the production fast path, `update(parsed)` kept
+for the stub-based unit tests.
+
+**Bonus bug fix:** pyubx2 expands `sigFlags` into `prUsed_NN`/`health_NN` and
+does *not* expose a combined `sigFlags_NN`, so the old `getattr(parsed,
+'sigFlags_NN', 0)` read **0** on every real message — `prUsed`/`crUsed`/
+`doUsed`/`health` were silently false in production (the long-standing
+"`prUsed=1` never appears"). The vectorized decoder reads `sigFlags` from the
+bytes, so the store now populates the real bits (verified live: `C13/BDS-B2aI
+prUsed=1 doUsed=1 health=1`). Safe — `--nav-sig-gate` is off by default;
+`nav_sig_disagree` is logging-only.
+
+**Both decoders, live A/B (clkPoC3):**
+
+```
+pyubx2 parse on-CPU:  42%  →  28% (RAWX only)  →  7.6% (RAWX + NAV-SIG)
+reader read-idle:     38%  →  50%              →  64%
+per-epoch GIL holds removed: RAWX 22 ms + NAV-SIG 29 ms = ~51 ms
+TDCP dropouts: 0% (steady-state)   n_stalls: 0   convergence: err +0.2 ns ✓
+```
+
+What's left (7.6 %) is the small fixed-size messages (NAV-PVT/NAV-CLOCK/
+TIM-TP/SFRBX) — none a long GIL hold. The obs-delivery thread is now ~64 %
+idle.
 
 ## Bottom line
 
