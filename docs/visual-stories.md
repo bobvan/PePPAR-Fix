@@ -350,8 +350,10 @@ multi-day overview *plus* a minutes-scale zoom inset.
     ~10 s cadence, so CNES's intermittent GLONASS coverage shows as gaps, not
     held-value flats).  Code/phase bias are genuinely quasi-static, so a
     value-change detector can't distinguish "held fresh" from "stale" — they
-    are **not** gap-broken (a real bias-gap detector needs correction *age*,
-    a future logger field).
+    are **not** gap-broken by value-change.  The logger now records `age_s`
+    (staleness = snapshot − rx_time) and `disc` (bias discontinuity counter),
+    so the next capture can age-gap the biases and flag the per-SV phase-bias
+    re-reference jumps (the BeiDou discontinuities) directly.
 - **Cherry-picked SVs:** GPS `G24` (IIF) vs `G04` (III); Galileo `E26`,
   `E36` (FOC); GLONASS `R02`, `R20`; BeiDou-3 MEO `C21`, `C36` — all eight on
   every figure, coloured by constellation.
