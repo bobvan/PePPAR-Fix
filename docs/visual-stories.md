@@ -335,10 +335,23 @@ multi-day overview *plus* a minutes-scale zoom inset.
 - **Logger:** `scripts/log_ssr_corrections.py` reuses the engine's
   `NtripStream` + `SSRState` to snapshot all four components per SV into
   a long-format CSV (metres + ns) every `--interval` seconds.
-- **Plotter:** `scripts/plot_ssr_corrections.py` renders two figures:
-  `ssr_components.png` (4 stacked ns panels + clock zoom inset) and
-  `ssr_constellation_clock.png` (clock by constellation).
+- **Plotter:** `scripts/plot_ssr_corrections.py` renders **four separate
+  figures** — `ssr_clock.png`, `ssr_orbit.png`, `ssr_codebias.png`,
+  `ssr_phasebias.png` — each:
+  - **detrended** (per-SV mean removed) so the variance is symmetric about
+    zero and shows *character*, not the per-SV datum offset (raw SSR clock
+    `c0` carries tens-of-ns per-SV offsets that are absorbed by the receiver
+    clock + inter-system bias and would otherwise read as alarming biases);
+  - on a **common ±10 ns scale** so magnitude can be compared *across* the
+    four figures (the contrast is the story: code bias ≈ 0 ≪ clock < orbit;
+    a trace exceeding ±10 ns is clipped and its peak is named in the title —
+    e.g. GLONASS orbit ±40 ns, BeiDou phase ±18 ns);
+  - **gap-broken** for clock & orbit (`_break_stale` NaNs values held past the
+    ~10 s cadence, so CNES's intermittent GLONASS coverage shows as gaps, not
+    held-value flats).  Code/phase bias are genuinely quasi-static, so a
+    value-change detector can't distinguish "held fresh" from "stale" — they
+    are **not** gap-broken (a real bias-gap detector needs correction *age*,
+    a future logger field).
 - **Cherry-picked SVs:** GPS `G24` (IIF) vs `G04` (III); Galileo `E26`,
-  `E36` (FOC); GLONASS `R02`, `R20`; BeiDou-3 MEO `C21`, `C36`.  The
-  component figure uses one representative per constellation
-  (`G04/E26/R02/C21`); the constellation figure uses all eight.
+  `E36` (FOC); GLONASS `R02`, `R20`; BeiDou-3 MEO `C21`, `C36` — all eight on
+  every figure, coloured by constellation.
