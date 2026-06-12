@@ -47,6 +47,27 @@ PREF_PHASE = {"G": ["L1C", "L1W"], "E": ["L1C", "L1B"],
               "R": ["L1C", "L1P"], "C": ["L2I", "L1I", "L5I"]}
 
 
+GAP_THRESH_S = 60.0   # value held longer than this = SSR coverage dropout, not data
+
+
+def _break_stale(t, v, thresh=GAP_THRESH_S):
+    """Return v with samples NaN'd where the value has been frozen longer than
+    `thresh` seconds, so SSR coverage dropouts render as gaps rather than
+    misleading flat lines.  Normal SSR clock cadence is ~10 s; a value held for
+    minutes-to-hours means no correction is being provided (e.g. CNES dropping a
+    GLONASS SV).  The logger snapshots the live SSR state and holds the last
+    value across a dropout, so this is a plot-time reconstruction of the gap."""
+    out = np.asarray(v, dtype=float).copy()
+    orig = np.asarray(v, dtype=float)
+    run_start = t[0]
+    for i in range(1, len(out)):
+        if orig[i] != orig[i - 1]:
+            run_start = t[i]
+        elif t[i] - run_start > thresh:
+            out[i] = np.nan
+    return out
+
+
 def load(path):
     """Return (data, t0) where data[(prn, component, signal)] = (t_s, ns)."""
     ts = defaultdict(list)
@@ -143,7 +164,8 @@ def fig_constellation_clock(data, t0, svs, out):
         if key not in data:
             continue
         t, v = data[key]
-        v = v - v.mean()              # center each SV: show clock character, not the datum
+        v = _break_stale(t, v)        # gaps where no correction provided (coverage dropout)
+        v = v - np.nanmean(v)         # center on real values: show clock character, not the datum
         th = (t - t0) / 3600.0
         sysc = prn[0]
         lbl = SYS_NAME[sysc] if sysc not in seen else None
