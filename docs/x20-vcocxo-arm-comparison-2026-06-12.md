@@ -151,20 +151,15 @@ cycle slips — the estimator is behaving correctly. The chain:
 gap; the servo just gets a TDCP frequency update every ~1.1 s avg instead of
 1.0 s. The dropouts only depress TDCP's *standalone reproducibility* metric.
 
-**Remedies (in priority order):**
-
-- **Quick win — raise `TdcpEstimator.max_dt_s` 1.5 → 2.5 s.** Recovers the
-  single-gap (Δt=2.0 s) case: dropouts 10.1 % → 1.5 % (tdcp_1), 7.7 % → 0.9 %
-  (tdcp_2). Differencing across one 2 s gap is sound while the existing
-  per-SV slip protection (locktime drop / LLI / 3-MAD ensemble) holds; residual
-  risk is a slip hidden inside the single missing second (the MAD ensemble gate
-  still rejects single-SV outliers). One-line, immediately A/B-testable.
-- **Proper fix — eliminate the obs-epoch stall.** Profile the X20 serial
-  reader / UBX raw framer for the heavy RXM-RAWX epoch on the Pi 4; trim
-  message load (the consumption-alarm path suggests disabling SFRBX/PVT) or
-  raise USB read cadence so the heavy epoch assembles within 1 s. Removes the
-  gap instead of tolerating it, and would close the last ~1 % too. See the
-  profiling result below — the pyubx2 RAWX parse is the dominant cost.
+**Remedy — eliminate the obs-epoch stall at its source (DONE).** The stall is
+the reader thread holding the GIL for ~22 ms per epoch while pyubx2 parses
+RAWX; the servo/correlation-gate main loop can't run during that hold, so the
+obs↔PPS match occasionally misses and the next TDCP epoch lands 2–4 s later.
+The fix is the **vectorized RAWX decoder** (profiling section below) — it
+removes the 22 ms GIL hold, which **eliminated the stalls and the dropouts
+outright (10 % → 0 %), with no `max_dt_s` change needed.** A `max_dt_s`
+1.5 → 2.5 s bump was considered but rejected as symptom-patching: it would
+tolerate the gap rather than remove the GIL hold that causes it.
 
 ## Profiling the obs-epoch path — a 389× RAWX-decode vectorization win (2026-06-12)
 
@@ -204,14 +199,32 @@ count=numMeas, offset=16)` target. The `trkStat`/std bitfields decode
 vectorized with shifts/masks. **One numpy call replaces ~1100 attribute-sets.**
 
 **The win:** drop the reader thread's per-epoch GIL hold from **22.4 ms → 0.06 ms**.
-That is pure CPU headroom on the slowest host *and* removes the largest
-single GIL block on the obs-delivery thread — which should reduce the
-correlation-gate scheduling jitter that drives the `gate_wait_obs` stalls
-above (complementary to the `max_dt_s` fix, not a substitute — the dropouts'
-*direct* cause is correlation-gate timing). Implementation: a fast-path RAWX
-decoder dispatched in `serial_reader` (RAWX → numpy; all other UBX → pyubx2),
-gated behind a parity unit test (decode the same frame both ways, assert
-equal) before the live swap.
+Implemented as `peppar_fix/rawx_decode.py` (`is_rawx` + `decode_rawx` →
+`RawxEpoch` arrays), wired into `serial_reader` with `UBXReader(parsing=False)`
+so RAWX takes the numpy path and every other (small) UBX message is parsed on
+demand by pyubx2. Gated behind `test_rawx_decode` (7 cases, bit-exact parity
+vs pyubx2 incl. trkStat bits / zero-meas / truncation).
+
+### Live A/B on clkPoC3 (2026-06-12) — dropouts eliminated
+
+Same TDCP-arm config, X20 + VCOCXO, before vs after the decoder:
+
+| metric | pyubx2 (overnight) | vectorized | |
+|---|---|---|---|
+| TDCP `n_sv=0` dropouts | 10.1 % / 7.7 % | **0.3 %** | (the 1 is the unavoidable cold-start epoch → steady-state **0 %**) |
+| `n_stalls_gt_1.5s` | 376 / 296 | **0** | |
+| `max_stall_s` | 4.0 s | **0.0 s** | |
+| `gate_wait_obs` | 417 / 302 | **2** | |
+| RAWX parse | 22.4 ms/epoch | 58 µs (`rawx_decode` ≈ 0.4 % on-CPU) | |
+| `_set_attribute*` on-CPU | ~42 % | 28 % (residual = other msgs) | reader `read`-idle 38 % → 50 % |
+| convergence | err ≈ 0, −20.6 ppb | err +0.5 ns, −20.6 ppb | no regression |
+
+The 22 ms GIL hold *was* the whole causal chain — remove it and the obs-epoch
+stalls, the `gate_wait_obs` waits, and the TDCP dropouts all vanish together.
+Confirms the dropouts were a scheduling-jitter symptom of one long GIL hold,
+not a correlation-gate design limit. Residual pyubx2 cost (28 %, spread over
+NAV-SIG/SFRBX/NAV-* — none individually long enough to stall) is now the next
+target if more headroom is wanted, but it is not causing dropouts.
 
 ## Bottom line
 
