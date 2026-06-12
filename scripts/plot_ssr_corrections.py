@@ -143,6 +143,7 @@ def fig_constellation_clock(data, t0, svs, out):
         if key not in data:
             continue
         t, v = data[key]
+        v = v - v.mean()              # center each SV: show clock character, not the datum
         th = (t - t0) / 3600.0
         sysc = prn[0]
         lbl = SYS_NAME[sysc] if sysc not in seen else None
@@ -150,11 +151,11 @@ def fig_constellation_clock(data, t0, svs, out):
         ax.plot(th, v, lw=0.9, color=SYS_COLOR[sysc], alpha=0.85,
                 label=f"{prn} ({SYS_NAME[sysc]})")
     ax.set_xlabel("hours since capture start")
-    ax.set_ylabel("clock c0 [ns]")
+    ax.set_ylabel("clock c0 − per-SV mean  [ns]")
     ax.grid(alpha=0.3)
     ax.legend(loc="upper right", fontsize=8, ncol=2)
-    ax.set_title("SSR clock corrections by constellation (ns)\n"
-                 "oscillator story: Galileo PHM clean << GPS Rb < GLONASS Cs",
+    ax.set_title("SSR clock corrections by constellation — per-SV mean removed (ns)\n"
+                 "clock *character*: Galileo PHM smooth << GPS Rb < GLONASS Cs",
                  fontsize=12)
     fig.tight_layout()
     fig.savefig(out, dpi=130)
