@@ -163,7 +163,55 @@ gap; the servo just gets a TDCP frequency update every ~1.1 s avg instead of
   reader / UBX raw framer for the heavy RXM-RAWX epoch on the Pi 4; trim
   message load (the consumption-alarm path suggests disabling SFRBX/PVT) or
   raise USB read cadence so the heavy epoch assembles within 1 s. Removes the
-  gap instead of tolerating it, and would close the last ~1 % too.
+  gap instead of tolerating it, and would close the last ~1 % too. See the
+  profiling result below — the pyubx2 RAWX parse is the dominant cost.
+
+## Profiling the obs-epoch path — a 389× RAWX-decode vectorization win (2026-06-12)
+
+py-spy (`--nonblocking`, 180 s, clkPoC3 live X20 run, `pyspy_obs.folded`)
+of the obs-delivery path. Now that PR #117 vectorized the filter (`update`
+2.2 %, `_kalman` 0.2 %, `convolve` 0.6 % self-time), **the pyubx2 RXM-RAWX
+deserialize is the single biggest CPU consumer** — `_parse_ubx` 44 % inclusive,
+and ~42 % of all on-CPU samples in the `_set_attribute_*` family:
+
+```
+_set_attribute_single 11.1%   __setattr__      4.7%
+_set_attribute_bits    6.3%   bytes2val        3.4%
+_set_attribute_group   5.9%   attsiz           0.8%
+_set_attribute         5.8%   ─────────────────────
+_set_attribute_bitfield4.9%   ≈ 42% of on-CPU = pyubx2 RAWX parse
+```
+
+**Why it's so heavy on the X20:** each RAWX epoch carries **~78 measurements**
+(2.5 KB — all signals/constellations the X20 tracks), so pyubx2 builds
+**~78 × 14 ≈ 1100 Python attributes per epoch**, the vast majority for signals
+the engine immediately discards (it keeps ~11 GPS+GAL dual-freq). The reader
+thread **holds the GIL for the entire parse every second**, blocking the
+servo/correlation-gate main loop.
+
+**Microbenchmark** (`rawx_decode_bench.py`, real captured X20 frames, Pi 4):
+
+```
+pyubx2 parse :  22,416 µs/epoch   (22.4 ms — and a 22 ms GIL hold)
+np.frombuffer:      57.6 µs/epoch
+speedup      :     389×   — parity bit-exact vs pyubx2 (prMes/svId/cpValid)
+```
+
+RXM-RAWX is a fixed 16-byte header + **32-byte repeating measurement block**
+(`prMes` R8, `cpMes` R8, `doMes` R4, 4×`U1` ids, `locktime` U2, `cno` U1,
+4×`X1` flags, reserved) — a textbook `np.frombuffer(payload, dtype=BLOCK,
+count=numMeas, offset=16)` target. The `trkStat`/std bitfields decode
+vectorized with shifts/masks. **One numpy call replaces ~1100 attribute-sets.**
+
+**The win:** drop the reader thread's per-epoch GIL hold from **22.4 ms → 0.06 ms**.
+That is pure CPU headroom on the slowest host *and* removes the largest
+single GIL block on the obs-delivery thread — which should reduce the
+correlation-gate scheduling jitter that drives the `gate_wait_obs` stalls
+above (complementary to the `max_dt_s` fix, not a substitute — the dropouts'
+*direct* cause is correlation-gate timing). Implementation: a fast-path RAWX
+decoder dispatched in `serial_reader` (RAWX → numpy; all other UBX → pyubx2),
+gated behind a parity unit test (decode the same frame both ways, assert
+equal) before the live swap.
 
 ## Bottom line
 
