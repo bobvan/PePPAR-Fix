@@ -43,10 +43,10 @@ YLIM_NS = 10.0        # common vertical scale across all four figures
 
 # (component, title, signal-pref map, gap_break, output filename)
 PANELS = [
-    ("clock_c0",     "clock c0",     None,       True,  "ssr_clock.png"),
-    ("orbit_radial", "orbit radial", None,       True,  "ssr_orbit.png"),
-    ("code_bias",    "code bias",    PREF_CODE,  False, "ssr_codebias.png"),
-    ("phase_bias",   "phase bias",   PREF_PHASE, False, "ssr_phasebias.png"),
+    ("clock_c0",     "clock c0",     None,       True,  "ssr_clock"),
+    ("orbit_radial", "orbit radial", None,       True,  "ssr_orbit"),
+    ("code_bias",    "code bias",    PREF_CODE,  False, "ssr_codebias"),
+    ("phase_bias",   "phase bias",   PREF_PHASE, False, "ssr_phasebias"),
 ]
 
 
@@ -102,7 +102,7 @@ def pick_signal(data, prn, component, pref):
 def fig_component(data, t0, span_h, svs, component, title, pref, gap_break,
                   out, ylim=YLIM_NS, hours=None):
     win = hours if hours else span_h
-    fig, ax = plt.subplots(figsize=(12, 5))
+    fig, ax = plt.subplots(figsize=(16, 9))      # 16:9 for 4K presentation
     offscale = []
     for prn in svs:
         if pref:
@@ -140,10 +140,11 @@ def fig_component(data, t0, span_h, svs, component, title, pref, gap_break,
     ax.set_title(f"SSR {title} by constellation — detrended, common ±{ylim:.0f} ns scale\n"
                  f"{sub}{note}", fontsize=11)
     fig.tight_layout()
-    fig.savefig(out, dpi=130)
+    fig.savefig(out + ".pdf")                     # vector — scales cleanly to 4K
+    fig.savefig(out + ".png", dpi=200)            # raster — quick view
     plt.close(fig)
-    print(f"wrote {out}" + (f"   off-scale={[(p, round(m,1)) for p,m in offscale]}"
-                            if offscale else ""))
+    print(f"wrote {out}.pdf/.png"
+          + (f"   off-scale={[(p, round(m,1)) for p,m in offscale]}" if offscale else ""))
 
 
 def main():
