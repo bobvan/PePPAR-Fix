@@ -1124,6 +1124,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
         stop_event.set()
         return
 
+    from peppar_fix import rawx_decode
     from peppar_fix.gnss_stream import open_gnss
 
     # Default to F9T for backward compatibility
@@ -1137,7 +1138,15 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
         f"(type: {device_type}, driver: {driver.name})"
     )
     ser = stream
-    ubr = UBXReader(ser, protfilter=2)  # UBX only
+    # parsing=False → read() returns the raw UBX frame only, with no
+    # UBXMessage build.  RXM-RAWX (the heavy, high-rate message — ~78
+    # measurements/epoch, ~22 ms of pyubx2 attribute-parse on a Pi 4,
+    # holding the GIL on this obs-delivery thread the whole time) is
+    # decoded via np.frombuffer in rawx_decode (~58 µs, 389× faster,
+    # parity-tested).  Every other (small, low-rate) UBX message is
+    # parsed on demand with UBXReader.parse below.
+    # See docs/x20-vcocxo-arm-comparison-2026-06-12.md (profiling section).
+    ubr = UBXReader(ser, protfilter=2, parsing=False)  # UBX only, raw frames
 
     # Signal name mapping from receiver driver
     SIG_NAMES = driver.signal_names
@@ -1183,21 +1192,39 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                     break
 
         try:
-            raw, parsed = ubr.read()
+            raw, parsed = ubr.read()   # parsing=False → parsed is None
             if ubx_log_file is not None and raw:
                 try:
                     ubx_log_file.write(raw)
                 except (OSError, ValueError):
                     log.warning("--ubx-out write failed; disabling capture")
                     ubx_log_file = None
-            if parsed is None:
+            if not raw:
                 continue
             delay_injector.maybe_inject_delay(source_name)
             if mute_controller.should_drop(source_name):
                 mute_controller.note_drop(source_name)
                 continue
 
-            msg_id = parsed.identity
+            # RXM-RAWX takes the np.frombuffer fast path (rawx holds the
+            # decoded epoch); every other UBX message is parsed on demand
+            # with pyubx2, which is cheap for the small/low-rate messages.
+            rawx = None
+            if rawx_decode.is_rawx(raw):
+                msg_id = "RXM-RAWX"
+                try:
+                    rawx = rawx_decode.decode_rawx(raw)
+                except ValueError as _rawx_err:
+                    log.debug("RAWX decode skipped: %s", _rawx_err)
+                    continue
+            else:
+                try:
+                    parsed = UBXReader.parse(raw)
+                except Exception:
+                    continue
+                if parsed is None:
+                    continue
+                msg_id = parsed.identity
 
             # Broadcast ephemeris from SFRBX
             # (We'll rely on NTRIP for ephemeris; SFRBX decoding is complex)
@@ -1281,50 +1308,51 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                 extint_store.update(parsed)
 
             if msg_id == 'RXM-RAWX':
-                # Fire raw callback before IF processing (for NTRIP caster)
+                # Fire raw callback before IF processing (for NTRIP caster).
+                # The caster re-encodes RTCM from the full pyubx2 object, so
+                # parse on demand only when a callback is registered — the
+                # timing path has none and stays on the numpy fast path.
                 if raw_callback is not None:
                     try:
-                        raw_callback(parsed)
+                        raw_callback(UBXReader.parse(raw))
                     except Exception as e:
                         log.debug(f"raw_callback error: {e}")
 
-                # New RAWX epoch — process and enqueue
+                # New RAWX epoch — process and enqueue.  Fields come from the
+                # vectorized rawx_decode arrays (rawx), not pyubx2 attributes.
                 ts = datetime.now(timezone.utc)  # Use wall clock for now
-                rcvTow = parsed.rcvTow
-                week = parsed.week
-                leapS = parsed.leapS
-                numMeas = parsed.numMeas
+                rcvTow = rawx.rcvTow
+                week = rawx.week
+                leapS = rawx.leapS
+                numMeas = rawx.numMeas
 
                 # Build observation set
                 raw_obs = defaultdict(dict)  # sv → role → data
-                for i in range(1, numMeas + 1):
-                    i2 = f"{i:02d}"
-                    gnss_id = getattr(parsed, f'gnssId_{i2}', None)
-                    sig_id = getattr(parsed, f'sigId_{i2}', None)
-                    sv_id = getattr(parsed, f'svId_{i2}', None)
-                    if gnss_id is None or sig_id is None:
-                        continue
+                for i in range(numMeas):
+                    gnss_id = int(rawx.gnssId[i])
+                    sig_id = int(rawx.sigId[i])
 
                     sig_name = SIG_NAMES.get((gnss_id, sig_id))
                     if sig_name is None or sig_name not in sig_lookup:
                         continue
 
                     _, prefix, role, a1, a2, _ = sig_lookup[sig_name]
-                    sv = f"{prefix}{int(sv_id):02d}"
+                    sv_id = int(rawx.svId[i])
+                    sv = f"{prefix}{sv_id:02d}"
 
                     # BDS-2 GEO/IGSO exclusion
-                    if prefix == 'C' and int(sv_id) < BDS_MIN_PRN:
+                    if prefix == 'C' and sv_id < BDS_MIN_PRN:
                         continue
 
-                    pr = getattr(parsed, f'prMes_{i2}', None)
-                    cp = getattr(parsed, f'cpMes_{i2}', None)
-                    cno = getattr(parsed, f'cno_{i2}', None)
-                    lock_ms = getattr(parsed, f'locktime_{i2}', 0)
-                    pr_valid = getattr(parsed, f'prValid_{i2}', 0)
-                    cp_valid = getattr(parsed, f'cpValid_{i2}', 0)
-                    half_cyc = getattr(parsed, f'halfCyc_{i2}', 0)
+                    pr = float(rawx.prMes[i])
+                    cp = float(rawx.cpMes[i])
+                    cno = int(rawx.cno[i])
+                    lock_ms = float(rawx.locktime[i])
+                    pr_valid = bool(rawx.prValid[i])
+                    cp_valid = bool(rawx.cpValid[i])
+                    half_cyc = bool(rawx.halfCyc[i])
 
-                    if not pr_valid or pr is None:
+                    if not pr_valid:
                         continue
                     if pr < 1e6 or pr > 4e7:
                         continue
