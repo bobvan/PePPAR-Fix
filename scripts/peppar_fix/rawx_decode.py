@@ -44,8 +44,15 @@ _HDR_LEN = 16
 class RawxEpoch:
     """One decoded RXM-RAWX epoch.
 
-    Per-measurement fields are numpy arrays of length ``numMeas`` (read-only
-    views into the frame buffer; the consumer reads scalars out of them).
+    Per-measurement fields are numpy arrays of length ``numMeas``.
+
+    LIFETIME: these arrays are read-only **views into the source frame
+    bytes**, not copies — decode is zero-copy by design.  They are valid
+    only while the ``raw`` frame passed to ``decode_rawx`` is alive.  The
+    serial-reader consumer reads scalars out synchronously within the same
+    loop iteration (the frame outlives that), so this is safe.  A caller
+    that wants to retain the epoch past the current frame must ``.copy()``
+    the arrays first.
     """
 
     rcvTow: float

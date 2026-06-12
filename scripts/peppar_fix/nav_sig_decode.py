@@ -43,7 +43,13 @@ _HDR_LEN = 8
 @dataclass
 class NavSigEpoch:
     """One decoded NAV-SIG epoch.  Per-signal fields are numpy arrays of
-    length ``numSigs`` (read-only views into the frame buffer)."""
+    length ``numSigs``.
+
+    LIFETIME: like ``rawx_decode.RawxEpoch``, these arrays are read-only
+    **views into the source frame bytes** (zero-copy), valid only while the
+    ``raw`` frame passed to ``decode_nav_sig`` is alive.  ``update_decoded``
+    reads scalars out synchronously, so this is safe; a caller retaining the
+    epoch past the current frame must ``.copy()`` the arrays first."""
 
     iTOW: int
     numSigs: int
