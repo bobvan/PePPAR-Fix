@@ -110,11 +110,60 @@ startup/phase anchor or sanity arm, not as the disciplining observer.
 | TDCP | 1.46 / 0.72 / 2.80 | moderate; long-τ tail + TDCP `n_sv=0` dropouts add variance |
 | EXTINT | 0.17 / 0.01 / 0.83 | non-reproducible (burst-driven) |
 
-TDCP showed intermittent `n_sv=0/11 → nan` epochs (a few per minute); the TICC
-phase anchor carries the loop through them, but they inflate the long-τ tail
-and run-to-run variance. Worth investigating (SV-geometry / screening gate)
-before TDCP can claim TICC-class reproducibility, but its *short-τ* discipline
-already matches TICC.
+TDCP showed intermittent `n_sv=0/11 → nan` epochs (10.1% / 7.7% of epochs);
+the TICC phase anchor carries the loop through them, but they inflate the
+long-τ tail and run-to-run variance. **Root cause traced — see next section.**
+Its *short-τ* discipline already matches TICC.
+
+## The TDCP `n_sv=0` dropouts — root cause (2026-06-12 follow-up)
+
+Dug in on the dropouts. They are **not** a TDCP defect, geometry, screening, or
+cycle slips — the estimator is behaving correctly. The chain:
+
+1. **Signature:** dropouts are all-or-nothing (`n_sv` jumps 10–14 → 0, never
+   1/2/3) with `c_dt_rx=nan` AND `mad=nan` — i.e. the `not residuals` path
+   (`tdcp_estimator.py:228`): *every* SV skipped before producing a residual.
+2. **The discriminator is the inter-epoch interval.** The logged `dt_s=1.00`
+   on dropouts is the misleading **empty-default** (`dt_used = median(dts) if
+   dts else 1.0`, line 226). The real `gps_time` delta from the CSV:
+
+   | inter-epoch Δt | n_used=0 (drop) | n_used>0 (good) |
+   |---|---|---|
+   | 1.0 s | 0 | 3382 |
+   | 2.0 s | 323 | 0 |
+   | 3.0 s | 51 | 0 |
+   | 4.0 s | 4 | 0 |
+
+   Every dropout is the epoch *after* a 2–4 s gap. The **`dt > max_dt_s = 1.5`
+   gate** (line 215) then correctly refuses to difference across the gap (a gap
+   could hide a slip), so all SVs are skipped.
+3. **The gap is an observation-epoch delivery stall, not receiver loss.**
+   NAV-CLOCK `iTOW` is continuous over the whole run (4217 epochs, 0 gaps >1 ms),
+   and `corr_wait = 0`. The engine's own `Skip stats` pins it:
+   `gate_wait_obs = 417` (tdcp_1) / `302` (tdcp_2), `n_stalls_gt_1.5s = 376 / 296`,
+   `max_stall_s = 4.0` — matching the 378 / 296 TDCP `dt≥2 s` gaps almost exactly.
+   So the **heavy carrier-phase observation epoch (RXM-RAWX) stalls 2–4 s in
+   delivery/assembly ~8–10 % of the time, while the light NAV-CLOCK stays on
+   time** — a transport/CPU latency on the heavy message (clkPoC3 = the slowest
+   lab host, Pi 4 / 906 MB). The TDCP gate faithfully reflects that hole.
+
+**Benign for discipline:** the TICC phase anchor carries the loop through every
+gap; the servo just gets a TDCP frequency update every ~1.1 s avg instead of
+1.0 s. The dropouts only depress TDCP's *standalone reproducibility* metric.
+
+**Remedies (in priority order):**
+
+- **Quick win — raise `TdcpEstimator.max_dt_s` 1.5 → 2.5 s.** Recovers the
+  single-gap (Δt=2.0 s) case: dropouts 10.1 % → 1.5 % (tdcp_1), 7.7 % → 0.9 %
+  (tdcp_2). Differencing across one 2 s gap is sound while the existing
+  per-SV slip protection (locktime drop / LLI / 3-MAD ensemble) holds; residual
+  risk is a slip hidden inside the single missing second (the MAD ensemble gate
+  still rejects single-SV outliers). One-line, immediately A/B-testable.
+- **Proper fix — eliminate the obs-epoch stall.** Profile the X20 serial
+  reader / UBX raw framer for the heavy RXM-RAWX epoch on the Pi 4; trim
+  message load (the consumption-alarm path suggests disabling SFRBX/PVT) or
+  raise USB read cadence so the heavy epoch assembles within 1 s. Removes the
+  gap instead of tolerating it, and would close the last ~1 % too.
 
 ## Bottom line
 
