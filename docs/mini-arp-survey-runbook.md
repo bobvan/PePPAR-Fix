@@ -149,6 +149,30 @@ an L5-fleet receiver it drops to single-frequency, so treat it as a sanity floor
 not a co-equal third dual-frequency opinion.  So: survey a fresh capture, but
 **adopt the ARP only after finals land** (or after switching to dual-freq GPS).
 
+**Counter-example — London Mini, 2026-06-13.**  On a dual-frequency-GPS + GAL
+capture (LEA-F9T-11B, L1C/L2X + E1X/E5b), the 3-way landed **CSRS − PRIDE at
+2.30 cm 3D** the same day on NRT products (CSRS used EMR ultra-rapid, PRIDE used
+WUM rapid-RTS), already passing the ≤ 3 cm consensus gate.  RTKLIB was the lone
+outlier at ~48 cm 3D (almost all in U), which is the *broadcast-eph* PPP
+signature — RTKLIB with `pos1-sateph=brdc` doesn't apply SSR / precise SP3+CLK
+and so can't reach the cm regime that CSRS and PRIDE share.  The right reading
+of the ptBoat lesson is therefore:
+
+- *Two independent precise-products solvers* (CSRS + PRIDE) on ITRF2020-aware
+  rapid/ultra-rapid streams can reach the ≤ 3 cm gate on NRT, provided the
+  capture has dual-frequency GPS (CSRS's required regime — Galileo finals are
+  not in the ultra-rapid stream, so CSRS will drop GAL).
+- *Broadcast-eph PPP* (RTKLIB default) is the binding constraint that drove
+  the "wait for finals" recommendation, because broadcast-PPP can't catch up
+  to precise-product PPP-AR no matter how long you wait.  Use it as a sanity
+  floor, not as the second cm-class opinion — or run RTKLIB with
+  `pos1-sateph=brdc+ssr` plus a precise SP3/CLK product to put it on the same
+  product chain as the others.
+- Adoption today: when CSRS + PRIDE agree ≤ 3 cm 3D on a dual-freq-GPS arc,
+  adopt the mean as the APC/ARP at the mid-window epoch and tag it ITRF2020;
+  schedule a finals re-run (londonArpFinals-class follow-up) to refine σ, but
+  don't gate the operator on it.
+
 ---
 
 ## Gotchas distilled from ptBoat
