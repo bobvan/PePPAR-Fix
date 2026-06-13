@@ -127,6 +127,47 @@ configures **L1/L2 if supported** (maximising product compatibility for the
 survey backends), falling back to L1/L5 only when L2C/E5b NAK.  Full
 ACK/NAK matrix in [`f9t-firmware-capabilities.md`](f9t-firmware-capabilities.md).
 
+## Techniques proven on the London run (to incorporate)
+
+peppar-survey today runs **exactly one backend** (`--pride` / `--rtklib` /
+`--opus` / `--cors`).  The 2026-06-12 London Mini PT 24 h survey (writeup +
+`london.survey.toml` under `~/gt/peppar-survey-data/raw/london-24h-l1l2-20260612/`)
+ran several and cross-checked them, and that surfaced four reusable techniques:
+
+1. **Multi-backend consensus, not single-backend.**  Run ≥2 independent solvers
+   over the *same* RINEX and adopt the agreement-gated **mean** as the survey.
+   London: PRIDE PPP-AR (WUM rapid-RTS) + CSRS-PPP (EMR ultra-rapid) agreed to
+   **2.3 cm 3D / 1.3 cm 2D** → mean written as the APC (σ ≈ 23 mm).  Add a
+   `--consensus` mode that fans out to the existing backends and gates on
+   `|Δ| ≤ 3 cm 3D` before writing `.survey.toml`.
+
+2. **Product-grade-aware: keep broadcast-eph as a *sanity check*, never in the
+   mean.**  RTKLIB with broadcast eph landed **~48 cm off (almost all vertical)**
+   — that's the broadcast-products *signature*, not a pipeline bug.  Form the
+   consensus from **precise-product** solvers (PRIDE-RTS, CSRS) only; use a
+   broadcast-eph run as a coarse gross-error cross-check and record why it was
+   excluded (`rtklib_excluded_reason`).  Averaging it in would have wrecked a
+   2 cm answer into 50 cm.
+
+3. **APC-not-ARP honesty for uncalibrated antennas.**  When the antenna PCV is
+   unknown (the F9T-11B antenna), survey with **ANT=NONE / zero-PCV** and record
+   the result as the **antenna phase centre (APC)**, with a `kind_note`, rather
+   than pretending it's the physical ARP.  Don't chase the missing antex as a
+   bias.  (PCV → ARP can be applied later if/when the antenna is calibrated.)
+
+4. **Provisional-now → finals-later, two-pass lifecycle.**  Adopt a *provisional*
+   survey from NRT/rapid products immediately (so the host isn't blocked), then
+   auto-schedule a **re-run when IGS/WUM finals land (~13–20 d)** for the
+   authoritative value.  London adopted a provisional APC and filed
+   `londonArpFinals` to re-run ~2026-06-25.  A `provisional = true` flag in
+   `.survey.toml` + a finals-rerun reminder closes the loop.
+
+**Provenance schema** (also from London): `.survey.toml` should carry the
+quality metadata that makes a survey auditable — `source` (which products/ACs),
+`consensus_2d_cm`/`consensus_3d_cm`, per-solver coordinates, fixing rates
+(`csrs_iar_pct`, NL/WL %), `capture_{start,end}_iso` + `capture_duration_h`,
+`frame`, and `kind_note`.
+
 ## Selection logic
 
 ```
