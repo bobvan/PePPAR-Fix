@@ -73,3 +73,22 @@ clock+orbit, GPS + Galileo, ns scale + a Galileo zoom) and a one-paragraph
 verdict on HAS's time-domain value given Galileo's already-excellent broadcast.
 The free-service angle (HAS needs no terrestrial NTRIP) is the framing — not
 "beat the premium SSR clock," which the X20P data says it won't.
+
+## Implementation status
+
+- **DONE — comparison plotter** (`scripts/plot_ssr_comparison.py`, 2026-06-12):
+  overlays N per-source CSVs (`--source LABEL=csv`) as broadcast clock+orbit
+  time error per SV — **constellation = colour, source = linestyle** — with a
+  two-key legend, the ±5 ns full view, and a **±1 ns Galileo zoom**.  Validated
+  against the CNES capture (CNES + a stand-in second source render + overlay
+  correctly); real HAS-E6 / HAS-IDD CSVs slot in as added linestyles.
+- **TODO — log the HAS tier.** `log_ssr_corrections.py` only reads an NTRIP
+  stream; needs a `--records-file` mode that tails the HAS bridge's records
+  JSON and ingests via `SSRState.update_from_records` (the engine already does
+  this for `--ssr-records-file`), so the HAS-E6 / HAS-IDD tiers become CSVs the
+  plotter can consume.
+- **BLOCKED — the capture.** E6-SIS HAS needs the X20P on PiPuss (only lab
+  receiver tracking E6); IDD needs an internet HAS feed.  Concurrent with
+  broadcast eph + CNES SSR.  Hardware/agent-gated, not codeable here.
+- **LATER — truth residuals.** Differencing each tier against IGS/CODE finals
+  (~12–20 d latency) for the absolute "residual vs truth" view.
