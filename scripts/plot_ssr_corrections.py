@@ -53,6 +53,11 @@ PREF_PHASE = {"G": ["L1C", "L1W"], "E": ["L1C", "L1B"],
               "R": ["L1C", "L1P"], "C": ["L2I", "L1I", "L5I"]}
 GAP_THRESH_S = 60.0   # value held longer than this = SSR coverage dropout, not data
 YLIM_NS = 5.0         # common vertical scale across figures
+# Draw order (low first / bottom) + line width: emphasize the least-varying
+# constellations by drawing them last (on top) and thicker, so GPS/Galileo
+# stand out instead of being buried under the busy GLONASS/BeiDou traces.
+PLOT_ORDER = {"R": 0, "C": 1, "G": 2, "E": 3}
+LINE_W = {"R": 1.0, "C": 1.0, "G": 1.7, "E": 1.7}
 
 # (component, title, signal-pref map, gap_break, output basename)
 PANELS = [
@@ -133,8 +138,9 @@ def fig_component(data, t0, span_h, svs, component, title, pref, gap_break,
                   out, ylim=YLIM_NS, hours=None):
     win = hours if hours else span_h
     fig, ax = plt.subplots(figsize=(16, 9))
+    ax.axhline(0, color="gray", lw=0.6)
     peaks = {}
-    for prn in svs:
+    for prn in sorted(svs, key=lambda p: PLOT_ORDER.get(p[0], 9)):
         if pref:
             sig = pick_signal(data, prn, component, pref)
             if not sig:
@@ -152,9 +158,9 @@ def fig_component(data, t0, span_h, svs, component, title, pref, gap_break,
         m = th <= win + 1e-9
         if not np.any(m):
             continue
-        ax.plot(th[m], v[m], lw=1.0, color=SYS_COLOR[prn[0]], alpha=0.85, label=lbl)
+        ax.plot(th[m], v[m], lw=LINE_W.get(prn[0], 1.0), color=SYS_COLOR[prn[0]],
+                alpha=0.85, label=lbl)
         peaks[prn[0]] = max(peaks.get(prn[0], 0.0), float(np.nanmax(np.abs(v[m]))))
-    ax.axhline(0, color="gray", lw=0.6)
     ax.set_ylim(-ylim, ylim)
     ax.set_xlim(0, win)
     ax.set_xlabel(f"hours since capture start   (window {win:.1f} h)")
@@ -173,8 +179,9 @@ def fig_component(data, t0, span_h, svs, component, title, pref, gap_break,
 def fig_broadcast_error(data, t0, span_h, svs, out, ylim=YLIM_NS, hours=None):
     win = hours if hours else span_h
     fig, ax = plt.subplots(figsize=(16, 9))
+    ax.axhline(0, color="black", lw=3.2, label="WITH SSR corrections (~0)")  # bottom layer
     peaks = {}
-    for prn in svs:
+    for prn in sorted(svs, key=lambda p: PLOT_ORDER.get(p[0], 9)):
         kc, ko = (prn, "clock_c0", ""), (prn, "orbit_radial", "")
         if kc not in data or ko not in data:
             continue
@@ -186,10 +193,9 @@ def fig_broadcast_error(data, t0, span_h, svs, out, ylim=YLIM_NS, hours=None):
         m = th <= win + 1e-9
         if not np.any(m):
             continue
-        ax.plot(th[m], err[m], lw=1.0, color=SYS_COLOR[prn[0]], alpha=0.85,
-                label=f"{prn} ({SYS_NAME[prn[0]]})")
+        ax.plot(th[m], err[m], lw=LINE_W.get(prn[0], 1.0), color=SYS_COLOR[prn[0]],
+                alpha=0.85, label=f"{prn} ({SYS_NAME[prn[0]]})")
         peaks[prn[0]] = max(peaks.get(prn[0], 0.0), float(np.nanmax(np.abs(err[m]))))
-    ax.axhline(0, color="black", lw=3.2, label="WITH SSR corrections (~0)")
     ax.set_ylim(-ylim, ylim)
     ax.set_xlim(0, win)
     ax.set_xlabel(f"hours since capture start   (window {win:.1f} h)")
