@@ -712,20 +712,17 @@ class Nav2SignalStore:
         self._signal_names = signal_names
 
     def update(self, parsed_msg):
-        """Store a freshly-decoded UBX-NAV-SIG message.
+        """Store a NAV-SIG message from a pyubx2-style attribute object.
 
-        Iterates per-signal entries and updates internal map.  Returns
-        a list of (sv_label, sig_name, prev_pr_used, new_pr_used)
-        tuples for prUsed transitions in this epoch — consumers (e.g.,
-        Charlie's disagreement logger) can use this directly, or
-        register on_transition callbacks that fire on each transition.
+        Compatibility entry point (used by unit tests with attribute
+        stubs).  Production uses ``update_decoded`` with the vectorized
+        ``nav_sig_decode`` output — pyubx2 does not expose a combined
+        ``sigFlags_NN`` attribute (only the expanded ``prUsed_NN`` etc.),
+        so this getattr path reads 0 for the validity bits on a real
+        pyubx2 message.  Returns the prUsed-transition list.
         """
-        signal_names = self._signal_names or {}
         num_sigs = getattr(parsed_msg, 'numSigs', 0) or 0
-        host_mono = time.monotonic()
-        transitions = []  # (sv_label, sig_name, prev_pr_used, new_pr_used)
-        epoch_snapshot = {}  # (sv_label, sig_name) → SigStatus
-
+        rows = []
         for i in range(1, num_sigs + 1):
             i2 = f"{i:02d}"
             gnss_id = getattr(parsed_msg, f'gnssId_{i2}', None)
@@ -733,19 +730,52 @@ class Nav2SignalStore:
             sig_id  = getattr(parsed_msg, f'sigId_{i2}',  None)
             if gnss_id is None or sv_id is None or sig_id is None:
                 continue
-            sig_flags = getattr(parsed_msg, f'sigFlags_{i2}', 0) or 0
-            cno       = getattr(parsed_msg, f'cno_{i2}',       None)
-            qual      = getattr(parsed_msg, f'qualityInd_{i2}', None)
-            pr_res    = getattr(parsed_msg, f'prRes_{i2}',     None)
-            # prRes is signed 16-bit in units of 0.1 m per the UBX spec.
-            # pyubx2 may already decode the scaling; we apply the 0.1
-            # conversion defensively if the value looks like raw ticks.
+            rows.append((
+                gnss_id, sv_id, sig_id,
+                getattr(parsed_msg, f'sigFlags_{i2}', 0) or 0,
+                getattr(parsed_msg, f'cno_{i2}',        None),
+                getattr(parsed_msg, f'qualityInd_{i2}', None),
+                getattr(parsed_msg, f'prRes_{i2}',      None),
+            ))
+        return self._ingest(rows)
+
+    def update_decoded(self, epoch):
+        """Store a vectorized-decoded NAV-SIG epoch (``nav_sig_decode``).
+
+        The production fast path — no pyubx2 attribute parse, and reads
+        ``sigFlags`` straight from the bytes so prUsed/crUsed/doUsed/
+        health are populated correctly (the getattr path above reads 0).
+        """
+        rows = []
+        for i in range(epoch.numSigs):
+            rows.append((
+                int(epoch.gnssId[i]), int(epoch.svId[i]), int(epoch.sigId[i]),
+                int(epoch.sigFlags[i]),
+                int(epoch.cno[i]), int(epoch.qualityInd[i]),
+                float(epoch.prRes[i]) * 0.1,   # raw 0.1 m units → metres
+            ))
+        return self._ingest(rows)
+
+    def _ingest(self, rows):
+        """Shared core: build a SigStatus per (gnss, sv, sig) row, detect
+        prUsed transitions, update the map, fire callbacks.
+
+        Each row is ``(gnss_id, sv_id, sig_id, sig_flags, cno, qual,
+        pr_res_m)`` where ``pr_res_m`` is in metres.  Returns the
+        prUsed-transition list.
+        """
+        signal_names = self._signal_names or {}
+        host_mono = time.monotonic()
+        transitions = []  # (sv_label, sig_name, prev_pr_used, new_pr_used)
+        epoch_snapshot = {}  # (sv_label, sig_name) → SigStatus
+
+        for gnss_id, sv_id, sig_id, sig_flags, cno, qual, pr_res in rows:
+            sig_flags = sig_flags or 0
+            # prRes is signed metres.  The >100 heuristic is preserved
+            # verbatim from the prior code (defensive raw-ticks guard).
             pr_res_m = None
             if pr_res is not None:
-                # Heuristic: if |pr_res| > 100 we assume raw 0.1m units.
-                pr_res_m = (pr_res * 0.1
-                             if abs(pr_res) > 100
-                             else float(pr_res))
+                pr_res_m = (pr_res * 0.1 if abs(pr_res) > 100 else float(pr_res))
 
             sig_name = signal_names.get((gnss_id, sig_id))
             if sig_name is None:
@@ -777,7 +807,6 @@ class Nav2SignalStore:
             self._epoch += 1
             self._update_count += 1
             cbs = list(self._transition_cbs)
-            epoch = self._epoch
 
         # Fire callbacks OUTSIDE the lock so a slow consumer can't
         # block other readers.  Errors per-callback don't fail others.
@@ -1018,7 +1047,7 @@ def _nav_sig_log_due(now_mono=None):
     return False
 
 
-def _emit_nav_sig_log(store, parsed_msg):
+def _emit_nav_sig_log(store):
     """Emit a structured per-epoch [NAV-SIG] log line.
 
     Format (one signal per line, multi-line on epochs >1 signal):
@@ -1124,6 +1153,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
         stop_event.set()
         return
 
+    from peppar_fix import nav_sig_decode, rawx_decode
     from peppar_fix.gnss_stream import open_gnss
 
     # Default to F9T for backward compatibility
@@ -1137,7 +1167,15 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
         f"(type: {device_type}, driver: {driver.name})"
     )
     ser = stream
-    ubr = UBXReader(ser, protfilter=2)  # UBX only
+    # parsing=False → read() returns the raw UBX frame only, with no
+    # UBXMessage build.  RXM-RAWX (the heavy, high-rate message — ~78
+    # measurements/epoch, ~22 ms of pyubx2 attribute-parse on a Pi 4,
+    # holding the GIL on this obs-delivery thread the whole time) is
+    # decoded via np.frombuffer in rawx_decode (~58 µs, 389× faster,
+    # parity-tested).  Every other (small, low-rate) UBX message is
+    # parsed on demand with UBXReader.parse below.
+    # See docs/x20-vcocxo-arm-comparison-2026-06-12.md (profiling section).
+    ubr = UBXReader(ser, protfilter=2, parsing=False)  # UBX only, raw frames
 
     # Signal name mapping from receiver driver
     SIG_NAMES = driver.signal_names
@@ -1183,21 +1221,49 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                     break
 
         try:
-            raw, parsed = ubr.read()
+            raw, parsed = ubr.read()   # parsing=False → parsed is None
             if ubx_log_file is not None and raw:
                 try:
                     ubx_log_file.write(raw)
                 except (OSError, ValueError):
                     log.warning("--ubx-out write failed; disabling capture")
                     ubx_log_file = None
-            if parsed is None:
+            if not raw:
                 continue
             delay_injector.maybe_inject_delay(source_name)
             if mute_controller.should_drop(source_name):
                 mute_controller.note_drop(source_name)
                 continue
 
-            msg_id = parsed.identity
+            # RXM-RAWX and NAV-SIG — the two big, high-rate repeating-group
+            # messages (~78 and ~104 entries/epoch; ~22 ms and ~29 ms of
+            # pyubx2 attribute-parse on a Pi 4, both on this obs-delivery
+            # thread holding the GIL) — take the np.frombuffer fast path.
+            # Every other (small, low-rate) UBX message is parsed on demand.
+            rawx = None
+            nav_sig = None
+            if rawx_decode.is_rawx(raw):
+                msg_id = "RXM-RAWX"
+                try:
+                    rawx = rawx_decode.decode_rawx(raw)
+                except ValueError as _rawx_err:
+                    log.debug("RAWX decode skipped: %s", _rawx_err)
+                    continue
+            elif nav_sig_decode.is_nav_sig(raw):
+                msg_id = "NAV-SIG"
+                try:
+                    nav_sig = nav_sig_decode.decode_nav_sig(raw)
+                except ValueError as _ns_err:
+                    log.debug("NAV-SIG decode skipped: %s", _ns_err)
+                    continue
+            else:
+                try:
+                    parsed = UBXReader.parse(raw)
+                except Exception:
+                    continue
+                if parsed is None:
+                    continue
+                msg_id = parsed.identity
 
             # Broadcast ephemeris from SFRBX
             # (We'll rely on NTRIP for ephemeris; SFRBX decoding is complex)
@@ -1248,13 +1314,13 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
             # Phase A.5 disagreement detector.  Sampled every NAV-SIG
             # epoch (default 1 Hz when CFG-MSGOUT-UBX_NAV_SIG_*=1).
             if msg_id == 'NAV-SIG' and nav_sig_store is not None:
-                nav_sig_store.update(parsed)
+                nav_sig_store.update_decoded(nav_sig)
                 # Store updates every epoch (gate + disagree detector);
                 # the verbose ~50-line dump is throttled to a periodic
                 # sample to spare the SD/eMMC write life + avoid the
                 # write-back stalls behind clkpoc3F9tInputReboot.
                 if _nav_sig_log_due():
-                    _emit_nav_sig_log(nav_sig_store, parsed)
+                    _emit_nav_sig_log(nav_sig_store)
 
             # NAV-CLOCK: receiver's own clock bias / drift / accuracy.
             # Diagnostic visibility into receiver-side time state for
@@ -1281,50 +1347,51 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                 extint_store.update(parsed)
 
             if msg_id == 'RXM-RAWX':
-                # Fire raw callback before IF processing (for NTRIP caster)
+                # Fire raw callback before IF processing (for NTRIP caster).
+                # The caster re-encodes RTCM from the full pyubx2 object, so
+                # parse on demand only when a callback is registered — the
+                # timing path has none and stays on the numpy fast path.
                 if raw_callback is not None:
                     try:
-                        raw_callback(parsed)
+                        raw_callback(UBXReader.parse(raw))
                     except Exception as e:
                         log.debug(f"raw_callback error: {e}")
 
-                # New RAWX epoch — process and enqueue
+                # New RAWX epoch — process and enqueue.  Fields come from the
+                # vectorized rawx_decode arrays (rawx), not pyubx2 attributes.
                 ts = datetime.now(timezone.utc)  # Use wall clock for now
-                rcvTow = parsed.rcvTow
-                week = parsed.week
-                leapS = parsed.leapS
-                numMeas = parsed.numMeas
+                rcvTow = rawx.rcvTow
+                week = rawx.week
+                leapS = rawx.leapS
+                numMeas = rawx.numMeas
 
                 # Build observation set
                 raw_obs = defaultdict(dict)  # sv → role → data
-                for i in range(1, numMeas + 1):
-                    i2 = f"{i:02d}"
-                    gnss_id = getattr(parsed, f'gnssId_{i2}', None)
-                    sig_id = getattr(parsed, f'sigId_{i2}', None)
-                    sv_id = getattr(parsed, f'svId_{i2}', None)
-                    if gnss_id is None or sig_id is None:
-                        continue
+                for i in range(numMeas):
+                    gnss_id = int(rawx.gnssId[i])
+                    sig_id = int(rawx.sigId[i])
 
                     sig_name = SIG_NAMES.get((gnss_id, sig_id))
                     if sig_name is None or sig_name not in sig_lookup:
                         continue
 
                     _, prefix, role, a1, a2, _ = sig_lookup[sig_name]
-                    sv = f"{prefix}{int(sv_id):02d}"
+                    sv_id = int(rawx.svId[i])
+                    sv = f"{prefix}{sv_id:02d}"
 
                     # BDS-2 GEO/IGSO exclusion
-                    if prefix == 'C' and int(sv_id) < BDS_MIN_PRN:
+                    if prefix == 'C' and sv_id < BDS_MIN_PRN:
                         continue
 
-                    pr = getattr(parsed, f'prMes_{i2}', None)
-                    cp = getattr(parsed, f'cpMes_{i2}', None)
-                    cno = getattr(parsed, f'cno_{i2}', None)
-                    lock_ms = getattr(parsed, f'locktime_{i2}', 0)
-                    pr_valid = getattr(parsed, f'prValid_{i2}', 0)
-                    cp_valid = getattr(parsed, f'cpValid_{i2}', 0)
-                    half_cyc = getattr(parsed, f'halfCyc_{i2}', 0)
+                    pr = float(rawx.prMes[i])
+                    cp = float(rawx.cpMes[i])
+                    cno = int(rawx.cno[i])
+                    lock_ms = float(rawx.locktime[i])
+                    pr_valid = bool(rawx.prValid[i])
+                    cp_valid = bool(rawx.cpValid[i])
+                    half_cyc = bool(rawx.halfCyc[i])
 
-                    if not pr_valid or pr is None:
+                    if not pr_valid:
                         continue
                     if pr < 1e6 or pr > 4e7:
                         continue
