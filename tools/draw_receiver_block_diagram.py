@@ -109,13 +109,26 @@ def main():
     arrow(ax, (13.5, 6.6), (14.0, 6.6), color="#38761d", lw=2.6)     # PPP -> PPP solution
     arrow(ax, (14.95, 5.95), (14.95, 4.35), color="#38761d", lw=2.6,
           label="discipline", lcolor="#38761d", fs=11)               # solution -> DO
-    arrow(ax, (14.95, 3.05), (14.95, 2.3), color="#38761d", lw=2.8)  # DO -> sub-nano PPS
-    ax.text(14.95, 2.05, "Sub-nano PPS", ha="center", va="center", fontsize=13,
+    arrow(ax, (14.95, 3.05), (14.95, 2.35), color="#38761d", lw=2.8)  # DO -> sub-nano PPS
+    ax.text(14.95, 2.1, "Sub-nano PPS", ha="center", va="center", fontsize=13,
             color="#38761d", weight="bold")
+    # flat-line glyph (clean, sub-ns) to the left of the label
+    ax.plot([12.35, 13.55], [2.1, 2.1], color="#38761d", lw=2.8, zorder=5)
+    ax.text(12.95, 1.78, "≪ 1 ns", ha="center", va="center", fontsize=10.5, color="#38761d")
+
     # raw PPS out the bottom of the receiver (the timing receiver's own PPS pin)
     arrow(ax, (4.7, 2.85), (4.7, 1.95), color="#666666", lw=2.6)
-    ax.text(5.5, 2.15, "Raw PPS", ha="left", va="center", fontsize=13,
+    ax.text(5.5, 2.1, "Raw PPS", ha="left", va="center", fontsize=13,
             color="#444444", weight="bold")
+    # sawtooth glyph (~8 ns quantization) to the right of the label
+    _sx, _amp, _yc, _teeth = 6.45, 0.17, 2.1, 4
+    _xs, _ys, _per = [], [], (7.95 - 6.45) / 4
+    for _i in range(_teeth):
+        _xa = _sx + _i * _per
+        _xs += [_xa, _xa + _per, _xa + _per]
+        _ys += [_yc - _amp, _yc + _amp, _yc - _amp]
+    ax.plot(_xs, _ys, color="#666666", lw=2.0, zorder=5, solid_joinstyle="miter")
+    ax.text(7.2, 1.78, "≈ 8 ns p-p", ha="center", va="center", fontsize=10.5, color="#666666")
 
     # ── title + legend + caption ────────────────────────────────────────
     ax.text(8.0, 8.62, "One set of raw observations  →  two timing solutions",
