@@ -126,6 +126,15 @@ def main(argv: list[str] | None = None) -> int:
              "NOAA CORS base.  Requires rnx2rtkp on PATH or via "
              "PEPPAR_RNX2RTKP_BIN.",
     )
+    backends.add_argument(
+        "--consensus", metavar="B1,B2[,B3]", default=None,
+        help="Run several backends over the SAME capture and write the "
+             "agreement-gated mean (London technique), e.g. "
+             "'pride,rtklib' or 'pride,csrs'.  Precise/rapid solvers form "
+             "the mean (≥2 required); broadcast-grade (rtklib PPP) is a "
+             "gross-error sanity check, never in the mean.  See "
+             "--consensus options.",
+    )
     pride = ap.add_argument_group("--pride options")
     pride.add_argument(
         "--rinex-glob", default=None,
@@ -249,6 +258,36 @@ def main(argv: list[str] | None = None) -> int:
              "rnx2rtkp will have no co-temporal epochs to solve.",
     )
 
+    cons = ap.add_argument_group("--consensus options")
+    cons.add_argument(
+        "--consensus-tol-cm", type=float, default=3.0,
+        help="Max inter-solver 3D agreement (cm) to accept the mean "
+             "(default 3).  Above this, no survey is written.",
+    )
+    cons.add_argument(
+        "--consensus-work-dir", default=None,
+        help="Scratch dir for consensus solves (per-backend subdirs). "
+             "Default: $TMPDIR/peppar-survey-consensus/.",
+    )
+    cons.add_argument(
+        "--apc", action="store_true",
+        help="Uncalibrated antenna: record the result as the APC (antenna "
+             "phase centre), not ARP — adds the kind_note.  (Zero-PCV is the "
+             "default for an antenna absent from the antex catalog.)",
+    )
+    cons.add_argument(
+        "--provisional", action="store_true",
+        help="Mark the survey provisional (NRT/rapid products) and stamp a "
+             "finals re-run horizon (~20 d) into .survey.toml.",
+    )
+    cons.add_argument(
+        "--csrs-result", default=None,
+        help="Path to a TOML stub transcribed from a CSRS-PPP report "
+             "(ecef_m=[X,Y,Z], sigma_m, optional iar_pct/grade), ingested as "
+             "a 'csrs' consensus member.  CSRS REST is unreliable, so the "
+             "operator uploads via browser and transcribes the result.",
+    )
+
     args = ap.parse_args(argv)
 
     logging.basicConfig(
@@ -267,14 +306,16 @@ def main(argv: list[str] | None = None) -> int:
         args.receiver_uid = uid
         log.info("Auto-discovered receiver_uid=%s", uid)
 
+    if args.consensus:
+        return _run_consensus(args)
     if args.pride:
         return _run_pride(args)
     if args.rtklib:
         return _run_rtklib(args)
 
     log.error(
-        "No backend selected.  Pass one of: --pride, --rtklib, "
-        "--opus, --cors.  --pride and --rtklib are implemented today."
+        "No backend selected.  Pass one of: --pride, --rtklib, --consensus, "
+        "--opus, --cors.  --pride, --rtklib and --consensus are implemented today."
     )
     return 2
 
@@ -389,6 +430,102 @@ def _run_rtklib(args) -> int:
                     else DEFAULT_MAX_SIG0_M),
         min_n_obs=(args.min_n_obs if args.min_n_obs is not None
                    else DEFAULT_MIN_N_OBS),
+        dry_run=args.dry_run,
+    )
+
+
+def _run_consensus(args) -> int:
+    """Dispatch to the multi-backend consensus layer."""
+    import tempfile
+    from glob import glob
+    from pathlib import Path
+
+    from peppar_fix.peppar_survey_consensus import run_consensus
+
+    backends = [b.strip() for b in args.consensus.split(",") if b.strip()]
+    if not backends:
+        log.error("--consensus needs a comma list, e.g. 'pride,rtklib'")
+        return 2
+    unknown = [b for b in backends if b not in ("pride", "rtklib", "csrs")]
+    if unknown:
+        log.error("--consensus: unknown backend(s) %s (use pride|rtklib|csrs)",
+                  ", ".join(unknown))
+        return 2
+
+    obs_files: list = []
+    if any(b in ("pride", "rtklib") for b in backends):
+        if not args.rinex_glob:
+            log.error("--consensus with pride/rtklib requires --rinex-glob")
+            return 2
+        obs_files = [Path(p) for p in sorted(glob(args.rinex_glob))]
+        if not obs_files:
+            log.error("--rinex-glob %r matched no files", args.rinex_glob)
+            return 1
+    if "csrs" in backends and not args.csrs_result:
+        log.error("--consensus with csrs requires --csrs-result <toml>")
+        return 2
+
+    work_dir = Path(args.consensus_work_dir or os.path.join(
+        tempfile.gettempdir(), "peppar-survey-consensus"))
+
+    # Per-backend solve kwargs assembled from the existing option groups.
+    solve_kw: dict = {}
+    if "pride" in backends:
+        pk = dict(
+            sys_attempts=tuple(s.strip() for s in args.pride_sys.split(",")
+                               if s.strip()),
+            n_days=args.n_days,
+            brdm_source=args.brdm_source,
+            wum_source=args.wum_source,
+        )
+        if args.max_sig0_m is not None:
+            pk["max_sig0_m"] = args.max_sig0_m
+        if args.min_n_obs is not None:
+            pk["min_n_obs"] = args.min_n_obs
+        solve_kw["pride"] = pk
+    if "rtklib" in backends:
+        selected = [v for v in (args.cors_station, args.cors_rinex_path,
+                                args.cors_ntrip_host) if v]
+        if len(selected) > 1:
+            log.error("--consensus rtklib accepts at most one CORS source")
+            return 2
+        rk = dict(
+            mode="rtk" if selected else "ppp",
+            n_days=args.n_days,
+            cors_station=args.cors_station,
+            cors_rinex_path=(Path(args.cors_rinex_path)
+                             if args.cors_rinex_path else None),
+            nav_file=Path(args.rtklib_nav) if args.rtklib_nav else None,
+        )
+        if args.cors_ntrip_host:
+            from peppar_fix.peppar_survey_cors import (
+                CorsNtripConfig, DEFAULT_CORS_NTRIP_DURATION_S,
+            )
+            rk["cors_ntrip"] = CorsNtripConfig(
+                host=args.cors_ntrip_host, port=args.cors_ntrip_port,
+                mount=args.cors_ntrip_mount,
+                duration_s=(args.cors_ntrip_duration
+                            if args.cors_ntrip_duration is not None
+                            else DEFAULT_CORS_NTRIP_DURATION_S))
+        if args.max_sig0_m is not None:
+            rk["max_sig0_m"] = args.max_sig0_m
+        if args.min_n_obs is not None:
+            rk["min_n_obs"] = args.min_n_obs
+        solve_kw["rtklib"] = rk
+
+    return run_consensus(
+        backends=backends,
+        obs_files=obs_files,
+        work_dir=work_dir,
+        receiver_uid=args.receiver_uid,
+        positions_dir=args.positions_dir,
+        history_dir=args.history_dir,
+        mount_sn=args.mount_sn,
+        tol_3d_cm=args.consensus_tol_cm,
+        apc=args.apc,
+        provisional=args.provisional,
+        csrs_pos=args.csrs_result,
+        solve_kw=solve_kw,
         dry_run=args.dry_run,
     )
 

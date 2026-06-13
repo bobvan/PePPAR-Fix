@@ -577,12 +577,11 @@ def write_survey_from_running(
     return state, path
 
 
-def run_pride_backend(
+def solve_pride_capture(
     obs_files: Sequence[Path],
     work_dir: Path,
     receiver_uid: str,
     *,
-    positions_dir: str | None = None,
     history_dir: str | None = None,
     mount_sn: int = 0,
     sys_attempts: Sequence[str] = DEFAULT_SYS_ATTEMPTS,
@@ -593,33 +592,26 @@ def run_pride_backend(
     timeout_s: int = DEFAULT_PDP3_TIMEOUT_S,
     dry_run: bool = False,
     pdp3_runner=invoke_pdp3,
-    source_label: str = "peppar-survey --pride",
     brdm_source: Path | str | None = None,
     wum_source: Path | str | None = None,
-) -> int:
-    """Run PRIDE over each RINEX, archive solutions, write survey.toml.
+    product_grade: str = "rapid",
+) -> tuple["RunningArp | None", str, dict]:
+    """Solve each RINEX with pdp3, append to history, and return the
+    running-mean ``RunningArp`` (or ``None``), the product grade, and
+    provenance meta — **without** writing ``.survey.toml``.
 
-    Exit code (shell convention):
-      0  one or more solutions ingested and a running mean computed.
-      1  no input obs files.
-      2  every obs file failed pdp3 (or no quality-passing solution).
-      3  pdp3 binary missing or not executable.
+    Shared seam: ``run_pride_backend`` calls this then writes; the consensus
+    layer (``peppar_survey_consensus``) calls it to collect one member.
+    PRIDE always solves against precise/rapid IGS products, so the grade is
+    ``"rapid"`` (WUM rapid-RTS) or ``"final"`` — never ``"broadcast"``.
     """
-    if not obs_files:
-        log.error("no RINEX obs files supplied")
-        return 1
-
-    if not dry_run and not os.path.isfile(pdp3_bin):
-        log.error("pdp3 binary not found at %s — set PEPPAR_PDP3_BIN "
-                  "or install PRIDE-PPP-AR", pdp3_bin)
-        return 3
-
     work_dir = Path(work_dir)
     history_path = default_history_path(receiver_uid, history_dir)
 
     n_solved = 0
     n_quality_ok = 0
     n_failed = 0
+    last_sol = None
     for obs in sorted(Path(p) for p in obs_files):
         log.info("--- pdp3: %s ---", obs.name)
         sol, last = process_one_obs(
@@ -639,6 +631,7 @@ def run_pride_backend(
         quality_ok = apply_quality_filter(
             sol, max_sig0_m=max_sig0_m, min_n_obs=min_n_obs)
         n_solved += 1
+        last_sol = sol
         if quality_ok:
             n_quality_ok += 1
         if dry_run:
@@ -647,7 +640,7 @@ def run_pride_backend(
                      history_path, sol.sig0_m, sol.sigma_3d_m,
                      sol.n_obs, quality_ok)
             continue
-        rec = append_solution(
+        append_solution(
             history_path, sol,
             mount_sn=mount_sn,
             quality_ok=quality_ok,
@@ -658,9 +651,13 @@ def run_pride_backend(
     log.info("pdp3 sweep complete: %d solved (%d quality_ok), %d failed",
              n_solved, n_quality_ok, n_failed)
 
+    meta = {"n_solved": n_solved, "n_quality_ok": n_quality_ok,
+            "n_failed": n_failed}
+    if last_sol is not None:
+        meta["n_obs"] = last_sol.n_obs
+        meta["sig0_m"] = round(last_sol.sig0_m, 4)
     if n_solved == 0:
-        log.error("no PRIDE solutions produced — survey.toml not written")
-        return 2
+        return None, product_grade, meta
 
     running = running_mean(
         history_path,
@@ -668,10 +665,66 @@ def run_pride_backend(
         mount_sn=mount_sn,
         require_quality_ok=True,
     )
+    return running, product_grade, meta
+
+
+def run_pride_backend(
+    obs_files: Sequence[Path],
+    work_dir: Path,
+    receiver_uid: str,
+    *,
+    positions_dir: str | None = None,
+    history_dir: str | None = None,
+    mount_sn: int = 0,
+    sys_attempts: Sequence[str] = DEFAULT_SYS_ATTEMPTS,
+    n_days: int = DEFAULT_N_DAYS,
+    max_sig0_m: float = DEFAULT_MAX_SIG0_M,
+    min_n_obs: int = DEFAULT_MIN_N_OBS,
+    pdp3_bin: str = DEFAULT_PDP3,
+    timeout_s: int = DEFAULT_PDP3_TIMEOUT_S,
+    dry_run: bool = False,
+    pdp3_runner=invoke_pdp3,
+    source_label: str = "peppar-survey --pride",
+    brdm_source: Path | str | None = None,
+    wum_source: Path | str | None = None,
+    product_grade: str = "rapid",
+) -> int:
+    """Run PRIDE over each RINEX, archive solutions, write survey.toml.
+
+    Exit code (shell convention):
+      0  one or more solutions ingested and a running mean computed.
+      1  no input obs files.
+      2  every obs file failed pdp3 (or no quality-passing solution).
+      3  pdp3 binary missing or not executable.
+    """
+    if not obs_files:
+        log.error("no RINEX obs files supplied")
+        return 1
+
+    if not dry_run and not os.path.isfile(pdp3_bin):
+        log.error("pdp3 binary not found at %s — set PEPPAR_PDP3_BIN "
+                  "or install PRIDE-PPP-AR", pdp3_bin)
+        return 3
+
+    running, _grade, _meta = solve_pride_capture(
+        obs_files, work_dir, receiver_uid,
+        history_dir=history_dir,
+        mount_sn=mount_sn,
+        sys_attempts=sys_attempts,
+        n_days=n_days,
+        max_sig0_m=max_sig0_m,
+        min_n_obs=min_n_obs,
+        pdp3_bin=pdp3_bin,
+        timeout_s=timeout_s,
+        dry_run=dry_run,
+        pdp3_runner=pdp3_runner,
+        brdm_source=brdm_source,
+        wum_source=wum_source,
+        product_grade=product_grade,
+    )
     if running is None:
-        log.error("running_mean returned None (no quality_ok solutions "
-                  "in mount_sn=%d partition) — survey.toml not written",
-                  mount_sn)
+        log.error("no PRIDE solutions / no quality_ok in mount_sn=%d "
+                  "partition — survey.toml not written", mount_sn)
         return 2
 
     state, path = write_survey_from_running(

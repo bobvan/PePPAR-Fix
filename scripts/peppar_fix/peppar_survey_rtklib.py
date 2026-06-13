@@ -723,6 +723,106 @@ def write_survey_from_running(
     return state, path
 
 
+def solve_rtklib_capture(
+    obs_files: Sequence[Path],
+    work_dir: Path,
+    receiver_uid: str,
+    *,
+    mode: str = "ppp",
+    cors_station: str | None = None,
+    cors_rinex_path: Path | None = None,
+    nav_file: Path | None = None,
+    history_dir: str | None = None,
+    mount_sn: int = 0,
+    n_days: int = DEFAULT_N_DAYS,
+    max_sig0_m: float = DEFAULT_MAX_SIG0_M,
+    min_n_obs: int = DEFAULT_MIN_N_OBS,
+    rnx2rtkp_bin: str = DEFAULT_RNX2RTKP,
+    timeout_s: int = DEFAULT_RNX2RTKP_TIMEOUT_S,
+    cors_ntrip=None,
+    dry_run: bool = False,
+    rnx2rtkp_runner=invoke_rnx2rtkp,
+    cors_fetcher=fetch_cors_rinex,
+    cors_ntrip_capturer=None,
+) -> tuple["RunningArp | None", str, dict]:
+    """Solve each obs with rnx2rtkp, append to history, and return the
+    running-mean ``RunningArp`` (or ``None``), the product grade, and
+    provenance meta — **without** writing ``.survey.toml``.
+
+    Shared seam: ``run_rtklib_backend`` calls this then writes; the consensus
+    layer calls it to collect one member.  Grade follows the product chain:
+    RTK against a CORS base is cm-class → ``"precise"``; plain PPP-static on
+    broadcast eph is the dm-class broadcast-products signature → ``"broadcast"``
+    (a consensus *sanity check*, never in the mean).
+    """
+    work_dir = Path(work_dir)
+    history_path = default_history_path(receiver_uid, history_dir)
+    grade = "precise" if mode == "rtk" else "broadcast"
+
+    n_solved = 0
+    n_quality_ok = 0
+    n_failed = 0
+    last_sol = None
+    for obs in sorted(Path(p) for p in obs_files):
+        log.info("--- rnx2rtkp: %s ---", obs.name)
+        sol, last = process_one_obs(
+            obs, work_dir / obs.stem,
+            mode=mode,
+            cors_station=cors_station,
+            cors_rinex_path=cors_rinex_path,
+            cors_ntrip=cors_ntrip,
+            nav_file=nav_file,
+            rnx2rtkp_bin=rnx2rtkp_bin,
+            timeout_s=timeout_s,
+            rnx2rtkp_runner=rnx2rtkp_runner,
+            cors_fetcher=cors_fetcher,
+            cors_ntrip_capturer=cors_ntrip_capturer,
+        )
+        if sol is None:
+            n_failed += 1
+            log.warning("FAILED %s: %s",
+                        obs.name, last.error if last else "no attempt")
+            continue
+        # Adapt to PrideSolution so arp_history's append + running_mean
+        # can consume RTKLIB output through the same pipeline.
+        adapter = rtklib_to_pride_solution(
+            sol, src_path=str(obs))
+        quality_ok = apply_quality_filter(
+            adapter, max_sig0_m=max_sig0_m, min_n_obs=min_n_obs)
+        n_solved += 1
+        last_sol = sol
+        if quality_ok:
+            n_quality_ok += 1
+        if dry_run:
+            log.info("  DRY RUN — would append (σ_3d=%.4fm n_obs=%d "
+                     "quality_ok=%s)",
+                     sol.sigma_3d_m, sol.n_obs, quality_ok)
+            continue
+        append_solution(
+            history_path, adapter,
+            mount_sn=mount_sn, quality_ok=quality_ok,
+        )
+        log.info("  appended %s → %s (σ_3d=%.4fm quality_ok=%s)",
+                 sol.date_iso, history_path, sol.sigma_3d_m, quality_ok)
+
+    log.info("rnx2rtkp sweep complete: %d solved (%d quality_ok), %d failed",
+             n_solved, n_quality_ok, n_failed)
+
+    meta = {"mode": mode, "n_solved": n_solved,
+            "n_quality_ok": n_quality_ok, "n_failed": n_failed}
+    if last_sol is not None:
+        meta["n_obs"] = last_sol.n_obs
+    if n_solved == 0:
+        return None, grade, meta
+
+    running = running_mean(
+        history_path,
+        n_days=n_days, mount_sn=mount_sn,
+        require_quality_ok=True,
+    )
+    return running, grade, meta
+
+
 def run_rtklib_backend(
     obs_files: Sequence[Path],
     work_dir: Path,
@@ -767,8 +867,6 @@ def run_rtklib_backend(
                   rnx2rtkp_bin)
         return 3
 
-    work_dir = Path(work_dir)
-    history_path = default_history_path(receiver_uid, history_dir)
     if source_label is None:
         if mode == "rtk" and cors_ntrip is not None:
             source_label = (
@@ -779,64 +877,28 @@ def run_rtklib_backend(
         else:
             source_label = "peppar-survey --rtklib"
 
-    n_solved = 0
-    n_quality_ok = 0
-    n_failed = 0
-    for obs in sorted(Path(p) for p in obs_files):
-        log.info("--- rnx2rtkp: %s ---", obs.name)
-        sol, last = process_one_obs(
-            obs, work_dir / obs.stem,
-            mode=mode,
-            cors_station=cors_station,
-            cors_rinex_path=cors_rinex_path,
-            cors_ntrip=cors_ntrip,
-            nav_file=nav_file,
-            rnx2rtkp_bin=rnx2rtkp_bin,
-            timeout_s=timeout_s,
-            rnx2rtkp_runner=rnx2rtkp_runner,
-            cors_fetcher=cors_fetcher,
-            cors_ntrip_capturer=cors_ntrip_capturer,
-        )
-        if sol is None:
-            n_failed += 1
-            log.warning("FAILED %s: %s",
-                        obs.name, last.error if last else "no attempt")
-            continue
-        # Adapt to PrideSolution so arp_history's append + running_mean
-        # can consume RTKLIB output through the same pipeline.
-        adapter = rtklib_to_pride_solution(
-            sol, src_path=str(obs))
-        quality_ok = apply_quality_filter(
-            adapter, max_sig0_m=max_sig0_m, min_n_obs=min_n_obs)
-        n_solved += 1
-        if quality_ok:
-            n_quality_ok += 1
-        if dry_run:
-            log.info("  DRY RUN — would append (σ_3d=%.4fm n_obs=%d "
-                     "quality_ok=%s)",
-                     sol.sigma_3d_m, sol.n_obs, quality_ok)
-            continue
-        append_solution(
-            history_path, adapter,
-            mount_sn=mount_sn, quality_ok=quality_ok,
-        )
-        log.info("  appended %s → %s (σ_3d=%.4fm quality_ok=%s)",
-                 sol.date_iso, history_path, sol.sigma_3d_m, quality_ok)
-
-    log.info("rnx2rtkp sweep complete: %d solved (%d quality_ok), %d failed",
-             n_solved, n_quality_ok, n_failed)
-
-    if n_solved == 0:
-        log.error("no rtklib solutions produced — survey.toml not written")
-        return 2
-
-    running = running_mean(
-        history_path,
-        n_days=n_days, mount_sn=mount_sn,
-        require_quality_ok=True,
+    running, _grade, _meta = solve_rtklib_capture(
+        obs_files, work_dir, receiver_uid,
+        mode=mode,
+        cors_station=cors_station,
+        cors_rinex_path=cors_rinex_path,
+        nav_file=nav_file,
+        history_dir=history_dir,
+        mount_sn=mount_sn,
+        n_days=n_days,
+        max_sig0_m=max_sig0_m,
+        min_n_obs=min_n_obs,
+        rnx2rtkp_bin=rnx2rtkp_bin,
+        timeout_s=timeout_s,
+        cors_ntrip=cors_ntrip,
+        dry_run=dry_run,
+        rnx2rtkp_runner=rnx2rtkp_runner,
+        cors_fetcher=cors_fetcher,
+        cors_ntrip_capturer=cors_ntrip_capturer,
     )
     if running is None:
-        log.error("running_mean returned None — survey.toml not written")
+        log.error("no rtklib solutions / running_mean None — "
+                  "survey.toml not written")
         return 2
 
     write_survey_from_running(

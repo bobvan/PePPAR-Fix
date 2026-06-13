@@ -19,13 +19,10 @@ Four London techniques implemented here:
   3. APC-not-ARP framing for uncalibrated antennas (apc=True);
   4. provisional-now → finals-later lifecycle (provisional=True + rerun stamp).
 
-STATUS: the consensus layer (gate / grade split / mean / provenance / write)
-is complete.  The one integration seam is `_solve_member()` — each existing
-backend needs a compute-only entry point that RETURNS its single-capture
-solution instead of writing.  That's a small refactor of run_pride_backend /
-run_rtklib_backend (factor the solve+running_mean part out of the write part,
-which already lives in their separate write_survey_from_running()).  NOT wired
-into the peppar_survey.py CLI yet.
+Wired: `peppar-survey --consensus pride,rtklib[,csrs]`.  Each backend exposes a
+compute-only `solve_*_capture()` that returns its single-capture RunningArp +
+grade + meta (the write half stays in `write_survey_from_running()`); this layer
+collects them, gates, and writes one consensus `.survey.toml`.
 """
 
 from __future__ import annotations
@@ -72,56 +69,117 @@ class ConsensusMember:
 # --------------------------------------------------------------------------- #
 #  Per-backend solve seam (the one piece needing a small backend refactor)
 # --------------------------------------------------------------------------- #
-def _solve_member(name: str, *, obs_files, work_dir, apc: bool,
-                  csrs_pos=None, **kw) -> ConsensusMember | None:
+def _solve_member(name: str, *, obs_files, work_dir, receiver_uid,
+                  history_dir=None, mount_sn=0, dry_run=False,
+                  csrs_pos=None, solve_kw=None) -> ConsensusMember | None:
     """Run ONE backend over the capture and return its single-capture solution
     WITHOUT writing .survey.toml.
 
-    Integration points (factor the solve part out of each run_*_backend; the
-    write half already lives in write_survey_from_running()):
+      pride  → peppar_survey_pride.solve_pride_capture  (grade 'rapid'/'final')
+      rtklib → peppar_survey_rtklib.solve_rtklib_capture (RTK 'precise', else
+               'broadcast' = sanity-check only)
+      csrs   → ingest an operator-downloaded CSRS-PPP result (--csrs-result);
+               CSRS REST is unreliable (opaque SEVERE errors) so transcribe,
+               don't auto-submit.
 
-      pride  → peppar_survey_pride.solve_capture(obs_files, …, antex=None if apc)
-               returns RunningArp(+meta); WUM-RTS ⇒ grade 'rapid', finals ⇒ 'final'
-      rtklib → peppar_survey_rtklib.solve_capture(obs_files, …)
-               sateph=brdc ⇒ grade 'broadcast'; precise SP3/CLK ⇒ 'precise'
-      csrs   → parse an operator-downloaded CSRS-PPP .pos (--csrs-pos); grade per
-               its product line (ultra-rapid⇒'rapid', final⇒'final').  CSRS REST
-               is unreliable (opaque SEVERE errors) so ingest, don't auto-submit.
-
-    `apc=True` ⇒ ANT=NONE / zero-PCV (uncalibrated antenna ⇒ APC not ARP).
+    `solve_kw` is {backend: {extra kwargs}} forwarded to the solve function.
     """
+    from pathlib import Path
+
+    from peppar_fix.position_state import decimal_year_from_mjd
+    kw = (solve_kw or {}).get(name, {})
+
     if name == "csrs":
-        if not csrs_pos:
-            log.warning("csrs member needs --csrs-pos <downloaded .pos>; skipping")
-            return None
-        # parse_pos / a CSRS reader → ecef + σ95 + IAR%; grade from the header
-        raise NotImplementedError("ingest CSRS .pos via pride_pos_reader/CSRS parser")
-    # pride / rtklib: call the (to-be-added) compute-only solve and wrap it.
-    raise NotImplementedError(
-        f"wire {name}: add solve_capture(...) -> (RunningArp, grade, meta) to "
-        f"peppar_survey_{name}, then build ConsensusMember from it")
+        return _ingest_csrs(csrs_pos, **kw)
+
+    wd = Path(work_dir) / name          # isolate per-backend scratch
+    # Isolate each backend's history too — otherwise pride and rtklib would
+    # append to the SAME history.jsonl (keyed by receiver_uid) and their
+    # running means would cross-contaminate.
+    hist = str(Path(history_dir) / name) if history_dir else str(wd)
+    if name == "pride":
+        from peppar_fix.peppar_survey_pride import solve_pride_capture
+        running, grade, meta = solve_pride_capture(
+            obs_files, wd, receiver_uid, history_dir=hist,
+            mount_sn=mount_sn, dry_run=dry_run, **kw)
+    elif name == "rtklib":
+        from peppar_fix.peppar_survey_rtklib import solve_rtklib_capture
+        running, grade, meta = solve_rtklib_capture(
+            obs_files, wd, receiver_uid, history_dir=hist,
+            mount_sn=mount_sn, dry_run=dry_run, **kw)
+    else:
+        log.error("unknown consensus backend %r (use pride|rtklib|csrs)", name)
+        return None
+
+    if running is None:
+        return ConsensusMember(name, (0.0, 0.0, 0.0), float("inf"), grade,
+                               Frame(CANONICAL_REALIZATION, None),
+                               ok=False, meta=meta)
+    mid_mjd = 0.5 * (running.oldest_mjd + running.newest_mjd)
+    meta["window_count"] = running.count
+    meta["epoch_decimal_year"] = decimal_year_from_mjd(mid_mjd)
+    return ConsensusMember(
+        name, tuple(running.ecef_m), float(running.sigma_3d_m), grade,
+        Frame(CANONICAL_REALIZATION, decimal_year_from_mjd(mid_mjd)),
+        ok=True, meta=meta)
+
+
+def _ingest_csrs(path, *, grade: str = "rapid",
+                 epoch_decimal_year=None) -> ConsensusMember | None:
+    """Ingest an operator-downloaded CSRS-PPP result as a consensus member.
+
+    CSRS-PPP's REST endpoint returns opaque SEVERE errors; the reliable path is
+    the operator's browser upload, then transcribe the report into a small TOML
+    stub::
+
+        ecef_m  = [3979160.4832, -4257.8608, 4968043.1627]   # m, ITRF2020
+        sigma_m = 0.0093                                       # 3D 1σ (σ95/1.96)
+        iar_pct = 89.5                                         # optional
+        grade   = "rapid"                                      # or "final"
+    """
+    if not path:
+        log.warning("csrs member needs --csrs-result <toml>; skipping")
+        return None
+    try:
+        import tomllib
+    except ModuleNotFoundError:                       # py < 3.11
+        import tomli as tomllib                        # type: ignore
+    try:
+        with open(path, "rb") as f:
+            d = tomllib.load(f)
+        ecef = tuple(float(v) for v in d["ecef_m"])
+        sigma = float(d["sigma_m"])
+    except (OSError, KeyError, ValueError, TypeError) as e:
+        log.error("csrs result %s unreadable: %s", path, e)
+        return None
+    meta = {k: d[k] for k in ("iar_pct", "n_obs", "product") if k in d}
+    return ConsensusMember(
+        "csrs", ecef, sigma, str(d.get("grade", grade)),
+        Frame(CANONICAL_REALIZATION,
+              d.get("epoch_decimal_year", epoch_decimal_year)),
+        ok=True, meta=meta)
 
 
 # --------------------------------------------------------------------------- #
 #  Consensus
 # --------------------------------------------------------------------------- #
 def run_consensus(*, backends, obs_files, work_dir, receiver_uid,
-                  positions_dir=None, mount_sn=0, tol_3d_cm=3.0,
-                  apc=False, provisional=False, csrs_pos=None,
-                  dry_run=False, **kw) -> int:
+                  positions_dir=None, history_dir=None, mount_sn=0,
+                  tol_3d_cm=3.0, apc=False, provisional=False,
+                  csrs_pos=None, solve_kw=None, dry_run=False) -> int:
     """Run `backends` over one capture, write the agreement-gated mean.
 
     backends: ordered list, e.g. ['pride', 'rtklib', 'csrs'].
+    solve_kw: {backend: {extra solve kwargs}} forwarded to each solve_*_capture.
     Returns a process exit code (0 ok, 1 no-consensus/failure).
     """
     members: list[ConsensusMember] = []
     for name in backends:
         try:
             m = _solve_member(name, obs_files=obs_files, work_dir=work_dir,
-                              apc=apc, csrs_pos=csrs_pos, mount_sn=mount_sn, **kw)
-        except NotImplementedError as e:
-            log.error("backend %s not wired: %s", name, e)
-            m = None
+                              receiver_uid=receiver_uid, history_dir=history_dir,
+                              mount_sn=mount_sn, dry_run=dry_run,
+                              csrs_pos=csrs_pos, solve_kw=solve_kw)
         except Exception as e:                       # one bad backend ≠ fatal
             log.error("backend %s failed: %s", name, e)
             m = None
@@ -239,12 +297,21 @@ def _enu(P, mean):
 
 
 def _consensus_frame(members) -> Frame:
-    """All precise PPP products realize ITRF2020/IGS20; stamp the capture epoch."""
-    ep = [m.meta.get("epoch_decimal_year") for m in members
-          if m.meta.get("epoch_decimal_year")]
-    return Frame(CANONICAL_REALIZATION, sum(ep) / len(ep) if ep else None)
+    """All precise PPP products realize ITRF2020/IGS20; stamp the capture epoch
+    (mean of the members' epochs; current epoch if none carry one)."""
+    eps = [m.frame.epoch for m in members
+           if getattr(m, "frame", None) and m.frame.epoch is not None]
+    if eps:
+        return Frame(CANONICAL_REALIZATION, sum(eps) / len(eps))
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    y0 = datetime(now.year, 1, 1, tzinfo=timezone.utc)
+    y1 = datetime(now.year + 1, 1, 1, tzinfo=timezone.utc)
+    return Frame(CANONICAL_REALIZATION, now.year + (now - y0) / (y1 - y0))
 
 
 def _plus_days_iso(days: float) -> str:
-    # NOTE: real impl stamps capture_end + days; kept seam-simple in the sketch.
-    raise NotImplementedError("stamp capture_end_iso + days for the finals rerun")
+    """Reminder horizon for the finals re-run (now + days, UTC)."""
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(days=days)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
