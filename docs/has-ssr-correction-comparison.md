@@ -82,13 +82,38 @@ The free-service angle (HAS needs no terrestrial NTRIP) is the framing — not
   two-key legend, the ±5 ns full view, and a **±1 ns Galileo zoom**.  Validated
   against the CNES capture (CNES + a stand-in second source render + overlay
   correctly); real HAS-E6 / HAS-IDD CSVs slot in as added linestyles.
-- **TODO — log the HAS tier.** `log_ssr_corrections.py` only reads an NTRIP
-  stream; needs a `--records-file` mode that tails the HAS bridge's records
-  JSON and ingests via `SSRState.update_from_records` (the engine already does
-  this for `--ssr-records-file`), so the HAS-E6 / HAS-IDD tiers become CSVs the
-  plotter can consume.
-- **BLOCKED — the capture.** E6-SIS HAS needs the X20P on PiPuss (only lab
-  receiver tracking E6); IDD needs an internet HAS feed.  Concurrent with
-  broadcast eph + CNES SSR.  Hardware/agent-gated, not codeable here.
+- **DONE — log the HAS tier** (`log_ssr_corrections.py --records-file`,
+  2026-06-13): tails the HAS bridge's records JSON (rewritten atomically each
+  HAS message) and ingests via `SSRState.update_from_records`, emitting the
+  *same* CSV the plotter consumes (GPS+Galileo only; `n_pbias=0` — HAS carries
+  no phase bias).  Verified: a decoded 53-record set → orbit/clock/code-bias
+  rows in both metres and ns, loaded back by `plot_ssr_comparison.load`.
+- **DONE — E6-SIS capture chain validated** (2026-06-13).  The receiver is the
+  **ZED-X20P on clkPoC3** (`/dev/ttyACM1`; the only lab receiver tracking E6,
+  idle and confirmed emitting GAL sigId-8 / E6 pages — *no reconfig*).  Because
+  clkPoC3's system `pyubx2` can't frame the X20, the chain keeps **all parsing
+  on gt**:
+
+  ```sh
+  # 1. clkPoC3 → gt: real-time raw UBX (plain cat, no parsing on clkPoC3)
+  ssh clkPoC3 "stty -F /dev/ttyACM1 raw -echo; cat /dev/ttyACM1" > x20_live.ubx &
+  # 2. gt: tail the growing file, decode E6 → HAS records JSON (~1 Hz)
+  tools/has_ssr_bridge.py --ubx-file x20_live.ubx --out has_records.json --seconds <dur>
+  # 3. gt: tail records → the comparison CSV
+  scripts/log_ssr_corrections.py --records-file has_records.json \
+      --duration <dur> --interval 10 --out has_e6.csv
+  ```
+
+  The bridge's `--ubx-file` mode *seeks to end and batches by read-time
+  wall-second* — it needs the live, real-time-paced stream above, **not** a
+  static captured file (a saved `.ubx` decodes 0).  End-to-end smoke (180 s):
+  **22 HAS messages → 53 complete records (27 GPS + 26 Galileo)**, orbit +
+  clock + code-bias each.
+- **REMAINING — the concurrent multi-hour run.** Launch the chain above on
+  clkPoC3/gt **concurrent with a CNES SSR capture on ptpmon** (per the
+  offload-to-ptpmon convention; `ntrip-cnes.conf` lives there) so both tiers
+  cover the same SVs/epochs, then `plot_ssr_comparison.py --source
+  CNES=… --source HAS-E6=…`.  IDD HAS is a bonus third linestyle (internet feed,
+  any host).  Duration/timing is an operator call.
 - **LATER — truth residuals.** Differencing each tier against IGS/CODE finals
   (~12–20 d latency) for the absolute "residual vs truth" view.

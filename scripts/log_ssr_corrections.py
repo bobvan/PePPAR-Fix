@@ -49,20 +49,17 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--conf", default="ntrip-cnes.conf",
                     help="NTRIP conf (ini with [ntrip] caster/port/mount/user/password/tls)")
+    ap.add_argument("--records-file", default=None,
+                    help="instead of NTRIP, tail a HAS-bridge records JSON "
+                         "(tools/has_ssr_bridge.py --out) and ingest via "
+                         "SSRState.update_from_records — the HAS (E6/IDD) tier. "
+                         "Produces the same CSV the plotter consumes.")
     ap.add_argument("--duration", type=float, default=86400.0, help="seconds (default 24h)")
     ap.add_argument("--interval", type=float, default=10.0, help="snapshot cadence s")
     ap.add_argument("--out", default="ssr_corrections.csv")
     ap.add_argument("--report-every", type=float, default=1800.0)
     args = ap.parse_args()
 
-    conf = configparser.ConfigParser()
-    if not conf.read(args.conf):
-        print(f"ERROR: cannot read conf {args.conf!r}", file=sys.stderr)
-        return 2
-    n = conf["ntrip"]
-    stream = NtripStream(n["caster"], int(n["port"]), n["mount"],
-                         user=n.get("user"), password=n.get("password"),
-                         tls=n.getboolean("tls", fallback=True))
     ssr = SSRState()
     out = open(args.out, "w")
     out.write("utc_iso,mono_s,prn,sys,component,signal,value_m,value_ns,iod,epoch_s,age_s,disc\n")
@@ -106,12 +103,61 @@ def main():
         out.flush()
         n_rows += len(buf)
 
-    print(f"connecting {n['caster']}:{n['port']}/{n['mount']} for "
-          f"{args.duration:.0f}s, snapshot every {args.interval:.0f}s -> {args.out}",
-          flush=True)
+    def report(now):
+        ncb = sum(len(v) for v in ssr._code_bias.values())
+        npb = sum(len(v) for v in ssr._phase_bias.values())
+        print(f"  t={now:6.0f}s rows={n_rows} n_orbit={len(ssr._orbit)} "
+              f"n_clock={len(ssr._clock)} n_cbias={ncb} n_pbias={npb}", flush=True)
+
     t0 = time.monotonic()
     last_snap = -1e9
     last_report = t0
+
+    if args.records_file:
+        # HAS tier: tail the bridge's records JSON (rewritten atomically each
+        # HAS message) and ingest via the decoder-neutral records path.
+        import json
+        import os
+        print(f"tailing records {args.records_file} for {args.duration:.0f}s, "
+              f"snapshot every {args.interval:.0f}s -> {args.out}", flush=True)
+        last_mtime = None
+        while True:
+            now = time.monotonic() - t0
+            try:
+                mtime = os.stat(args.records_file).st_mtime
+                if mtime != last_mtime:
+                    last_mtime = mtime
+                    with open(args.records_file) as f:
+                        d = json.load(f)
+                    ssr.update_from_records(d.get("records", []),
+                                            float(d.get("epoch_s", 0.0)))
+            except (FileNotFoundError, ValueError, json.JSONDecodeError):
+                pass   # not written yet, or caught mid-rename
+            if now - last_snap >= args.interval:
+                snapshot(now)
+                last_snap = now
+            nowm = time.monotonic()
+            if nowm - last_report >= args.report_every:
+                report(now)
+                last_report = nowm
+            if now > args.duration:
+                break
+            time.sleep(0.5)
+        out.close()
+        print(f"done: {n_rows} rows over {args.duration:.0f}s -> {args.out}", flush=True)
+        return 0
+
+    conf = configparser.ConfigParser()
+    if not conf.read(args.conf):
+        print(f"ERROR: cannot read conf {args.conf!r}", file=sys.stderr)
+        return 2
+    n = conf["ntrip"]
+    stream = NtripStream(n["caster"], int(n["port"]), n["mount"],
+                         user=n.get("user"), password=n.get("password"),
+                         tls=n.getboolean("tls", fallback=True))
+    print(f"connecting {n['caster']}:{n['port']}/{n['mount']} for "
+          f"{args.duration:.0f}s, snapshot every {args.interval:.0f}s -> {args.out}",
+          flush=True)
     for msg, meta in stream.messages_with_metadata():
         now = time.monotonic() - t0
         try:
@@ -123,10 +169,7 @@ def main():
             last_snap = now
         nowm = time.monotonic()
         if nowm - last_report >= args.report_every:
-            ncb = sum(len(v) for v in ssr._code_bias.values())
-            npb = sum(len(v) for v in ssr._phase_bias.values())
-            print(f"  t={now:6.0f}s rows={n_rows} n_orbit={len(ssr._orbit)} "
-                  f"n_clock={len(ssr._clock)} n_cbias={ncb} n_pbias={npb}", flush=True)
+            report(now)
             last_report = nowm
         if now > args.duration:
             break
