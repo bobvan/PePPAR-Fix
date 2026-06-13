@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""plot_ssr_corrections.py — per-component SSR-correction figures from a
-log_ssr_corrections.py CSV (see docs/visual-stories.md "SSR corrections").
+"""plot_ssr_corrections.py — SSR-correction figures from a log_ssr_corrections.py
+CSV (see docs/visual-stories.md "SSR corrections").
 
-Four separate figures, one per correction component, each:
-  - **detrended** (per-SV mean removed) so variance sits symmetrically about
-    zero and shows the correction's *character*, not the per-SV datum offset;
-  - on a **common vertical scale** (default ±10 ns) so magnitudes can be
-    compared across the four figures; a trace exceeding the scale is clipped
-    and its peak is called out in the title rather than hidden;
-  - clock & orbit get a **gap-break** — SSR coverage dropouts render as gaps,
-    not held-value flat lines. Code/phase bias are genuinely quasi-static, so a
-    value-change detector can't tell "held fresh" from "stale"; they are NOT
-    gap-broken (a real bias-gap detector needs correction age, a future logger
-    field).
+Five figures, sized 16:9 with large fonts for auditorium projection, each as
+PDF (vector) + PNG:
 
-Outputs: ssr_clock.png, ssr_orbit.png, ssr_codebias.png, ssr_phasebias.png.
-x-axis is the full capture by default; --hours sets a finer common window.
+  ssr_clock / ssr_orbit / ssr_codebias / ssr_phasebias — one correction
+    component each, detrended (per-SV mean removed) so variance is symmetric
+    about zero (character, not datum), on a common **±5 ns** scale so
+    magnitudes compare across figures.  GLONASS deliberately clips; any figure
+    with clipping carries a per-constellation **peak-|value| table** so the
+    real ranges are still on the slide.  Clock & orbit are gap-broken
+    (coverage dropouts -> gaps); code/phase bias are quasi-static and not.
+
+  ssr_broadcast_error — the with/without-corrections contrast: per-SV broadcast
+    clock+orbit *time error* (= the SSR correction, i.e. what a broadcast-only
+    filter suffers; steps are broadcast-ephemeris/IOD transitions) vs the
+    SSR-corrected residual (~0, the black line).  Phase bias is excluded — it
+    isn't a broadcast quantity, so a no-SSR filter never sees its jumps.
 
 Usage:
     python3 scripts/plot_ssr_corrections.py ssr_corrections.csv --out-dir plots
@@ -31,17 +33,28 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Large fonts for projection (~2x matplotlib defaults).
+plt.rcParams.update({
+    "font.size": 18,
+    "axes.titlesize": 24,
+    "axes.labelsize": 22,
+    "xtick.labelsize": 20,
+    "ytick.labelsize": 20,
+    "legend.fontsize": 17,
+})
+
 DEFAULT_SVS = ["G24", "G04", "E26", "E36", "R02", "R20", "C21", "C36"]
 SYS_COLOR = {"G": "tab:blue", "E": "tab:green", "R": "tab:red", "C": "tab:orange"}
 SYS_NAME = {"G": "GPS", "E": "Galileo", "R": "GLONASS", "C": "BeiDou"}
+CONST_ORDER = [("G", "GPS"), ("E", "Galileo"), ("R", "GLONASS"), ("C", "BeiDou")]
 PREF_CODE = {"G": ["C1C", "C1W", "C1P"], "E": ["C1C", "C1B"],
              "R": ["C1C", "C1P"], "C": ["C2I", "C1I", "C5I"]}
 PREF_PHASE = {"G": ["L1C", "L1W"], "E": ["L1C", "L1B"],
               "R": ["L1C", "L1P"], "C": ["L2I", "L1I", "L5I"]}
 GAP_THRESH_S = 60.0   # value held longer than this = SSR coverage dropout, not data
-YLIM_NS = 10.0        # common vertical scale across all four figures
+YLIM_NS = 5.0         # common vertical scale across figures
 
-# (component, title, signal-pref map, gap_break, output filename)
+# (component, title, signal-pref map, gap_break, output basename)
 PANELS = [
     ("clock_c0",     "clock c0",     None,       True,  "ssr_clock"),
     ("orbit_radial", "orbit radial", None,       True,  "ssr_orbit"),
@@ -51,10 +64,9 @@ PANELS = [
 
 
 def _break_stale(t, v, thresh=GAP_THRESH_S):
-    """NaN samples held > thresh s, so SSR coverage dropouts render as gaps
-    rather than held-value flat lines (the logger snapshots live state and
-    holds the last value across a dropout). Valid only for components that
-    change every update (clock, orbit)."""
+    """NaN samples held > thresh s so SSR coverage dropouts render as gaps, not
+    held-value flat lines.  Valid only for components that change every update
+    (clock, orbit)."""
     out = np.asarray(v, dtype=float).copy()
     orig = np.asarray(v, dtype=float)
     run_start = t[0]
@@ -67,7 +79,6 @@ def _break_stale(t, v, thresh=GAP_THRESH_S):
 
 
 def load(path):
-    """Return (data, t0) where data[(prn, component, signal)] = (t_s, ns)."""
     ts = defaultdict(list)
     vs = defaultdict(list)
     with open(path) as f:
@@ -99,11 +110,30 @@ def pick_signal(data, prn, component, pref):
     return avail[0] if avail else None
 
 
+def _peak_table(ax, peaks, ylim, label="peak |value|"):
+    """Per-constellation peak-|value| table (so clipped ranges stay on the slide)."""
+    lines = [f"{label}:"]
+    for s, name in CONST_ORDER:
+        if s in peaks:
+            mark = "  < clips" if peaks[s] > ylim else ""
+            lines.append(f"{name:<8s}{peaks[s]:6.1f} ns{mark}")
+    ax.text(0.012, 0.975, "\n".join(lines), transform=ax.transAxes,
+            va="top", ha="left", family="monospace", fontsize=18,
+            bbox=dict(boxstyle="round", fc="white", ec="0.5", alpha=0.92))
+
+
+def _finish(fig, out):
+    fig.tight_layout()
+    fig.savefig(out + ".pdf")
+    fig.savefig(out + ".png", dpi=200)
+    plt.close(fig)
+
+
 def fig_component(data, t0, span_h, svs, component, title, pref, gap_break,
                   out, ylim=YLIM_NS, hours=None):
     win = hours if hours else span_h
-    fig, ax = plt.subplots(figsize=(16, 9))      # 16:9 for 4K presentation
-    offscale = []
+    fig, ax = plt.subplots(figsize=(16, 9))
+    peaks = {}
     for prn in svs:
         if pref:
             sig = pick_signal(data, prn, component, pref)
@@ -122,29 +152,55 @@ def fig_component(data, t0, span_h, svs, component, title, pref, gap_break,
         m = th <= win + 1e-9
         if not np.any(m):
             continue
-        ax.plot(th[m], v[m], lw=0.8, color=SYS_COLOR[prn[0]], alpha=0.85, label=lbl)
-        peak = np.nanmax(np.abs(v[m]))
-        if peak > ylim:
-            offscale.append((prn, peak))
-    ax.axhline(0, color="gray", lw=0.4)
+        ax.plot(th[m], v[m], lw=1.0, color=SYS_COLOR[prn[0]], alpha=0.85, label=lbl)
+        peaks[prn[0]] = max(peaks.get(prn[0], 0.0), float(np.nanmax(np.abs(v[m]))))
+    ax.axhline(0, color="gray", lw=0.6)
     ax.set_ylim(-ylim, ylim)
     ax.set_xlim(0, win)
-    ax.set_xlabel(f"hours since capture start  (window {win:.1f} h, 10 s snapshots)")
+    ax.set_xlabel(f"hours since capture start   (window {win:.1f} h)")
     ax.set_ylabel(f"{title} − per-SV mean  [ns]")
     ax.grid(alpha=0.3)
-    ax.legend(loc="upper right", fontsize=7, ncol=4)
-    sub = ("gaps = no SSR correction provided (coverage dropout)" if gap_break
+    ax.legend(loc="upper right", ncol=4)
+    sub = ("gaps = no SSR correction (coverage dropout)" if gap_break
            else "quasi-static — held between rare updates (not gap-broken)")
-    note = ("   •   off-scale: " + ", ".join(f"{p} peaks ±{m:.0f} ns" for p, m in offscale)
-            if offscale else "")
-    ax.set_title(f"SSR {title} by constellation — detrended, common ±{ylim:.0f} ns scale\n"
-                 f"{sub}{note}", fontsize=11)
-    fig.tight_layout()
-    fig.savefig(out + ".pdf")                     # vector — scales cleanly to 4K
-    fig.savefig(out + ".png", dpi=200)            # raster — quick view
-    plt.close(fig)
-    print(f"wrote {out}.pdf/.png"
-          + (f"   off-scale={[(p, round(m,1)) for p,m in offscale]}" if offscale else ""))
+    ax.set_title(f"SSR {title} by constellation — detrended, ±{ylim:.0f} ns\n{sub}")
+    if any(p > ylim for p in peaks.values()):
+        _peak_table(ax, peaks, ylim)
+    _finish(fig, out)
+    print(f"wrote {out}.pdf/.png   peaks={ {k: round(v,1) for k,v in peaks.items()} }")
+
+
+def fig_broadcast_error(data, t0, span_h, svs, out, ylim=YLIM_NS, hours=None):
+    win = hours if hours else span_h
+    fig, ax = plt.subplots(figsize=(16, 9))
+    peaks = {}
+    for prn in svs:
+        kc, ko = (prn, "clock_c0", ""), (prn, "orbit_radial", "")
+        if kc not in data or ko not in data:
+            continue
+        tc, vc = data[kc]
+        to, vo = data[ko]
+        err = _break_stale(tc, vc) + np.interp(tc, to, vo)   # broadcast clock+orbit error
+        err = err - np.nanmean(err)                          # drop the calibratable offset
+        th = (tc - t0) / 3600.0
+        m = th <= win + 1e-9
+        if not np.any(m):
+            continue
+        ax.plot(th[m], err[m], lw=1.0, color=SYS_COLOR[prn[0]], alpha=0.85,
+                label=f"{prn} ({SYS_NAME[prn[0]]})")
+        peaks[prn[0]] = max(peaks.get(prn[0], 0.0), float(np.nanmax(np.abs(err[m]))))
+    ax.axhline(0, color="black", lw=3.2, label="WITH SSR corrections (~0)")
+    ax.set_ylim(-ylim, ylim)
+    ax.set_xlim(0, win)
+    ax.set_xlabel(f"hours since capture start   (window {win:.1f} h)")
+    ax.set_ylabel("time error − per-SV mean  [ns]")
+    ax.grid(alpha=0.3)
+    ax.legend(loc="upper right", ncol=3)
+    ax.set_title("Time error WITHOUT (coloured) vs WITH (black) SSR corrections\n"
+                 "broadcast clock+orbit error; steps = broadcast-ephemeris (IOD) transitions")
+    _peak_table(ax, peaks, ylim, label="broadcast error peak")
+    _finish(fig, out)
+    print(f"wrote {out}.pdf/.png   peaks={ {k: round(v,1) for k,v in peaks.items()} }")
 
 
 def main():
@@ -152,12 +208,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", help="CSV from log_ssr_corrections.py")
     ap.add_argument("--out-dir", default=".")
-    ap.add_argument("--svs", default=",".join(DEFAULT_SVS),
-                    help="comma-separated SVs (1-2 per constellation)")
-    ap.add_argument("--ylim", type=float, default=YLIM_NS,
-                    help="common vertical scale, ±ns (default 10)")
-    ap.add_argument("--hours", type=float, default=None,
-                    help="common x-axis window in hours (default: full capture)")
+    ap.add_argument("--svs", default=",".join(DEFAULT_SVS))
+    ap.add_argument("--ylim", type=float, default=YLIM_NS, help="common ±ns scale (default 5)")
+    ap.add_argument("--hours", type=float, default=None, help="x window (default: full)")
     args = ap.parse_args()
 
     data, t0 = load(args.csv)
@@ -172,6 +225,9 @@ def main():
     for component, title, pref, gap_break, name in PANELS:
         fig_component(data, t0, span_h, svs, component, title, pref, gap_break,
                       os.path.join(args.out_dir, name), ylim=args.ylim, hours=args.hours)
+    fig_broadcast_error(data, t0, span_h, svs,
+                        os.path.join(args.out_dir, "ssr_broadcast_error"),
+                        ylim=args.ylim, hours=args.hours)
     return 0
 
 

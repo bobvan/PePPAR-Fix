@@ -335,17 +335,19 @@ multi-day overview *plus* a minutes-scale zoom inset.
 - **Logger:** `scripts/log_ssr_corrections.py` reuses the engine's
   `NtripStream` + `SSRState` to snapshot all four components per SV into
   a long-format CSV (metres + ns) every `--interval` seconds.
-- **Plotter:** `scripts/plot_ssr_corrections.py` renders **four separate
-  figures** — `ssr_clock.png`, `ssr_orbit.png`, `ssr_codebias.png`,
-  `ssr_phasebias.png` — each:
+- **Plotter:** `scripts/plot_ssr_corrections.py` renders **five figures**
+  (each PDF + PNG, 16:9, large fonts for auditorium projection) — four
+  per-component (`ssr_clock`, `ssr_orbit`, `ssr_codebias`, `ssr_phasebias`)
+  plus the with/without contrast (`ssr_broadcast_error`):
   - **detrended** (per-SV mean removed) so the variance is symmetric about
     zero and shows *character*, not the per-SV datum offset (raw SSR clock
     `c0` carries tens-of-ns per-SV offsets that are absorbed by the receiver
     clock + inter-system bias and would otherwise read as alarming biases);
-  - on a **common ±10 ns scale** so magnitude can be compared *across* the
-    four figures (the contrast is the story: code bias ≈ 0 ≪ clock < orbit;
-    a trace exceeding ±10 ns is clipped and its peak is named in the title —
-    e.g. GLONASS orbit ±40 ns, BeiDou phase ±18 ns);
+  - on a **common ±5 ns scale** so magnitude can be compared *across* figures
+    (the story lives within ±5 ns; code bias ≈ 0 ≪ clock < orbit).  **GLONASS
+    deliberately clips**, and any figure with clipping carries a
+    **per-constellation peak-|value| table** so the true ranges stay on the
+    slide (e.g. GLONASS orbit ~40 ns, BeiDou phase ~18 ns);
   - **gap-broken** for clock & orbit (`_break_stale` NaNs values held past the
     ~10 s cadence, so CNES's intermittent GLONASS coverage shows as gaps, not
     held-value flats).  Code/phase bias are genuinely quasi-static, so a
@@ -354,6 +356,14 @@ multi-day overview *plus* a minutes-scale zoom inset.
     (staleness = snapshot − rx_time) and `disc` (bias discontinuity counter),
     so the next capture can age-gap the biases and flag the per-SV phase-bias
     re-reference jumps (the BeiDou discontinuities) directly.
+  - **`ssr_broadcast_error`** is the headline contrast: per-SV broadcast
+    clock+orbit *time error* (= `−(c0 + orbit_radial)`, what a broadcast-only
+    filter suffers — its steps are broadcast-ephemeris/IOD transitions,
+    verified against the logged IOD) vs the SSR-corrected residual (~0, the
+    black line).  Phase bias is **excluded** — it isn't a broadcast quantity,
+    so a no-SSR filter never sees its jumps.  Per-constellation peak time
+    error: Galileo ~0.9, GPS ~1.4, BeiDou ~3.7, GLONASS ~39 ns → all collapsed
+    to ~0 by SSR.
 - **Cherry-picked SVs:** GPS `G24` (IIF) vs `G04` (III); Galileo `E26`,
   `E36` (FOC); GLONASS `R02`, `R20`; BeiDou-3 MEO `C21`, `C36` — all eight on
   every figure, coloured by constellation.
