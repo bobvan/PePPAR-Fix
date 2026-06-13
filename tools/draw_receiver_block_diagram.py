@@ -86,11 +86,12 @@ def main():
 
     # ── external PPP branch (right, outside) ────────────────────────────
     box(ax, 11.9, 6.6, 3.2, 1.5,
-        "PPP engine  (host)\nfloat / ambiguity-resolved filter\n→ precise time", C_PPP,
+        "PPP engine  (host)\nfloat / ambiguity-resolved filter\n→ precise clock & time", C_PPP,
         fs=12.5, lw=2.2, weight="bold")
     box(ax, 11.9, 3.7, 3.2, 1.4,
         "SSR corrections  (NTRIP)\nprecise orbit · clock\n· code & phase bias", C_SSR, fs=12)
-    box(ax, 14.9, 6.6, 1.7, 1.3, "Precise\ntime / PPS\n(PPP)", C_OUT, fs=12.5, weight="bold")
+    box(ax, 14.95, 6.6, 1.9, 1.3, "PPP solution\nprecise\nclock & time", C_OUT, fs=12, weight="bold")
+    box(ax, 14.95, 3.7, 1.9, 1.3, "Disciplined\nOscillator", "#6aa84f", fs=13, lw=2.4, weight="bold")
 
     # ── arrows ──────────────────────────────────────────────────────────
     arrow(ax, (0.95, 6.6), (1.6, 6.6))                       # antenna -> RF
@@ -105,18 +106,27 @@ def main():
           lpos=(9.55, 7.45), lcolor=C_EXT, fs=11.5)
     arrow(ax, (11.9, 4.4), (11.9, 5.85), color=C_EXT, lw=2.6,
           label="+ SSR", lpos=(12.45, 5.1), lcolor=C_EXT)
-    arrow(ax, (13.5, 6.6), (14.05, 6.6), color="#38761d", lw=2.6)   # PPP -> precise PPS
+    arrow(ax, (13.5, 6.6), (14.0, 6.6), color="#38761d", lw=2.6)     # PPP -> PPP solution
+    arrow(ax, (14.95, 5.95), (14.95, 4.35), color="#38761d", lw=2.6,
+          label="discipline", lcolor="#38761d", fs=11)               # solution -> DO
+    arrow(ax, (14.95, 3.05), (14.95, 2.3), color="#38761d", lw=2.8)  # DO -> sub-nano PPS
+    ax.text(14.95, 2.05, "Sub-nano PPS", ha="center", va="center", fontsize=13,
+            color="#38761d", weight="bold")
+    # raw PPS out the bottom of the receiver (the timing receiver's own PPS pin)
+    arrow(ax, (4.7, 2.85), (4.7, 1.95), color="#666666", lw=2.6)
+    ax.text(5.5, 2.15, "Raw PPS", ha="left", va="center", fontsize=13,
+            color="#444444", weight="bold")
 
     # ── title + legend + caption ────────────────────────────────────────
     ax.text(8.0, 8.62, "One set of raw observations  →  two timing solutions",
             ha="center", va="center", fontsize=23, weight="bold")
-    ax.plot([1.4, 2.0], [1.65, 1.65], color="#666666", lw=3.5)
-    ax.text(2.15, 1.65, "internal SPP + carrier smoothing  (no PPP)", ha="left",
+    ax.plot([1.4, 2.0], [1.2, 1.2], color="#666666", lw=3.5)
+    ax.text(2.15, 1.2, "internal SPP + carrier smoothing → Raw PPS  (no PPP)", ha="left",
             va="center", fontsize=13)
-    ax.plot([8.3, 8.9], [1.65, 1.65], color=C_EXT, lw=3.5)
-    ax.text(9.05, 1.65, "external PPP fused with real-time SSR  (more precise)",
+    ax.plot([8.3, 8.9], [1.2, 1.2], color=C_EXT, lw=3.5)
+    ax.text(9.05, 1.2, "external PPP + SSR → disciplined oscillator → Sub-nano PPS",
             ha="left", va="center", fontsize=13)
-    ax.text(8.0, 0.7,
+    ax.text(8.0, 0.55,
             "The same raw carrier-phase + code observations either drive the receiver's own "
             "SPP fix, or leave the receiver for an\nexternal PPP engine fused with SSR.  "
             "(How PPP turns SSR + raw observations into a precise time fix:  later slides.)",
