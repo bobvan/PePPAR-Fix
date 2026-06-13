@@ -100,6 +100,33 @@ Work (this is the (b) free-position work, repurposed for the self-survey —
 
 (Confirm actual RTK support per unit before wiring auto-select.)
 
+## Band selection — capture L1/L2 when the receiver can (London-survey lesson)
+
+**Learned from the 2026-06-12 London LEA-F9T survey:** the band set you
+capture decides which post-processing products the survey can use, and a
+receiver's `MOD=` string does **not** fix its band set.
+
+- **Prefer L1/L2** (GPS L1C/A+L2C, GAL E1+E5b → classic ionosphere-free).
+  L1/L2 is accepted by **CSRS-PPP, OPUS-Static, and IGS/CODE final products**,
+  so it gives a genuine multi-source third opinion alongside Tier 1 PRIDE.
+- **L1/L5 is the fallback**, not the default: **CSRS-PPP and OPUS won't use
+  L5**, so an L1/L5 capture is limited to MGEX products + PRIDE/RTKLIB-demo5 —
+  no independent OPUS/CSRS cross-check.
+- **Don't trust `MOD=` for the band set.** Confirmed: ptBoat's **LEA-F9T
+  (TIM 2.22) is L5-only** — it NAKs L2C/E5b/B2I even with the L5 slot freed —
+  while London's **LEA-F9T-11B does L1/L2 *or* L1/L5**, switchable.  Same base
+  part string, different bands.  **Probe with a CFG-VALSET (one key per VALSET)
+  before relying on a band.**
+- **Switching to L1/L2 on the -11B takes TWO ordered VALSETs**: (1) disable
+  *all* L5-band signals (GPS L5, GAL E5a, BDS B2a, NavIC L5), *then* (2) enable
+  L2C/E5b — they NAK while any L5-band signal is still on.  One combined VALSET
+  fails.
+
+**For peppar-survey:** add a receiver-prep step that probes band capability and
+configures **L1/L2 if supported** (maximising product compatibility for the
+survey backends), falling back to L1/L5 only when L2C/E5b NAK.  Full
+ACK/NAK matrix in [`f9t-firmware-capabilities.md`](f9t-firmware-capabilities.md).
+
 ## Selection logic
 
 ```
@@ -123,5 +150,9 @@ portable ones with neither products nor CORS — has a path to a ≤10 cm ARP.
   grade — characterize it).
 - peppar-survey ergonomics: auto-select the tier vs explicit flag; keep the
   install lean (Tier 2/3 shouldn't require the PRIDE Fortran stack).
+- **Receiver band-prep (London lesson):** probe band capability and configure
+  **L1/L2 when supported** (CSRS/OPUS/IGS-final compatible) before capture,
+  falling back to L1/L5 only on L2C/E5b NAK; implement the two-ordered-VALSET
+  switch (disable all L5-band first).  Don't infer bands from `MOD=`.
 - Cross-ref: pickyEaterSSR (I-210733) — making non-CNES ACs digest would
   also widen Tier 3's correction options.
