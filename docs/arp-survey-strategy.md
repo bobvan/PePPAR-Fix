@@ -127,19 +127,22 @@ configures **L1/L2 if supported** (maximising product compatibility for the
 survey backends), falling back to L1/L5 only when L2C/E5b NAK.  Full
 ACK/NAK matrix in [`f9t-firmware-capabilities.md`](f9t-firmware-capabilities.md).
 
-## Techniques proven on the London run (to incorporate)
+## Techniques proven on the London run (implemented in `--consensus`)
 
-peppar-survey today runs **exactly one backend** (`--pride` / `--rtklib` /
-`--opus` / `--cors`).  The 2026-06-12 London Mini PT 24 h survey (writeup +
+peppar-survey historically ran **exactly one backend** (`--pride` / `--rtklib`
+/ `--opus` / `--cors`).  The 2026-06-12 London Mini PT 24 h survey (writeup +
 `london.survey.toml` under `~/gt/peppar-survey-data/raw/london-24h-l1l2-20260612/`)
 ran several and cross-checked them, and that surfaced four reusable techniques:
 
 1. **Multi-backend consensus, not single-backend.**  Run ≥2 independent solvers
    over the *same* RINEX and adopt the agreement-gated **mean** as the survey.
    London: PRIDE PPP-AR (WUM rapid-RTS) + CSRS-PPP (EMR ultra-rapid) agreed to
-   **2.3 cm 3D / 1.3 cm 2D** → mean written as the APC (σ ≈ 23 mm).  Add a
-   `--consensus` mode that fans out to the existing backends and gates on
-   `|Δ| ≤ 3 cm 3D` before writing `.survey.toml`.
+   **2.3 cm 3D / 1.3 cm 2D** → mean written as the APC (σ ≈ 23 mm).
+   **Implemented** as `peppar-survey --consensus pride,rtklib[,csrs]`
+   (`--consensus-tol-cm`, default 3): each backend exposes a compute-only
+   `solve_*_capture()` returning `(RunningArp, grade, meta)`; the consensus
+   layer (`peppar_fix/peppar_survey_consensus.py`) fans out (isolated per-backend
+   work/history dirs), gates on `|Δ| ≤ tol`, and writes one `.survey.toml`.
 
 2. **Product-grade-aware: keep broadcast-eph as a *sanity check*, never in the
    mean.**  RTKLIB with broadcast eph landed **~48 cm off (almost all vertical)**
@@ -162,11 +165,18 @@ ran several and cross-checked them, and that surfaced four reusable techniques:
    `londonArpFinals` to re-run ~2026-06-25.  A `provisional = true` flag in
    `.survey.toml` + a finals-rerun reminder closes the loop.
 
-**Provenance schema** (also from London): `.survey.toml` should carry the
-quality metadata that makes a survey auditable — `source` (which products/ACs),
+**Provenance schema** (also from London): `.survey.toml` carries the quality
+metadata that makes a survey auditable — `source` (which products/ACs),
 `consensus_2d_cm`/`consensus_3d_cm`, per-solver coordinates, fixing rates
-(`csrs_iar_pct`, NL/WL %), `capture_{start,end}_iso` + `capture_duration_h`,
-`frame`, and `kind_note`.
+(`csrs_iar_pct`, NL/WL %), `frame`, `*_excluded_reason`, and `kind_note`.
+
+**Status:** all four implemented — `--consensus` (technique 1) with broadcast-
+as-sanity-only (2), `--apc` kind_note (3), and `--provisional` +
+`finals_rerun_after_iso` (4); provenance written to `.survey.toml`.  Backends
+gained `solve_*_capture()` (compute-only) without changing single-backend
+behavior.  Remaining: CSRS auto-submit (today `--csrs-result` ingests an
+operator-transcribed TOML stub, since the CSRS REST endpoint is unreliable);
+`capture_{start,end}_iso` from the RINEX header.
 
 ## Selection logic
 
