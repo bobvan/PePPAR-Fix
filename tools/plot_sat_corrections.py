@@ -47,6 +47,9 @@ M2NS = 1e9 / C  # 3.3356 ns/m
 RE = 6371000.0
 H_ION = 350000.0
 TECU_M_L1 = 0.162  # metres of L1 delay per TECU
+KM_PER_US = 0.299792458  # 1 µs of clock error = 299.79 m of range
+SYS_NAME = {"G": "GPS", "E": "Galileo", "C": "BeiDou"}
+SYS_TINT = {"G": "#dbe7f3", "E": "#dcefdc", "C": "#ffe9d6"}
 
 plt.rcParams.update({
     "font.size": 18, "axes.titlesize": 23, "axes.labelsize": 22,
@@ -57,11 +60,6 @@ plt.rcParams.update({
 def latest(ephs, prn):
     v = ephs.get(prn)
     return v[-1] if v else None
-
-
-def clock_poly_us(eph, dt):
-    """SV clock polynomial (no relativistic/TGD) in microseconds."""
-    return (eph["af0"] + eph["af1"] * dt + eph["af2"] * dt * dt) * 1e6
 
 
 def elev_rad(sat_ecef, up, rx_ecef):
@@ -87,38 +85,56 @@ def sagnac_ns(sat_ecef, rx_ecef):
     return d_m * M2NS
 
 
-def fig_satclock(ephs, out, span_h=2.0):
-    svs = [p for p in sorted(ephs) if p[0] in "GE" and latest(ephs, p)]
-    tk = np.linspace(-span_h * 3600, span_h * 3600, 121)
-    th = tk / 3600.0
+def fig_satclock_table(ephs, out):
+    """Per-constellation satellite-clock-offset table (the offset is ~constant
+    in time, so a table beats a time series).  Makes the point: you can't do
+    naïve math on raw observations — apply at least the broadcast clock."""
+    rows, tints = [], []
+    for sysc in ["G", "E", "C"]:
+        svs = [p for p in ephs if p[0] == sysc and latest(ephs, p)]
+        if not svs:
+            continue
+        off = [latest(ephs, p)["af0"] * 1e6 for p in svs]                       # µs
+        drift = [abs(latest(ephs, p)["af1"] * 86400
+                     + latest(ephs, p).get("af2", 0.0) * 86400 ** 2) * 1e6       # µs/day
+                 for p in svs]
+        lo, hi = min(off), max(off)
+        worst = max(abs(lo), abs(hi))
+        worst_str = f"{worst/1000:.2f} ms" if worst >= 1000 else f"{worst:.0f} µs"
+        rows.append([SYS_NAME[sysc], str(len(svs)), f"{lo:+.0f} … {hi:+.0f} µs",
+                     f"{worst_str}  ≈ {worst*KM_PER_US:.0f} km", f"≤ {max(drift):.1f} µs"])
+        tints.append(SYS_TINT[sysc])
+    cols = ["Constellation", "SVs", "clock-offset range",
+            "worst error  (≡ position)", "drift / 24 h"]
+
     fig, ax = plt.subplots(figsize=(16, 9))
-    peak = {"G": 0.0, "E": 0.0}
-    for prn in svs:
-        eph = latest(ephs, prn)
-        y = np.array([clock_poly_us(eph, t) for t in tk])  # µs
-        peak[prn[0]] = max(peak[prn[0]], abs(y).max())
-        ax.plot(th, y, lw=1.4, color="tab:blue" if prn[0] == "G" else "tab:green", alpha=0.7)
-    ax.axhline(0, color="gray", lw=0.6)
-    ax.set_xlim(-span_h, span_h)
-    ax.set_xlabel("hours from clock reference epoch (toc)")
-    ax.set_ylabel("satellite clock offset from system time  [µs]")
-    ax.grid(alpha=0.3)
-    ax.plot([], [], color="tab:blue", lw=3, label="GPS")
-    ax.plot([], [], color="tab:green", lw=3, label="Galileo")
-    ax.legend(loc="upper right")
-    gms, ems = peak["G"] / 1e3, peak["E"] / 1e3  # ms
-    ax.set_title("Satellite clock correction — each SV's clock offset from system time\n"
-                 f"GPS within ±{gms:.2f} ms · Galileo to ±{ems:.1f} ms "
-                 f"(≈ ±{peak['E']*0.3:.0f} km uncorrected) — known & broadcast, subtracted exactly")
-    ax.text(0.012, 0.045,
-            "dt_sv(t) = af0 + af1·(t−toc) + af2·(t−toc)²   ·   1 µs ≈ 300 m of range\n"
-            "GPS af0 range ±0.98 ms · Galileo af0 range ±62.5 ms — Galileo doesn't steer SV phase\n"
-            "NOT an error: a known broadcast offset; residual after applying ≈ 0.5–1 ns",
-            transform=ax.transAxes, fontsize=14, family="monospace",
-            bbox=dict(boxstyle="round", fc="white", ec="0.6", alpha=0.92))
-    fig.tight_layout(); fig.savefig(out + ".pdf"); fig.savefig(out + ".png", dpi=200)
+    fig.subplots_adjust(top=0.78, bottom=0.24)
+    ax.axis("off")
+    tbl = ax.table(cellText=rows, colLabels=cols, loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(21)
+    tbl.scale(1, 3.0)
+    tbl.auto_set_column_width(col=list(range(len(cols))))
+    for (r, c), cell in tbl.get_celld().items():
+        cell.set_edgecolor("0.65")
+        if r == 0:
+            cell.set_facecolor("#333333")
+            cell.get_text().set_color("white")
+            cell.get_text().set_fontweight("bold")
+        else:
+            cell.set_facecolor(tints[r - 1])
+            if c in (0, 3):
+                cell.get_text().set_fontweight("bold")
+    fig.suptitle("Satellite clock offset from system time —\nyou must apply the broadcast clock correction",
+                 fontsize=26, fontweight="bold", y=0.93)
+    fig.text(0.5, 0.17,
+             "The SV clock isn't synced to system time — it free-runs at a large, known, broadcast offset\n"
+             "(here ~constant: drift ≪ offset, so no time axis needed).  Skip it and naïve math on the raw\n"
+             "observations is wrong by hundreds of km.  Apply it and the residual is ≈ 0.5–1 ns.",
+             ha="center", fontsize=17)
+    fig.savefig(out + ".pdf"); fig.savefig(out + ".png", dpi=200)
     plt.close(fig)
-    print(f"wrote {out}.pdf/.png   GPS peak={peak['G']:.0f}us  GAL peak={peak['E']:.0f}us  ({len(svs)} SVs)")
+    print(f"wrote {out}.pdf/.png   rows={[r[0] for r in rows]}")
 
 
 def fig_combined(ephs, arp, lat, lon, out, span_h=2.5):
@@ -191,7 +207,7 @@ def main():
     ephs = json.load(open(args.eph_json))
     arp, lat, lon = load_arp(args.arp_label, args.antennas_json)
     os.makedirs(args.out_dir, exist_ok=True)
-    fig_satclock(ephs, os.path.join(args.out_dir, "satcorr_clock_alone"))
+    fig_satclock_table(ephs, os.path.join(args.out_dir, "satcorr_clock_table"))
     fig_combined(ephs, arp, lat, lon, os.path.join(args.out_dir, "satcorr_combined"))
     return 0
 
