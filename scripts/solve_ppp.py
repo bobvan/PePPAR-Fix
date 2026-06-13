@@ -70,6 +70,59 @@ def _log_cond(tag, **mats):
     if parts:
         log.info("[COND] %-9s | %s", tag, "  ".join(parts))
 
+
+# ── float128 EKF path (condNumberLogging follow-up) ───────────────── #
+# Gated by PEPPAR_FLOAT128=1.  Tests whether the position EKF's poor
+# conditioning (measured cond(S) ~ 4e11 → only ~4 float64 digits left)
+# actually limits convergence, by re-running the filter in extended
+# precision.  numpy's linalg (LAPACK) silently downcasts longdouble →
+# float64, so we hand-roll a longdouble Gauss-Jordan solve to keep the
+# inversion in full precision.  If the converged solution is unchanged
+# vs float64 → the 4-digit margin is sufficient (problem is structural
+# weak-observability, not numerics).  If it changes → conditioning bites.
+_FLOAT128 = os.environ.get("PEPPAR_FLOAT128", "").strip().lower() \
+    not in ("", "0", "false", "no", "off")
+_DT = np.longdouble if _FLOAT128 else np.float64
+
+
+def _gauss_solve_ld(A, B):
+    """Solve A X = B entirely in np.longdouble (partial-pivot Gauss-Jordan)."""
+    n = A.shape[0]
+    M = np.array(A, dtype=np.longdouble, copy=True)
+    squeeze = (np.ndim(B) == 1)
+    X = np.array(B, dtype=np.longdouble, copy=True).reshape(n, -1)
+    for col in range(n):
+        piv = int(np.argmax(np.abs(M[col:, col]))) + col
+        if M[piv, col] == 0:
+            raise np.linalg.LinAlgError("singular matrix (longdouble solve)")
+        if piv != col:
+            M[[col, piv]] = M[[piv, col]]
+            X[[col, piv]] = X[[piv, col]]
+        pv = M[col, col]
+        M[col] /= pv
+        X[col] /= pv
+        for r in range(n):
+            if r != col:
+                f = M[r, col]
+                if f != 0:
+                    M[r] -= f * M[col]
+                    X[r] -= f * X[col]
+    return X[:, 0] if squeeze else X
+
+
+def _inv(A):
+    """Matrix inverse; full-precision longdouble Gauss-Jordan when gated."""
+    if _FLOAT128:
+        return _gauss_solve_ld(A, np.eye(A.shape[0], dtype=np.longdouble))
+    return np.linalg.inv(A)
+
+
+def _solve(A, b):
+    """Linear solve; full-precision longdouble Gauss-Jordan when gated."""
+    if _FLOAT128:
+        return _gauss_solve_ld(A, b)
+    return np.linalg.solve(A, b)
+
 from solve_pseudorange import (
     SP3, C, OMEGA_E, ecef_to_lla, ecef_to_enu, lla_to_ecef,
     timestamp_to_gpstime,
@@ -443,7 +496,7 @@ class PPPFilter:
         the multi-meter cold-start transient observed under pinned mode
         on 2026-05-04 — see I-024942 + scripts/peppar_fix/saastamoinen.py.
         """
-        self.x = np.zeros(N_BASE)
+        self.x = np.zeros(N_BASE, dtype=_DT)
         self.x[:3] = pos_ecef
         self.x[IDX_CLK] = clock_m
         self.x[IDX_ISB_GAL] = isb_gal
@@ -451,13 +504,13 @@ class PPPFilter:
         self.x[IDX_ZTD] = float(init_ztd_m)  # residual ZTD (apriori handles bulk)
         self._ztd_sigma_m = float(ztd_sigma_m)
         self._pos_sigma_m_init = float(pos_sigma_m)
-        self.P = np.diag([
+        self.P = np.diag(np.array([
             pos_sigma_m**2, pos_sigma_m**2, pos_sigma_m**2,
             1e8,
             1e6,
             1e6,
             self._ztd_sigma_m**2,  # ZTD residual prior
-        ])
+        ], dtype=_DT))
         self._ztd_window_elapsed = 0.0  # PWC-60 segment timer (s)
         # Pin ISBs whose reference system isn't present.  Priority order:
         # GPS > GAL > BDS — the highest-priority present system is the
@@ -1145,7 +1198,7 @@ class PPPFilter:
             S = H @ P_prior @ H.T + R
             _log_cond("ppp", S=S, P=P_prior, H=H)
             try:
-                K = P_prior @ H.T @ np.linalg.inv(S)
+                K = P_prior @ H.T @ _inv(S)
             except np.linalg.LinAlgError:
                 self.x = x_iter
                 self.P = P_prior
@@ -2030,7 +2083,7 @@ def ls_init(observations, sp3, t, clk_file=None):
             HTW = H.T @ W_mat
             _HtWH = HTW @ H
             _log_cond("lsinit", HtWH=_HtWH, H=H)
-            dx = np.linalg.solve(_HtWH, HTW @ dz_arr)
+            dx = _solve(_HtWH, HTW @ dz_arr)
         except np.linalg.LinAlgError:
             result = np.zeros(6)
             result[:4] = x[:4]
