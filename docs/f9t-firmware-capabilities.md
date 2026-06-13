@@ -153,6 +153,7 @@ Beyond which signals exist, the families differ in how they're driven.
 | BDS B2a cpMes reference | **L1-ref on 2.25**⁴ | native | native | **native** (verified) |
 | pyubx2 minimum | any | any | any | **≥1.2.57**⁵ |
 | Driver class | `F9T*Driver` | `F9PDriver` | `F10TDriver` | `X20PDriver` |
+| **qErr (TIM-TP quantization)** | **populated** (~8 ns sawtooth) | **0 — not populated**⁶ | populated (TIM fw — exp.)⁶ | **0 — not populated**⁶ |
 
 ³ X20P TMODE not probed; `X20PDriver` sets `supports_timing_mode=False`
 (HPG positioning firmware, not a TIM timing part).
@@ -163,6 +164,21 @@ cycles** — the 2026-04-19 "1500 ns ISB" bug; the engine multiplies by
 (verified 2026-06-08), so `X20PDriver.bds_l1_ref_cycles` is empty.
 ⁵ pyubx2 < 1.2.57 misframes the PROTVER-50.10 stream and `UBXReader.read()`
 hangs for minutes holding the port; 1.2.57 added the X20P NAV payload defs.
+⁶ **qErr is a TIM-firmware feature.**  The UBX-TIM-TP `qErr` field (the PPS
+quantization error vs the receiver's internal clock — the ~8 ns sawtooth you
+correct to reach sub-ns) is computed only by **TIM (timing) firmware**.  HPG
+(high-precision positioning) firmware still emits TIM-TP but leaves
+`qErr = 0`.  Directly confirmed 2026-06-13: **LEA-F9T** (ptBoat, TIM 2.22) —
+clean ±4000 ps / 8 ns sawtooth over a 24 h capture; **ZED-F9P** (MadHat,
+HPG 1.51) — 120 consecutive samples all 0; **ZED-X20P** (HPG 2.02) — 232
+samples all 0.  ZED-F9T / ZED-F9T-20B qErr is established by the moonshot
+servo / qErr-correlation work.  NEO-F10T (TIM 3.01) is timing firmware so
+qErr is *expected* but not yet directly captured here.  **Operational
+consequence:** the DO servo's **qErr-corrected-PPS arm is only available on
+TIM-firmware receivers**.  On HPG hosts (F9P, X20P) that arm is implicitly
+inactive — discipline must lean on the PPS / TDCP / TICC arms instead (X20P's
+moonshot path already uses TDCP, which needs no qErr).  See
+[`qerr-correlation.md`](qerr-correlation.md).
 
 ## ZED-X20P (Generation 10) — key findings
 

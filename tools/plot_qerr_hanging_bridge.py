@@ -84,6 +84,15 @@ def main():
     phase = np.unwrap(seg, period=args.period_ps)
     phase = phase - phase[0]
 
+    # classify the crossing at the slope-zero point (bridge centre): if the raw
+    # qErr alternates sign every sample there (period-2), the PPS slips ~½ quantum
+    # per second => a 0.5 Hz crossing; a smooth turn => 1 Hz.
+    tp = int(np.argmin(np.abs(np.gradient(phase))))
+    near = seg[max(0, tp - 20):tp + 20]
+    d = np.diff(near)
+    alt = float(np.mean(np.sign(d[:-1]) != np.sign(d[1:]))) if len(d) > 2 else 0.0
+    crossing = "0.5 Hz (period-2 pairs)" if alt > 0.7 else "1 Hz"
+
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 9), height_ratios=[1.15, 1])
     ax1.plot(t, seg, ".-", ms=3, lw=0.8, color="tab:blue")
     pp = seg.max() - seg.min()
@@ -91,7 +100,7 @@ def main():
     ax1.set_title(f"{args.label}: PPS quantization sawtooth + hanging bridge  "
                   f"(≈{pp/1000:.1f} ns p-p)")
     ax1.grid(alpha=0.3)
-    ax1.annotate("hanging bridge\n(TCXO freq through 1 Hz boundary)",
+    ax1.annotate(f"hanging bridge\n(rx-TCXO freq through {crossing} boundary)",
                  xy=(0.5, 0.04), xycoords="axes fraction", ha="center", fontsize=15,
                  bbox=dict(boxstyle="round", fc="#fff3d6", ec="0.6"))
 
