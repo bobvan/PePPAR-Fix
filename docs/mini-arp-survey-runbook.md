@@ -114,10 +114,17 @@ Nothing else from the Mini is needed for analysis.
 ## Phase 3 — Analysis on gt (3-way PPP consensus)
 
 1. **Concatenate** the hourly `.ubx` files, then **convbin (RTKLIB) → RINEX 3**:
-   `convbin -r ubx -o out.obs -n out.nav <concatenated>.ubx`
+   `convbin -r ubx -v 3.04 -od -os -o out.obs -n out.nav <concatenated>.ubx`
+   (`-od -os` keep doppler + SNR; sanity-check the obs header for the expected
+   signals — L1/L2 vs L1/L5 — *before* solving).
 2. **Three independent static-PPP solutions** (independent so agreement is
    meaningful):
-   - **RTKLIB:** `rnx2rtkp -p 7 -m S ...` (PPP static).
+   - **RTKLIB:** PPP-static via `rnx2rtkp`. **Two gotchas the ptBoat dry run hit
+     (2026-06-12):** (1) the mode `-p` number differs between builds — in
+     **RTKLIB-demo5, ppp-static is `-p 8`** (`-p 7` is ppp-*kinematic*), so use
+     `rnx2rtkp -p 8 -m S ...`; (2) on an L5-fleet receiver the GAL E5a / BDS B2a
+     signals land in RTKLIB's **L5 slot**, so set `pos1-frequency=l1+l2+l5` —
+     `l1+l2` returns a **zero / empty** solution.
    - **PRIDE-PPP-AR:** `pdp3 ...` (cm-class, ambiguity-resolved).
      **Antex gotcha:** inject the **London antenna's** NGS calibration into
      PRIDE's antex DB (`scripts/inject_lab_antennas.sh` + `support/antex/`).
@@ -130,6 +137,17 @@ Nothing else from the Mini is needed for analysis.
    ever written by a survey backend, never by the engine). If they disagree,
    investigate (antex mismatch, multipath, short/!static arc) before trusting
    any single solution.
+
+**Products & timing — the limiter (ptBoat dry run, 2026-06-12).**  A capture only
+a day old has **only real-time / NRT products** (IGS/CODE rapid + final not yet
+published); PRIDE and RTKLIB then share product heritage and disagreed **~25 cm
+3D** — *not* cm-consensus, and not a pipeline bug.  For cm you need either
+**IGS/CODE final products (~12–20 day latency)**, or **dual-frequency GPS** so
+the dominant constellation contributes the IF combination (an L1-only / L5-fleet
+capture leans on weaker GAL + BDS geometry).  Note **CSRS-PPP won't use L5** — on
+an L5-fleet receiver it drops to single-frequency, so treat it as a sanity floor,
+not a co-equal third dual-frequency opinion.  So: survey a fresh capture, but
+**adopt the ARP only after finals land** (or after switching to dual-freq GPS).
 
 ---
 
