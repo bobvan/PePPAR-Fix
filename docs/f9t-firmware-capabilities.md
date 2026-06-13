@@ -178,7 +178,13 @@ consequence:** the DO servo's **qErr-corrected-PPS arm is only available on
 TIM-firmware receivers**.  On HPG hosts (F9P, X20P) that arm is implicitly
 inactive — discipline must lean on the PPS / TDCP / TICC arms instead (X20P's
 moonshot path already uses TDCP, which needs no qErr).  See
-[`qerr-correlation.md`](qerr-correlation.md).
+[`qerr-correlation.md`](qerr-correlation.md).  **The underlying quantization is
+the same on all of them** — measured externally on TICC chB (detrended sub-second
+phase), F9T-20B / F9P / X20P all show a ~8 ns sawtooth at RMS ≈ 2.4–2.9 ns
+(2026-06-13, `tools/plot_pps_quantization.py`).  So HPG parts aren't *worse* in
+PPS quantization; they share the same clock grid — they just don't *expose* qErr,
+so the sawtooth is unrecoverable from the message stream and the PPS servo input
+carries the full ~2.5 ns.
 
 ## ZED-X20P (Generation 10) — key findings
 
