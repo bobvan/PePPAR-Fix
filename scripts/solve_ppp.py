@@ -22,6 +22,7 @@ import argparse
 import csv
 import logging
 import math
+import os
 import sys
 from collections import defaultdict, deque
 from datetime import timedelta
@@ -29,6 +30,45 @@ from datetime import timedelta
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+# ── EKF conditioning diagnostics (condNumberLogging) ──────────────── #
+# Gated by env var PEPPAR_COND_LOG=1 so it is zero-cost in production.
+# Tests the float64-conditioning hypothesis for unreliable position
+# convergence: logs the condition number of the matrices we actually
+# invert (innovation covariance S, normal-equations H^T W H) plus the
+# diagonal dynamic range of the covariance P.  cond < ~1e8 over the
+# run → conditioning is NOT eating float64 precision (exonerates the
+# numeric hypothesis, points at structural weak-observability instead);
+# cond >> 1e8 → naive inv()/normal-equations are losing digits.
+_COND_LOG = os.environ.get("PEPPAR_COND_LOG", "").strip().lower() \
+    not in ("", "0", "false", "no", "off")
+
+
+def _cond(M):
+    try:
+        return float(np.linalg.cond(M))
+    except Exception:  # noqa: BLE001 — diagnostic must never crash the filter
+        return float("nan")
+
+
+def _log_cond(tag, **mats):
+    """Emit a compact [COND] line for the named matrices (gated)."""
+    if not _COND_LOG:
+        return
+    parts = []
+    for name, M in mats.items():
+        if M is None:
+            continue
+        A = np.asarray(M, dtype=float)
+        if A.ndim == 2 and A.shape[0] == A.shape[1]:
+            d = np.abs(np.diag(A))
+            d = d[d > 0]
+            dyn = float(d.max() / d.min()) if d.size else float("nan")
+            parts.append(f"{name} cond={_cond(A):.2e} dyn={dyn:.2e} n={A.shape[0]}")
+        else:
+            parts.append(f"{name} cond={_cond(A):.2e} shape={A.shape}")
+    if parts:
+        log.info("[COND] %-9s | %s", tag, "  ".join(parts))
 
 from solve_pseudorange import (
     SP3, C, OMEGA_E, ecef_to_lla, ecef_to_enu, lla_to_ecef,
@@ -1103,6 +1143,7 @@ class PPPFilter:
             labels = [labels_full[i] for i in keep_idx]
 
             S = H @ P_prior @ H.T + R
+            _log_cond("ppp", S=S, P=P_prior, H=H)
             try:
                 K = P_prior @ H.T @ np.linalg.inv(S)
             except np.linalg.LinAlgError:
@@ -1790,6 +1831,7 @@ class FixedPosFilter:
         self._consecutive_catastrophic_rejects = 0
 
         S = H @ self.P @ H.T + R
+        _log_cond("fixedpos", S=S, P=self.P, H=H)
         # Snapshot clock + clock variance before update — filter-state
         # diagnostic uses these to compute K_z_clk and P delta.
         _clk_pre = float(self.x[self.IDX_CLK])
@@ -1986,7 +2028,9 @@ def ls_init(observations, sp3, t, clk_file=None):
         W_mat = np.diag(W)
         try:
             HTW = H.T @ W_mat
-            dx = np.linalg.solve(HTW @ H, HTW @ dz_arr)
+            _HtWH = HTW @ H
+            _log_cond("lsinit", HtWH=_HtWH, H=H)
+            dx = np.linalg.solve(_HtWH, HTW @ dz_arr)
         except np.linalg.LinAlgError:
             result = np.zeros(6)
             result[:4] = x[:4]
