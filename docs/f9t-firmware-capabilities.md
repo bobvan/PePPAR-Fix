@@ -94,6 +94,18 @@ observed tracking (Yes = output with carrier phase; No = not tracked;
 ⁷ Timebeat's -11B signal datasheet omits GLONASS; not probed.
 ⁸ From Timebeat's -11B datasheet (B1I/B1C/B2a, NavIC L5).  Only GPS L1C/A+L5 and GAL E1+E5a (tracked), plus L2C/E5b (NAK), were independently verified on-unit; the rest is datasheet-claimed, not CFG-probed.
 
+**"LEA-F9T" is not one capability.**  A *second* LEA-F9T — ptBoat's,
+`MOD=LEA-F9T FWVER=TIM 2.22` — was CFG-probed 2026-06-12 and **NAKs GPS L2C,
+GAL E5b, _and_ BDS B2I even with the L5-band slot freed** (GPS L5 / GAL E5a /
+BDS B2a / NavIC disabled first, all ACK).  So that unit is **L5-only — no L1/L2
+option at all**, unlike the L2-switchable `-11B` (London) above.  Same base part
+string, opposite L2 capability: "LEA-F9T" alone doesn't fix the band set — the
+variant (`-11B`?) or the firmware does.  Whether the split is hardware variant
+or firmware version is open pending the London unit's MON-VER (FWVER/PROTVER)
+for a direct compare.  Operational upshot: a **ptBoat** ARP re-survey is stuck
+on L1/L5 → MGEX / final products only; **London** (L2-capable, now configured
+L1/L2) gets the classic L1/L2 + standard-product path.
+
 **The X20P is multi-band, not two-band-limited.**  Every F9T discussion
 below turns on the "two frequency bands maximum" RF-chain limit (L2 *or*
 L5, never both).  The X20P breaks that: the 2026-06-08 survey saw GPS
