@@ -22,6 +22,7 @@ import argparse
 import csv
 import logging
 import math
+import os
 import sys
 from collections import defaultdict, deque
 from datetime import timedelta
@@ -29,6 +30,98 @@ from datetime import timedelta
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+# ── EKF conditioning diagnostics (condNumberLogging) ──────────────── #
+# Gated by env var PEPPAR_COND_LOG=1 so it is zero-cost in production.
+# Tests the float64-conditioning hypothesis for unreliable position
+# convergence: logs the condition number of the matrices we actually
+# invert (innovation covariance S, normal-equations H^T W H) plus the
+# diagonal dynamic range of the covariance P.  cond < ~1e8 over the
+# run → conditioning is NOT eating float64 precision (exonerates the
+# numeric hypothesis, points at structural weak-observability instead);
+# cond >> 1e8 → naive inv()/normal-equations are losing digits.
+_COND_LOG = os.environ.get("PEPPAR_COND_LOG", "").strip().lower() \
+    not in ("", "0", "false", "no", "off")
+
+
+def _cond(M):
+    try:
+        return float(np.linalg.cond(M))
+    except Exception:  # noqa: BLE001 — diagnostic must never crash the filter
+        return float("nan")
+
+
+def _log_cond(tag, **mats):
+    """Emit a compact [COND] line for the named matrices (gated)."""
+    if not _COND_LOG:
+        return
+    parts = []
+    for name, M in mats.items():
+        if M is None:
+            continue
+        A = np.asarray(M, dtype=float)
+        if A.ndim == 2 and A.shape[0] == A.shape[1]:
+            d = np.abs(np.diag(A))
+            d = d[d > 0]
+            dyn = float(d.max() / d.min()) if d.size else float("nan")
+            parts.append(f"{name} cond={_cond(A):.2e} dyn={dyn:.2e} n={A.shape[0]}")
+        else:
+            parts.append(f"{name} cond={_cond(A):.2e} shape={A.shape}")
+    if parts:
+        log.info("[COND] %-9s | %s", tag, "  ".join(parts))
+
+
+# ── float128 EKF path (condNumberLogging follow-up) ───────────────── #
+# Gated by PEPPAR_FLOAT128=1.  Tests whether the position EKF's poor
+# conditioning (measured cond(S) ~ 4e11 → only ~4 float64 digits left)
+# actually limits convergence, by re-running the filter in extended
+# precision.  numpy's linalg (LAPACK) silently downcasts longdouble →
+# float64, so we hand-roll a longdouble Gauss-Jordan solve to keep the
+# inversion in full precision.  If the converged solution is unchanged
+# vs float64 → the 4-digit margin is sufficient (problem is structural
+# weak-observability, not numerics).  If it changes → conditioning bites.
+_FLOAT128 = os.environ.get("PEPPAR_FLOAT128", "").strip().lower() \
+    not in ("", "0", "false", "no", "off")
+_DT = np.longdouble if _FLOAT128 else np.float64
+
+
+def _gauss_solve_ld(A, B):
+    """Solve A X = B entirely in np.longdouble (partial-pivot Gauss-Jordan)."""
+    n = A.shape[0]
+    M = np.array(A, dtype=np.longdouble, copy=True)
+    squeeze = (np.ndim(B) == 1)
+    X = np.array(B, dtype=np.longdouble, copy=True).reshape(n, -1)
+    for col in range(n):
+        piv = int(np.argmax(np.abs(M[col:, col]))) + col
+        if M[piv, col] == 0:
+            raise np.linalg.LinAlgError("singular matrix (longdouble solve)")
+        if piv != col:
+            M[[col, piv]] = M[[piv, col]]
+            X[[col, piv]] = X[[piv, col]]
+        pv = M[col, col]
+        M[col] /= pv
+        X[col] /= pv
+        for r in range(n):
+            if r != col:
+                f = M[r, col]
+                if f != 0:
+                    M[r] -= f * M[col]
+                    X[r] -= f * X[col]
+    return X[:, 0] if squeeze else X
+
+
+def _inv(A):
+    """Matrix inverse; full-precision longdouble Gauss-Jordan when gated."""
+    if _FLOAT128:
+        return _gauss_solve_ld(A, np.eye(A.shape[0], dtype=np.longdouble))
+    return np.linalg.inv(A)
+
+
+def _solve(A, b):
+    """Linear solve; full-precision longdouble Gauss-Jordan when gated."""
+    if _FLOAT128:
+        return _gauss_solve_ld(A, b)
+    return np.linalg.solve(A, b)
 
 from solve_pseudorange import (
     SP3, C, OMEGA_E, ecef_to_lla, ecef_to_enu, lla_to_ecef,
@@ -403,7 +496,7 @@ class PPPFilter:
         the multi-meter cold-start transient observed under pinned mode
         on 2026-05-04 — see I-024942 + scripts/peppar_fix/saastamoinen.py.
         """
-        self.x = np.zeros(N_BASE)
+        self.x = np.zeros(N_BASE, dtype=_DT)
         self.x[:3] = pos_ecef
         self.x[IDX_CLK] = clock_m
         self.x[IDX_ISB_GAL] = isb_gal
@@ -411,13 +504,13 @@ class PPPFilter:
         self.x[IDX_ZTD] = float(init_ztd_m)  # residual ZTD (apriori handles bulk)
         self._ztd_sigma_m = float(ztd_sigma_m)
         self._pos_sigma_m_init = float(pos_sigma_m)
-        self.P = np.diag([
+        self.P = np.diag(np.array([
             pos_sigma_m**2, pos_sigma_m**2, pos_sigma_m**2,
             1e8,
             1e6,
             1e6,
             self._ztd_sigma_m**2,  # ZTD residual prior
-        ])
+        ], dtype=_DT))
         self._ztd_window_elapsed = 0.0  # PWC-60 segment timer (s)
         # Pin ISBs whose reference system isn't present.  Priority order:
         # GPS > GAL > BDS — the highest-priority present system is the
@@ -635,7 +728,7 @@ class PPPFilter:
         HPHt = self.P[:3, :3]                          # 3x3
         S = HPHt + R_ecef                              # 3x3
         try:
-            S_inv = np.linalg.inv(S)
+            S_inv = _inv(S)                            # longdouble when PEPPAR_FLOAT128
         except np.linalg.LinAlgError:
             # Singular S — extremely tight R combined with degenerate
             # P shouldn't happen in practice; bail out rather than
@@ -1103,8 +1196,9 @@ class PPPFilter:
             labels = [labels_full[i] for i in keep_idx]
 
             S = H @ P_prior @ H.T + R
+            _log_cond("ppp", S=S, P=P_prior, H=H)
             try:
-                K = P_prior @ H.T @ np.linalg.inv(S)
+                K = P_prior @ H.T @ _inv(S)
             except np.linalg.LinAlgError:
                 self.x = x_iter
                 self.P = P_prior
@@ -1790,6 +1884,7 @@ class FixedPosFilter:
         self._consecutive_catastrophic_rejects = 0
 
         S = H @ self.P @ H.T + R
+        _log_cond("fixedpos", S=S, P=self.P, H=H)
         # Snapshot clock + clock variance before update — filter-state
         # diagnostic uses these to compute K_z_clk and P delta.
         _clk_pre = float(self.x[self.IDX_CLK])
@@ -1986,7 +2081,9 @@ def ls_init(observations, sp3, t, clk_file=None):
         W_mat = np.diag(W)
         try:
             HTW = H.T @ W_mat
-            dx = np.linalg.solve(HTW @ H, HTW @ dz_arr)
+            _HtWH = HTW @ H
+            _log_cond("lsinit", HtWH=_HtWH, H=H)
+            dx = _solve(_HtWH, HTW @ dz_arr)
         except np.linalg.LinAlgError:
             result = np.zeros(6)
             result[:4] = x[:4]
