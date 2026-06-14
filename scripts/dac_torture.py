@@ -23,6 +23,13 @@ a capacitively-overloaded SDA line (the slowest rising edges, the most
 charge the pull-up must source).  A bus that passes ``alternate`` at high
 rate passes anything the servo will ever do.
 
+SAFETY — exclusive hardware: stop the engine/servo first
+(``sudo pkill -f peppar_fix_engine``).  This tool drives the DAC
+continuously and competes with the servo for the I2C bus; on a host whose
+DAC steers an OCXO it also yanks the oscillator across its full range, so
+nothing else should be disciplining that clock while it runs.  It leaves
+the DAC parked at a safe mid-code on exit.
+
 Usage (defaults pulled from the host config so you can't fat-finger the
 address):
 
