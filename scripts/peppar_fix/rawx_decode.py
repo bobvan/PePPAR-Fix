@@ -59,6 +59,7 @@ class RawxEpoch:
     week: int
     leapS: int
     numMeas: int
+    clk_reset: bool          # recStat.clkReset — integer-ms local-clock realign this epoch
     gnssId: np.ndarray
     svId: np.ndarray
     sigId: np.ndarray
@@ -96,6 +97,13 @@ def decode_rawx(raw: bytes) -> RawxEpoch:
     week = int(np.frombuffer(payload, dtype="<u2", count=1, offset=8)[0])
     leapS = int(np.frombuffer(payload, dtype="i1", count=1, offset=10)[0])
     numMeas = payload[11]
+    # recStat (X1, offset 12): bit0 leapSec, bit1 clkReset.  The receiver
+    # steps its local clock in integer-ms increments as the RX TCXO drifts
+    # and flags the step here; FixedPosFilter.update(clk_reset=...) absorbs
+    # it instead of catastrophic-rejecting the ~ms PR jump.  pyubx2 used to
+    # surface this as parsed.clkReset; the vectorized path must carry it
+    # through too (regression fix — see gracefulClkReset I-145624).
+    clk_reset = bool((payload[12] >> 1) & 0x01)
     need = _HDR_LEN + 32 * numMeas
     if len(payload) < need:
         raise ValueError(f"RAWX truncated: payload {len(payload)} < {need}")
@@ -103,6 +111,7 @@ def decode_rawx(raw: bytes) -> RawxEpoch:
     trk = m["trkStat"]
     return RawxEpoch(
         rcvTow=rcvTow, week=week, leapS=leapS, numMeas=int(numMeas),
+        clk_reset=clk_reset,
         gnssId=m["gnssId"], svId=m["svId"], sigId=m["sigId"], freqId=m["freqId"],
         prMes=m["prMes"], cpMes=m["cpMes"], doMes=m["doMes"],
         cno=m["cno"], locktime=m["locktime"],

@@ -22,13 +22,13 @@ def _ubx_checksum(body: bytes) -> bytes:
     return bytes((ck_a, ck_b))
 
 
-def _build_rawx(rcvTow, week, leapS, meas) -> bytes:
+def _build_rawx(rcvTow, week, leapS, meas, rec_stat=0) -> bytes:
     """Assemble a complete UBX RXM-RAWX frame from a list of measurement
     dicts (gnssId, svId, sigId, freqId, prMes, cpMes, doMes, locktime,
-    cno, trkStat).
+    cno, trkStat).  ``rec_stat`` is the X1 recStat bitfield (bit1=clkReset).
     """
     hdr = struct.pack(
-        "<dHbBBBH", rcvTow, week, leapS, len(meas), 0, 1, 0
+        "<dHbBBBH", rcvTow, week, leapS, len(meas), rec_stat, 1, 0
     )  # rcvTow, week, leapS, numMeas, recStat, version, reserved(2)
     blocks = b""
     for m in meas:
@@ -117,6 +117,32 @@ class TestRawxDecodeRobustness(unittest.TestCase):
         frame = _build_rawx(1.0, 2400, 18, _MEAS)
         with self.assertRaises(ValueError):
             rawx_decode.decode_rawx(frame[:20])  # header claims 3 meas
+
+
+class TestRawxClkReset(unittest.TestCase):
+    """recStat.clkReset decode — regression guard for the #163 plumbing
+    break that let the clkPoC3 21 ms wrap exit-5 (gracefulClkReset)."""
+
+    def test_clk_reset_clear_by_default(self):
+        dec = rawx_decode.decode_rawx(_build_rawx(1.0, 2400, 18, _MEAS, rec_stat=0))
+        self.assertFalse(dec.clk_reset)
+
+    def test_clk_reset_set(self):
+        # recStat bit1 = clkReset; bit0 = leapSec (must NOT be read as clkReset)
+        self.assertTrue(rawx_decode.decode_rawx(
+            _build_rawx(1.0, 2400, 18, _MEAS, rec_stat=0b10)).clk_reset)
+        self.assertFalse(rawx_decode.decode_rawx(
+            _build_rawx(1.0, 2400, 18, _MEAS, rec_stat=0b01)).clk_reset)  # leapSec only
+        self.assertTrue(rawx_decode.decode_rawx(
+            _build_rawx(1.0, 2400, 18, _MEAS, rec_stat=0b11)).clk_reset)  # both
+
+    def test_clk_reset_parity_vs_pyubx2(self):
+        from pyubx2 import UBXReader
+        for rs in (0b00, 0b01, 0b10, 0b11):
+            frame = _build_rawx(1.0, 2400, 18, _MEAS, rec_stat=rs)
+            dec = rawx_decode.decode_rawx(frame)
+            ref = UBXReader.parse(frame)
+            self.assertEqual(dec.clk_reset, bool(ref.clkReset), f"rec_stat={rs:#04b}")
 
 
 if __name__ == "__main__":
