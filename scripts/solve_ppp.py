@@ -728,7 +728,7 @@ class PPPFilter:
         HPHt = self.P[:3, :3]                          # 3x3
         S = HPHt + R_ecef                              # 3x3
         try:
-            S_inv = np.linalg.inv(S)
+            S_inv = _inv(S)                            # longdouble when PEPPAR_FLOAT128
         except np.linalg.LinAlgError:
             # Singular S — extremely tight R combined with degenerate
             # P shouldn't happen in practice; bail out rather than
