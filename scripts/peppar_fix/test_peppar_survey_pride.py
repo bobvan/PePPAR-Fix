@@ -976,5 +976,14 @@ class RunPrideBackendTest(unittest.TestCase):
         self.assertEqual(rc, 2)
 
 
+class FallbackSiteTests(unittest.TestCase):
+    def test_derives_4char_lowercase(self):
+        from peppar_fix.peppar_survey_pride import fallback_site
+        # pdp3 needs -n/--site; derive from filename when MARKER NAME is blank
+        self.assertEqual(fallback_site(Path("london-30s.obs")), "lond")
+        self.assertEqual(fallback_site(Path("MadHat-2026.obs")), "madh")
+        self.assertEqual(len(fallback_site(Path("ab.obs"))), 4)  # padded
+
+
 if __name__ == "__main__":
     unittest.main()

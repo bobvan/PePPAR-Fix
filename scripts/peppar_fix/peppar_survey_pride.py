@@ -116,6 +116,15 @@ def site_from_obs_header(path: Path) -> str | None:
     return None
 
 
+def fallback_site(obs_file: Path) -> str:
+    """4-char lowercase site code from the obs filename, used when the RINEX
+    header has no MARKER NAME (common in convbin output) — pdp3 then refuses
+    to run ("please use -n / --site")."""
+    import re
+    stem = re.sub(r"[^a-z0-9]", "", obs_file.stem.lower())
+    return (stem[:4] or "site").ljust(4, "0")
+
+
 def expected_pos_name(year: int, doy: int, site: str) -> str:
     """The basename pdp3 writes for a static-mode solution."""
     return f"pos_{year:04d}{doy:03d}_{site}"
@@ -423,7 +432,12 @@ def invoke_pdp3(
                     log.info("no WUM products matched %d/%d in %s",
                              year, doy, wum_source)
 
-    cmd = [pdp3_bin, "-m", "S", "-sys", sys_str] + list(extra_args) + [obs_local.name]
+    # pdp3 requires a site name (-n / --site).  Prefer the RINEX MARKER NAME;
+    # fall back to a code from the filename when it's blank (convbin output
+    # often leaves MARKER NAME empty), otherwise pdp3 refuses to run.
+    site = site_from_obs_header(obs_file) or fallback_site(obs_file)
+    cmd = ([pdp3_bin, "-m", "S", "-sys", sys_str, "-n", site]
+           + list(extra_args) + [obs_local.name])
     log.info("Running pdp3 in %s: %s", work_dir, " ".join(cmd))
     # pdp3 (the bash wrapper) does `$(dirname $(which pdp3))/config_template`
     # to find its config template.  That `which` returns empty when pdp3
