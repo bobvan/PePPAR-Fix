@@ -66,7 +66,7 @@ def main():
     nb = max(b for b, _ in acc) + 1
     hrs = np.arange(nb) * args.bin_s / 3600.0
     means = {}
-    for s in ("G", "E", "C"):
+    for s in ("G", "E", "C", "R"):
         y = np.full(nb, np.nan)
         for (b, ss), (sm, ct) in acc.items():
             if ss == s and ct:
@@ -76,7 +76,11 @@ def main():
     fig, ax = plt.subplots(figsize=(16, 9))
     ax.axhline(0, color="gray", lw=0.6)
     span_h = hrs[-1]
-    for s, name, col in (("E", "GAL−GPS", "tab:green"), ("C", "BDS−GPS", "tab:orange")):
+    # GLONASS drawn first (it's the largest/noisiest — Cs clocks, FDMA) so the
+    # tighter GAL/BDS traces stay on top and legible.
+    for s, name, col in (("R", "GLO−GPS", "tab:red"),
+                         ("C", "BDS−GPS", "tab:orange"),
+                         ("E", "GAL−GPS", "tab:green")):
         if np.isfinite(means[s]).sum() < 10 or np.isfinite(means["G"]).sum() < 10:
             continue
         d = means[s] - means["G"]
