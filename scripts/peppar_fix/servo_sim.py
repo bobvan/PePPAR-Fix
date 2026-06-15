@@ -149,6 +149,26 @@ class SimConfig:
     drop_measurements_window_s: Optional[tuple] = None
     in_holdover_window_s: Optional[tuple] = None
 
+    # ekfStateSanityNoRecovery (PR #126) — closed-loop validation harness
+    # (Main I-073222).  When True, poll `servo.is_state_corrupted()` each
+    # epoch and route through `_request_servo_reset` on a True read
+    # (same funnel as the binary-layer site, so the shared ResetBudget
+    # applies when `reset_budget_enabled` is also on).
+    #
+    # `force_state_corruption_at_s` is the test hook that reliably
+    # triggers the failure mode: at the specified epoch the sim
+    # directly pokes `self.ekf.x[2] = force_state_corruption_value_ns`
+    # (default 2e8 ns, past the 1e8 ns sanity bound).  Combine with a
+    # `drop_measurements_window_s` that starts at the same t_s so no
+    # measurement pulls x[2] back down — then predict-only propagation
+    # keeps |x[2]| above the bound each epoch, the consec counter
+    # accumulates, and the LQR short-circuit (PR #126) holds the
+    # actuator at last-sane during the consec=1..N-1 epochs.
+    # Reproduces the 22:21 MadHat failure mode without lab time.
+    state_sanity_recovery_enabled: bool = False
+    force_state_corruption_at_s: Optional[float] = None
+    force_state_corruption_value_ns: float = 2e8
+
     # exitFiveToServoReset (bravo PR #121) — shared windowed ResetBudget
     # consumed by both the binary layer and any synthetic test-only
     # reset requests.  When `reset_budget_enabled` is True, the sim
@@ -424,6 +444,12 @@ class ClosedLoopSim:
         # Per-epoch gross-fault event log; populated only when the
         # binary layer fires.  Tests assert on the length + timestamps.
         self.gross_fault_events: list = []
+        # ekfStateSanityNoRecovery (#126 + I-073222) recovery events:
+        # one per sustained state-sanity violation that crossed the
+        # consec threshold (servo.is_state_corrupted() == True).  Tuple
+        # is (t_s, x2_before_reset).  Routes through the same
+        # _request_servo_reset funnel so the ResetBudget applies.
+        self.state_sanity_events: list = []
         # exitFiveToServoReset (#121) consumption: shared ResetBudget +
         # the reset_events log.  When `reset_budget_enabled` is False
         # the budget is still constructed (so the helper has a uniform
@@ -569,7 +595,19 @@ class ClosedLoopSim:
         # coast_cap_from_p22 fed by DOFreqEst.project_p22_coast.  Starts
         # at the requested ceiling; the cap only ever tightens it.
         dyn_coast_every = coast_every
+        # ekfStateSanityNoRecovery test hook: poke x[2] to corruption
+        # value when the loop crosses force_state_corruption_at_s.
+        # One-shot via this flag so we don't re-poke each epoch.
+        _corruption_pending = (c.force_state_corruption_at_s is not None)
         for k in range(n):
+            # State-corruption injection (test hook).  Fires once when
+            # t crosses force_state_corruption_at_s; pairs naturally
+            # with a drop_measurements_window starting at the same time
+            # (no measurement → predict-only keeps |x[2]| > bound).
+            if (_corruption_pending
+                    and (k * c.dt_s) >= float(c.force_state_corruption_at_s)):
+                self.ekf.x[2] = float(c.force_state_corruption_value_ns)
+                _corruption_pending = False
             # The servo corrects every `coast_every` epochs ONCE
             # converged; while still converging it corrects every epoch
             # (the M7 scheduler's _converging flag).  Between corrections
@@ -684,6 +722,20 @@ class ClosedLoopSim:
                    and float(self._pending_synthetic[0][0]) <= t_s[k]):
                 _t_req, _reason = self._pending_synthetic.pop(0)
                 self._request_servo_reset(t_s[k], str(_reason))
+
+            # ekfStateSanityNoRecovery (Main I-073222 — closed-loop
+            # validation of PR #126).  Mirrors the engine site
+            # (peppar_fix_engine.py: after servo.update, poll
+            # is_state_corrupted, route through _request_servo_reset).
+            # is_state_corrupted() flips True only after N consecutive
+            # |x[i]| > bound violations (set in DOFreqEst with
+            # _state_sanity_consec_threshold, default 3), so the
+            # LQR-short-circuit inside DOFreqEst.update() will have
+            # held adjfine at last-sane for the consec=1..N-1 epochs.
+            if c.state_sanity_recovery_enabled and self.ekf.is_state_corrupted():
+                x2_pre = float(self.ekf.x[2])
+                self.state_sanity_events.append((float(t_s[k]), x2_pre))
+                self._request_servo_reset(t_s[k], "state_sanity")
 
             # Stop the run if the budget denied a request — the engine's
             # exit-5 path tears down the process; the sim shouldn't

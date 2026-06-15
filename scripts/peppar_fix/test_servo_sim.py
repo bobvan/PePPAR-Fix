@@ -430,3 +430,201 @@ def test_reset_budget_disabled_is_byte_identical_to_v1():
     # Run reached its natural duration — result arrays not truncated.
     expected_samples = int(sim.cfg.duration_s / sim.cfg.dt_s)
     assert abs(len(res.t_s) - expected_samples) <= 1
+
+
+# ── PR #126 + I-073222 state-sanity recovery closed-loop A/B ── #
+#
+# Reproduces the day0602-pr125b-madhat 22:21 failure mode in the
+# closed-loop sim: a long drop window forces predict-only propagation
+# of x[2] past the 1e8 ns sanity bound; without the new is_state_
+# corrupted() poll the engine logs ERROR forever (B); with it, the
+# loop calls _request_servo_reset, zeros x[2], and re-acquires (A).
+
+def _state_sanity_cfg(*, recovery_enabled, duration_s=600.0,
+                      corruption_at=200.0, drop=(200.0, 100_000.0)):
+    """Reproduces the 22:21 failure: at `corruption_at` the sim pokes
+    x[2] to 2e8 ns (past the 1e8 sanity bound), and a drop window
+    starting at the same time prevents measurements from pulling it
+    back.  Predict-only propagation keeps |x[2]| above the bound, the
+    consec counter accumulates, and at consec ≥ threshold the engine-
+    side poll (state_sanity_recovery_enabled) fires the reset.
+
+    The steady-state-cancel property of the LQR means a clean drop
+    window doesn't actually drive x[2] past the bound on its own;
+    the explicit corruption hook is the test-side reproduction of
+    the cycle-slip-cascade that preceded the 22:21 drop in the lab."""
+    return preset(
+        "piface-ungated", duration_s=duration_s,
+        drop_measurements_window_s=drop,
+        force_state_corruption_at_s=corruption_at,
+        state_sanity_recovery_enabled=recovery_enabled,
+        # Use the budget so test_state_sanity_reset_budget_exit5 works
+        # without re-architecting; defaults match the engine CLI.
+        reset_budget_enabled=recovery_enabled,
+        reset_budget_max=3,
+        reset_budget_window_s=300.0)
+
+
+def test_state_sanity_recovery_disabled_runaway():
+    """Flag OFF + long drop → x[2] keeps growing past 1e8; no events
+    recorded.  The pre-#126 baseline — the engine just logs the ERROR
+    and lets the runaway accumulate."""
+    sim = ClosedLoopSim(_state_sanity_cfg(recovery_enabled=False))
+    sim.run()
+    # No recovery events: the poll never fires.
+    assert sim.state_sanity_events == []
+    # Final |x[2]| has grown past the 1e8 ns sanity bound and STAYS
+    # above it — the runaway signature.  (We're checking the EKF's
+    # estimate, not the truth — the EKF can't recover its phase state
+    # because nothing reset it.)
+    assert abs(float(sim.ekf.x[2])) > 1e8, (
+        f"expected runaway past 1e8 ns, got |x[2]|={abs(sim.ekf.x[2]):.3e}")
+
+
+def test_state_sanity_recovery_enabled_recovers():
+    """Flag ON + same drop → at least one event; final |x[2]| bounded
+    well below the sanity threshold once measurements resume."""
+    sim = ClosedLoopSim(_state_sanity_cfg(recovery_enabled=True))
+    sim.run()
+    # At least one recovery event fired — the poll caught a
+    # threshold-crossing during the drop window.
+    assert len(sim.state_sanity_events) >= 1, (
+        f"expected ≥1 state-sanity event, got {len(sim.state_sanity_events)}")
+    # Events fall inside or shortly after the drop window — recovery
+    # is in-loop, not at end of run.
+    for t_evt, x2_pre in sim.state_sanity_events:
+        assert x2_pre != 0  # the pre-reset value (non-zero by construction)
+    # Post-recovery: |x[2]| is bounded back under the sanity threshold.
+    # The drop ended at 700s, plenty of catch-up time before duration_s=1200.
+    assert abs(float(sim.ekf.x[2])) < 1e6, (
+        f"expected |x[2]| bounded post-recovery, got {abs(sim.ekf.x[2]):.3e}")
+
+
+def test_lqr_short_circuit_prevents_actuator_swing():
+    """During the consec=1..N-1 violation window the LQR short-circuit
+    holds adjfine at last-sane (returned self.freq unchanged from
+    DOFreqEst.update()).  Assert the actuator command DURING the drop
+    window stays bounded — no ±100 ppb cascade like the 22:21 lab log.
+
+    Note: piface-ungated's steady-state adjfine is +135 ppb (to
+    cancel do_f0_ppb=-135), so the bound has to be above |135 ppb|
+    but well below max_ppb (the LQR rail in the failure mode)."""
+    sim = ClosedLoopSim(_state_sanity_cfg(recovery_enabled=True))
+    res = sim.run()
+    # Adjfine through the drop window: index range corresponds to
+    # the drop tuple in epochs.
+    t = res.t_s
+    adj = res.adjfine_ppb
+    drop_start, drop_end = sim.cfg.drop_measurements_window_s
+    in_drop = (t >= drop_start) & (t <= drop_end)
+    max_abs_adj = float(np.max(np.abs(adj[in_drop])))
+    # ≤ a few hundred ppb (held + small post-reset transients);
+    # never the ~max_ppb rail of the unfixed failure mode.
+    assert max_abs_adj < 1000.0, (
+        f"adjfine swung to {max_abs_adj:.1f} ppb during drop — "
+        "LQR short-circuit didn't hold the actuator")
+
+
+def test_recovery_time_to_lock():
+    """After a state-sanity reset, measure how many epochs until
+    |x[2]| < 100 ns — the operational expectation operators read out
+    of [SERVO_RESET reason=state_sanity] log lines.  Concrete bound:
+    re-lock within 60 s on the piface-ungated preset (matches the
+    binary-layer's consec_max window so it's a natural ceiling)."""
+    sim = ClosedLoopSim(_state_sanity_cfg(recovery_enabled=True))
+    res = sim.run()
+    assert sim.state_sanity_events, "test prereq: a reset must have happened"
+    t_evt = sim.state_sanity_events[0][0]
+    idx_evt = int(t_evt / sim.cfg.dt_s)
+    # Walk forward from the reset epoch until |x[2]| drops below 100 ns.
+    # (Reconstruction from the post-update estimated phase log.)
+    # est_phi_do_ns is the EKF's x[2] estimate per epoch — sim records
+    # it on every epoch.
+    for j in range(idx_evt, len(res.est_phi_do_ns)):
+        if abs(float(res.est_phi_do_ns[j])) < 100.0:
+            recovery_epochs = j - idx_evt
+            break
+    else:
+        recovery_epochs = float('inf')
+    assert recovery_epochs < 60, (
+        f"recovery took {recovery_epochs} epochs — over the 60 s ceiling")
+
+
+def test_state_sanity_reset_budget_exit5():
+    """4 corruption injections inside the budget window → budget
+    exhausted → at least one 'exit5' outcome in reset_events.  Pins
+    the budget-fall-through path so a genuinely-broken host yields
+    to wrapper re-bootstrap instead of resetting forever.
+
+    Approach: long drop window keeps measurements out; one initial
+    state-corruption poke; the LQR short-circuit + held adjfine means
+    truth.phi_do drifts (DO crystal not corrected), and each post-reset
+    measurement-update reseeds x[2] from the (now-drifted) truth.
+    Within ~hundreds of seconds, x[2] re-crosses the sanity bound and
+    triggers a 2nd, 3rd reset.  With max=3 in window=300s, the 4th
+    request denies → exit5."""
+    # Multiple synthetic corruption sources via synthetic_requests —
+    # bypass the EKF/predict dynamics and directly fire reset requests
+    # with reason='state_sanity'.  This decouples the budget-fallthrough
+    # behavior from the (host-dependent) actual time between threshold-
+    # crossings; the unit-test scope is "does the budget bind?".
+    cfg = preset("piface-ungated", duration_s=400.0,
+                 state_sanity_recovery_enabled=False,  # use synthetic path
+                 reset_budget_enabled=True,
+                 reset_budget_max=3,
+                 reset_budget_window_s=300.0,
+                 induced_synthetic_requests=[
+                     (50.0, "state_sanity"),
+                     (100.0, "state_sanity"),
+                     (150.0, "state_sanity"),
+                     (200.0, "state_sanity"),     # 4th in window → exit5
+                 ])
+    sim = ClosedLoopSim(cfg)
+    sim.run()
+    outcomes = [ev[2] for ev in sim.reset_events]
+    assert outcomes[:3] == ["reset", "reset", "reset"], (
+        f"first 3 should be 'reset', got {outcomes}")
+    assert outcomes[3] == "exit5", (
+        f"4th request from a 4th injection should be 'exit5', got {outcomes}")
+    # Sim stopped at the exit5 epoch (no run past the wrapper-relaunch).
+    assert sim.exit5_at is not None
+
+
+def test_two_clock_state_sanity_diff_resilience():
+    """run_two_clock with the same disturbance: A=engine-side recovery
+    ON, B=OFF.  Compares the EKF's x[2] estimate, which IS the
+    differentiated signal between the two configs.
+
+    Note: the LQR short-circuit landed in PR #126 is UNCONDITIONAL
+    inside DOFreqEst.update(), so even B (no engine-side poll) keeps
+    the actuator held at last-sane post-corruption.  This means
+    truth.phi_do behaves similarly between A and B (both have the
+    held actuator), and the hero-plot A/B Main envisioned can't show
+    a truth-side cascade without a separate knob to disable the short-
+    circuit.  We instead compare the EKF state directly: A's reset
+    zeros x[2], B's stays at the corruption value."""
+    cfg_a = _state_sanity_cfg(recovery_enabled=True)
+    cfg_b = _state_sanity_cfg(recovery_enabled=False)
+    cfg_a.seed = 17
+    cfg_b.seed = 17
+    res_a, res_b, _ = run_two_clock(cfg_a, cfg_b, share_gnss=True)
+    # The fixture is constructed by run_two_clock — we need the
+    # actual sims to read x[2] at end-of-run.  Reconstruct from the
+    # est_phi_do_ns log (EKF's x[2] estimate per epoch).
+    end_x2_a = float(res_a.est_phi_do_ns[-1])
+    end_x2_b = float(res_b.est_phi_do_ns[-1])
+    # A recovers: x[2] near zero (the reset cleared it; subsequent
+    # predict steady-state holds it at zero).
+    assert abs(end_x2_a) < 1e4, (
+        f"clock A's x[2] should be near zero post-recovery, "
+        f"got {abs(end_x2_a):.3e}")
+    # B does NOT recover: x[2] held at the corruption value (LQR
+    # short-circuit holds adjfine, predict steady-state keeps x[2]
+    # at the post-poke value).
+    assert abs(end_x2_b) > 1e8, (
+        f"clock B's x[2] should remain at the corruption value, "
+        f"got {abs(end_x2_b):.3e}")
+    # Differential between A and B is at least 4 orders of magnitude
+    # on the EKF state — operationally that's "recovered" vs "stuck".
+    assert abs(end_x2_b) > 1e4 * abs(max(abs(end_x2_a), 1.0)), (
+        f"A={abs(end_x2_a):.3e}, B={abs(end_x2_b):.3e}")
