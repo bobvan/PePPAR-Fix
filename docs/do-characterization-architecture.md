@@ -91,9 +91,23 @@ treated as black boxes from the PePPAR-Fix engine's perspective.
 
 ## Schema
 
-One TOML file per DO at `state/dos/<do_uid>.toml`.  Sections are
-fixed; tools may add fields within a section but may not invent
-sections.
+Two files per DO, with strict ownership.  The split is structural,
+not stylistic — it eliminates a write-race and makes "the engine
+never opens the characterization file" a property of the
+filesystem, not a convention readers can violate.
+
+| Path | Owner | Lifetime |
+|---|---|---|
+| `state/dos/<do_uid>.toml` | measurement tools | written once per characterization phase, persists for months |
+| `state/dos/<do_uid>.runtime.toml` | engine only | rewritten every save_do_state checkpoint |
+
+The characterization file is hand-commented and sectioned; the
+runtime file is engine-rewritten with no comments to preserve.
+Splitting them means a per-checkpoint engine write can't corrupt
+tool-written comments (`tomli_w` doesn't preserve them) and can't
+race with a characterization tool writing the main file.
+
+### `state/dos/<do_uid>.toml` — characterization
 
 ```toml
 schema_version = "1"
@@ -122,16 +136,16 @@ measured_at = "2026-05-30T14:40:06Z"
 source = "measured"               # measured | class-default
 measurement_channel = "DO PPS (chA vs TICC Rb)"
                                   # MUST be a DO-pointing channel.
-                                  # Allowed:
-                                  #   "DO PPS (chA vs TICC Rb)"
-                                  #   "DO PPS (chA-chB)"
+                                  # Allowed (preferred order):
+                                  #   1. "DO PPS (chA vs TICC Rb)"  (preferred — Rb is the cleanest reference)
+                                  #   2. "DO PPS (chA-chB)"          (acceptable fallback when no Rb available; picks up rx-TCXO motion)
                                   # Rejected at write time:
-                                  #   anything receiver-side
-                                  #   ("Carrier", "dt_rx", "qErr", ...)
-                                  #   anything control-loop
-                                  #   ("adjfine", "freq_command", ...)
+                                  #   anything receiver-side ("Carrier", "dt_rx", "qErr", ...)
+                                  #   anything control-loop ("adjfine", "freq_command", ...)
 sigma_do_phase_ns = 0.0425        # ns/√s — DOFreqEst Q[2,2]^0.5
-sigma_do_freq_ppb = 0.000382      # ppb/√s — DOFreqEst Q[3,3]^0.5
+sigma_do_freq_ppb = 0.000382      # ppb/√s — DOFreqEst Q[3,3]^0.5 (from ADEV RWFM tail — see §"Q[3,3] design change")
+coast_tdev_ref_ns = 0.0425        # ns at tau=1s — Goldilocks coast-cap anchor
+coast_tdev_slope = -0.571         # power-law slope (TDEV(τ) ∝ τ^slope) — Goldilocks coast-cap reaches non-trivial τ via these two scalars; the engine never opens the sidecar
 captured = "2026-05-30T14:40:06Z"
 duration_s = 3604
 
@@ -141,22 +155,34 @@ sigma_q_ppb = 0.05                # σ_q for Goldilocks τ* formula
 write_settle_ms = 1
 i2c_error_rate_per_million = 0
 measured_at = "2026-06-01T00:00:00Z"
-
-[operational_state]               # engine writes here every save
-last_known_freq_offset_ppb = +144.65
-last_known_dac_code = 32768
-last_updated = "2026-06-15T16:00:00Z"
+# Open question (Bravo's actuatorNoiseChar measurement): if σ_q
+# turns out to scale with step size rather than being fixed-per-
+# actuation, this section grows to σ_q(δ) — either (intercept,
+# slope) or a piecewise table.  Schema stays scalar-only until
+# Bravo's measurement closes that question, then revises once.
 
 [aging]                           # long-term drift, manual or refined
 drift_ppb_per_year = 0.5
 last_cal_date = "2026-05-30"
 ```
 
+### `state/dos/<do_uid>.runtime.toml` — engine-only
+
+```toml
+schema_version = "1"
+
+[operational_state]               # engine writes here every save_do_state
+last_known_freq_offset_ppb = +144.65
+last_known_dac_code = 32768
+last_updated = "2026-06-15T16:00:00Z"
+```
+
 PSD curves, ADEV tables, and TDEV tables go in a sidecar
 `<do_uid>.noise.toml` — they're 10+ KB and don't need to round-trip
-through a human editor.  The engine reads only `sigma_do_phase_ns`
-and `sigma_do_freq_ppb` from the main file; the sidecar exists for
-post-hoc analysis and replotting.
+through a human editor.  The engine reads only the two main-file
+scalars (`sigma_do_phase_ns`, `sigma_do_freq_ppb`) and the two
+coast-cap scalars (`coast_tdev_ref_ns`, `coast_tdev_slope`); the
+sidecar exists for post-hoc analysis and replotting only.
 
 ### Schema rules
 
@@ -173,11 +199,12 @@ post-hoc analysis and replotting.
 4. **No `sources` dict.**  The flat-bucket-of-measurements pattern
    from the old JSON schema is what conflated physical quantities.
    Each quantity gets its own typed field.
-5. **The engine never writes characterization sections.**  Only
-   `[operational_state]` is engine-writable.  Tools own everything
-   else; this prevents the engine's runtime observations from
-   accidentally polluting freerun characterization (the PiFace
-   mechanism).
+5. **The engine never opens the characterization file.**  This is
+   structural, not a convention — the engine's runtime state lives
+   in a separate file (`<uid>.runtime.toml`).  The engine reads
+   `<uid>.toml` at startup, writes only to `<uid>.runtime.toml`
+   afterwards.  Eliminates the write-race against tools and the
+   comment-strip problem that `tomli_w` would otherwise create.
 
 
 ## Tools — one per section
@@ -188,7 +215,7 @@ Strict 1:1 mapping between sections and tools.
 |---|---|---|
 | `[identity]` | `scripts/do_register.py <uid> <model>` | Creates a new DO file with class defaults filled in.  Mandatory before the engine will start with a new `do_label`. |
 | `[steering]` | `scripts/do_steering_char.py` | DAC sweep, linear fit, range detection.  Outputs slope, intercept, code_min, code_max. |
-| `[freerun_noise]` | `scripts/do_freerun_char.py` | TICC chA observation against Rb (or against chB), computes ADEV/TDEV/PSD, derives σ_do_phase + σ_do_freq.  Refuses any source label not in the allowed enum. |
+| `[freerun_noise]` | `scripts/do_freerun_char.py` | TICC chA observation against Rb (preferred) or against chB (acceptable fallback), computes ADEV/TDEV/PSD, derives σ_do_phase + σ_do_freq + coast_tdev_ref_ns + coast_tdev_slope.  Refuses any source label not in the allowed enum.  When both Rb and chB are available, `chA vs Rb` wins — chB carries rx-TCXO motion that contaminates the DO signal. |
 | `[actuation_noise]` | `scripts/do_actuator_char.py` | Holds adjfine constant, observes residual TDEV, derives σ_q. |
 | `[operational_state]` | engine (only) | Updates last_known_* on each save_do_state checkpoint. |
 | `[aging]` | manual entry initially; later `scripts/do_aging_refresh.py` extracts drift_ppb_per_year from `[operational_state]` history. |
@@ -204,6 +231,39 @@ Out of scope (for this design):
 - `[thermal]` section.  Bob is adding temperature sensors to the
   OCXOs; revisit when there's data to populate it.  The schema
   reserves the section name; the loader accepts its absence.
+
+
+## Q[3,3] design change vs qFromCharPerActuator
+
+The previous design (`qFromCharPerActuator`, codified in
+`do_state.py:325-340`) deliberately made the actuator-command ASD
+(`freq_command` / `adjfine`) the **primary** σ_do_freq source —
+the "freq noise floor at the actuator input."  This document
+overturns that decision.  Stating the change explicitly so it's
+not silent:
+
+**Old**: σ_do_freq derived from `freq_command` / `adjfine` ASD,
+falling back to ADEV-RWFM only when those weren't present.
+
+**New**: σ_do_freq derived **only** from the freerun-ADEV RWFM
+tail.  The disciplined `adjfine` ASD is reframed as σ_q under
+`[actuation_noise]` and **never** feeds Q[3,3].
+
+The reframe matches the physics: a disciplined `adjfine` stream
+reflects loop activity + reference noise + DO response, not the
+DO's open-loop random-walk-FM.  Its honest home is the actuator
+chain's per-write quantization + write-noise budget (σ_q), which
+is what the Goldilocks τ* formula expects.  The freerun-ADEV RWFM
+tail is the physically correct open-loop frequency random walk
+and is what Q[3,3] models.
+
+**Gating**: this change ships behind a closedLoopServoSim A/B
+check before the schema PR lands.  Acceptance criterion (signed
+off by Bob 2026-06-15): replay PiFace's overnight trace under
+each Q[3,3] source.  Under the old source, the sim should
+reproduce the observed ~60 ppb adjfine std wobble.  Under the
+new source, it should drop to clkPoC3-class (single-digit ppb
+std).  If both reproduce as expected, the change is validated.
 
 
 ## Lifecycle
@@ -250,15 +310,17 @@ DOFreqEst Q: sigma_do_phase=0.1000 ns/√s (source=class-default[OCXO]),
 ## Class defaults
 
 Conservative starting points so a freshly-registered DO can run
-the engine immediately.  Numbers will be argued in PR review;
-the structure is what matters here.
+the engine immediately.  Each default must be looser than the
+worst-real-unit measurement we have, so a default-using DO is
+never *implicitly* asserted to be tighter than a measured DO of
+the same class.
 
-| Class | σ_DO_phase | σ_DO_freq | σ_q | Notes |
+| Class | σ_DO_phase | σ_DO_freq | σ_q | Lineage (real unit this must beat) |
 |---|---:|---:|---:|---|
-| OCXO | 0.1 ns/√s | 0.001 ppb/√s | 0.05 ppb | conservative; well-tuned units do ~10× better |
-| TCXO | 1.0 ns/√s | 0.1 ppb/√s | 0.1 ppb | typical free-running TCXO |
-| Rb | 0.01 ns/√s | 0.0001 ppb/√s | 0.01 ppb | beats most OCXOs |
-| PHC (i226 adjfine) | 0.5 ns/√s | 0.1 ppb/√s | 0.5 ppb | empirically from adaptive-scheduler-motivation-timehat memory |
+| OCXO | 0.1 ns/√s | 0.001 ppb/√s | 0.05 ppb | ~2.6× looser than clkPoC3 measured (0.0382 / 0.000382); leaves headroom for noisier OCXOs |
+| TCXO | **3.0 ns/√s** | 0.1 ppb/√s | 0.1 ppb | TimeHat measured freerun TDEV(1s) = 2.6 ns/√s (per Main's review); class default must be looser, hence 3.0 |
+| Rb | 0.01 ns/√s | 0.0001 ppb/√s | 0.01 ppb | beats most OCXOs by design; a Rb that needs class-default is broken |
+| PHC (i226 adjfine) | 0.5 ns/√s | 0.1 ppb/√s | 0.5 ppb | empirically from `[[adaptive-scheduler-motivation-timehat]]` — 1 Hz actuation worse than coasting implies actuator σ_q is ns-class, not the 15-fs LSB floor |
 
 Class defaults live in code (`peppar_fix.do_schema.CLASS_DEFAULTS`),
 not in a per-DO file.  When the engine reads a section with
@@ -276,29 +338,48 @@ DOFreqEst Q: sigma_do_freq=0.001000 ppb/√s (source=class-default[OCXO]
 
 ## Migration
 
-One-time port from the existing `state/dos/<uid>.json` files to
-the new TOML schema.  Reversible.
+One-shot, supervised, across all hosts.  Zero installed base, so
+no need for reversibility or operator-confirmation logic — we
+control every host, we run the migration, we delete the old files
+when the new ones validate clean.
 
-`scripts/migrate_do_state.py` does:
+`scripts/migrate_do_state.py` per host:
 
-1. Read the old JSON.
-2. Map known fields into the new schema sections.
-3. Drop receiver-side and control-loop entries from `sources`
-   with a logged WARNING listing exactly which entries were
-   dropped and why.
-4. Write `state/dos/<uid>.toml`.
-5. Rename old JSON to `<uid>.json.preMigration` so it's still
-   on disk for forensics.
+1. Read whatever `state/dos/<uid>.json` / `<uid>_noise.json` /
+   `<uid>-v2.json` files exist.
+2. Best-effort extract DO-pointing measurements (`DO PPS (chA vs TICC Rb)`
+   first, `DO PPS (chA-chB)` second).  Drop everything else.
+3. Map known fields into the new schema sections.
+4. Write `state/dos/<uid>.toml` (characterization) and
+   `state/dos/<uid>.runtime.toml` (operational state).
+5. Validate the new files load cleanly through the new schema.
+6. Print a per-section provenance summary so it's immediately
+   obvious which sections fell to `class-default` and need
+   urgent re-characterization:
 
-Per-host migration is a single command, deterministic, idempotent.
-The engine starts looking for `.toml` first; if absent and
-`.json.preMigration` exists, it refuses with a clear error
-("DO file not migrated; run scripts/migrate_do_state.py").
+   ```
+   ocxo-piface migration summary:
+     [identity]:          measured       (from ocxo-piface.json)
+     [steering]:          measured       (from ocxo-piface.json:adjustment)
+     [freerun_noise]:     measured       (DO PPS (chA vs TICC Rb), σ_phase=0.0425)
+     [actuation_noise]:   class-default  ← run do_actuator_char.py
+     [aging]:             class-default  ← manual entry pending
+   ```
+
+7. Delete the old `.json` / `_noise.json` / `-v2.json` / `.bak.*`
+   files for this DO.  No `.preMigration` backups — we have the
+   git history of the migration script and the new files round-
+   trip cleanly.
+
+The migration is a single afternoon's work across the fleet
+(PiFace, clkPoC3, MadHat, TimeHat).  Each host: `git pull && sudo
+python3 scripts/migrate_do_state.py`, eyeball the provenance
+summary, confirm.
 
 After the migration lands, the hardcoded `_PHASE_FALLBACK_NS = 0.92`
 in `do_freq_est.py` gets deleted.  Its replacement is the
-class-default mechanism above — which has explicit provenance
-in the log line instead of an unsourced 0.92.
+class-default mechanism above — which has explicit provenance in
+the log line instead of an unsourced 0.92.
 
 
 ## Execution
