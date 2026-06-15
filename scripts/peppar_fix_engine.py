@@ -11144,10 +11144,14 @@ Two-phase operation:
     servo.add_argument("--fire-every-epoch", action="store_true", default=False,
                        help="fasterUpdateRate (B): actuate every measurement "
                             "epoch (loop BW = measurement rate), bypassing the "
-                            "adaptive coast. For the >1 Hz prototype — directly "
-                            "tests whether faster discipline suppresses the "
-                            "mid-τ DO bump, at the cost of more actuator-σ_q "
-                            "events. Off by default.")
+                            "adaptive coast. DIAGNOSTIC ONLY — NOT a deployment "
+                            "discipline mode. It is provably contrary to the "
+                            "Goldilocks premise whenever τ_opt > 1/rate (e.g. "
+                            "clkPoC3 τ_opt≈1.45 s): below τ_opt the actuator σ_q "
+                            "injected per correction dominates the DO wander it "
+                            "saves. Use only to measure that σ_q cost (the gap "
+                            "vs adaptive). See docs/goldilocks-update-rate-"
+                            "review-2026-06-15.md. Off by default.")
     servo.add_argument("--max-interval", type=int, default=120,
                        help="Maximum discipline interval (default: 120)")
     servo.add_argument("--min-interval", type=int, default=1,
