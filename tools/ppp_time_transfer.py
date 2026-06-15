@@ -12,10 +12,14 @@ ADEV/TDEV of each difference tells the stability story.
                          is the PPP transfer noise, not the clocks)
 
 Each input is a 2-column clock series "epoch_s  clock" extracted from a PPP run:
+  - CSRS-PPP:    the **`.clk`** file in the downloaded results — RINEX-clock
+                 format, per-epoch receiver clock offset + 95% sigma (the
+                 quantified data behind the report's "Station Clock Offset"
+                 plot).  Pull the clock from its `AR <site> …` records (or the
+                 per-epoch clock column of the `.pos`).  The `.sum` carries the
+                 final coords + stats.
   - PRIDE pdp3:  the `rck_YYYYDDD_<site>` file (receiver clock; check units —
                  PRIDE writes clock in metres or ns, set --scale-to-ns).
-  - CSRS-PPP:    the per-epoch clock column of the .pos / full output (the same
-                 series the report's "Station Clock Offset" plot draws).
 Use --col / --time-col / --scale-to-ns to map whatever columns your file has;
 defaults assume "epoch_s, clock_ns".
 
