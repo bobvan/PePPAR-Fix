@@ -161,9 +161,12 @@ def main() -> int:
                 bottom = np.maximum(fri, floor)
                 room = np.isfinite(ci) & np.isfinite(bottom) & (ci > bottom)
                 if room.any():
+                    # Texture, not colour: transparent face + diagonal hatch, so
+                    # this region is visually distinct from the win slide's SOLID
+                    # improvement fill even though both use the host colour.
                     ax.fill_between(tau_grid[room], bottom[room], ci[room],
-                                    facecolor=mcolors.to_rgba(c, 0.08),
-                                    edgecolor=mcolors.to_rgba(c, 0.55),
+                                    facecolor='none',
+                                    edgecolor=mcolors.to_rgba(c, 0.85),
                                     hatch='////', lw=0.0, zorder=1.5,
                                     label=('Remaining room for improvement'
                                            if i == 0 else None))
