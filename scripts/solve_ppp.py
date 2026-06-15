@@ -1325,7 +1325,7 @@ class FixedPosFilter:
 
     def __init__(self, pos_ecef, init_ztd_m=0.0, init_ztd_sigma_m=0.5,
                  r_calibration=None, q_clk_step=None, q_clk_rate_step=None,
-                 q_ztd_step=None):
+                 q_ztd_step=None, meas_rate_hz=1.0):
         """Fixed-position PPP filter.
 
         Args:
@@ -1422,6 +1422,22 @@ class FixedPosFilter:
         self.last_kz_clk_td = 0.0
         self.last_p_clk_ztd = 0.0
         self.last_p_clk_isb_gal = 0.0
+        # Rate-generalize the catastrophic epoch-count thresholds
+        # (fasterUpdateRate I-145624/I-fasterUpdateRate-main).  These are
+        # authored as wall-time intents at 1 Hz (HISTORY_MAX=10 s window,
+        # HISTORY_MIN=5 s warmup, REJECT_LIMIT≈30 s of sustained corruption
+        # before exit-5).  At N Hz an epoch arrives every 1/N s, so scale
+        # the COUNTS by the measurement rate to preserve the time intent.
+        # Shadow the class constants as instance attrs so both this filter
+        # and the engine's getattr(filt, 'CATASTROPHIC_REJECT_LIMIT') pick
+        # up the scaled values.  meas_rate_hz=1.0 → identical to before.
+        self._meas_rate_hz = float(meas_rate_hz)
+        self.CATASTROPHIC_HISTORY_MAX = max(
+            1, round(FixedPosFilter.CATASTROPHIC_HISTORY_MAX * self._meas_rate_hz))
+        self.CATASTROPHIC_HISTORY_MIN = max(
+            1, round(FixedPosFilter.CATASTROPHIC_HISTORY_MIN * self._meas_rate_hz))
+        self.CATASTROPHIC_REJECT_LIMIT = max(
+            1, round(FixedPosFilter.CATASTROPHIC_REJECT_LIMIT * self._meas_rate_hz))
         # Catastrophic residual gate state (I-202649).  History records
         # accepted-epoch median |PR residual|; rejected epochs do NOT
         # update history so the baseline stays clean across bursts.
