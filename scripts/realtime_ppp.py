@@ -1888,7 +1888,12 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                         n_raw=len(raw_obs),
                         n_off_const=n_off_const,
                         n_single=n_single,
-                        clk_reset=bool(getattr(parsed, 'clkReset', 0)),
+                        # recStat.clkReset from the vectorized RAWX decode.
+                        # (Pre-#163 this read parsed.clkReset; with
+                        # parsing=False, parsed is None for RAWX, so the bit
+                        # must come from rawx — restores the FixedPosFilter
+                        # clk_reset realign path.  See gracefulClkReset.)
+                        clk_reset=bool(rawx.clk_reset),
                     ))
                     n_epochs += 1
 
