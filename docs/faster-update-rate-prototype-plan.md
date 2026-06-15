@@ -121,6 +121,33 @@ past the realign handler would otherwise hit the 30-epoch limit in 6 s at
    (b) whether the τ32/τ64 mid-τ bump shrinks vs the 281/659 ps baseline.
    Cross-check TimeHat (TCXO).
 
+## First 5 Hz run (2026-06-15) — plumbing works, NEW blocker found
+
+Launched mode B (`--measurement-rate-ms 200 --fire-every-epoch --servo-input
+tdcp --no-extint`) on clkPoC3. Confirmed working end-to-end at the receiver:
+**X20 reconfigured to 5.0 Hz (`CFG_RATE_MEAS=200 OK`), NAV-CLOCK streaming at
+200 ms**, CAS SSR flowing, the scheduler/filter plumbing all engaged.
+
+But the loop **starved — 0 OBS_ADMIT ever.** Root cause: the **obs↔PPS
+correlation gate.** The DO-PPS / TICC phase anchor is **1 Hz** (one PPS edge
+per second), and the gate matches each obs epoch to a PPS event by
+CLOCK_MONOTONIC with an `expected_offset` tuned for **1 Hz** cadence. At 5 Hz
+there are 5 obs epochs per PPS (5:1), and the 1 Hz-tuned matching window
+admits **none** → the DO bootstrap's "10-epoch" clock filter took 2.5 min and
+failed to converge, and the main loop produced no admitted obs. NAV-CLOCK
+(serial-reader thread) kept streaming at 5 Hz, confirming the receiver side is
+fine; it's the correlation layer.
+
+**This is the next (deeper) blocker** — beyond the scheduler/filter plumbing,
+which is correct and necessary. The fix is architectural: **decouple the N Hz
+obs/TDCP path from the 1 Hz PPS-correlation requirement.** TDCP frequency
+doesn't need a per-epoch PPS match (it's a carrier-phase delta); only the
+phase *anchor* needs the 1 Hz PPS. So: let all 5 Hz obs flow to the TDCP arm,
+and correlate only the 1 Hz subset (the epochs nearest a PPS edge) for the
+TICC/EXTINT phase anchor — rather than gating *all* obs on a PPS match. See
+docs/stream-timescale-correlation.md. Until then, the 5 Hz run can't admit
+obs; the 1 Hz baseline (τ32=270 ps, τ64=527 ps) stands.
+
 ## Risks
 
 - **Actuator σ_q injection** (the TimeHat "1 Hz worse than coasting"
