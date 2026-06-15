@@ -156,6 +156,49 @@ class SchemaError(ValueError):
 # ── Validation ───────────────────────────────────────────────────── #
 
 
+# Required keys for each measured section.  When a section has
+# source = "measured", these keys must be present AND positive (or
+# non-zero for steering slope which is sign-meaningful).  The
+# class-default path builds these keys explicitly from CLASS_DEFAULTS,
+# so the measured path needs the same completeness guarantee — else a
+# measured section missing a key would silently fall through to the
+# engine, which is the exact silent-incompleteness this module is here
+# to prevent.
+_REQUIRED_MEASURED_KEYS: dict[str, tuple[str, ...]] = {
+    "freerun_noise": (
+        "sigma_do_phase_ns",
+        "sigma_do_freq_ppb",
+        "coast_tdev_ref_ns",
+        "coast_tdev_slope",
+    ),
+    "actuation_noise": (
+        "sigma_q_ns",
+    ),
+    "steering": (
+        "slope_ppb_per_code",
+    ),
+}
+
+
+def _check_measured_required(section_name: str, section: dict,
+                              required: tuple[str, ...]) -> list[str]:
+    """Enforce that a source=measured section has every consumed key.
+
+    Returns errors for missing keys.  Positivity is checked by the
+    individual validation blocks below (which also catch the
+    class-default path's invariants).
+    """
+    errors: list[str] = []
+    for key in required:
+        if key not in section:
+            errors.append(
+                f"[{section_name}].{key} required when source='measured' "
+                f"(present in CLASS_DEFAULTS but missing in the file — "
+                f"this is the silent-incompleteness this schema prevents)"
+            )
+    return errors
+
+
 def validate_characterization(data: dict) -> list[str]:
     """Return a list of validation errors; empty list = clean."""
     errors: list[str] = []
@@ -181,19 +224,23 @@ def validate_characterization(data: dict) -> list[str]:
                 f"[identity].class must be one of {list(ALLOWED_CLASSES)}, "
                 f"got {ident.get('class')!r}"
             )
-        if (ident.get("actuator_type") is not None and
-                ident.get("actuator_type") not in ALLOWED_ACTUATOR_TYPES):
-            errors.append(
-                f"[identity].actuator_type must be one of "
-                f"{list(ALLOWED_ACTUATOR_TYPES)}, "
-                f"got {ident.get('actuator_type')!r}"
-            )
+        if ident.get("actuator_type") not in ALLOWED_ACTUATOR_TYPES:
+            # Required-keys loop above catches the missing case; this
+            # only fires when actuator_type is present but unrecognized.
+            if "actuator_type" in ident:
+                errors.append(
+                    f"[identity].actuator_type must be one of "
+                    f"{list(ALLOWED_ACTUATOR_TYPES)}, "
+                    f"got {ident.get('actuator_type')!r}"
+                )
 
     # [freerun_noise] validation.  Optional section — class defaults
     # fill in when absent.  When present and source=measured, the full
-    # contract applies.
+    # contract applies: every consumed key must be present AND positive.
     fr = data.get("freerun_noise")
     if isinstance(fr, dict) and fr.get("source") == "measured":
+        errors.extend(_check_measured_required(
+            "freerun_noise", fr, _REQUIRED_MEASURED_KEYS["freerun_noise"]))
         ch = fr.get("measurement_channel")
         if ch not in ALLOWED_MEASUREMENT_CHANNELS:
             errors.append(
@@ -220,7 +267,10 @@ def validate_characterization(data: dict) -> list[str]:
 
     # [actuation_noise] validation
     an = data.get("actuation_noise")
-    if isinstance(an, dict):
+    if isinstance(an, dict) and an.get("source") == "measured":
+        errors.extend(_check_measured_required(
+            "actuation_noise", an,
+            _REQUIRED_MEASURED_KEYS["actuation_noise"]))
         sq = an.get("sigma_q_ns")
         if sq is not None and sq <= 0:
             errors.append(
@@ -230,6 +280,8 @@ def validate_characterization(data: dict) -> list[str]:
     # [steering] validation — slope must be non-zero (sign-meaningful)
     st = data.get("steering")
     if isinstance(st, dict) and st.get("source") == "measured":
+        errors.extend(_check_measured_required(
+            "steering", st, _REQUIRED_MEASURED_KEYS["steering"]))
         slope = st.get("slope_ppb_per_code")
         if slope is not None and slope == 0:
             errors.append(
@@ -287,6 +339,18 @@ def load_do_characterization(do_uid: str,
         raise SchemaError(f"{path}: {msg}")
 
     ident = data["identity"]  # validated present above
+    # do_uid <-> filename mismatch guard.  A renamed or copy-pasted
+    # file is exactly the multi-file confusion (clkPoC3 v1/v2) that
+    # motivated this whole architecture — a silent identity mismatch
+    # would let the engine discipline DO X using DO Y's
+    # characterization.  Fail loud.
+    if ident.get("do_uid") != do_uid:
+        raise SchemaError(
+            f"{path}: [identity].do_uid={ident.get('do_uid')!r} does not "
+            f"match requested do_uid={do_uid!r}.  Filename and identity "
+            f"must agree — a mismatch means a renamed or copy-pasted file "
+            f"that would discipline the wrong DO."
+        )
     do_class = ident["class"]
     defaults = class_defaults(do_class)
 
@@ -347,7 +411,14 @@ def load_do_characterization(do_uid: str,
 
 def load_runtime_state(do_uid: str,
                        dos_dir: str | None = None) -> RuntimeState | None:
-    """Load <uid>.runtime.toml.  Returns None if absent (cold start)."""
+    """Load <uid>.runtime.toml.  Returns None if absent (cold start)
+    or on a soft I/O failure.
+
+    Schema-version mismatch returns None and logs a warning rather
+    than raising — runtime state is engine-rewritten on the next
+    checkpoint, so an unrecognized version means "cold start" not
+    "refuse to operate."
+    """
     path = _runtime_path(do_uid, dos_dir)
     if not os.path.exists(path):
         return None
@@ -356,6 +427,13 @@ def load_runtime_state(do_uid: str,
             data = tomllib.load(f)
     except (tomllib.TOMLDecodeError, OSError) as e:
         log.warning("Failed to read runtime state at %s: %s", path, e)
+        return None
+    v = data.get("schema_version")
+    if v != SCHEMA_VERSION:
+        log.warning(
+            "Runtime state at %s has schema_version=%r, expected %r — "
+            "treating as cold start; engine will rewrite on next checkpoint",
+            path, v, SCHEMA_VERSION)
         return None
     op = data.get("operational_state") or {}
     return RuntimeState(

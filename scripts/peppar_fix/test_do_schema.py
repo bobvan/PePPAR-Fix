@@ -416,6 +416,116 @@ class TestRuntimeRoundTrip(unittest.TestCase):
             self.assertIsNone(load_runtime_state("nosuch", dos_dir=td))
 
 
+class TestMeasuredRequiredFields(unittest.TestCase):
+    """Main's MUST-FIX from round 3: a source='measured' section with a
+    valid channel but missing consumed-key must be refused.  The
+    class-default path builds the keys explicitly; the measured path
+    must enforce the same completeness."""
+
+    def _drop_line(self, key: str) -> str:
+        # Remove the line "<key> = ..." from GOOD_CHAR_TOML.
+        out = []
+        for line in GOOD_CHAR_TOML.splitlines():
+            if line.lstrip().startswith(f"{key} ="):
+                continue
+            out.append(line)
+        return "\n".join(out) + "\n"
+
+    def test_freerun_missing_sigma_phase(self):
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", self._drop_line("sigma_do_phase_ns"))
+            with self.assertRaises(SchemaError) as cm:
+                load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertIn("sigma_do_phase_ns", str(cm.exception))
+            self.assertIn("required when source='measured'",
+                          str(cm.exception))
+
+    def test_freerun_missing_sigma_freq(self):
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test",
+                        self._drop_line("sigma_do_freq_ppb"))
+            with self.assertRaises(SchemaError) as cm:
+                load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertIn("sigma_do_freq_ppb", str(cm.exception))
+
+    def test_freerun_missing_coast_ref(self):
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test",
+                        self._drop_line("coast_tdev_ref_ns"))
+            with self.assertRaises(SchemaError) as cm:
+                load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertIn("coast_tdev_ref_ns", str(cm.exception))
+
+    def test_freerun_missing_coast_slope(self):
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test",
+                        self._drop_line("coast_tdev_slope"))
+            with self.assertRaises(SchemaError) as cm:
+                load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertIn("coast_tdev_slope", str(cm.exception))
+
+    def test_actuation_missing_sigma_q(self):
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", self._drop_line("sigma_q_ns"))
+            with self.assertRaises(SchemaError) as cm:
+                load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertIn("sigma_q_ns", str(cm.exception))
+
+    def test_steering_missing_slope(self):
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test",
+                        self._drop_line("slope_ppb_per_code"))
+            with self.assertRaises(SchemaError) as cm:
+                load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertIn("slope_ppb_per_code", str(cm.exception))
+
+
+class TestDoUidFilenameMismatch(unittest.TestCase):
+    """Main's SHOULD-FIX from round 3: the multi-file confusion
+    (clkPoC3 v1/v2) that motivated this whole architecture would let
+    a renamed file load silently under the wrong identity.  Fail
+    loud."""
+
+    def test_filename_mismatch_rejected(self):
+        # Write a file whose contents say "ocxo-piface" but live at
+        # "ocxo-test.toml".
+        toml = GOOD_CHAR_TOML.replace('do_uid = "ocxo-test"',
+                                       'do_uid = "ocxo-piface"')
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", toml)
+            with self.assertRaises(SchemaError) as cm:
+                load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertIn("do_uid", str(cm.exception))
+            self.assertIn("does not match", str(cm.exception))
+            self.assertIn("ocxo-piface", str(cm.exception))
+
+
+class TestRuntimeSchemaVersion(unittest.TestCase):
+    """Main's nit 1 from round 3: runtime loader should not silently
+    load an unknown version.  Loads return None (cold start)."""
+
+    def test_runtime_wrong_version_returns_none(self):
+        with _TempDir() as td:
+            path = os.path.join(td, "ocxo-test.runtime.toml")
+            with open(path, "w") as f:
+                f.write('schema_version = "99"\n\n'
+                        '[operational_state]\n'
+                        'last_known_freq_offset_ppb = 1.0\n'
+                        'last_updated = "2026-06-15T00:00:00Z"\n')
+            self.assertIsNone(
+                load_runtime_state("ocxo-test", dos_dir=td))
+
+    def test_runtime_no_version_returns_none(self):
+        with _TempDir() as td:
+            path = os.path.join(td, "ocxo-test.runtime.toml")
+            with open(path, "w") as f:
+                f.write('[operational_state]\n'
+                        'last_known_freq_offset_ppb = 1.0\n'
+                        'last_updated = "2026-06-15T00:00:00Z"\n')
+            self.assertIsNone(
+                load_runtime_state("ocxo-test", dos_dir=td))
+
+
 class TestValidatorAlone(unittest.TestCase):
     """validate_characterization itself, in isolation from the loader.
     Useful for tools that want to validate before writing."""
