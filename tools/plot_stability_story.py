@@ -161,13 +161,14 @@ def main() -> int:
                 bottom = np.maximum(fri, floor)
                 room = np.isfinite(ci) & np.isfinite(bottom) & (ci > bottom)
                 if room.any():
-                    # Texture, not colour: transparent face + diagonal hatch, so
+                    # Texture, not colour: transparent face + dotted fill, so
                     # this region is visually distinct from the win slide's SOLID
-                    # improvement fill even though both use the host colour.
+                    # improvement fill even though both use the host colour.  Dots
+                    # (not diagonal hatch) avoid colliding with the ~45° line slope.
                     ax.fill_between(tau_grid[room], bottom[room], ci[room],
                                     facecolor='none',
                                     edgecolor=mcolors.to_rgba(c, 0.85),
-                                    hatch='////', lw=0.0, zorder=1.5,
+                                    hatch='....', lw=0.0, zorder=1.5,
                                     label=('Remaining room for improvement'
                                            if i == 0 else None))
 
