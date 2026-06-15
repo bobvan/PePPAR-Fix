@@ -117,19 +117,23 @@
         "Adafruit-GPS"
       ],
       "ticcs": [],
-      "notes": "chrony stratum 1, PTP GM domain 20. GPS on /dev/gps0."
+      "notes": "chrony stratum 1, PTP GM domain 20. GPS on /dev/gps0. Reachable ONLY via the PTP LAN (ssh 10.168.13.14) — no trusted-LAN/Tailscale/mDNS interface, so PTP-LAN SSH is the sole option for this host."
     },
     "ocxo": {
-      "description": "x86 host with Intel E810 OCXO NIC and onboard F9T",
+      "description": "DECOMMISSIONED 2026-06-14. The E810-XXVDA4T x86 machine that was host 'ocxo' was recommissioned as host 'ptpmon' (same physical box). 'ocxo' and 'ptpmon' never coexist; do not expect to host 'ocxo' again.",
       "hw_label": "hw:ocxo",
       "hostname": "ocxo",
       "platform": "x86_64",
       "os": "Linux",
-      "interfaces": [
-        "mbeth (onboard, e1000e, PTP slave-only)",
-        "e810p0..e810p3 (Intel E810-XXVDA4T, ice driver, OCXO PHC /dev/ptp1)",
-        "i226 (TimeHAT v6 add-in, igc driver, second PHC for cross-comparison)"
-      ],
+      "recommissioned_as": "ptpmon",
+      "status": "decommissioned"
+    },
+    "ptpmon": {
+      "description": "x86_64 Ubuntu 24.04 utility host (NTRIP/offline captures, x86-only tools). Same physical machine formerly commissioned as host 'ocxo' (E810-XXVDA4T); ocxo and ptpmon never coexist.",
+      "access": "ssh ptpmon",
+      "platform": "x86_64",
+      "os": "Ubuntu 24.04 (kernel 6.8)",
+      "was": "ocxo",
       "location": "lab rack",
       "status": "active"
     }

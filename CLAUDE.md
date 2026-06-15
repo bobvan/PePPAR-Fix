@@ -390,13 +390,20 @@ passwordless for user `bob`.
 | ~~Onocoy~~ | mothballed 2026-04-08 | F10T + PX1125T disconnected; TICC #2 moved to ocxo | – | Powered down. Never had a peppar-fix checkout. |
 | otcBob1 | `ssh otcBob1` | Timebeat OTC SBC, OCXO, Renesas ClockMatrix | F9T on `/dev/ttyAMA0` at 460800 | Stop `timebeat` before accessing I2C or GNSS |
 | ptBoat | `ssh ptBoat` | Timebeat OTC Mini PT, weatherproof, PoE | F9T on `/dev/ttyAMA0` at 115200 | Same Renesas ClockMatrix as otcBob1 |
-| ocxo | `ssh ocxo` | E810-XXVDA4T x86 host, OCXO, DPLL | F9T on `/dev/gnss0` (kernel, I2C) | PHC at `/dev/ptp1`, trusted net + PTP net |
-| bbb | `ssh bbb` | BeagleBone, GPS L1 only | `/dev/gps0` at 9600 | Legacy NTP/PTP GM |
+| ~~ocxo~~ → ptpmon | `ssh ptpmon` | **Decommissioned 2026-06-14.** The E810-XXVDA4T x86 machine that was host `ocxo` was recommissioned as **ptpmon** (x86_64 Ubuntu utility host — NTRIP/offline captures, x86-only tools). `ocxo` and `ptpmon` are the **same physical machine** and never coexist; **do not expect to host `ocxo` again.** | – | See [[ptpmon-arch]] |
+| bbb | `ssh bbb` (→ 10.168.13.14, PTP LAN) | BeagleBone, GPS L1 only | `/dev/gps0` at 9600 | Legacy NTP/PTP GM. **Reachable ONLY via the PTP LAN** — no trusted-LAN/Tailscale/mDNS interface, so PTP-LAN SSH is the sole option here (see resolution note). |
 
 **Hostname resolution**: Try `<host>` first (DNS search domain VanValzah.Com).
 If that fails, try `<host>.local` (mDNS). PiPuss only resolves via
-`.local`.  Never use the PTP LAN (10.168.13.x) for SSH — keep that
-clean for timing traffic.
+`.local`.
+
+**SSH interface preference**: always prefer a host's **trusted-LAN or
+Tailscale** interface, and keep the PTP LAN (10.168.13.x) clean for
+timing traffic.  **Exception**: when the PTP LAN is a host's *only*
+reachable interface — as it is for `bbb` (10.168.13.14, no other NIC) —
+use it for SSH.  Connectivity over the PTP LAN beats no connectivity;
+the "keep PTP clean" rule yields to "reach the host at all" when there's
+no alternative.
 
 ## Serial Port Gotchas
 
