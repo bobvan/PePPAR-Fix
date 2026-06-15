@@ -53,5 +53,35 @@ class TestRateScaledCatastrophicThresholds(unittest.TestCase):
         self.assertGreaterEqual(f._pr_median_history.maxlen, 1)
 
 
+class TestSchedulerRateAwareness(unittest.TestCase):
+    """(A) rate-aware adaptive interval + (B) fire-every-epoch mode."""
+
+    def _sched(self, rate, **kw):
+        from peppar_fix.discipline import DisciplineScheduler
+        return DisciplineScheduler(meas_rate_hz=rate, **kw)
+
+    def test_fire_every_epoch_mode_B(self):
+        s = self._sched(5.0, fire_every_epoch=True)
+        s.accumulate(0.05, 0.05, "test")        # tiny error, well under budget
+        self.assertTrue(s.should_correct())      # fires regardless of interval
+
+    def test_adaptive_interval_scales_seconds_to_epochs(self):
+        import time
+        # Transient regime (large error vs sigma_freerun) → τ = min_interval
+        # SECONDS; the rate conversion then turns it into epochs.
+        def interval(rate):
+            s = self._sched(rate, adaptive=True, min_interval=2, max_interval=120,
+                            sigma_freerun_short_ns=0.1, transient_k_sigma=3.0)
+            s.accumulate(1000.0, 1.0, "test", t_monotonic=time.monotonic())
+            s.compute_adaptive_interval()
+            return s.interval
+        self.assertEqual(interval(1.0), 2)    # 2 s ≡ 2 epochs at 1 Hz (unchanged)
+        self.assertEqual(interval(5.0), 10)   # 2 s × 5 Hz = 10 epochs
+
+    def test_meas_rate_stored(self):
+        self.assertEqual(self._sched(5.0)._meas_rate_hz, 5.0)
+        self.assertEqual(self._sched(1.0)._meas_rate_hz, 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -86,7 +86,22 @@ past the realign handler would otherwise hit the 30-epoch limit in 6 s at
    constructions (main servo, re-bootstrap, bootstrap). `--measurement-rate-ms
    200` ⇒ X20 at 5 Hz RAWX + filter thresholds scaled. 1 Hz identical.
 
-2. **`discipline.py` scheduler — rate-aware (BLOCKER for a valid 5 Hz run).**
+2. **`discipline.py` scheduler — DONE (both A + B).** `DisciplineScheduler`
+   now takes `meas_rate_hz` and `fire_every_epoch`:
+   - **(A) rate-aware adaptive**: `compute_adaptive_interval()` clamps the
+     Goldilocks coast in seconds exactly as before, then converts seconds →
+     epochs via `× meas_rate_hz` at the final step (1 Hz byte-identical). So
+     the adaptive scheduler coasts the same *wall-time* at any rate.
+   - **(B) `--fire-every-epoch`**: `should_correct()` returns True every
+     epoch, bypassing the coast → loop BW = measurement rate. The prototype
+     mode for the max-rate test.
+
+   Running A vs B at 5 Hz gives an *indirect* read on actuator σ_q (the
+   gap between coast-optimal and fire-every-epoch chA TDEV is the σ_q cost),
+   complementing a direct σ_q measurement. Even if fire-every-epoch isn't
+   optimal for today's plants, it may be for a future one.
+
+   _(original note kept for history)_ The blocker was:
    `should_correct()` fires at `len(self._errors) >= interval` (an epoch
    COUNT), but the **adaptive** path (`--adaptive-interval`, which defaults
    ON and has no CLI off-switch — `store_true`+`default=True`) sets

@@ -7330,6 +7330,8 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         coast_cap_k_sigma=getattr(args, 'coast_cap_k_sigma', 1.0),
         sigma_freerun_short_ns=_sigma_freerun_short_ns,
         sigma_actuator_q_ns=_sigma_actuator_q_ns,
+        meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
+        fire_every_epoch=getattr(args, 'fire_every_epoch', False),
     )
 
     # disciplineModeFsm increment #1: the single derived continuous
@@ -7879,6 +7881,8 @@ def _enter_obs_holdover(ctx, args, reason_code, detail):
         # d_physical path).
         sigma_freerun_short_ns=ctx.get('sigma_freerun_short_ns'),
         sigma_actuator_q_ns=ctx.get('sigma_actuator_q_ns'),
+        meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
+        fire_every_epoch=getattr(args, 'fire_every_epoch', False),
     )
     ctx['phase'] = 'tracking'
     ctx['tracking_large_error_count'] = 0
@@ -11137,6 +11141,13 @@ Two-phase operation:
                        help="Fixed discipline interval (default: 1)")
     servo.add_argument("--adaptive-interval", action="store_true", default=True,
                        help="Enable adaptive discipline interval (default: on)")
+    servo.add_argument("--fire-every-epoch", action="store_true", default=False,
+                       help="fasterUpdateRate (B): actuate every measurement "
+                            "epoch (loop BW = measurement rate), bypassing the "
+                            "adaptive coast. For the >1 Hz prototype — directly "
+                            "tests whether faster discipline suppresses the "
+                            "mid-τ DO bump, at the cost of more actuator-σ_q "
+                            "events. Off by default.")
     servo.add_argument("--max-interval", type=int, default=120,
                        help="Maximum discipline interval (default: 120)")
     servo.add_argument("--min-interval", type=int, default=1,
