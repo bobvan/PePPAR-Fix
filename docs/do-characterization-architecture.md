@@ -145,19 +145,35 @@ measurement_channel = "DO PPS (chA vs TICC Rb)"
 sigma_do_phase_ns = 0.0425        # ns/√s — DOFreqEst Q[2,2]^0.5
 sigma_do_freq_ppb = 0.000382      # ppb/√s — DOFreqEst Q[3,3]^0.5 (from ADEV RWFM tail — see §"Q[3,3] design change")
 coast_tdev_ref_ns = 0.0425        # ns at tau=1s — Goldilocks coast-cap anchor
-coast_tdev_slope = -0.571         # power-law slope (TDEV(τ) ∝ τ^slope) — Goldilocks coast-cap reaches non-trivial τ via these two scalars; the engine never opens the sidecar
+coast_tdev_slope = +0.530         # power-law slope (TDEV(τ) ∝ τ^slope) over the RWFM/flicker
+                                  # RISING tail.  MUST be > 0 — a slope ≤ 0 would silently
+                                  # disable the Goldilocks τ_opt computation
+                                  # (compute_goldilocks_tau treats slope ≤ 0 as degenerate
+                                  # and returns max_interval, scheduler quietly off).
+                                  # Validator rejects slope ≤ 0 at write time.
+                                  # The schema requires the rising tail specifically:
+                                  # +0.5 white-FM, +1.0 flicker-FM, +1.5 RWFM.
+                                  # do_freerun_char fits this tail explicitly — NOT a
+                                  # global log-log LSQ over the whole U-shaped curve.
 captured = "2026-05-30T14:40:06Z"
 duration_s = 3604
 
 [actuation_noise]                 # the actuator chain's per-write noise
 source = "measured"               # measured | class-default
-sigma_q_ppb = 0.05                # σ_q for Goldilocks τ* formula
+sigma_q_ns = 0.05                 # phase residual per actuation event, in ns.
+                                  # Goldilocks formula consumes ns directly.
+                                  # NOT stored in ppb — that would require a silent
+                                  # σ_q_ns = σ_q_ppb × tau_ref conversion with tau_ref
+                                  # pinned at 1 s elsewhere.  Bravo's actuatorNoiseChar
+                                  # measurement produces phase residual in ns directly;
+                                  # storing in the consumer's unit removes one units bridge.
 write_settle_ms = 1
 i2c_error_rate_per_million = 0
 measured_at = "2026-06-01T00:00:00Z"
-# Open question (Bravo's actuatorNoiseChar measurement): if σ_q
-# turns out to scale with step size rather than being fixed-per-
-# actuation, this section grows to σ_q(δ) — either (intercept,
+# Open question (Bravo's actuatorNoiseChar measurement, in flight on
+# clkPoC3 now — HOLD/REWRITE/STEP2/STEP8 × 600s, chA-vs-Rb):
+# if σ_q turns out to scale with step size rather than being fixed-
+# per-actuation, this section grows to σ_q(δ) — either (intercept,
 # slope) or a piecewise table.  Schema stays scalar-only until
 # Bravo's measurement closes that question, then revises once.
 
@@ -178,11 +194,14 @@ last_updated = "2026-06-15T16:00:00Z"
 ```
 
 PSD curves, ADEV tables, and TDEV tables go in a sidecar
-`<do_uid>.noise.toml` — they're 10+ KB and don't need to round-trip
-through a human editor.  The engine reads only the two main-file
-scalars (`sigma_do_phase_ns`, `sigma_do_freq_ppb`) and the two
-coast-cap scalars (`coast_tdev_ref_ns`, `coast_tdev_slope`); the
-sidecar exists for post-hoc analysis and replotting only.
+`<do_uid>.noise.toml` — they're 10+ KB and don't need to
+round-trip through a human editor.  The engine reads only the
+main-file scalars (`sigma_do_phase_ns`, `sigma_do_freq_ppb`,
+`coast_tdev_ref_ns`, `coast_tdev_slope`, `sigma_q_ns`); the
+sidecar exists for post-hoc analysis, replotting, and as the
+durable home of the hour-long freerun capture artifacts.  Tools
+that need to re-fit the RWFM tail or replot PSD read the sidecar
+directly; the engine does not.
 
 ### Schema rules
 
@@ -215,7 +234,7 @@ Strict 1:1 mapping between sections and tools.
 |---|---|---|
 | `[identity]` | `scripts/do_register.py <uid> <model>` | Creates a new DO file with class defaults filled in.  Mandatory before the engine will start with a new `do_label`. |
 | `[steering]` | `scripts/do_steering_char.py` | DAC sweep, linear fit, range detection.  Outputs slope, intercept, code_min, code_max. |
-| `[freerun_noise]` | `scripts/do_freerun_char.py` | TICC chA observation against Rb (preferred) or against chB (acceptable fallback), computes ADEV/TDEV/PSD, derives σ_do_phase + σ_do_freq + coast_tdev_ref_ns + coast_tdev_slope.  Refuses any source label not in the allowed enum.  When both Rb and chB are available, `chA vs Rb` wins — chB carries rx-TCXO motion that contaminates the DO signal. |
+| `[freerun_noise]` | `scripts/do_freerun_char.py` | TICC chA observation against Rb (preferred) or against chB (acceptable fallback), computes ADEV/TDEV/PSD, derives σ_do_phase + σ_do_freq + coast_tdev_ref_ns + coast_tdev_slope.  Refuses any source label not in the allowed enum.  When both Rb and chB are available, `chA vs Rb` wins — chB carries rx-TCXO motion that contaminates the DO signal.  `coast_tdev_slope` is fit explicitly to the RWFM/flicker **rising tail** (positive-slope region), NOT a single global log-log LSQ — a global fit over a U-shaped TDEV curve can return a negative slope that silently disables the Goldilocks scheduler at runtime.  The schema validator rejects slope ≤ 0 at write time. |
 | `[actuation_noise]` | `scripts/do_actuator_char.py` | Holds adjfine constant, observes residual TDEV, derives σ_q. |
 | `[operational_state]` | engine (only) | Updates last_known_* on each save_do_state checkpoint. |
 | `[aging]` | manual entry initially; later `scripts/do_aging_refresh.py` extracts drift_ppb_per_year from `[operational_state]` history. |
@@ -258,12 +277,23 @@ tail is the physically correct open-loop frequency random walk
 and is what Q[3,3] models.
 
 **Gating**: this change ships behind a closedLoopServoSim A/B
-check before the schema PR lands.  Acceptance criterion (signed
-off by Bob 2026-06-15): replay PiFace's overnight trace under
-each Q[3,3] source.  Under the old source, the sim should
-reproduce the observed ~60 ppb adjfine std wobble.  Under the
-new source, it should drop to clkPoC3-class (single-digit ppb
-std).  If both reproduce as expected, the change is validated.
+check before the schema PR lands.  Two-arm acceptance criterion:
+
+1. **Over-loose arm** — replay PiFace's overnight trace under each
+   Q[3,3] source.  Under the OLD source, the sim should reproduce
+   the observed ~60 ppb adjfine std wobble.  Under the NEW source,
+   it should drop to clkPoC3-class (single-digit ppb std).
+2. **Over-tight arm** — inject a long GNSS-gap coast on clkPoC3
+   under the NEW Q source.  Confirm no overconfident-coast
+   divergence on GNSS-return (the longTauGnssCoupling √P[2,2]
+   cap should still bound the coast residual).  This is the
+   regression the over-loose arm can't see by itself.
+
+PASS = wobble gone (PiFace, over-loose arm) AND coast stays
+bounded (clkPoC3, over-tight arm).  Expected to pass because
+`_sigma_do_freq_ppb_from_adev` picks largest-τ as the safe
+direction, but verify, don't assume — that's the half of the
+regression the original one-sided criterion couldn't catch.
 
 
 ## Lifecycle
@@ -350,8 +380,15 @@ when the new ones validate clean.
 2. Best-effort extract DO-pointing measurements (`DO PPS (chA vs TICC Rb)`
    first, `DO PPS (chA-chB)` second).  Drop everything else.
 3. Map known fields into the new schema sections.
-4. Write `state/dos/<uid>.toml` (characterization) and
-   `state/dos/<uid>.runtime.toml` (operational state).
+4. Write three files: `state/dos/<uid>.toml` (characterization),
+   `state/dos/<uid>.runtime.toml` (operational state), and
+   `state/dos/<uid>.noise.toml` (sidecar — dense ADEV / TDEV /
+   PSD curves extracted from the old JSON's sources).  The
+   sidecar is the one genuinely irreplaceable artifact in the
+   old JSON: everything else recomputes or class-defaults, but
+   the hour-long freerun captures don't.  Writing the sidecar
+   here makes the no-backup deletion in step 7 safe — the
+   sidecar IS their new home, not a backup of it.
 5. Validate the new files load cleanly through the new schema.
 6. Print a per-section provenance summary so it's immediately
    obvious which sections fell to `class-default` and need
@@ -367,9 +404,9 @@ when the new ones validate clean.
    ```
 
 7. Delete the old `.json` / `_noise.json` / `-v2.json` / `.bak.*`
-   files for this DO.  No `.preMigration` backups — we have the
-   git history of the migration script and the new files round-
-   trip cleanly.
+   files for this DO.  No `.preMigration` backups — the new files
+   (main + runtime + sidecar) carry every artifact that was in the
+   old JSON; everything else recomputes or class-defaults.
 
 The migration is a single afternoon's work across the fleet
 (PiFace, clkPoC3, MadHat, TimeHat).  Each host: `git pull && sudo
