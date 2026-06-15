@@ -95,6 +95,15 @@ def at_tau(taus, vals, x):
     return vals[j]
 
 
+def loglog_interp(t, dev, grid):
+    """Interpolate (t, dev) onto grid in log-log; NaN outside the data range."""
+    if len(t) < 2:
+        return np.full(len(grid), np.nan)
+    out = np.interp(np.log10(grid), np.log10(t), np.log10(dev),
+                    left=np.nan, right=np.nan)
+    return 10.0 ** out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -146,12 +155,13 @@ def main() -> int:
 
         # Raw GNSS PPS (chB) — muted, thin; and anchor the ideal to its τ=1s.
         anchor1s = None
+        g_t = g_dev = None
         if gnss:
             glabel, gph = gnss
-            t, dev, _ = dev_with_err(gph, kind, taus_spec)
-            ax.plot(t, dev, color=GNSS_PPS_COLOR, lw=2.0, ls='-', marker='.',
+            g_t, g_dev, _ = dev_with_err(gph, kind, taus_spec)
+            ax.plot(g_t, g_dev, color=GNSS_PPS_COLOR, lw=2.0, ls='-', marker='.',
                     ms=5, alpha=0.85, zorder=3, label=glabel)
-            anchor1s = at_tau(t, dev, 1.0)
+            anchor1s = at_tau(g_t, g_dev, 1.0)
 
         # GNSS time-transfer ideal (white PM): τ⁻¹ on ADEV, τ⁻¹ᐟ² on TDEV.
         if anchor1s:
@@ -161,9 +171,27 @@ def main() -> int:
                     label=('GNSS ideal  (τ⁻¹)' if kind == 'adev'
                            else 'GNSS ideal  (τ⁻¹ᐟ²)'))
 
+        # Compute hero deviations up front (needed for the improvement band).
+        hero_dev = [(label, *dev_with_err(ph, kind, taus_spec))
+                    for label, ph in heroes]
+
+        # Improvement shading — the gap between raw GNSS PPS and the OCXO
+        # output is the stability PePPAR-Fix delivers over the bare receiver.
+        if g_t is not None and len(g_t):
+            idx = next((k for k, h in enumerate(hero_dev)
+                        if 'OCXO' in h[0].upper()), 0)
+            _, o_t, o_dev, _ = hero_dev[idx]
+            gi = loglog_interp(g_t, g_dev, tau_grid)
+            oi = loglog_interp(o_t, o_dev, tau_grid)
+            band = np.isfinite(gi) & np.isfinite(oi) & (gi > oi)
+            if band.any():
+                ax.fill_between(tau_grid[band], oi[band], gi[band],
+                                color=TRACE_COLORS[idx % len(TRACE_COLORS)],
+                                alpha=0.15, zorder=1.5, lw=0,
+                                label='Improvement over raw PPS')
+
         # Hero traces — bold + ±1σ band.
-        for i, (label, ph) in enumerate(heroes):
-            t, dev, err = dev_with_err(ph, kind, taus_spec)
+        for i, (label, t, dev, err) in enumerate(hero_dev):
             c = TRACE_COLORS[i % len(TRACE_COLORS)]
             ax.fill_between(t, np.maximum(dev - err, dev * 0.3), dev + err,
                             color=c, alpha=0.18, zorder=4, lw=0)
