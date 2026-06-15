@@ -4279,7 +4279,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                           r_calibration=r_cal_obj,
                           q_clk_step=q_clk_step_arg,
                           q_clk_rate_step=q_clk_rate_step_arg,
-                          q_ztd_step=q_ztd_step_arg)
+                          q_ztd_step=q_ztd_step_arg,
+                          meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0))
     filt.prev_clock = 0.0
 
     # TDCP estimator — runs alongside the FixedPosFilter on the same
@@ -5338,6 +5339,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                                 known_ecef,
                                 init_ztd_m=init_ztd_m,
                                 init_ztd_sigma_m=init_ztd_sigma_m,
+                                meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
                             )
                             prev_t = None
                             watchdog.reset()
@@ -6123,7 +6125,8 @@ def _bootstrap_measure_freq_and_clock(args, timestamper, known_ecef, obs_queue,
     # ── 2. Short FixedPosFilter for dt_rx ─────────────────────────── #
     log.info("Running %d-epoch FixedPosFilter for clock estimate...",
              args.bootstrap_epochs)
-    filt = FixedPosFilter(known_ecef)
+    filt = FixedPosFilter(known_ecef,
+                          meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0))
     prev_t = None
     dt_rx_ns = None
     dt_rx_sigma_ns = None
@@ -7327,6 +7330,8 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         coast_cap_k_sigma=getattr(args, 'coast_cap_k_sigma', 1.0),
         sigma_freerun_short_ns=_sigma_freerun_short_ns,
         sigma_actuator_q_ns=_sigma_actuator_q_ns,
+        meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
+        fire_every_epoch=getattr(args, 'fire_every_epoch', False),
     )
 
     # disciplineModeFsm increment #1: the single derived continuous
@@ -7876,6 +7881,8 @@ def _enter_obs_holdover(ctx, args, reason_code, detail):
         # d_physical path).
         sigma_freerun_short_ns=ctx.get('sigma_freerun_short_ns'),
         sigma_actuator_q_ns=ctx.get('sigma_actuator_q_ns'),
+        meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
+        fire_every_epoch=getattr(args, 'fire_every_epoch', False),
     )
     ctx['phase'] = 'tracking'
     ctx['tracking_large_error_count'] = 0
@@ -11134,6 +11141,17 @@ Two-phase operation:
                        help="Fixed discipline interval (default: 1)")
     servo.add_argument("--adaptive-interval", action="store_true", default=True,
                        help="Enable adaptive discipline interval (default: on)")
+    servo.add_argument("--fire-every-epoch", action="store_true", default=False,
+                       help="fasterUpdateRate (B): actuate every measurement "
+                            "epoch (loop BW = measurement rate), bypassing the "
+                            "adaptive coast. DIAGNOSTIC ONLY — NOT a deployment "
+                            "discipline mode. It is provably contrary to the "
+                            "Goldilocks premise whenever τ_opt > 1/rate (e.g. "
+                            "clkPoC3 τ_opt≈1.45 s): below τ_opt the actuator σ_q "
+                            "injected per correction dominates the DO wander it "
+                            "saves. Use only to measure that σ_q cost (the gap "
+                            "vs adaptive). See docs/goldilocks-update-rate-"
+                            "review-2026-06-15.md. Off by default.")
     servo.add_argument("--max-interval", type=int, default=120,
                        help="Maximum discipline interval (default: 120)")
     servo.add_argument("--min-interval", type=int, default=1,
@@ -11915,6 +11933,12 @@ Two-phase operation:
             args.measurement_rate_ms = 2000  # kernel GNSS I2C: 0.5 Hz for lossless
         else:
             args.measurement_rate_ms = 1000
+    # Nominal measurement/servo rate in Hz, derived from the receiver
+    # measurement period (fasterUpdateRate I-fasterUpdateRate-main).  Used
+    # to rate-scale FixedPosFilter's wall-time-intent epoch counters so the
+    # 5/10 Hz prototype keeps the same time semantics.  1000 ms → 1.0 Hz
+    # (unchanged); 200 ms → 5.0 Hz.
+    args.meas_rate_hz = 1000.0 / float(args.measurement_rate_ms)
     if getattr(args, 'sfrbx_rate', None) is None:
         _base = os.path.basename(args.serial)
         if _base.startswith("gnss") and _base[4:].isdigit():

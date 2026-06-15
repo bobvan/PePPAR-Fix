@@ -79,13 +79,40 @@ past the realign handler would otherwise hit the 30-epoch limit in 6 s at
 
 ## Remaining for the live 5 Hz run (when clkPoC3 is back — `hw:clkPoC3`)
 
-1. **Wire `meas_rate_hz` end-to-end**: a host-config / CLI `--meas-rate-hz`
-   → `peppar_rx_config` `CFG-RATE measRate/navRate` (set the X20 to 5 Hz
-   RAWX) → pass to `FixedPosFilter(meas_rate_hz=...)`. (The knob exists in
-   the filter now; the plumbing is the remaining glue.)
-2. **`discipline.py` scheduler intervals** — rate-scale `min_interval`
-   (1 → 0.2 s) and `max_interval` (keep ~the same coast *seconds*), or make
-   the scheduler operate in seconds rather than epoch counts.
+1. **Wire `meas_rate_hz` end-to-end** — **DONE.** The receiver rate was
+   already wired (`--measurement-rate-ms` → `ensure_receiver_ready` →
+   `configure_rate`). This PR derives `args.meas_rate_hz = 1000 /
+   measurement_rate_ms` and passes it to all three `FixedPosFilter(...)`
+   constructions (main servo, re-bootstrap, bootstrap). `--measurement-rate-ms
+   200` ⇒ X20 at 5 Hz RAWX + filter thresholds scaled. 1 Hz identical.
+
+2. **`discipline.py` scheduler — DONE (both A + B).** `DisciplineScheduler`
+   now takes `meas_rate_hz` and `fire_every_epoch`:
+   - **(A) rate-aware adaptive**: `compute_adaptive_interval()` clamps the
+     Goldilocks coast in seconds exactly as before, then converts seconds →
+     epochs via `× meas_rate_hz` at the final step (1 Hz byte-identical). So
+     the adaptive scheduler coasts the same *wall-time* at any rate.
+   - **(B) `--fire-every-epoch`**: `should_correct()` returns True every
+     epoch, bypassing the coast → loop BW = measurement rate. The prototype
+     mode for the max-rate test.
+
+   Running A vs B at 5 Hz gives an *indirect* read on actuator σ_q (the
+   gap between coast-optimal and fire-every-epoch chA TDEV is the σ_q cost),
+   complementing a direct σ_q measurement. Even if fire-every-epoch isn't
+   optimal for today's plants, it may be for a future one.
+
+   _(original note kept for history)_ The blocker was:
+   `should_correct()` fires at `len(self._errors) >= interval` (an epoch
+   COUNT), but the **adaptive** path (`--adaptive-interval`, which defaults
+   ON and has no CLI off-switch — `store_true`+`default=True`) sets
+   `interval` from `compute_adaptive_interval()`, a Goldilocks τ in
+   **seconds**. At 1 Hz seconds==epochs so it's right; at 5 Hz it fires at
+   τ epochs = τ/5 s → **5× over-actuation**, injecting σ_q (the TimeHat
+   "1 Hz worse than coasting" failure mode). So the 5 Hz run must NOT start
+   until the scheduler converts τ-seconds → epochs via `× meas_rate_hz`
+   (and scales `base/min/max_interval`). Pass `meas_rate_hz` into
+   `DisciplineScheduler`; multiply the computed interval (and the clamps)
+   by the rate; 1 Hz stays identical. **This is the next increment.**
 3. **TDEV metric** — chA stays 1 Hz (`rate=1.0`); any *TDCP-rate* series
    plotted from `--tdcp-log` must use `rate=meas_rate_hz`.
 4. **Run** (TDCP arm, `--servo-input tdcp`): 5 Hz RAWX on clkPoC3 (Pi 4,
@@ -93,6 +120,33 @@ past the realign handler would otherwise hit the 30-epoch limit in 6 s at
    vectorized decoders, vs ~255 ms/s GIL if it were still pyubx2), and
    (b) whether the τ32/τ64 mid-τ bump shrinks vs the 281/659 ps baseline.
    Cross-check TimeHat (TCXO).
+
+## First 5 Hz run (2026-06-15) — plumbing works, NEW blocker found
+
+Launched mode B (`--measurement-rate-ms 200 --fire-every-epoch --servo-input
+tdcp --no-extint`) on clkPoC3. Confirmed working end-to-end at the receiver:
+**X20 reconfigured to 5.0 Hz (`CFG_RATE_MEAS=200 OK`), NAV-CLOCK streaming at
+200 ms**, CAS SSR flowing, the scheduler/filter plumbing all engaged.
+
+But the loop **starved — 0 OBS_ADMIT ever.** Root cause: the **obs↔PPS
+correlation gate.** The DO-PPS / TICC phase anchor is **1 Hz** (one PPS edge
+per second), and the gate matches each obs epoch to a PPS event by
+CLOCK_MONOTONIC with an `expected_offset` tuned for **1 Hz** cadence. At 5 Hz
+there are 5 obs epochs per PPS (5:1), and the 1 Hz-tuned matching window
+admits **none** → the DO bootstrap's "10-epoch" clock filter took 2.5 min and
+failed to converge, and the main loop produced no admitted obs. NAV-CLOCK
+(serial-reader thread) kept streaming at 5 Hz, confirming the receiver side is
+fine; it's the correlation layer.
+
+**This is the next (deeper) blocker** — beyond the scheduler/filter plumbing,
+which is correct and necessary. The fix is architectural: **decouple the N Hz
+obs/TDCP path from the 1 Hz PPS-correlation requirement.** TDCP frequency
+doesn't need a per-epoch PPS match (it's a carrier-phase delta); only the
+phase *anchor* needs the 1 Hz PPS. So: let all 5 Hz obs flow to the TDCP arm,
+and correlate only the 1 Hz subset (the epochs nearest a PPS edge) for the
+TICC/EXTINT phase anchor — rather than gating *all* obs on a PPS match. See
+docs/stream-timescale-correlation.md. Until then, the 5 Hz run can't admit
+obs; the 1 Hz baseline (τ32=270 ps, τ64=527 ps) stands.
 
 ## Risks
 

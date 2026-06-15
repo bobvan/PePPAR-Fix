@@ -70,13 +70,25 @@ class DisciplineScheduler:
                  coast_cap_k_sigma=1.0,
                  sigma_freerun_short_ns=None,
                  transient_k_sigma=3.0,
-                 sigma_actuator_q_ns=None):
+                 sigma_actuator_q_ns=None,
+                 meas_rate_hz=1.0,
+                 fire_every_epoch=False):
         self.base_interval = base_interval
         self.adaptive = adaptive
         self.min_interval = min_interval
         self.max_interval = max_interval
         self.interval = base_interval
         self.phase_error_budget_ns = float(phase_error_budget_ns)
+        # fasterUpdateRate (I-fasterUpdateRate-main): the adaptive interval
+        # is a Goldilocks τ in SECONDS but is consumed as an epoch COUNT in
+        # should_correct().  meas_rate_hz converts τ-seconds → epochs so the
+        # coast time stays the same wall-clock duration at N Hz (1.0 =
+        # byte-identical to 1 Hz).  fire_every_epoch is the (B) prototype
+        # mode: actuate every epoch (loop BW = measurement rate) to directly
+        # test whether faster discipline suppresses the mid-τ DO bump, at the
+        # cost of more actuator-σ_q events — bypasses the adaptive coast.
+        self._meas_rate_hz = float(meas_rate_hz)
+        self._fire_every_epoch = bool(fire_every_epoch)
 
         # longTauGnssCoupling coast-cap config (all optional; absent =
         # today's drift-budget-only behavior).  coast_tdev = the DO's
@@ -210,6 +222,12 @@ class DisciplineScheduler:
         n = len(self._errors)
         if n == 0:
             return False
+
+        # (B) fire-every-epoch prototype mode: actuate as fast as
+        # measurements arrive (loop BW = measurement rate), bypassing the
+        # adaptive coast.  See fasterUpdateRate I-fasterUpdateRate-main.
+        if self._fire_every_epoch:
+            return True
 
         # Hard budget cap: if the most recently buffered error already
         # exceeds the tolerated phase budget, fire immediately
@@ -541,10 +559,14 @@ class DisciplineScheduler:
         if distance_to_lock is not None:
             tau = graded_interval(tau, distance_to_lock, self.min_interval)
 
+        # Clamp in SECONDS exactly as before (seconds≡epochs at 1 Hz)...
         tau = max(self.min_interval,
                   min(self.max_interval, int(round(tau))))
-        self.interval = tau
-        return tau
+        # ...then convert the coast duration (seconds) → epoch count at the
+        # measurement rate (fasterUpdateRate).  meas_rate_hz=1.0 leaves this
+        # byte-identical (tau≥min_interval≥1 ⇒ round(tau×1)=tau).
+        self.interval = max(1, int(round(tau * self._meas_rate_hz)))
+        return self.interval
 
     def _apply_coast_caps(self, tau, p22_at_tau):
         """Bound τ (seconds) by the DO's stochastic phase wander.
