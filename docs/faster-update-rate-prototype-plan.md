@@ -79,13 +79,25 @@ past the realign handler would otherwise hit the 30-epoch limit in 6 s at
 
 ## Remaining for the live 5 Hz run (when clkPoC3 is back — `hw:clkPoC3`)
 
-1. **Wire `meas_rate_hz` end-to-end**: a host-config / CLI `--meas-rate-hz`
-   → `peppar_rx_config` `CFG-RATE measRate/navRate` (set the X20 to 5 Hz
-   RAWX) → pass to `FixedPosFilter(meas_rate_hz=...)`. (The knob exists in
-   the filter now; the plumbing is the remaining glue.)
-2. **`discipline.py` scheduler intervals** — rate-scale `min_interval`
-   (1 → 0.2 s) and `max_interval` (keep ~the same coast *seconds*), or make
-   the scheduler operate in seconds rather than epoch counts.
+1. **Wire `meas_rate_hz` end-to-end** — **DONE.** The receiver rate was
+   already wired (`--measurement-rate-ms` → `ensure_receiver_ready` →
+   `configure_rate`). This PR derives `args.meas_rate_hz = 1000 /
+   measurement_rate_ms` and passes it to all three `FixedPosFilter(...)`
+   constructions (main servo, re-bootstrap, bootstrap). `--measurement-rate-ms
+   200` ⇒ X20 at 5 Hz RAWX + filter thresholds scaled. 1 Hz identical.
+
+2. **`discipline.py` scheduler — rate-aware (BLOCKER for a valid 5 Hz run).**
+   `should_correct()` fires at `len(self._errors) >= interval` (an epoch
+   COUNT), but the **adaptive** path (`--adaptive-interval`, which defaults
+   ON and has no CLI off-switch — `store_true`+`default=True`) sets
+   `interval` from `compute_adaptive_interval()`, a Goldilocks τ in
+   **seconds**. At 1 Hz seconds==epochs so it's right; at 5 Hz it fires at
+   τ epochs = τ/5 s → **5× over-actuation**, injecting σ_q (the TimeHat
+   "1 Hz worse than coasting" failure mode). So the 5 Hz run must NOT start
+   until the scheduler converts τ-seconds → epochs via `× meas_rate_hz`
+   (and scales `base/min/max_interval`). Pass `meas_rate_hz` into
+   `DisciplineScheduler`; multiply the computed interval (and the clamps)
+   by the rate; 1 Hz stays identical. **This is the next increment.**
 3. **TDEV metric** — chA stays 1 Hz (`rate=1.0`); any *TDCP-rate* series
    plotted from `--tdcp-log` must use `rate=meas_rate_hz`.
 4. **Run** (TDCP arm, `--servo-input tdcp`): 5 Hz RAWX on clkPoC3 (Pi 4,
