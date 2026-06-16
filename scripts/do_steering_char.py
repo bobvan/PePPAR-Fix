@@ -10,9 +10,11 @@ The third leg of the DO characterization suite:
     do_steering_char.py  -> [steering]         (THIS — the DAC->freq gain curve)
     (future)             -> [actuation_noise]  (sigma_q)  +  [thermal] (temp slope)
 
-This is the tool the engine's steering-MISSING refuse-to-actuate gate
+This is the tool the engine's steering refuse-to-actuate gate
 (``do_char_resolve.should_refuse_for_steering``) has been waiting for: run it
-ONCE per DO and the engine no longer needs ``--allow-default-steering`` for it.
+ONCE per DAC DO so its [steering] is measured and the engine will discipline
+it.  (PHC_adjfine / ClockMatrix_FCW gains are intrinsic constants the gate
+already exempts — they don't need this.)
 
 Measurement reuses ``dac_slope_cal``'s proven primitives — ``measure_freq_offset``
 (TICC chA-chB linear regression) and ``detect_linear_region`` (excludes the
@@ -168,7 +170,7 @@ def main(argv=None) -> int:
     path = do_schema.update_characterization_section(
         args.uid, "steering", fields, dos_dir=args.dos_dir)
     print(f"wrote [steering] (source=measured) -> {path}")
-    print("This DO no longer needs --allow-default-steering.")
+    print("DAC steering measured — the engine will now discipline this DO.")
     return 0
 
 

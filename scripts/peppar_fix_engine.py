@@ -7138,28 +7138,25 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             raise SystemExit(
                 f"DO {do_uid_local}: cannot resolve characterization — {e}"
             ) from e
-    # Steering-MISSING refuse-to-actuate (Main nit 2): a DO whose actuator
-    # gain was never measured must not be disciplined.  --allow-default-
-    # steering is the escape hatch the hosts currently run with (their
-    # [steering] is still class-default/MISSING); it is removed — and
-    # uncalibrated actuation refused unconditionally — once do_steering_char
-    # has populated measured [steering] fleet-wide (gated; not this PR).
+    # Steering refuse-to-actuate (Main nit 2): a DO whose MEASURABLE actuator
+    # gain was never measured must not be disciplined.  Actuator-aware — fires
+    # only for DAC (per-unit EFC slope must be measured via do_steering_char);
+    # PHC_adjfine / ClockMatrix_FCW gains are intrinsic constants and are
+    # exempt (which is why TimeHat needs no escape hatch).  No
+    # --allow-default-steering: an uncharacterized DAC is fatal — register +
+    # do_steering_char it first.
     if _engine_char is not None:
         from peppar_fix.do_char_resolve import should_refuse_for_steering
         _refuse_steering = should_refuse_for_steering(
-            _engine_char,
-            has_servo=bool(getattr(args, 'servo', None)),
-            allow_default_steering=getattr(args, 'allow_default_steering',
-                                           False))
+            _engine_char, has_servo=bool(getattr(args, 'servo', None)))
     else:
         _refuse_steering = False
     if _refuse_steering:
         raise SystemExit(
             f"DO {do_uid_local}: [steering] provenance is "
-            f"{_engine_char.steering_provenance!r} (not measured) — refusing "
-            f"to actuate an uncalibrated actuator.  Run "
-            f"scripts/do_steering_char.py, or pass --allow-default-steering "
-            f"for first-boot bring-up.")
+            f"{_engine_char.steering_provenance!r} (not measured) on a DAC "
+            f"actuator — refusing to discipline an uncalibrated DAC.  Run "
+            f"scripts/do_steering_char.py to measure its EFC slope first.")
     log.info("DOFreqEst Q: sigma_do_phase=%.4f ns/√s (%s), "
              "sigma_do_freq=%.4f ppb/√s (%s)",
              sigma_do_phase_ns_eff, _q_phase_source,
@@ -11353,14 +11350,6 @@ Two-phase operation:
                             "characterized freerun noise floor (from "
                             "state/dos/<uid>.json).  Complements the "
                             "chi² gate — keys on physics, not filter state.")
-    servo.add_argument("--allow-default-steering", action="store_true",
-                       default=False,
-                       help="Permit actuation when the DO's [steering] "
-                            "characterization is class-default or MISSING "
-                            "(first-boot bring-up).  Without it the engine "
-                            "refuses to discipline an uncalibrated actuator "
-                            "on the new .toml schema.  Removed in the "
-                            "doCharacterizationArchitecture burn-down (PR 4).")
     servo.add_argument("--ocxo-trusted-k-sigma", type=float, default=10.0,
                        help="OCXO gate confidence multiplier.  Threshold = "
                             "K × σ_DO × √dt.  Default 10.0.")
