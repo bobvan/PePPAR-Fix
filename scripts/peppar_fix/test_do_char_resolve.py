@@ -123,8 +123,10 @@ def test_legacy_steering_never_missing(tmp_path):
     # applies on the .toml path during transition).
     d = str(tmp_path)
     _write_legacy_json(d, "ocxo-e")
-    ec = dcr.resolve_engine_characterization("ocxo-e", dos_dir=d,
-                                             json_state_dir=d)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        ec = dcr.resolve_engine_characterization("ocxo-e", dos_dir=d,
+                                                 json_state_dir=d)
     assert ec.steering_provenance == "legacy-json"
 
 
@@ -138,6 +140,56 @@ def test_deprecation_warning_one_shot(tmp_path):
         dcr.resolve_engine_characterization("ocxo-f", dos_dir=d,
                                             json_state_dir=d)
     assert sum(issubclass(x.category, DeprecationWarning) for x in w) == 1
+
+
+# ── steering refuse policy ──────────────────────────────────────────── #
+
+def _ec(schema, steering_prov):
+    return dcr.EngineCharacterization(
+        schema=schema, provenance={"steering": steering_prov})
+
+
+def test_refuse_when_toml_missing_steering_and_servo():
+    assert dcr.should_refuse_for_steering(
+        _ec(dcr.SCHEMA_TOML, "MISSING"),
+        has_servo=True, allow_default_steering=False)
+
+
+def test_refuse_when_toml_class_default_steering():
+    assert dcr.should_refuse_for_steering(
+        _ec(dcr.SCHEMA_TOML, "class-default[OCXO]"),
+        has_servo=True, allow_default_steering=False)
+
+
+def test_no_refuse_when_measured():
+    assert not dcr.should_refuse_for_steering(
+        _ec(dcr.SCHEMA_TOML, "measured"),
+        has_servo=True, allow_default_steering=False)
+
+
+def test_no_refuse_when_escape_hatch():
+    assert not dcr.should_refuse_for_steering(
+        _ec(dcr.SCHEMA_TOML, "MISSING"),
+        has_servo=True, allow_default_steering=True)
+
+
+def test_no_refuse_without_servo():
+    assert not dcr.should_refuse_for_steering(
+        _ec(dcr.SCHEMA_TOML, "MISSING"),
+        has_servo=False, allow_default_steering=False)
+
+
+def test_no_refuse_on_legacy_path():
+    # Legacy JSON never trips the gate during transition.
+    assert not dcr.should_refuse_for_steering(
+        _ec(dcr.SCHEMA_LEGACY, "legacy-json"),
+        has_servo=True, allow_default_steering=False)
+
+
+def test_no_refuse_on_none_schema():
+    assert not dcr.should_refuse_for_steering(
+        _ec(dcr.SCHEMA_NONE, "absent"),
+        has_servo=True, allow_default_steering=False)
 
 
 # ── provenance log formatting ───────────────────────────────────────── #

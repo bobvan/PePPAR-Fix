@@ -169,6 +169,24 @@ def resolve_engine_characterization(
                                   provenance={"steering": "absent"})
 
 
+def should_refuse_for_steering(ec: EngineCharacterization, *,
+                               has_servo: bool,
+                               allow_default_steering: bool) -> bool:
+    """Engine policy: refuse to actuate an uncalibrated actuator.
+
+    True only when ALL hold: the DO is on the new .toml schema, its
+    [steering] provenance is not "measured" (class-default or MISSING), a
+    servo/actuator is configured, and the operator hasn't opted in with
+    --allow-default-steering.  The legacy JSON path never trips this (it
+    reports steering="legacy-json"), so the gate stays dormant through the
+    migration.  Removed when the legacy path goes in PR 4.
+    """
+    return (ec.schema == SCHEMA_TOML
+            and ec.steering_provenance != "measured"
+            and has_servo
+            and not allow_default_steering)
+
+
 def format_provenance_log(do_uid: str, ec: EngineCharacterization) -> list[str]:
     """Operator-facing provenance lines for engine startup.
 
