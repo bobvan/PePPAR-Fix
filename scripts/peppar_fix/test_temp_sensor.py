@@ -130,5 +130,77 @@ class TempSensorAdt7410Tests(unittest.TestCase):
         self.assertIsNone(ts.read_celsius())
 
 
+class OnboardTempTests(unittest.TestCase):
+    """read_onboard_temps: RPi thermal-zone reader (DO-environment proxy)."""
+
+    @staticmethod
+    def _zone(root, idx, temp_milli, ztype):
+        import os
+        d = os.path.join(root, f"thermal_zone{idx}")
+        os.makedirs(d)
+        with open(os.path.join(d, "temp"), "w") as f:
+            f.write(str(temp_milli))
+        if ztype is not None:
+            with open(os.path.join(d, "type"), "w") as f:
+                f.write(ztype)
+
+    def test_reads_and_converts(self):
+        import tempfile
+        from peppar_fix import temp_sensor
+        with tempfile.TemporaryDirectory() as r:
+            self._zone(r, 0, 45123, "cpu-thermal")
+            self.assertEqual(temp_sensor.read_onboard_temps(r),
+                             {"cpu-thermal": 45.123})
+
+    def test_multiple_zones_dedupe(self):
+        import tempfile
+        from peppar_fix import temp_sensor
+        with tempfile.TemporaryDirectory() as r:
+            self._zone(r, 0, 45000, "cpu-thermal")
+            self._zone(r, 1, 39000, "cpu-thermal")   # same type → deduped
+            self._zone(r, 2, 41500, "rp1_adc")
+            out = temp_sensor.read_onboard_temps(r)
+            self.assertEqual(out["cpu-thermal"], 45.0)
+            self.assertEqual(out["cpu-thermal1"], 39.0)
+            self.assertEqual(out["rp1_adc"], 41.5)
+
+    def test_implausible_dropped(self):
+        import tempfile
+        from peppar_fix import temp_sensor
+        with tempfile.TemporaryDirectory() as r:
+            self._zone(r, 0, -273000, "bogus_cold")
+            self._zone(r, 1, 200000, "bogus_hot")
+            self._zone(r, 2, 47000, "cpu-thermal")
+            self.assertEqual(temp_sensor.read_onboard_temps(r),
+                             {"cpu-thermal": 47.0})
+
+    def test_missing_type_falls_back(self):
+        import tempfile
+        from peppar_fix import temp_sensor
+        with tempfile.TemporaryDirectory() as r:
+            self._zone(r, 0, 44000, None)
+            out = temp_sensor.read_onboard_temps(r)
+            self.assertEqual(list(out.values()), [44.0])
+            self.assertTrue(list(out)[0].startswith("zone"))
+
+    def test_garbage_temp_skipped(self):
+        import os, tempfile
+        from peppar_fix import temp_sensor
+        with tempfile.TemporaryDirectory() as r:
+            self._zone(r, 0, 44000, "cpu-thermal")
+            d = os.path.join(r, "thermal_zone1"); os.makedirs(d)
+            with open(os.path.join(d, "temp"), "w") as f:
+                f.write("not-a-number")
+            self.assertEqual(temp_sensor.read_onboard_temps(r),
+                             {"cpu-thermal": 44.0})
+
+    def test_no_zones_or_missing_root(self):
+        import tempfile
+        from peppar_fix import temp_sensor
+        with tempfile.TemporaryDirectory() as r:
+            self.assertEqual(temp_sensor.read_onboard_temps(r), {})
+        self.assertEqual(temp_sensor.read_onboard_temps("/no/such/path"), {})
+
+
 if __name__ == "__main__":
     unittest.main()

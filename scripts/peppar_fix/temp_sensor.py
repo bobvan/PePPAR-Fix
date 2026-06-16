@@ -13,10 +13,57 @@ those land.
 """
 from __future__ import annotations
 
+import glob
 import logging
+import os
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+
+# ── On-board thermal zones (RPi CPU etc.) ──────────────────────────── #
+#
+# Every Raspberry Pi exposes at least one Linux thermal zone (the SoC/CPU
+# sensor) at /sys/class/thermal/thermal_zone*/temp (millidegrees C), with a
+# human label in the sibling `type` file (e.g. "cpu-thermal", "rp1_adc").
+# These don't measure lab air or the OCXO oven directly, but they track the
+# DO's operating ENVIRONMENT closely enough to be a useful proxy until a
+# dedicated I2C sensor (ADT7410 above) is fitted per host.  No deps, no
+# probing — just sysfs reads; returns {} on a non-Linux/sensorless host.
+_THERMAL_ROOT = "/sys/class/thermal"
+
+
+def read_onboard_temps(thermal_root: str = _THERMAL_ROOT) -> dict[str, float]:
+    """Return {label: celsius} for every readable on-board thermal zone.
+
+    Labels come from each zone's `type` file (deduped with a numeric
+    suffix on collision).  Implausible readings (outside −40..150 °C, e.g.
+    a disabled zone reporting 0 or a huge sentinel) are dropped.  Never
+    raises — a host with no thermal zones just yields an empty dict.
+    """
+    out: dict[str, float] = {}
+    try:
+        zones = sorted(glob.glob(os.path.join(thermal_root, "thermal_zone*")))
+    except OSError:
+        return out
+    for i, zdir in enumerate(zones):
+        try:
+            with open(os.path.join(zdir, "temp")) as f:
+                milli = int(f.read().strip())
+            c = milli / 1000.0
+            if not (-40.0 <= c <= 150.0):
+                continue
+            try:
+                with open(os.path.join(zdir, "type")) as f:
+                    label = f.read().strip() or f"zone{i}"
+            except OSError:
+                label = f"zone{i}"
+            if label in out:                      # dedupe same-type zones
+                label = f"{label}{i}"
+            out[label] = round(c, 3)
+        except (OSError, ValueError):
+            continue
+    return out
 
 
 # (label, addr, id_reg, expected_id_byte)
