@@ -1,23 +1,17 @@
-"""Transition bridge — resolve a DO's engine-consumed characterization.
+"""Engine adapter — resolve a DO's engine-consumed characterization.
 
 The engine consumes a small fixed set of scalars from a DO's
 characterization: σ_do_phase, σ_do_freq (Q[2,2]/Q[3,3]), the coast-cap
-TDEV power law, and σ_q (actuator).  Two storage formats coexist during
-the doCharacterizationArchitecture migration:
-
-  NEW  state/dos/<uid>.toml      — do_schema.load_do_characterization,
-                                    one quantity per section, class
-                                    defaults fill absent sections.
-  OLD  state/dos/<uid>.json      — do_state.load_do_state + the
-                                    derive_* heuristics, σ_q from
-                                    --dac-ppb-per-code.
+TDEV power law, and σ_q (actuator).  These all live in the per-section
+schema at state/dos/<uid>.toml (do_schema.load_do_characterization;
+class defaults fill absent sections).
 
 This module is the single place the engine asks "what are this DO's Q
-inputs, and where did each come from".  It PREFERS the new schema and
-FALLS BACK to the legacy JSON so the engine keeps running on un-migrated
-hosts (PR 2 of doSchemaEngineIntegration ships before the per-host
-migration in PR 3).  The hard "refuse unregistered DO" gate is PR 4
-(burn-down), at which point this bridge and the legacy path are deleted.
+inputs, and where did each come from".  Post burn-down (PR 4) there is
+exactly ONE storage format: an unregistered DO (no .toml) RAISES — the
+engine refuses to discipline it — and there is no silent Q fallback.
+(The legacy <uid>.json path was removed in the burn-down; the migration
+tool scripts/migrate_do_state.py is the only remaining reader of it.)
 
 Provenance is carried through verbatim so the engine can log it and so
 the steering-MISSING refuse-to-actuate policy has something to gate on.
@@ -26,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import os
-import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -35,24 +28,17 @@ from peppar_fix import do_schema
 log = logging.getLogger(__name__)
 
 
-# One-shot deprecation per do_uid (don't spam the log every checkpoint).
-_warned_legacy: set[str] = set()
-
-
-# Provenance schema label.  "toml" = new schema; "legacy-json" =
-# migrated-from-old; "none" = neither file present (engine falls back to
-# its own _PHASE_FALLBACK until PR 4 makes this fatal).
+# Provenance schema label.  Only the new per-section schema remains.
 SCHEMA_TOML = "toml"
-SCHEMA_LEGACY = "legacy-json"
-SCHEMA_NONE = "none"
 
 
 @dataclass
 class EngineCharacterization:
     """The scalars the engine consumes, plus per-section provenance.
 
-    Any of the Q scalars may be None when neither storage format
-    supplies them; the engine keeps its existing fallback for those.
+    For a registered DO the .toml schema always supplies the Q scalars
+    (measured or class-default), so they are non-None; an unregistered DO
+    raises in resolve_engine_characterization rather than yielding Nones.
     """
     schema: str                                   # SCHEMA_*
     sigma_do_phase_ns: Optional[float] = None     # Q[2,2]^0.5
@@ -92,89 +78,29 @@ def _resolve_from_toml(do_uid: str, dos_dir: Optional[str]
         provenance=dict(c.provenance))
 
 
-def _resolve_from_legacy(do_uid: str, json_state_dir: Optional[str],
-                         dac_ppb_per_code: Optional[float]
-                         ) -> Optional[EngineCharacterization]:
-    from peppar_fix import do_state
-    ds = do_state.load_do_state(do_uid, state_dir=json_state_dir)
-    if not ds:
-        return None
-    if do_uid not in _warned_legacy:
-        _warned_legacy.add(do_uid)
-        warnings.warn(
-            f"DO {do_uid!r} loaded from legacy state/dos/{do_uid}.json — "
-            f"run scripts/migrate_do_state.py to convert to the per-section "
-            f"schema (state/dos/{do_uid}.toml).  Legacy path is removed in "
-            f"the doCharacterizationArchitecture burn-down (PR 4).",
-            DeprecationWarning, stacklevel=2)
-        log.warning("DO %s using LEGACY JSON characterization — migrate to "
-                    ".toml (do_char_resolve fallback; removed in PR 4)",
-                    do_uid)
-    prov: dict = {}
-    sigma_phase = sigma_freq = None
-    coast = None
-    char = ds.get("characterization")
-    if char:
-        derived = do_state.derive_do_process_noise(char) or {}
-        if derived.get("sigma_do_phase_ns") is not None:
-            sigma_phase = float(derived["sigma_do_phase_ns"])
-            prov["freerun_noise.sigma_do_phase_ns"] = (
-                f"legacy-json:{derived.get('sigma_do_phase_source')}")
-        if derived.get("sigma_do_freq_ppb") is not None:
-            sigma_freq = float(derived["sigma_do_freq_ppb"])
-            prov["freerun_noise.sigma_do_freq_ppb"] = (
-                f"legacy-json:{derived.get('sigma_do_freq_source')}")
-        coast = do_state.derive_coast_tdev_from_char(char)
-        if coast is not None:
-            prov["freerun_noise.coast_tdev"] = "legacy-json:derive_coast_tdev"
-    # σ_q: legacy engine derived it from --dac-ppb-per-code (ppb ≈ ns @ 1 s).
-    sigma_q = None
-    if dac_ppb_per_code is not None and dac_ppb_per_code != 0.0:
-        sigma_q = abs(float(dac_ppb_per_code))
-        prov["actuation_noise.sigma_q_ns"] = "legacy-json:dac_ppb_per_code"
-    # Legacy steering provenance is unknown to this layer (the DAC slope
-    # lives in args / a separate cal file), so don't assert MISSING — the
-    # refuse-to-actuate gate only applies on the new .toml path.
-    prov["steering"] = "legacy-json"
-    return EngineCharacterization(
-        schema=SCHEMA_LEGACY, sigma_do_phase_ns=sigma_phase,
-        sigma_do_freq_ppb=sigma_freq, coast_tdev=coast, sigma_q_ns=sigma_q,
-        steering={}, provenance=prov)
-
-
 def resolve_engine_characterization(
         do_uid: str, *, dos_dir: Optional[str] = None,
         json_state_dir: Optional[str] = None,
         dac_ppb_per_code: Optional[float] = None) -> EngineCharacterization:
-    """Resolve a DO's engine Q inputs, preferring the new .toml schema.
+    """Resolve a DO's engine Q inputs from the per-section .toml schema.
 
-    Order:
-      1. state/dos/<uid>.toml present → new schema (class defaults fill
-         absent sections; full provenance).
-      2. else state/dos/<uid>.json present → legacy heuristics + a
-         one-shot DeprecationWarning.
-      3. else → SCHEMA_NONE with all-None scalars (engine keeps its own
-         fallback; PR 4 makes this a hard refusal).
-
-    Fail-loud contract: this function only takes the .toml path when the
-    file EXISTS, so a do_schema.SchemaError from that path means
-    "present but invalid" and is **propagated** (not swallowed) — the
-    caller must treat it as fatal, never as a soft fallback.  Silently
-    degrading a corrupt characterization to the generic Q fallback is the
-    exact failure the schema validator (#172) exists to prevent.  The
-    soft path (return SCHEMA_NONE) is reserved for genuinely-absent files.
-
-    `dos_dir` / `json_state_dir` override the default state dirs (tests).
-    `dac_ppb_per_code` supplies the legacy σ_q only.
+    Burn-down (PR 4): the legacy <uid>.json fallback is GONE — the engine
+    reads ONLY state/dos/<uid>.toml.  An unregistered DO (no .toml) RAISES
+    SchemaError ("refuse unregistered DOs"); a present-but-invalid .toml
+    also raises (propagated, not swallowed) — both are fatal at the caller.
+    There is no longer any silent Q fallback.  (json_state_dir /
+    dac_ppb_per_code are accepted for signature stability but unused now
+    that the legacy path is removed.)
     """
     toml_path = do_schema._char_path(do_uid, dos_dir)
-    if os.path.exists(toml_path):
-        return _resolve_from_toml(do_uid, dos_dir)
-    legacy = _resolve_from_legacy(do_uid, json_state_dir, dac_ppb_per_code)
-    if legacy is not None:
-        return legacy
-    return EngineCharacterization(schema=SCHEMA_NONE,
-                                  provenance={"steering": "absent"})
+    if not os.path.exists(toml_path):
+        raise do_schema.SchemaError(
+            f"DO {do_uid!r} is not registered: no {toml_path}.  Run "
+            f"scripts/do_register.py (then the do_*_char.py tools, or "
+            f"scripts/migrate_do_state.py for a legacy host).  The engine "
+            f"refuses to discipline an unregistered DO — there is no longer "
+            f"a silent Q fallback.")
+    return _resolve_from_toml(do_uid, dos_dir)
 
 
 def should_refuse_for_steering(ec: EngineCharacterization, *,
@@ -182,12 +108,12 @@ def should_refuse_for_steering(ec: EngineCharacterization, *,
                                allow_default_steering: bool) -> bool:
     """Engine policy: refuse to actuate an uncalibrated actuator.
 
-    True only when ALL hold: the DO is on the new .toml schema, its
-    [steering] provenance is not "measured" (class-default or MISSING), a
-    servo/actuator is configured, and the operator hasn't opted in with
-    --allow-default-steering.  The legacy JSON path never trips this (it
-    reports steering="legacy-json"), so the gate stays dormant through the
-    migration.  Removed when the legacy path goes in PR 4.
+    True only when ALL hold: [steering] provenance is not "measured"
+    (class-default or MISSING), a servo/actuator is configured, and the
+    operator hasn't opted in with --allow-default-steering.  The escape
+    hatch stays until do_steering_char has populated measured [steering] on
+    the hosts (they currently run with --allow-default-steering); only then
+    is the flag removed and uncalibrated actuation refused unconditionally.
     """
     return (ec.schema == SCHEMA_TOML
             and ec.steering_provenance != "measured"
