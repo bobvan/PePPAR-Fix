@@ -4443,11 +4443,11 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 and not args.freerun
                 and not getattr(args, 'skip_bootstrap', False)):
             try:
-                from peppar_fix.do_state import is_do_warm_startable
+                from peppar_fix.runtime_state_resolve import is_warm_startable
                 _do_uid_ws = (getattr(args, 'do_unique_id', None)
                               or _resolve_do_uid(args))
                 if _do_uid_ws is not None:
-                    ok, info = is_do_warm_startable(
+                    ok, info = is_warm_startable(
                         _do_uid_ws,
                         max_age_s=args.warm_start_max_age_s,
                         max_ppb=args.warm_start_max_ppb)
@@ -5928,8 +5928,8 @@ def _save_osc_freq_corr(ctx):
     do_uid = ctx.get('do_unique_id')
     if do_uid is not None:
         try:
-            from peppar_fix.do_state import save_do_freq_offset
-            save_do_freq_offset(do_uid, adjfine)
+            from peppar_fix.runtime_state_resolve import update_runtime_freq
+            update_runtime_freq(do_uid, adjfine)
             log.info("Saved DO freq offset: adjfine=%.1f ppb (DO %s)",
                      adjfine, do_uid)
         except Exception as e:
@@ -5937,8 +5937,9 @@ def _save_osc_freq_corr(ctx):
         _act = ctx.get('actuator')
         if _act is not None and hasattr(_act, 'current_code'):
             try:
-                from peppar_fix.do_state import save_last_dac_code
-                save_last_dac_code(do_uid, _act.current_code)
+                from peppar_fix.runtime_state_resolve import (
+                    update_runtime_dac_code)
+                update_runtime_dac_code(do_uid, _act.current_code)
             except Exception as e:
                 log.warning("Failed to save last DAC code: %s", e)
 
@@ -6048,10 +6049,8 @@ def _init_carrier_tracker(args):
     receiver_uid = getattr(args, 'receiver_unique_id', None)
     if do_uid:
         try:
-            from peppar_fix.do_state import load_do_state
-            do_state = load_do_state(do_uid)
-            if do_state is not None:
-                phc_corr = do_state.get("last_known_freq_offset_ppb")
+            from peppar_fix.runtime_state_resolve import resolve_runtime_state
+            phc_corr = resolve_runtime_state(do_uid).freq_offset_ppb
         except Exception:
             pass
     if receiver_uid is not None:
@@ -6203,10 +6202,9 @@ def _bootstrap_compute_base_freq(args, pps_freq_ppb, pps_freq_unc,
             do_uid = _resolve_do_uid(args)
         if do_uid is not None:
             try:
-                from peppar_fix.do_state import load_do_state
-                s = load_do_state(do_uid)
-                if s is not None:
-                    stored_adjfine = s.get("last_known_freq_offset_ppb")
+                from peppar_fix.runtime_state_resolve import (
+                    resolve_runtime_state)
+                stored_adjfine = resolve_runtime_state(do_uid).freq_offset_ppb
             except Exception:
                 pass
         if pps_freq_unc is not None and pps_freq_unc <= args.freq_tolerance_ppb:
@@ -6366,8 +6364,9 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
         log.error("VCOCXO bootstrap requires --dac-ppb-per-code")
         return False
 
-    from peppar_fix.do_state import load_last_dac_code
-    _last_code = load_last_dac_code(do_label) if do_label else None
+    from peppar_fix.runtime_state_resolve import resolve_runtime_state
+    _last_code = (resolve_runtime_state(do_label).dac_code
+                  if do_label else None)
     if _last_code is not None:
         log.info("Bootstrap: loaded last DAC code %d for %s", _last_code, do_label)
     dac = DacActuator(
@@ -6453,14 +6452,11 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
         dac._bus = None
 
     try:
-        from peppar_fix.do_state import load_do_state, save_do_state
-        from peppar_fix.do_state import new_do_state, save_last_dac_code
+        from peppar_fix.runtime_state_resolve import (
+            update_runtime_freq, update_runtime_dac_code)
         do_uid = do_label
-        state = load_do_state(do_uid) or new_do_state(do_uid, label=do_label)
-        state["last_known_freq_offset_ppb"] = base_freq
-        state["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        save_do_state(state)
-        save_last_dac_code(do_uid, dac.current_code)
+        update_runtime_freq(do_uid, base_freq)
+        update_runtime_dac_code(do_uid, dac.current_code)
         log.info("DO freq saved: base=%.1f ppb, code=%d, dt_rx=%.1f ns",
                  base_freq, dac.current_code, dt_rx_ns)
     except Exception as e:
@@ -6659,8 +6655,9 @@ def _do_bootstrap_phc(args, ptp, pps_freq_ppb, pps_freq_unc,
 def _save_phc_bootstrap_freq(args, base_freq, dt_rx_ns):
     """Persist the computed base adjfine to DO state."""
     try:
-        from peppar_fix.do_state import phc_unique_id, save_do_freq_offset
-        save_do_freq_offset(phc_unique_id(args.servo), base_freq)
+        from peppar_fix.do_state import phc_unique_id
+        from peppar_fix.runtime_state_resolve import update_runtime_freq
+        update_runtime_freq(phc_unique_id(args.servo), base_freq)
         log.info("DO freq saved: base=%.1f ppb, dt_rx=%.1f ns",
                  base_freq, dt_rx_ns)
     except Exception as e:
@@ -6701,9 +6698,10 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
         dac_bus = getattr(args, 'dac_bus', None)
         if dac_bus is not None:
             from peppar_fix.dac_actuator import DacActuator
-            from peppar_fix.do_state import load_last_dac_code
+            from peppar_fix.runtime_state_resolve import resolve_runtime_state
             _do_lbl = getattr(args, 'do_label', None)
-            _pre_last = load_last_dac_code(_do_lbl) if _do_lbl else None
+            _pre_last = (resolve_runtime_state(_do_lbl).dac_code
+                         if _do_lbl else None)
             _dac_reset = DacActuator(
                 bus_num=dac_bus,
                 addr=int(getattr(args, 'dac_addr', '0x60'), 0),
@@ -6872,7 +6870,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     if getattr(args, 'dac_bus', None) is not None:
         try:
             from peppar_fix.dac_actuator import DacActuator
-            from peppar_fix.do_state import load_last_dac_code
+            from peppar_fix.runtime_state_resolve import resolve_runtime_state
             dac_addr = int(getattr(args, 'dac_addr', '0x60'), 0)
             ppb_per_code = getattr(args, 'dac_ppb_per_code', None)
             if ppb_per_code is None:
@@ -6881,7 +6879,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                 _last_code = None
                 _dac_do_uid = _resolve_do_uid(args)
                 if _dac_do_uid is not None:
-                    _last_code = load_last_dac_code(_dac_do_uid)
+                    _last_code = resolve_runtime_state(_dac_do_uid).dac_code
                     if _last_code is not None:
                         log.info("Loaded last DAC code %d for %s",
                                  _last_code, _dac_do_uid)
@@ -7062,10 +7060,9 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     do_uid_local = getattr(args, 'do_unique_id', None) or _resolve_do_uid(args)
     if do_uid_local is not None:
         try:
-            from peppar_fix.do_state import load_do_state
-            s = load_do_state(do_uid_local)
-            if s is not None:
-                bootstrap_base_freq = s.get('last_known_freq_offset_ppb')
+            from peppar_fix.runtime_state_resolve import resolve_runtime_state
+            bootstrap_base_freq = resolve_runtime_state(
+                do_uid_local).freq_offset_ppb
         except Exception:
             pass
     receiver_uid_local = getattr(args, 'receiver_unique_id', None)

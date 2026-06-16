@@ -395,6 +395,22 @@ class TestRuntimeRoundTrip(unittest.TestCase):
             self.assertEqual(loaded.last_updated,
                               "2026-06-15T16:00:00Z")
 
+    def test_unknown_freq_roundtrips_as_none_not_zero(self):
+        # A freq that was never measured must read back as None, not 0.0 —
+        # else a DAC-code-only checkpoint would warm-start at 0.0 ppb.
+        rs = RuntimeState(
+            last_known_freq_offset_ppb=None,
+            last_known_dac_code=40615,
+            last_updated="2026-06-15T16:00:00Z",
+        )
+        with _TempDir() as td:
+            save_runtime_state("ocxo-test", rs, dos_dir=td)
+            with open(do_schema._runtime_path("ocxo-test", dos_dir=td)) as f:
+                self.assertNotIn("last_known_freq_offset_ppb", f.read())
+            loaded = load_runtime_state("ocxo-test", dos_dir=td)
+            self.assertIsNone(loaded.last_known_freq_offset_ppb)
+            self.assertEqual(loaded.last_known_dac_code, 40615)
+
     def test_runtime_save_does_not_touch_characterization(self):
         # The structural firewall — save_runtime_state must never
         # open <uid>.toml.  We assert this by writing the

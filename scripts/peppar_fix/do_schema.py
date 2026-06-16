@@ -143,8 +143,14 @@ class Characterization:
 
 @dataclass(frozen=True)
 class RuntimeState:
-    """Engine-owned runtime state.  Written every save_do_state checkpoint."""
-    last_known_freq_offset_ppb: float
+    """Engine-owned runtime state.  Written every save_do_state checkpoint.
+
+    last_known_freq_offset_ppb is Optional: a freq that was never measured
+    must read back as None, NOT a misleading 0.0 — otherwise a runtime file
+    written by a DAC-code-only checkpoint before any freq is known would
+    warm-start the DO at 0.0 ppb instead of "unknown" (Main's PR #176 nit).
+    """
+    last_known_freq_offset_ppb: float | None
     last_known_dac_code: int | None
     last_updated: str
 
@@ -436,9 +442,9 @@ def load_runtime_state(do_uid: str,
             path, v, SCHEMA_VERSION)
         return None
     op = data.get("operational_state") or {}
+    _freq = op.get("last_known_freq_offset_ppb")
     return RuntimeState(
-        last_known_freq_offset_ppb=float(
-            op.get("last_known_freq_offset_ppb", 0.0)),
+        last_known_freq_offset_ppb=(None if _freq is None else float(_freq)),
         last_known_dac_code=op.get("last_known_dac_code"),
         last_updated=op.get("last_updated", ""),
     )
@@ -460,8 +466,11 @@ def _format_runtime_toml(rs: RuntimeState) -> str:
         f"schema_version = \"{SCHEMA_VERSION}\"",
         "",
         "[operational_state]",
-        f"last_known_freq_offset_ppb = {rs.last_known_freq_offset_ppb:.6f}",
     ]
+    # Omit the freq line when unknown so it reads back as None, not 0.0.
+    if rs.last_known_freq_offset_ppb is not None:
+        lines.append("last_known_freq_offset_ppb = "
+                     f"{rs.last_known_freq_offset_ppb:.6f}")
     if rs.last_known_dac_code is not None:
         lines.append(f"last_known_dac_code = {int(rs.last_known_dac_code)}")
     lines.append(f"last_updated = \"{rs.last_updated}\"")
