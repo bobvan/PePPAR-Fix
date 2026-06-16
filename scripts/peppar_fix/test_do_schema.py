@@ -636,5 +636,118 @@ class TestUidSanitization(unittest.TestCase):
             self.assertAlmostEqual(loaded.last_known_freq_offset_ppb, 152.24)
 
 
+# Identity-only registered DO — the post-migration / post-register starting
+# point a do_*_char tool writes a measured section into.
+_IDENTITY_ONLY = textwrap.dedent("""\
+    schema_version = "1"
+
+    [identity]
+    do_uid = "ocxo-test"
+    model = "Isotemp OCXO131-100"
+    class = "OCXO"
+    actuator_type = "DAC"
+    nominal_freq_hz = 10000000
+    """)
+
+# A measured [steering] section as do_steering_char supplies it (the writer
+# adds `source`, not the caller).
+_STEERING_FIELDS = dict(
+    slope_ppb_per_code=-0.0263, intercept_ppb_at_parked=-7.0,
+    parked_code=32768, code_min=8000, code_max=60000,
+    asymmetry_factor=1.0, rmse_ppb=0.5, measured_at="2026-06-16T20:00:00Z")
+
+
+class TestUpdateCharacterizationSection(unittest.TestCase):
+    """update_characterization_section — the shared do_*_char writer (steering
+    now; freerun/actuation as they migrate).  Read-modify-write ONE section,
+    re-validate the whole file, atomic write, fail loud."""
+
+    def test_writes_steering_into_registered_do(self):
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", _IDENTITY_ONLY)
+            do_schema.update_characterization_section(
+                "ocxo-test", "steering", dict(_STEERING_FIELDS), dos_dir=td)
+            c = load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertEqual(c.provenance["steering"], "measured")
+            self.assertAlmostEqual(c.steering["slope_ppb_per_code"], -0.0263)
+            self.assertEqual(c.steering["code_min"], 8000)
+            self.assertEqual(c.steering["source"], "measured")
+
+    def test_preserves_other_sections(self):
+        # Writing [steering] must not disturb a pre-existing measured
+        # [freerun_noise] (the whole-file round-trip preserves it).
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", GOOD_CHAR_TOML)
+            fields = dict(_STEERING_FIELDS, slope_ppb_per_code=-0.0299)
+            do_schema.update_characterization_section(
+                "ocxo-test", "steering", fields, dos_dir=td)
+            c = load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertEqual(c.provenance["freerun_noise"], "measured")
+            self.assertAlmostEqual(c.freerun_noise["sigma_do_freq_ppb"],
+                                   0.000382)
+            self.assertAlmostEqual(c.steering["slope_ppb_per_code"], -0.0299)
+
+    def test_refuses_operational_state_firewall(self):
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", _IDENTITY_ONLY)
+            with self.assertRaises(SchemaError):
+                do_schema.update_characterization_section(
+                    "ocxo-test", "operational_state",
+                    {"last_known_freq_offset_ppb": 1.0}, dos_dir=td)
+
+    def test_refuses_unknown_section(self):
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", _IDENTITY_ONLY)
+            with self.assertRaises(SchemaError):
+                do_schema.update_characterization_section(
+                    "ocxo-test", "bogus", {"x": 1}, dos_dir=td)
+
+    def test_refuses_unregistered_do(self):
+        with _TempDir() as td:
+            with self.assertRaises(SchemaError):
+                do_schema.update_characterization_section(
+                    "ocxo-ghost", "steering", dict(_STEERING_FIELDS),
+                    dos_dir=td)
+
+    def test_invalid_value_rejected_and_file_unchanged(self):
+        # slope == 0 fails validation → SchemaError, and the on-disk file is
+        # NOT modified (steering stays absent → provenance MISSING).
+        with _TempDir() as td:
+            path = _write_char(td, "ocxo-test", _IDENTITY_ONLY)
+            before = open(path).read()
+            bad = dict(_STEERING_FIELDS, slope_ppb_per_code=0.0)
+            with self.assertRaises(SchemaError):
+                do_schema.update_characterization_section(
+                    "ocxo-test", "steering", bad, dos_dir=td)
+            self.assertEqual(open(path).read(), before)
+            self.assertEqual(
+                load_do_characterization("ocxo-test", dos_dir=td)
+                .provenance["steering"], "MISSING")
+
+    def test_missing_required_field_rejected(self):
+        # A measured steering missing slope_ppb_per_code is incomplete →
+        # rejected by validate (the #178 measured-required guarantee).
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", _IDENTITY_ONLY)
+            incomplete = {k: v for k, v in _STEERING_FIELDS.items()
+                          if k != "slope_ppb_per_code"}
+            with self.assertRaises(SchemaError):
+                do_schema.update_characterization_section(
+                    "ocxo-test", "steering", incomplete, dos_dir=td)
+
+    def test_path_uid_writes_sanitized_file(self):
+        # MAC/path uid resolves to a sanitized .toml (doUid fix); the writer
+        # must hit the same sanitized path the loader reads.
+        with _TempDir() as td:
+            ident = _IDENTITY_ONLY.replace('do_uid = "ocxo-test"',
+                                           'do_uid = "54:49:4d:45:00:6b"')
+            _write_char(td, "54-49-4d-45-00-6b", ident)
+            do_schema.update_characterization_section(
+                "54:49:4d:45:00:6b", "steering", dict(_STEERING_FIELDS),
+                dos_dir=td)
+            c = load_do_characterization("54:49:4d:45:00:6b", dos_dir=td)
+            self.assertEqual(c.provenance["steering"], "measured")
+
+
 if __name__ == "__main__":
     unittest.main()

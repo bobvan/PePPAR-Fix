@@ -526,3 +526,102 @@ def save_runtime_state(do_uid: str, rs: RuntimeState,
         except OSError:
             pass
         raise
+
+
+# ── Characterization section writer (tool-side; shared by do_*_char) ── #
+
+# Sections that live in the CHARACTERIZATION file (<uid>.toml).
+# operational_state is deliberately absent — it lives in the engine-owned
+# <uid>.runtime.toml and must never be written through this path (the
+# "engine writes only the runtime file" firewall, rule #5).
+_CHAR_SECTIONS = ("identity", "steering", "thermal", "freerun_noise",
+                  "actuation_noise", "aging")
+
+
+def _fmt_toml_value(v) -> str:
+    """Format a scalar for a hand-written TOML line.  Fail loud on types the
+    schema doesn't use (lists/dicts belong in the .noise.toml sidecar)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return repr(v)
+    if isinstance(v, str):
+        return '"%s"' % v.replace("\\", "\\\\").replace('"', '\\"')
+    raise SchemaError(
+        f"unsupported TOML value type {type(v).__name__}: {v!r}")
+
+
+def _format_characterization_toml(data: dict) -> str:
+    """Serialize a characterization dict to TOML, sections in canonical order.
+
+    Hand-formatted (no tomli_w dependency, matching _format_runtime_toml).
+    Comments are NOT preserved — the file is tool-managed; values + section
+    structure are what round-trip.  Unknown dict sections are preserved
+    (appended, sorted) rather than dropped, so a forward-compat field is
+    never silently lost.
+    """
+    lines = [f'schema_version = "{data.get("schema_version", SCHEMA_VERSION)}"']
+    extra = sorted(k for k, v in data.items()
+                   if isinstance(v, dict) and k not in _CHAR_SECTIONS)
+    for sec in list(_CHAR_SECTIONS) + extra:
+        body = data.get(sec)
+        if not isinstance(body, dict):
+            continue
+        lines.append("")
+        lines.append(f"[{sec}]")
+        for k, v in body.items():
+            lines.append(f"{k} = {_fmt_toml_value(v)}")
+    return "\n".join(lines) + "\n"
+
+
+def update_characterization_section(do_uid: str, section: str, fields: dict,
+                                    *, dos_dir: str | None = None) -> str:
+    """Read-modify-write ONE characterization section of <uid>.toml.
+
+    The shared writer for the do_*_char tool family (steering now; freerun /
+    actuation as they migrate to the schema).  Loads the existing (registered)
+    <uid>.toml, replaces ``[section]`` with ``{source: "measured", **fields}``,
+    re-validates the WHOLE file through ``validate_characterization`` (fail
+    loud), then atomically writes it.  Refuses to:
+
+      * write operational_state / any non-characterization section (firewall),
+      * write a section the schema doesn't define,
+      * touch a DO that isn't registered yet (no <uid>.toml),
+      * land a file that fails validation (the new section is rejected before
+        it can be written — the same guarantee the loader gives on read).
+
+    Returns the path written.
+    """
+    if section not in _CHAR_SECTIONS:
+        raise SchemaError(
+            f"refusing to write section {section!r}: not a characterization "
+            f"section {list(_CHAR_SECTIONS)} (operational_state is engine-only, "
+            f"in <uid>.runtime.toml)")
+    path = _char_path(do_uid, dos_dir)
+    if not os.path.exists(path):
+        raise SchemaError(
+            f"{path}: no characterization file — run scripts/migrate_do_state.py "
+            f"or register the DO before measuring its {section}.")
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    data[section] = {"source": "measured", **fields}
+    errors = validate_characterization(data)
+    if errors:
+        raise SchemaError(f"{path}: {'; '.join(errors)}")
+    text = _format_characterization_toml(data)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
+                               prefix=f".{safe_uid(do_uid)}.",
+                               suffix=".toml.tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path
