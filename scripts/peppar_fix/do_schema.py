@@ -318,13 +318,27 @@ def class_defaults(do_class: str) -> dict[str, float]:
 # ── Loader ───────────────────────────────────────────────────────── #
 
 
+def safe_uid(do_uid: str) -> str:
+    """Filesystem-safe DO uid — MUST match do_state._do_path's mapping.
+
+    A do_uid can be a clean label ("ocxo-clkpoc3"), a MAC ("54:49:4d:45:00:6b"),
+    or a device path ("/dev/ptp_i226").  Without this, f"{do_uid}.toml" both
+    (a) leaves colons/slashes in the filename and (b) — for a path uid —
+    os.path.join ABSOLUTE-PATH-ESCAPES ("/dev/ptp_i226.toml" lands in /dev,
+    not under dos_dir), so MAC/path-uid hosts never find their .toml and fall
+    back silently to legacy (the doUidTomlPathSanitization bug).  Mirrors
+    do_state._do_path exactly so the new schema and legacy JSON co-resolve.
+    """
+    return str(do_uid).replace(":", "-").replace("/", "_")
+
+
 def _char_path(do_uid: str, dos_dir: str | None = None) -> str:
-    return os.path.join(dos_dir or DEFAULT_DOS_DIR, f"{do_uid}.toml")
+    return os.path.join(dos_dir or DEFAULT_DOS_DIR, f"{safe_uid(do_uid)}.toml")
 
 
 def _runtime_path(do_uid: str, dos_dir: str | None = None) -> str:
     return os.path.join(dos_dir or DEFAULT_DOS_DIR,
-                        f"{do_uid}.runtime.toml")
+                        f"{safe_uid(do_uid)}.runtime.toml")
 
 
 def load_do_characterization(do_uid: str,
@@ -356,8 +370,11 @@ def load_do_characterization(do_uid: str,
     # file is exactly the multi-file confusion (clkPoC3 v1/v2) that
     # motivated this whole architecture — a silent identity mismatch
     # would let the engine discipline DO X using DO Y's
-    # characterization.  Fail loud.
-    if ident.get("do_uid") != do_uid:
+    # characterization.  Fail loud.  Compare on the SANITIZED form so the
+    # equivalent uid spellings that map to one file (colon vs dash MAC,
+    # device-path slashes) are accepted — only a genuine cross-DO mismatch
+    # trips this, not "54:49:..6b" (engine) vs "54-49-..6b" (stored).
+    if safe_uid(ident.get("do_uid", "")) != safe_uid(do_uid):
         raise SchemaError(
             f"{path}: [identity].do_uid={ident.get('do_uid')!r} does not "
             f"match requested do_uid={do_uid!r}.  Filename and identity "
@@ -494,9 +511,10 @@ def save_runtime_state(do_uid: str, rs: RuntimeState,
     path = _runtime_path(do_uid, dos_dir)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     text = _format_runtime_toml(rs)
-    # Atomic write via temp + rename.
+    # Atomic write via temp + rename.  Sanitize the prefix too — a raw
+    # path/MAC uid would put slashes/colons in the temp name.
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
-                                prefix=f".{do_uid}.runtime.",
+                                prefix=f".{safe_uid(do_uid)}.runtime.",
                                 suffix=".toml.tmp")
     try:
         with os.fdopen(fd, "w") as f:
