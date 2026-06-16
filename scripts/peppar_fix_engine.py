@@ -7123,9 +7123,10 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     sigma_do_freq_ppb_eff = args.kalman_sigma_freq
     _engine_char = None
     if do_uid_local is not None:
+        from peppar_fix.do_char_resolve import (
+            resolve_engine_characterization, format_provenance_log)
+        from peppar_fix.do_schema import SchemaError
         try:
-            from peppar_fix.do_char_resolve import (
-                resolve_engine_characterization, format_provenance_log)
             _engine_char = resolve_engine_characterization(
                 do_uid_local,
                 dac_ppb_per_code=getattr(args, 'dac_ppb_per_code', None))
@@ -7143,7 +7144,21 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                     "freerun_noise.sigma_do_freq_ppb",
                     _engine_char.provenance.get("freerun_noise",
                                                 _engine_char.schema))
+        except SchemaError as e:
+            # A .toml that EXISTS but fails validation (bad schema_version,
+            # do_uid↔filename mismatch, measured-missing-field) is
+            # present-but-invalid → FATAL.  Swallowing it would silently run
+            # the engine on the generic Q fallback AND bypass the steering
+            # gate — the exact silent-degradation #172's validator prevents.
+            # Caught SEPARATELY from the broad handler below (Main's PR2
+            # must-fix).  Remove the file (→ legacy/bootstrap) or fix it.
+            raise SystemExit(
+                f"DO {do_uid_local}: characterization file is present but "
+                f"INVALID — {e}.  Fix state/dos/{do_uid_local}.toml (or "
+                f"remove it to fall back to legacy/bootstrap).") from e
         except Exception as e:
+            # Genuinely unexpected (non-schema) failure → soft fallback,
+            # the transition-safe path for transient issues on a host.
             log.warning("Could not resolve DO characterization for %s: %s "
                         "— using Q fallback", do_uid_local, e)
     # Steering-MISSING refuse-to-actuate (Main nit 2): a DO whose actuator

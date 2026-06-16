@@ -156,6 +156,14 @@ def resolve_engine_characterization(
       3. else → SCHEMA_NONE with all-None scalars (engine keeps its own
          fallback; PR 4 makes this a hard refusal).
 
+    Fail-loud contract: this function only takes the .toml path when the
+    file EXISTS, so a do_schema.SchemaError from that path means
+    "present but invalid" and is **propagated** (not swallowed) — the
+    caller must treat it as fatal, never as a soft fallback.  Silently
+    degrading a corrupt characterization to the generic Q fallback is the
+    exact failure the schema validator (#172) exists to prevent.  The
+    soft path (return SCHEMA_NONE) is reserved for genuinely-absent files.
+
     `dos_dir` / `json_state_dir` override the default state dirs (tests).
     `dac_ppb_per_code` supplies the legacy σ_q only.
     """

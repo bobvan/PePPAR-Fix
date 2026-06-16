@@ -88,6 +88,39 @@ def test_legacy_json_when_no_toml(tmp_path):
     assert any(issubclass(x.category, DeprecationWarning) for x in w)
 
 
+def test_invalid_toml_propagates_schemaerror(tmp_path):
+    # A .toml that EXISTS but fails validation must PROPAGATE SchemaError
+    # (present-but-invalid = fatal at the engine), NOT silently fall back.
+    # This is the contract the engine's fatal handler depends on (Main's
+    # PR2 must-fix).
+    from peppar_fix.do_schema import SchemaError
+    d = str(tmp_path)
+    # do_uid inside disagrees with the filename → SchemaError on load.
+    p = os.path.join(d, "ocxo-real.toml")
+    with open(p, "w") as f:
+        f.write('schema_version = "1"\n[identity]\n'
+                'do_uid = "ocxo-WRONG"\nmodel = "X"\nclass = "OCXO"\n'
+                'actuator_type = "DAC"\nnominal_freq_hz = 10000000\n')
+    with pytest.raises(SchemaError):
+        dcr.resolve_engine_characterization("ocxo-real", dos_dir=d,
+                                            json_state_dir=d)
+
+
+def test_invalid_toml_not_masked_by_legacy_json(tmp_path):
+    # Even with a perfectly good legacy .json present, an invalid .toml
+    # is fatal — the .toml is authoritative when it exists.
+    from peppar_fix.do_schema import SchemaError
+    d = str(tmp_path)
+    _write_legacy_json(d, "ocxo-both2")
+    with open(os.path.join(d, "ocxo-both2.toml"), "w") as f:
+        f.write('schema_version = "999"\n[identity]\n'
+                'do_uid = "ocxo-both2"\nmodel = "X"\nclass = "OCXO"\n'
+                'actuator_type = "DAC"\nnominal_freq_hz = 10000000\n')
+    with pytest.raises(SchemaError):
+        dcr.resolve_engine_characterization("ocxo-both2", dos_dir=d,
+                                            json_state_dir=d)
+
+
 def test_none_when_neither_present(tmp_path):
     ec = dcr.resolve_engine_characterization("ocxo-ghost", dos_dir=str(tmp_path),
                                              json_state_dir=str(tmp_path))
