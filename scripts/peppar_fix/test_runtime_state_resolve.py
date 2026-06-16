@@ -110,6 +110,19 @@ def test_update_seeds_from_legacy_on_first_write(tmp_path):
     assert rr.dac_code == 35000                   # seeded from legacy
 
 
+def test_dac_only_write_no_prior_freq_leaves_freq_unknown(tmp_path):
+    # update_runtime_dac_code with NO prior freq anywhere must NOT persist a
+    # misleading 0.0 — freq stays unknown (Main's PR #176 nit). A crash in
+    # this window then warm-starts at "unknown", not 0.0 ppb.
+    d = str(tmp_path)
+    rsr.update_runtime_dac_code("ocxo-z", 33000, dos_dir=d)
+    rr = rsr.resolve_runtime_state("ocxo-z", dos_dir=d)
+    assert rr.dac_code == 33000
+    assert rr.freq_offset_ppb is None          # NOT 0.0
+    ok, info = rsr.is_warm_startable("ocxo-z", dos_dir=d, json_state_dir=d)
+    assert not ok and info["reason"] == "no_last_known_freq"
+
+
 def test_update_freq_writes_toml_not_json(tmp_path):
     d = str(tmp_path)
     rsr.update_runtime_freq("ocxo-g", -22.2, dos_dir=d)

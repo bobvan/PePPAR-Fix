@@ -108,8 +108,11 @@ def resolve_runtime_state(do_uid: str, *, dos_dir: Optional[str] = None,
 
 def _save(do_uid: str, freq_ppb: Optional[float], dac_code: Optional[int],
           dos_dir: Optional[str]) -> None:
+    # Preserve "freq unknown" as None — never persist a misleading 0.0 (a
+    # DAC-code-only write before any freq is known must NOT warm-start the
+    # DO at 0.0 ppb; Main's PR #176 nit).
     rs = do_schema.RuntimeState(
-        last_known_freq_offset_ppb=(0.0 if freq_ppb is None
+        last_known_freq_offset_ppb=(None if freq_ppb is None
                                     else float(freq_ppb)),
         last_known_dac_code=(None if dac_code is None else int(dac_code)),
         last_updated=_now_iso())
