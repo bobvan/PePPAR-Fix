@@ -33,6 +33,12 @@ def discover_phc_mac(ptp_path):
     Returns:
         MAC address string (e.g. "54:49:4d:45:00:6b") or None
     """
+    # Resolve udev symlinks (e.g. /dev/ptp_i226 → /dev/ptpN) so the sysfs
+    # walk uses the real ptpN node.  Without this, a symlinked device's
+    # MAC is never found and phc_unique_id falls back to the device PATH —
+    # which made TimeHat key its DO state on "/dev/ptp_i226" instead of its
+    # MAC (the doUidTomlPathSanitization bug).
+    ptp_path = os.path.realpath(ptp_path)
     basename = os.path.basename(ptp_path)
     if not basename.startswith("ptp"):
         return None
@@ -56,6 +62,7 @@ def discover_phc_driver(ptp_path):
 
     Returns driver name (e.g. "igc", "ice") or None.
     """
+    ptp_path = os.path.realpath(ptp_path)  # resolve udev symlink → real ptpN
     basename = os.path.basename(ptp_path)
     if not basename.startswith("ptp"):
         return None

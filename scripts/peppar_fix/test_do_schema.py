@@ -577,5 +577,64 @@ class TestValidatorAlone(unittest.TestCase):
         self.assertEqual(validate_characterization(data), [])
 
 
+class TestUidSanitization(unittest.TestCase):
+    """doUidTomlPathSanitization: MAC/path uids must map to sanitized
+    filenames (mirroring do_state._do_path), and equivalent uid spellings
+    that map to one file must co-resolve."""
+
+    def test_safe_uid_maps_colon_and_slash(self):
+        self.assertEqual(do_schema.safe_uid("54:49:4d:45:00:6b"),
+                         "54-49-4d-45-00-6b")
+        self.assertEqual(do_schema.safe_uid("/dev/ptp_i226"),
+                         "_dev_ptp_i226")
+        self.assertEqual(do_schema.safe_uid("ocxo-clkpoc3"), "ocxo-clkpoc3")
+
+    def test_char_path_sanitizes_no_absolute_escape(self):
+        # The smoking gun: f"{uid}.toml" with a path uid escaped dos_dir.
+        p = do_schema._char_path("/dev/ptp_i226", "/state/dos")
+        self.assertEqual(p, "/state/dos/_dev_ptp_i226.toml")
+        # Stem matches do_state._do_path (so .toml and legacy .json co-resolve).
+        from peppar_fix import do_state
+        self.assertEqual(
+            os.path.basename(p),
+            os.path.basename(do_state._do_path("/dev/ptp_i226", "/state/dos"))
+            .replace(".json", ".toml"))
+
+    def test_runtime_path_sanitizes(self):
+        p = do_schema._runtime_path("54:49:4d:45:00:6b", "/x")
+        self.assertEqual(p, "/x/54-49-4d-45-00-6b.runtime.toml")
+
+    def test_colon_mac_request_loads_dash_mac_file(self):
+        # File written under the dash form (as migrate does); engine resolves
+        # the colon MAC (as phc_unique_id returns).  Must co-resolve, not
+        # trip the identity guard.
+        toml = GOOD_CHAR_TOML.replace('do_uid = "ocxo-test"',
+                                       'do_uid = "54-49-4d-45-00-6b"')
+        with _TempDir() as td:
+            _write_char(td, "54-49-4d-45-00-6b", toml)
+            c = load_do_characterization("54:49:4d:45:00:6b", dos_dir=td)
+            self.assertEqual(c.identity["do_uid"], "54-49-4d-45-00-6b")
+
+    def test_genuine_cross_do_mismatch_still_fatal(self):
+        # Sanitize-compare must NOT mask a real cross-DO mismatch.
+        toml = GOOD_CHAR_TOML.replace('do_uid = "ocxo-test"',
+                                       'do_uid = "ocxo-OTHER"')
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", toml)
+            with self.assertRaises(SchemaError):
+                load_do_characterization("ocxo-test", dos_dir=td)
+
+    def test_path_uid_roundtrip_save_load_runtime(self):
+        with _TempDir() as td:
+            rs = RuntimeState(last_known_freq_offset_ppb=152.24,
+                              last_known_dac_code=None,
+                              last_updated="2026-06-16T00:00:00Z")
+            save_runtime_state("/dev/ptp_i226", rs, dos_dir=td)
+            self.assertTrue(os.path.exists(
+                os.path.join(td, "_dev_ptp_i226.runtime.toml")))
+            loaded = load_runtime_state("/dev/ptp_i226", dos_dir=td)
+            self.assertAlmostEqual(loaded.last_known_freq_offset_ppb, 152.24)
+
+
 if __name__ == "__main__":
     unittest.main()
