@@ -1,9 +1,9 @@
-"""Tests for the runtime-state resolution bridge (PR 2c of
-doSchemaEngineIntegration): .runtime.toml-preferred / legacy-json fallback
-reads, .runtime.toml-only writes, and the warm-start check."""
-import json
+"""Tests for runtime_state_resolve (DO operational state).
+
+Post burn-down (PR 4): .runtime.toml only — no legacy-json fallback.  A
+missing runtime file is a cold start (SOURCE_NONE), NOT fatal.
+"""
 import os
-import warnings
 
 import pytest
 
@@ -18,61 +18,33 @@ def _write_runtime_toml(dos_dir, uid, freq, code=None):
     do_schema.save_runtime_state(uid, rs, dos_dir=dos_dir)
 
 
-def _write_legacy_json(dos_dir, uid, freq=-22.0, code=None):
-    state = {"unique_id": uid, "label": uid,
-             "last_known_freq_offset_ppb": freq}
-    if code is not None:
-        state["dac_code_by_temperature"] = {"last": code}
-    with open(os.path.join(dos_dir, f"{uid}.json"), "w") as f:
-        json.dump(state, f)
+# ── read ───────────────────────────────────────────────────────────── #
 
-
-@pytest.fixture(autouse=True)
-def _clear_warn():
-    rsr._warned_legacy.clear()
-    yield
-    rsr._warned_legacy.clear()
-
-
-# ── read ordering ───────────────────────────────────────────────────── #
-
-def test_runtime_toml_preferred(tmp_path):
+def test_reads_runtime_toml(tmp_path):
     d = str(tmp_path)
     _write_runtime_toml(d, "ocxo-a", -21.3, code=32768)
-    _write_legacy_json(d, "ocxo-a", freq=999.0, code=11111)
-    rr = rsr.resolve_runtime_state("ocxo-a", dos_dir=d, json_state_dir=d)
+    rr = rsr.resolve_runtime_state("ocxo-a", dos_dir=d)
     assert rr.source == rsr.SOURCE_RUNTIME_TOML
     assert rr.freq_offset_ppb == pytest.approx(-21.3)
     assert rr.dac_code == 32768
 
 
-def test_legacy_fallback_with_dac_table(tmp_path):
+def test_legacy_json_ignored(tmp_path):
+    # A leftover legacy .json must NOT be read post burn-down → cold start.
+    import json
     d = str(tmp_path)
-    _write_legacy_json(d, "ocxo-b", freq=-44.5, code=40615)
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        rr = rsr.resolve_runtime_state("ocxo-b", dos_dir=d, json_state_dir=d)
-    assert rr.source == rsr.SOURCE_LEGACY
-    assert rr.freq_offset_ppb == pytest.approx(-44.5)
-    assert rr.dac_code == 40615
-    assert any(issubclass(x.category, DeprecationWarning) for x in w)
-
-
-def test_none_when_neither(tmp_path):
-    rr = rsr.resolve_runtime_state("ghost", dos_dir=str(tmp_path),
-                                   json_state_dir=str(tmp_path))
+    with open(os.path.join(d, "ocxo-b.json"), "w") as f:
+        json.dump({"unique_id": "ocxo-b", "last_known_freq_offset_ppb": -44.5,
+                   "dac_code_by_temperature": {"last": 40615}}, f)
+    rr = rsr.resolve_runtime_state("ocxo-b", dos_dir=d)
     assert rr.source == rsr.SOURCE_NONE
     assert rr.freq_offset_ppb is None and rr.dac_code is None
 
 
-def test_legacy_deprecation_one_shot(tmp_path):
-    d = str(tmp_path)
-    _write_legacy_json(d, "ocxo-c")
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        rsr.resolve_runtime_state("ocxo-c", dos_dir=d, json_state_dir=d)
-        rsr.resolve_runtime_state("ocxo-c", dos_dir=d, json_state_dir=d)
-    assert sum(issubclass(x.category, DeprecationWarning) for x in w) == 1
+def test_none_when_absent(tmp_path):
+    rr = rsr.resolve_runtime_state("ghost", dos_dir=str(tmp_path))
+    assert rr.source == rsr.SOURCE_NONE
+    assert rr.freq_offset_ppb is None and rr.dac_code is None
 
 
 # ── writes go to .runtime.toml, preserving the other field ──────────── #
@@ -96,30 +68,15 @@ def test_update_dac_preserves_freq(tmp_path):
     assert rr.freq_offset_ppb == pytest.approx(-18.0)   # preserved
 
 
-def test_update_seeds_from_legacy_on_first_write(tmp_path):
-    # First write with only a legacy .json present must seed the other
-    # field from legacy, not clobber it.
-    d = str(tmp_path)
-    _write_legacy_json(d, "ocxo-f", freq=-30.0, code=35000)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        rsr.update_runtime_freq("ocxo-f", -31.0, dos_dir=d, json_state_dir=d)
-    rr = rsr.resolve_runtime_state("ocxo-f", dos_dir=d, json_state_dir=d)
-    assert rr.source == rsr.SOURCE_RUNTIME_TOML   # now toml-backed
-    assert rr.freq_offset_ppb == pytest.approx(-31.0)
-    assert rr.dac_code == 35000                   # seeded from legacy
-
-
 def test_dac_only_write_no_prior_freq_leaves_freq_unknown(tmp_path):
-    # update_runtime_dac_code with NO prior freq anywhere must NOT persist a
-    # misleading 0.0 — freq stays unknown (Main's PR #176 nit). A crash in
-    # this window then warm-starts at "unknown", not 0.0 ppb.
+    # update_runtime_dac_code with NO prior freq must NOT persist a
+    # misleading 0.0 — freq stays unknown (Main's PR #176 nit).
     d = str(tmp_path)
     rsr.update_runtime_dac_code("ocxo-z", 33000, dos_dir=d)
     rr = rsr.resolve_runtime_state("ocxo-z", dos_dir=d)
     assert rr.dac_code == 33000
     assert rr.freq_offset_ppb is None          # NOT 0.0
-    ok, info = rsr.is_warm_startable("ocxo-z", dos_dir=d, json_state_dir=d)
+    ok, info = rsr.is_warm_startable("ocxo-z", dos_dir=d)
     assert not ok and info["reason"] == "no_last_known_freq"
 
 
@@ -135,28 +92,18 @@ def test_update_freq_writes_toml_not_json(tmp_path):
 def test_warm_startable_from_toml(tmp_path):
     d = str(tmp_path)
     _write_runtime_toml(d, "ocxo-h", -22.0, code=32768)
-    ok, info = rsr.is_warm_startable("ocxo-h", dos_dir=d, json_state_dir=d)
+    ok, info = rsr.is_warm_startable("ocxo-h", dos_dir=d)
     assert ok and info["source"] == rsr.SOURCE_RUNTIME_TOML
     assert info["freq_ppb"] == pytest.approx(-22.0)
-
-
-def test_warm_startable_legacy_fallback(tmp_path):
-    d = str(tmp_path)
-    _write_legacy_json(d, "ocxo-i", freq=-22.0)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        ok, info = rsr.is_warm_startable("ocxo-i", dos_dir=d, json_state_dir=d)
-    assert ok and info["source"] == rsr.SOURCE_LEGACY
 
 
 def test_warm_start_rejects_out_of_envelope(tmp_path):
     d = str(tmp_path)
     _write_runtime_toml(d, "ocxo-j", 5000.0)   # absurd freq
-    ok, info = rsr.is_warm_startable("ocxo-j", dos_dir=d, json_state_dir=d)
+    ok, info = rsr.is_warm_startable("ocxo-j", dos_dir=d)
     assert not ok and "out_of_envelope" in info["reason"]
 
 
 def test_warm_start_no_file(tmp_path):
-    ok, info = rsr.is_warm_startable("ghost", dos_dir=str(tmp_path),
-                                     json_state_dir=str(tmp_path))
+    ok, info = rsr.is_warm_startable("ghost", dos_dir=str(tmp_path))
     assert not ok and info["reason"] == "no_state_file"

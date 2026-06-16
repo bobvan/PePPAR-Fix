@@ -7097,38 +7097,21 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                  bootstrap_base_freq, current_adj,
                  current_adj - bootstrap_base_freq)
 
-    # doProcessNoiseFromChar / qFromCharPerActuator: prefer process
-    # noise derived from a measured DO characterization; fall back to a
-    # PER-ACTUATOR-TYPE floor (not a universal 0.92 ns literal) only
-    # when no char exists.
+    # Q inputs come from the per-section .toml characterization, resolved
+    # through do_char_resolve.  ONE resolve serves the σ_DO derivation here,
+    # the coast-cap below, and the σ_q below.  The schema fills class
+    # defaults for absent sections, so a registered DO always yields
+    # complete Q scalars with honest provenance.
     #
-    # The real win is the char-derived path below: a freerun char now
-    # drives Q[3,3] (sigma_do_freq) from the rising-ADEV (RWFM) tail —
-    # the coast/convergence knob (Main, qFromCharPerActuator).  Q[3,3],
-    # not Q[2,2] (phase), governs coast P-growth: the freq-state
-    # uncertainty integrates into phase (Var_φ≈q_f·τ³/3), so an
-    # under-set Q[3,3] makes the filter overconfident and diverge on a
-    # long coast.
-    #
-    # The fallback below is per-actuator-STRUCTURED but currently
-    # behavior-preserving (same values for all types) — NOT inventing a
-    # pessimistic uncharacterized-OCXO freq constant here.  The honest
-    # path for an OCXO host is to run do_freerun_char so Q comes from
-    # ADEV.  Differentiating the uncharacterized-OCXO floor is a
-    # follow-up that needs a measured value or an agreed constant +
-    # closedLoopServoSim validation, not a guess.
-    # doSchemaEngineIntegration PR 2b: resolve the DO's Q inputs through the
-    # single characterization bridge (prefers state/dos/<uid>.toml, falls
-    # back to the legacy <uid>.json with a one-shot deprecation).  ONE
-    # resolve call serves the σ_DO derivation here, the coast-cap below, and
-    # the σ_q below — replacing three separate load_do_state reads + the
-    # derive_* heuristics.  The new schema fills class defaults for absent
-    # sections, so a registered .toml always yields complete Q scalars with
-    # honest provenance.
-    _PHASE_FALLBACK_NS = 0.92
-    _q_phase_source = f"fallback[{actuator_type}]"
-    _q_freq_source = f"fallback[{actuator_type}]"
-    sigma_do_phase_ns_eff = _PHASE_FALLBACK_NS
+    # Burn-down (PR 4): there is NO legacy fallback and NO silent Q default.
+    # An unregistered or invalid DO RAISES (→ SystemExit below); the engine
+    # refuses to discipline it.  The only place the placeholder init below
+    # survives is when no DO/servo is configured at all (do_uid_local None),
+    # where the servo Q is moot — the value mirrors DOFreqEst's own
+    # constructor default rather than a separate "fallback" knob.
+    _q_phase_source = "no-DO-configured"
+    _q_freq_source = "no-DO-configured"
+    sigma_do_phase_ns_eff = 0.92          # = DOFreqEst() default; no-DO only
     sigma_do_freq_ppb_eff = args.kalman_sigma_freq
     _engine_char = None
     if do_uid_local is not None:
@@ -7136,45 +7119,31 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             resolve_engine_characterization, format_provenance_log)
         from peppar_fix.do_schema import SchemaError
         try:
-            _engine_char = resolve_engine_characterization(
-                do_uid_local,
-                dac_ppb_per_code=getattr(args, 'dac_ppb_per_code', None))
+            _engine_char = resolve_engine_characterization(do_uid_local)
             for _ln in format_provenance_log(do_uid_local, _engine_char):
                 log.info("%s", _ln)
-            if _engine_char.sigma_do_phase_ns is not None:
-                sigma_do_phase_ns_eff = _engine_char.sigma_do_phase_ns
-                _q_phase_source = _engine_char.provenance.get(
-                    "freerun_noise.sigma_do_phase_ns",
-                    _engine_char.provenance.get("freerun_noise",
-                                                _engine_char.schema))
-            if _engine_char.sigma_do_freq_ppb is not None:
-                sigma_do_freq_ppb_eff = _engine_char.sigma_do_freq_ppb
-                _q_freq_source = _engine_char.provenance.get(
-                    "freerun_noise.sigma_do_freq_ppb",
-                    _engine_char.provenance.get("freerun_noise",
-                                                _engine_char.schema))
-        except SchemaError as e:
-            # A .toml that EXISTS but fails validation (bad schema_version,
-            # do_uid↔filename mismatch, measured-missing-field) is
-            # present-but-invalid → FATAL.  Swallowing it would silently run
-            # the engine on the generic Q fallback AND bypass the steering
-            # gate — the exact silent-degradation #172's validator prevents.
-            # Caught SEPARATELY from the broad handler below (Main's PR2
-            # must-fix).  Remove the file (→ legacy/bootstrap) or fix it.
-            raise SystemExit(
-                f"DO {do_uid_local}: characterization file is present but "
-                f"INVALID — {e}.  Fix state/dos/{do_uid_local}.toml (or "
-                f"remove it to fall back to legacy/bootstrap).") from e
+            sigma_do_phase_ns_eff = _engine_char.sigma_do_phase_ns
+            _q_phase_source = _engine_char.provenance.get(
+                "freerun_noise", _engine_char.schema)
+            sigma_do_freq_ppb_eff = _engine_char.sigma_do_freq_ppb
+            _q_freq_source = _engine_char.provenance.get(
+                "freerun_noise", _engine_char.schema)
         except Exception as e:
-            # Genuinely unexpected (non-schema) failure → soft fallback,
-            # the transition-safe path for transient issues on a host.
-            log.warning("Could not resolve DO characterization for %s: %s "
-                        "— using Q fallback", do_uid_local, e)
+            # Unregistered DO (no .toml), present-but-invalid .toml (bad
+            # schema_version, do_uid↔filename mismatch, measured-missing-
+            # field), or any other resolve failure is FATAL — there is no
+            # silent Q fallback for a configured DO.  Register the DO
+            # (do_register.py + do_*_char.py, or migrate_do_state.py for a
+            # legacy host), or fix the .toml.
+            raise SystemExit(
+                f"DO {do_uid_local}: cannot resolve characterization — {e}"
+            ) from e
     # Steering-MISSING refuse-to-actuate (Main nit 2): a DO whose actuator
-    # gain was never measured must not be disciplined.  Only enforced on the
-    # new .toml path (legacy JSON never reports steering MISSING — the gate
-    # stays dormant through the transition).  --allow-default-steering is the
-    # first-boot bring-up escape hatch (removed in the PR 4 burn-down).
+    # gain was never measured must not be disciplined.  --allow-default-
+    # steering is the escape hatch the hosts currently run with (their
+    # [steering] is still class-default/MISSING); it is removed — and
+    # uncalibrated actuation refused unconditionally — once do_steering_char
+    # has populated measured [steering] fleet-wide (gated; not this PR).
     if _engine_char is not None:
         from peppar_fix.do_char_resolve import should_refuse_for_steering
         _refuse_steering = should_refuse_for_steering(
@@ -7225,20 +7194,16 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
 
     # schedulerGoldilocksBreakeven: σ_actuator_q for the quiet-regime
     # breakeven formula τ = (σ_q / (k · σ_DO(1s)))^(1/slope).
-    # σ_q: prefer the resolved characterization (.toml
-    # [actuation_noise].sigma_q_ns — Bravo's measured value, in ns; or the
-    # legacy dac_ppb_per_code identity surfaced by the bridge).  Fall back to
-    # the raw --dac-ppb-per-code only when no characterization resolved
-    # (SCHEMA_NONE).  Switching the source off --dac-ppb-per-code is Bravo's
-    # forward note from the #172 review — so the measured σ_q actually
-    # reaches Goldilocks instead of the theoretical LSB identity.
+    # σ_q from the resolved characterization (.toml [actuation_noise].
+    # sigma_q_ns — Bravo's measured value, in ns; measured or class-default).
+    # The raw --dac-ppb-per-code is only a last resort for the no-DO-
+    # configured case (no _engine_char); a registered DO always supplies it.
     _sigma_actuator_q_ns = None
     _sigma_q_source = None
     if _engine_char is not None and _engine_char.sigma_q_ns is not None:
         _sigma_actuator_q_ns = float(_engine_char.sigma_q_ns)
         _sigma_q_source = _engine_char.provenance.get(
-            "actuation_noise.sigma_q_ns",
-            _engine_char.provenance.get("actuation_noise", _engine_char.schema))
+            "actuation_noise", _engine_char.schema)
     _ppb_per_code = getattr(args, 'dac_ppb_per_code', None)
     if (_sigma_actuator_q_ns is None
             and _ppb_per_code is not None and _ppb_per_code != 0.0):
