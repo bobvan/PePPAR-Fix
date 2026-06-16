@@ -45,7 +45,14 @@ SCHEMA_VERSION = "1"
 
 
 # Default directory.  Overridable per call (for tests, alt-state-dir).
-DEFAULT_DOS_DIR = os.path.expanduser("~/peppar-fix/state/dos")
+#
+# Repo-relative (matches do_state.DO_STATE_DIR) so the new schema and the
+# legacy JSON resolve to the SAME state/dos on every host.  On lab hosts the
+# checkout IS ~/peppar-fix so this equals ~/peppar-fix/state/dos; the earlier
+# hard-coded expanduser diverged from do_state on the dev box (repo =
+# ~/git/PePPAR-Fix), a migration/tooling trap flagged in PR #176 review.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DEFAULT_DOS_DIR = os.path.join(_REPO_ROOT, "state", "dos")
 
 
 # Allowed measurement channels for [freerun_noise].
