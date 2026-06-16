@@ -5580,6 +5580,15 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     if _t_c is not None:
                         log.info("[TEMP_C] sensor=%s addr=0x%02x t=%.3f",
                                  _temp_sensor.label, _temp_sensor.addr, _t_c)
+                # On-board RPi thermal zones (CPU etc.) — always logged when
+                # present, even with no I2C sensor, as a DO-environment proxy
+                # for the temperature-correlation analysis (PiFace pre-dawn
+                # excursion clustering, 2026-06-16).
+                from peppar_fix.temp_sensor import read_onboard_temps
+                _board = read_onboard_temps()
+                if _board:
+                    log.info("[TEMP_BOARD] %s", " ".join(
+                        f"{k}={v:.2f}" for k, v in _board.items()))
 
             # [CONFIDENCE_*] periodic log lines — see slice 9 of
             # docs/position-state-and-monitoring.md.  Three sibling
