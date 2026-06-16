@@ -4187,7 +4187,9 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     log.info(f"Position: {lat:.6f}, {lon:.6f}, {alt:.1f}m")
 
     # Optional ambient/oven temp sensor.  Silent no-error when absent.
-    from peppar_fix.temp_sensor import TempSensor
+    # read_onboard_temps (RPi thermal zones) imported here too so the
+    # every-60-epoch [TEMP_BOARD] log doesn't re-import in the hot loop.
+    from peppar_fix.temp_sensor import TempSensor, read_onboard_temps
     _temp_sensor = TempSensor(bus_num=1)
 
     # Cache mount_sn for the [CONFIDENCE] periodic log line.  See
@@ -5583,8 +5585,9 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 # On-board RPi thermal zones (CPU etc.) — always logged when
                 # present, even with no I2C sensor, as a DO-environment proxy
                 # for the temperature-correlation analysis (PiFace pre-dawn
-                # excursion clustering, 2026-06-16).
-                from peppar_fix.temp_sensor import read_onboard_temps
+                # excursion clustering, 2026-06-16).  NB (bravo #179 review):
+                # SoC temp is confounded by CPU load — a relaunch's CPU burst
+                # self-heats; control for load when correlating.
                 _board = read_onboard_temps()
                 if _board:
                     log.info("[TEMP_BOARD] %s", " ".join(
