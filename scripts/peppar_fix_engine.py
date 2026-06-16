@@ -7108,39 +7108,80 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     # ADEV.  Differentiating the uncharacterized-OCXO floor is a
     # follow-up that needs a measured value or an agreed constant +
     # closedLoopServoSim validation, not a guess.
+    # doSchemaEngineIntegration PR 2b: resolve the DO's Q inputs through the
+    # single characterization bridge (prefers state/dos/<uid>.toml, falls
+    # back to the legacy <uid>.json with a one-shot deprecation).  ONE
+    # resolve call serves the σ_DO derivation here, the coast-cap below, and
+    # the σ_q below — replacing three separate load_do_state reads + the
+    # derive_* heuristics.  The new schema fills class defaults for absent
+    # sections, so a registered .toml always yields complete Q scalars with
+    # honest provenance.
     _PHASE_FALLBACK_NS = 0.92
     _q_phase_source = f"fallback[{actuator_type}]"
     _q_freq_source = f"fallback[{actuator_type}]"
     sigma_do_phase_ns_eff = _PHASE_FALLBACK_NS
     sigma_do_freq_ppb_eff = args.kalman_sigma_freq
+    _engine_char = None
     if do_uid_local is not None:
+        from peppar_fix.do_char_resolve import (
+            resolve_engine_characterization, format_provenance_log)
+        from peppar_fix.do_schema import SchemaError
         try:
-            from peppar_fix.do_state import derive_do_process_noise
-            _ds = load_do_state(do_uid_local)
-            if _ds and _ds.get('characterization'):
-                derived = derive_do_process_noise(_ds['characterization'])
-                if derived:
-                    p = derived.get('sigma_do_phase_ns')
-                    f = derived.get('sigma_do_freq_ppb')
-                    if p is not None:
-                        log.info("DOFreqEst: sigma_do_phase override from "
-                                 "characterization: %.4f ns/√s (source=%s, "
-                                 "was %.4f)",
-                                 p, derived.get('sigma_do_phase_source'),
-                                 sigma_do_phase_ns_eff)
-                        sigma_do_phase_ns_eff = p
-                        _q_phase_source = derived.get('sigma_do_phase_source')
-                    if f is not None:
-                        log.info("DOFreqEst: sigma_do_freq override from "
-                                 "characterization: %.4f ppb/√s (source=%s, "
-                                 "was %.4f)",
-                                 f, derived.get('sigma_do_freq_source'),
-                                 sigma_do_freq_ppb_eff)
-                        sigma_do_freq_ppb_eff = f
-                        _q_freq_source = derived.get('sigma_do_freq_source')
+            _engine_char = resolve_engine_characterization(
+                do_uid_local,
+                dac_ppb_per_code=getattr(args, 'dac_ppb_per_code', None))
+            for _ln in format_provenance_log(do_uid_local, _engine_char):
+                log.info("%s", _ln)
+            if _engine_char.sigma_do_phase_ns is not None:
+                sigma_do_phase_ns_eff = _engine_char.sigma_do_phase_ns
+                _q_phase_source = _engine_char.provenance.get(
+                    "freerun_noise.sigma_do_phase_ns",
+                    _engine_char.provenance.get("freerun_noise",
+                                                _engine_char.schema))
+            if _engine_char.sigma_do_freq_ppb is not None:
+                sigma_do_freq_ppb_eff = _engine_char.sigma_do_freq_ppb
+                _q_freq_source = _engine_char.provenance.get(
+                    "freerun_noise.sigma_do_freq_ppb",
+                    _engine_char.provenance.get("freerun_noise",
+                                                _engine_char.schema))
+        except SchemaError as e:
+            # A .toml that EXISTS but fails validation (bad schema_version,
+            # do_uid↔filename mismatch, measured-missing-field) is
+            # present-but-invalid → FATAL.  Swallowing it would silently run
+            # the engine on the generic Q fallback AND bypass the steering
+            # gate — the exact silent-degradation #172's validator prevents.
+            # Caught SEPARATELY from the broad handler below (Main's PR2
+            # must-fix).  Remove the file (→ legacy/bootstrap) or fix it.
+            raise SystemExit(
+                f"DO {do_uid_local}: characterization file is present but "
+                f"INVALID — {e}.  Fix state/dos/{do_uid_local}.toml (or "
+                f"remove it to fall back to legacy/bootstrap).") from e
         except Exception as e:
-            log.warning("Could not derive DO process noise from "
-                        "characterization: %s", e)
+            # Genuinely unexpected (non-schema) failure → soft fallback,
+            # the transition-safe path for transient issues on a host.
+            log.warning("Could not resolve DO characterization for %s: %s "
+                        "— using Q fallback", do_uid_local, e)
+    # Steering-MISSING refuse-to-actuate (Main nit 2): a DO whose actuator
+    # gain was never measured must not be disciplined.  Only enforced on the
+    # new .toml path (legacy JSON never reports steering MISSING — the gate
+    # stays dormant through the transition).  --allow-default-steering is the
+    # first-boot bring-up escape hatch (removed in the PR 4 burn-down).
+    if _engine_char is not None:
+        from peppar_fix.do_char_resolve import should_refuse_for_steering
+        _refuse_steering = should_refuse_for_steering(
+            _engine_char,
+            has_servo=bool(getattr(args, 'servo', None)),
+            allow_default_steering=getattr(args, 'allow_default_steering',
+                                           False))
+    else:
+        _refuse_steering = False
+    if _refuse_steering:
+        raise SystemExit(
+            f"DO {do_uid_local}: [steering] provenance is "
+            f"{_engine_char.steering_provenance!r} (not measured) — refusing "
+            f"to actuate an uncalibrated actuator.  Run "
+            f"scripts/do_steering_char.py, or pass --allow-default-steering "
+            f"for first-boot bring-up.")
     log.info("DOFreqEst Q: sigma_do_phase=%.4f ns/√s (%s), "
              "sigma_do_freq=%.4f ppb/√s (%s)",
              sigma_do_phase_ns_eff, _q_phase_source,
@@ -7152,52 +7193,51 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     # Also extracts sigma_freerun_short_ns = TDEV(1s) for the
     # schedulerNoiseFloorCadence transient detector (independent of
     # --coast-cap; engages whenever DO characterization is available).
-    _coast_tdev = None
+    # Coast-cap TDEV power law comes from the same resolved characterization
+    # (.toml [freerun_noise].coast_tdev_ref_ns + coast_tdev_slope, or the
+    # legacy derive_coast_tdev_from_char fit).  tau_ref is fixed at 1.0 s so
+    # tdev_ref_ns IS TDEV(1s) — the per-DO σ_freerun the noise-floor cadence
+    # heuristic compares |err| against.
+    _coast_tdev = _engine_char.coast_tdev if _engine_char is not None else None
     _sigma_freerun_short_ns = None
-    if do_uid_local is not None:
-        try:
-            from peppar_fix.do_state import derive_coast_tdev_from_char
-            _ds_cc = load_do_state(do_uid_local)
-            if _ds_cc and _ds_cc.get('characterization'):
-                _coast_tdev = derive_coast_tdev_from_char(
-                    _ds_cc['characterization'])
-                if _coast_tdev is not None:
-                    # derive_coast_tdev_from_char fits tau_ref=1.0, so
-                    # tdev_ref_ns IS TDEV(1s) by construction.  This is
-                    # the per-DO σ_freerun the noise-floor cadence
-                    # heuristic compares |err| against.
-                    _sigma_freerun_short_ns = float(_coast_tdev[0])
-                    log.info(
-                        "scheduler: DO freerun σ(1s)=%.4f ns (slope=%+.3f) "
-                        "— noise-floor cadence active",
-                        _coast_tdev[0], _coast_tdev[1])
-                else:
-                    log.info("scheduler: no usable TDEV curve in "
-                             "characterization for %s — falling back to "
-                             "legacy d_physical cadence (pull-magnitude-"
-                             "dependent)", do_uid_local)
-        except Exception as e:
-            log.warning("scheduler: could not derive freerun TDEV params: "
-                        "%s — falling back to legacy d_physical cadence", e)
+    if _coast_tdev is not None:
+        _sigma_freerun_short_ns = float(_coast_tdev[0])
+        log.info("scheduler: DO freerun σ(1s)=%.4f ns (slope=%+.3f) "
+                 "— noise-floor cadence active",
+                 _coast_tdev[0], _coast_tdev[1])
+    elif do_uid_local is not None:
+        log.info("scheduler: no usable TDEV curve in characterization for %s "
+                 "— falling back to legacy d_physical cadence "
+                 "(pull-magnitude-dependent)", do_uid_local)
     if getattr(args, 'coast_cap', False) and _coast_tdev is None:
         log.warning("coast-cap requested but no usable TDEV curve in "
                     "characterization for %s — TDEV cap disabled "
                     "(P22 cap still active)", do_uid_local)
 
     # schedulerGoldilocksBreakeven: σ_actuator_q for the quiet-regime
-    # breakeven formula τ = (σ_q / (k · σ_DO(1s)))^(1/slope).  For DAC
-    # actuators this is the LSB phase quantum integrated over 1 s of
-    # coast: 1 ppb of frequency offset = 1 ns of phase per second, so
-    # σ_q (ns) = |dac_ppb_per_code|.  For PHC actuators adjfine's LSB
-    # (2^-16 ppm ≈ 1.5e-5 ppb) is effectively zero — leave σ_q=None and
-    # the scheduler falls back to max_interval-bounded coasting.
+    # breakeven formula τ = (σ_q / (k · σ_DO(1s)))^(1/slope).
+    # σ_q: prefer the resolved characterization (.toml
+    # [actuation_noise].sigma_q_ns — Bravo's measured value, in ns; or the
+    # legacy dac_ppb_per_code identity surfaced by the bridge).  Fall back to
+    # the raw --dac-ppb-per-code only when no characterization resolved
+    # (SCHEMA_NONE).  Switching the source off --dac-ppb-per-code is Bravo's
+    # forward note from the #172 review — so the measured σ_q actually
+    # reaches Goldilocks instead of the theoretical LSB identity.
     _sigma_actuator_q_ns = None
+    _sigma_q_source = None
+    if _engine_char is not None and _engine_char.sigma_q_ns is not None:
+        _sigma_actuator_q_ns = float(_engine_char.sigma_q_ns)
+        _sigma_q_source = _engine_char.provenance.get(
+            "actuation_noise.sigma_q_ns",
+            _engine_char.provenance.get("actuation_noise", _engine_char.schema))
     _ppb_per_code = getattr(args, 'dac_ppb_per_code', None)
-    if _ppb_per_code is not None and _ppb_per_code != 0.0:
+    if (_sigma_actuator_q_ns is None
+            and _ppb_per_code is not None and _ppb_per_code != 0.0):
         _sigma_actuator_q_ns = abs(float(_ppb_per_code))
-        log.info("scheduler: DAC σ_actuator_q=%.4f ns/LSB "
-                 "(from --dac-ppb-per-code=%.6f)",
-                 _sigma_actuator_q_ns, _ppb_per_code)
+        _sigma_q_source = "fallback:--dac-ppb-per-code"
+    if _sigma_actuator_q_ns is not None:
+        log.info("scheduler: σ_actuator_q=%.4f ns (source=%s)",
+                 _sigma_actuator_q_ns, _sigma_q_source)
         if _coast_tdev is not None:
             # Log the predicted Goldilocks cadence as a sanity check;
             # actual scheduler decision happens at runtime via the
@@ -11339,6 +11379,14 @@ Two-phase operation:
                             "characterized freerun noise floor (from "
                             "state/dos/<uid>.json).  Complements the "
                             "chi² gate — keys on physics, not filter state.")
+    servo.add_argument("--allow-default-steering", action="store_true",
+                       default=False,
+                       help="Permit actuation when the DO's [steering] "
+                            "characterization is class-default or MISSING "
+                            "(first-boot bring-up).  Without it the engine "
+                            "refuses to discipline an uncalibrated actuator "
+                            "on the new .toml schema.  Removed in the "
+                            "doCharacterizationArchitecture burn-down (PR 4).")
     servo.add_argument("--ocxo-trusted-k-sigma", type=float, default=10.0,
                        help="OCXO gate confidence multiplier.  Threshold = "
                             "K × σ_DO × √dt.  Default 10.0.")
