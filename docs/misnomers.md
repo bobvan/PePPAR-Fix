@@ -588,18 +588,46 @@ Arm 4's "corrected" differential gets chi²-rejected, the
 diagnosis path doesn't immediately point at the prediction
 model because of the qErr label.
 
-**Proposed**: rename `_qerr` → `_predicted_pps_phase_from_tcxo`
-(or `_pps_edge_from_x0`) and rename the route label
-`internal-qerr` → `model-predicted`.  Keep `external-qErr`
-unchanged — that one *is* the firmware quantization error and
-the camelCase reinforces it's a vendor field.
+**Proposed**: two surfaces, very different blast radius —
+verified 2026-06-16.
 
-**Notes**: not a blast-radius rename; touches `_qerr`, the
-`routed_qerr` flag, two router-test files, and the
-`routedQErrArm` design doc (`docs/routed-qerr-router-v2-qvir.md`).
-Worth doing the next time `do_freq_est.py` is opened for
-unrelated work.  See `docs/pps-ppp-error-source.md` for the
-underlying physics that motivates the rename.
+1. *Function* `_qerr` → `_predicted_pps_phase_from_tcxo` (or
+   `_pps_edge_from_x0`).  Module-private: 1 def (`do_freq_est.py:77`)
+   + 3 call sites (`do_freq_est.py:304`, `:598`, `servo_sim.py:553`),
+   all internal Python — a pure rename, fails loudly if a site is
+   missed, zero external footprint.  Free to do anytime.  (Mind the
+   unrelated namesakes — `set_pending_ref_qerr`, `ppp_qerr` in
+   `error_sources.py`, `test_reject_qerr` — leave those.)
+
+2. *Conceptual label* in human-facing text — comments, docstrings,
+   and the `routedQErrArm` design doc
+   (`docs/routed-qerr-router-v2-qvir.md`) that read "internal-qerr" —
+   reword to "model-predicted".  Kills the misleading framing where
+   it actually confuses readers; no code/data impact.
+
+Keep `external-qErr` unchanged — that one *is* the firmware
+quantization error and the camelCase reinforces it's a vendor
+field.
+
+**Deliberately NOT renaming**: the *emitted* route token `'int'`
+(the `'ext'/'int'/'raw'` triad).  It's the value written to the
+`ticc_route` column of the servo-log CSV (`peppar_fix_engine.py:4589`,
+`:8998`) and the `[ROUTED_QERR] … int=…` run.log line (`:9077-9082`),
+plus ~12 assertions across four test files (`test_routed_qerr_arm.py`,
+`test_routed_qerr_arm_v2.py`, `test_servo_sim.py`,
+`test_binary_layer.py`).  Renaming it would split the on-disk CSV
+vocabulary (archived captures say `int`, new ones wouldn't) for a
+column that is currently write-only telemetry — no analysis tool
+parses it today (grep of `tools/`, 2026-06-16).  Low value, real
+data-format churn → leave the 3-char token alone.  (Bob, 2026-06-16:
+"changing 'int' sounds too messy.")
+
+**Notes**: blast radius verified 2026-06-16 — the original "not a
+blast-radius rename" was right about the function but glossed the
+emitted-token surface.  Surfaces 1 & 2 are free; do them
+opportunistically the next time `do_freq_est.py` is open.  Defer the
+`'int'` token indefinitely.  See `docs/pps-ppp-error-source.md` for
+the underlying physics that motivates the rename.
 
 ## Adding to this list
 
