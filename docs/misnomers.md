@@ -552,7 +552,7 @@ ask.
 
 ## 2026-06-15
 
-### `_qerr(x[0])` / `internal-qerr` route — misleading
+### `_qerr(x[0])` / `internal-qerr` route — Dangerous
 
 **Where**: `scripts/peppar_fix/do_freq_est.py` — function `_qerr`,
 referenced in the Arm 4 (TICC) corrected-differential calculation
