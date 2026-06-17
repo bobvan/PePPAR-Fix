@@ -62,11 +62,21 @@ Do NOT use `write_byte_data(addr, 0xFC, page)` — that's the 8A34002
 | 0x2E | WRITE_PHASE_TIMER | 1 | |
 | 0x35 | REF_MODE | 1 | 0=automatic, 1=manual, 2=gpio, 3=slave |
 | 0x36 | PHASE_MEASUREMENT_CFG | 1 | |
-| 0x37 | MODE | 1 | pll_mode[2:0], state_mode[4:3] |
+| 0x37 | MODE | 1 | pll_mode[5:3], state_mode[2:0] |
 
 ### DPLL_MODE encoding
 
-Bits [2:0] — PLL mode:
+> **Corrected 2026-06-17 (PR #185 review).** This section previously
+> listed `pll_mode[2:0]` / `state_mode[4:3]`, which is **wrong** — it
+> would have callers write `phase_meas=0x05` / `write_freq=0x02`, the
+> latter actually selecting a *state* bit (force-lock), not write_freq.
+> The fields are `pll_mode[5:3]` and `state_mode[2:0]`.  Ground truth:
+> the running, TICC-confirmed actuator `scripts/peppar_fix/clockmatrix_actuator.py`
+> (`_PLL_MODE_SHIFT=3`, `_PLL_MODE_MASK=0x07<<3`, write_freq=`0x10`).
+> So **write_freq = 2 << 3 = `0x10`** and **phase_meas = 5 << 3 = `0x28`**.
+
+Bits [5:3] — PLL mode (write the value `<< 3`; e.g. write_freq=`0x10`,
+phase_meas=`0x28`):
 
 | Value | Name | Description |
 |-------|------|-------------|
@@ -78,7 +88,7 @@ Bits [2:0] — PLL mode:
 | 5 | phase_meas | Phase measurement only |
 | 6 | disabled | DPLL off |
 
-Bits [4:3] — State mode:
+Bits [2:0] — State mode:
 
 | Value | Name | Description |
 |-------|------|-------------|
@@ -88,8 +98,8 @@ Bits [4:3] — State mode:
 | 3 | force_holdover | Force holdover (keep last freq) |
 
 **Runtime writes to MODE stick on the 8A34002.** Confirmed 2026-04-04:
-wrote pll_mode=2 (write_freq) to DPLL_2, read back confirmed. No
-Timing Commander or EEPROM reprogramming needed.
+wrote pll_mode=2 (write_freq) — i.e. byte `0x10` (`2 << 3`) — to DPLL_2,
+read back confirmed. No Timing Commander or EEPROM reprogramming needed.
 
 ## DPLL control registers (frequency/phase write targets)
 
