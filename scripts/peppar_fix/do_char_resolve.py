@@ -48,11 +48,21 @@ class EngineCharacterization:
     coast_tdev: Optional[tuple] = None
     sigma_q_ns: Optional[float] = None            # actuator per-write noise
     steering: dict = field(default_factory=dict)  # measured steering, else {}
+    actuator_type: Optional[str] = None           # [identity].actuator_type
     provenance: dict = field(default_factory=dict)  # section -> source str
 
     @property
     def steering_provenance(self) -> str:
         return self.provenance.get("steering", "absent")
+
+
+# Actuators whose steering gain is a PER-UNIT quantity that must be MEASURED
+# (the DAC's EFC slope, ppb/code, varies per oscillator → do_steering_char).
+# PHC_adjfine and ClockMatrix_FCW are deliberately absent: their gain is an
+# exact, fixed hardware constant (the PTP-clock / ClockMatrix register→freq
+# mapping), so there is nothing to characterize and no [steering] measurement
+# to demand — the refuse gate must not fire on them.
+STEERING_MEASURED_REQUIRED = ("DAC",)
 
 
 def _resolve_from_toml(do_uid: str, dos_dir: Optional[str]
@@ -75,6 +85,7 @@ def _resolve_from_toml(do_uid: str, dos_dir: Optional[str]
         coast_tdev=coast,
         sigma_q_ns=(None if sq is None else float(sq)),
         steering=dict(c.steering),
+        actuator_type=c.identity.get("actuator_type"),
         provenance=dict(c.provenance))
 
 
@@ -104,21 +115,23 @@ def resolve_engine_characterization(
 
 
 def should_refuse_for_steering(ec: EngineCharacterization, *,
-                               has_servo: bool,
-                               allow_default_steering: bool) -> bool:
-    """Engine policy: refuse to actuate an uncalibrated actuator.
+                               has_servo: bool) -> bool:
+    """Engine policy: refuse to actuate an actuator whose MEASURABLE steering
+    gain was never measured.
 
-    True only when ALL hold: [steering] provenance is not "measured"
-    (class-default or MISSING), a servo/actuator is configured, and the
-    operator hasn't opted in with --allow-default-steering.  The escape
-    hatch stays until do_steering_char has populated measured [steering] on
-    the hosts (they currently run with --allow-default-steering); only then
-    is the flag removed and uncalibrated actuation refused unconditionally.
+    True only when ALL hold: a servo/actuator is configured, the DO is on the
+    .toml schema, the actuator's gain is a per-unit MEASURABLE quantity
+    (STEERING_MEASURED_REQUIRED — DAC), and its [steering] provenance is not
+    "measured".  Actuator-aware: a PHC_adjfine / ClockMatrix_FCW gain is an
+    intrinsic hardware constant (nothing to measure), so the gate never fires
+    on it — which is why TimeHat no longer needs an escape hatch.  There is no
+    --allow-default-steering: a DAC DO must be characterized (do_steering_char)
+    before it can discipline; an uncharacterized DAC is fatal.
     """
-    return (ec.schema == SCHEMA_TOML
-            and ec.steering_provenance != "measured"
-            and has_servo
-            and not allow_default_steering)
+    return (has_servo
+            and ec.schema == SCHEMA_TOML
+            and ec.actuator_type in STEERING_MEASURED_REQUIRED
+            and ec.steering_provenance != "measured")
 
 
 def format_provenance_log(do_uid: str, ec: EngineCharacterization) -> list[str]:

@@ -43,6 +43,7 @@ def test_resolves_measured_toml(tmp_path):
     assert ec.schema == dcr.SCHEMA_TOML
     assert ec.sigma_do_freq_ppb == pytest.approx(0.000382)
     assert ec.coast_tdev == (pytest.approx(0.0425), pytest.approx(0.53), 1.0)
+    assert ec.actuator_type == "DAC"   # carried from [identity] for the gate
 
 
 def test_unregistered_do_raises(tmp_path):
@@ -95,37 +96,41 @@ def test_toml_missing_steering_provenance(tmp_path):
     assert ec.steering_provenance == "MISSING"
 
 
-# ── steering refuse policy ──────────────────────────────────────────── #
+# ── steering refuse policy (actuator-aware; no escape hatch) ─────────── #
 
-def _ec(steering_prov):
+def _ec(steering_prov, actuator="DAC"):
     return dcr.EngineCharacterization(
-        schema=dcr.SCHEMA_TOML, provenance={"steering": steering_prov})
+        schema=dcr.SCHEMA_TOML, actuator_type=actuator,
+        provenance={"steering": steering_prov})
 
 
-def test_refuse_when_missing_steering_and_servo():
+def test_dac_refuse_when_missing_steering_and_servo():
+    assert dcr.should_refuse_for_steering(_ec("MISSING"), has_servo=True)
+
+
+def test_dac_refuse_when_class_default_steering():
     assert dcr.should_refuse_for_steering(
-        _ec("MISSING"), has_servo=True, allow_default_steering=False)
+        _ec("class-default[OCXO]"), has_servo=True)
 
 
-def test_refuse_when_class_default_steering():
-    assert dcr.should_refuse_for_steering(
-        _ec("class-default[OCXO]"), has_servo=True,
-        allow_default_steering=False)
-
-
-def test_no_refuse_when_measured():
-    assert not dcr.should_refuse_for_steering(
-        _ec("measured"), has_servo=True, allow_default_steering=False)
-
-
-def test_no_refuse_when_escape_hatch():
-    assert not dcr.should_refuse_for_steering(
-        _ec("MISSING"), has_servo=True, allow_default_steering=True)
+def test_dac_no_refuse_when_measured():
+    assert not dcr.should_refuse_for_steering(_ec("measured"), has_servo=True)
 
 
 def test_no_refuse_without_servo():
+    assert not dcr.should_refuse_for_steering(_ec("MISSING"), has_servo=False)
+
+
+def test_phc_adjfine_never_refuses_even_missing():
+    # PHC adjfine gain is an intrinsic constant — nothing to measure, so a
+    # MISSING [steering] must NOT refuse (TimeHat needs no escape hatch).
     assert not dcr.should_refuse_for_steering(
-        _ec("MISSING"), has_servo=False, allow_default_steering=False)
+        _ec("MISSING", actuator="PHC_adjfine"), has_servo=True)
+
+
+def test_clockmatrix_never_refuses_even_missing():
+    assert not dcr.should_refuse_for_steering(
+        _ec("MISSING", actuator="ClockMatrix_FCW"), has_servo=True)
 
 
 # ── provenance log formatting ───────────────────────────────────────── #
