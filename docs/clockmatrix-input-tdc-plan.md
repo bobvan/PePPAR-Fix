@@ -84,12 +84,19 @@ switching that one crashed otcBob1):
   [5:3]** ⇒ write **`0x28`**. (The old `timebeat-integration-paths` note "write
   0x05" predates the bitfield correction in `project_8a34012_register_map`:
   pll_mode is [5:3], not [2:0].)
-- `PHASE_MEASUREMENT_CFG` (DPLL base `+0x36`) → select `ref = CLK5` (GPS),
-  `fb = CLK_loopback`. **(bit layout = AN-1010 Table 1 — still an OPEN ITEM,
-  see below.)**
-- Read `PHASE_STATUS` (`0xC118` region; 36-bit signed × 50 ps); or enable
-  high-precision (`0xCD24[7]` + `tdc_clk` divider `0xCD20–0xCD24`) and read
-  `FILTER_STATUS` (× 0.39 ps).
+- `PHASE_MEASUREMENT_CFG` (DPLL base `+0x36`) → select the pair (AN-1010
+  Table 1): **`PFD_REF_CLK_SEL[3:0]`** = reference CLK and **`PFD_FB_CLK_SEL[3:0]`**
+  = feedback CLK, each `0x0–0xF` = CLK0–CLK15. For us: `ref = CLK5` (GPS PPS),
+  `fb = CLK_loopback` (disciplined output PPS). Two 4-bit fields; likely packed
+  `REF[7:4]|FB[3:0]` in the `+0x36` byte — confirm the byte layout by read-back
+  in P0.
+- Read `PHASE_STATUS` (`0xC118` region) for the low-precision path: AN-1010
+  Table 3 = **signed 36-bit × 50 ps**, +ve ⇒ feedback leads reference. Works
+  alongside FCW. (The old "impossible ~23 s" decode was a 64-bit mis-parse of a
+  36-bit signed value.) For the 0.39 ps path, enable high-precision (`0xCD24[7]`
+  + `tdc_clk` divider `0xCD20–0xCD24`) and read `FILTER_STATUS`: AN-1010 Table 5
+  = **signed 43-bit × 50/128 = 0.390625 ps** — synthesizer-only (no FCW on this
+  channel).
 
 Steering DPLL (the output channel): FCW via `DPLL_FREQ` write-frequency
 (`MODE = 0x10`), the already-proven gain-1.000 / 0.11 fppb path
@@ -130,19 +137,26 @@ For GPS-PPS-vs-output the F9T PPS noise (~ns) dominates the 0.39 ps TDC floor,
 so the win is *removing the box*, not better resolution per se.
 
 
-## Open items (close before P1)
+## Open items
 
-1. **`PHASE_MEASUREMENT_CFG` bitfields** (ref-select vs fb-select bit
-   positions) — AN-1010 Table 1 renders as an *image*; PyMuPDF text
-   extraction can't read it. **Plan: render the table pages with
-   `pdftoppm` (poppler-utils, being installed on gt) and read the bitfields
-   directly**; cross-check against the Linux `idt8a340`/`rsmu` driver or the
-   Timebeat Go parser.
-2. **`PHASE_STATUS` / `FILTER_STATUS` decode** — confirm 36-bit sign extension
-   and the ITDC_UI→ps scale (50 ps default; verify against an injected offset
-   in P0).
-3. **Which CLK inputs are spare** on ptBoat for the loopback, and the
-   CLK→register-index mapping for `PHASE_MEASUREMENT_CFG`.
-4. **tdc_clk divider** values for high-precision at 1 Hz inputs (the AN-1010
-   "Fine Measurement Example" worked an 8 kHz case; redo the arithmetic for
-   1 Hz so `tdc_clk` is non-integer-multiple of 1 Hz).
+**Register decode is now resolved** from AN-1010 (rendered table images,
+2026-06-17):
+- `PHASE_MEASUREMENT_CFG` = `PFD_REF_CLK_SEL[3:0]` + `PFD_FB_CLK_SEL[3:0]`
+  (CLK0–CLK15 each).
+- `PHASE_STATUS` = signed 36-bit × 50 ps; `FILTER_STATUS` = signed 43-bit ×
+  0.390625 ps (50/128); +ve ⇒ feedback leads reference.
+- `PLL_MODE` phase-measurement = field value **5** (Table 4) → `0x28` at the
+  MODE byte's `[5:3]` (matches our FCW-write finding: write_freq=2 → `0x10`).
+
+Remaining (none block P0/P1 on the 50 ps low-precision path):
+1. **Byte layout of `PHASE_MEASUREMENT_CFG`** at `+0x36` (`REF[7:4]|FB[3:0]`
+   vs two adjacent bytes) — verify by read-back in P0.
+2. **Which CLK inputs are spare** on ptBoat for the PPS-OUT loopback, and
+   confirm `CLK5` (F9T PPS) is selectable as `PFD_REF_CLK_SEL`.
+3. **`tdc_clk` divider for 1 Hz** (high-precision / P2 only):
+   `tdc_clk = fref·(w + n/d)` with `w = 0xCD24[6:0]`, `n = 0xCD20:0xCD21`,
+   `d = 0xCD22:0xCD23`, chosen so `tdc_clk` is **not** an integer multiple of
+   1 Hz (redo AN-1010's 8 kHz "Fine Measurement Example" for 1 PPS). The
+   50 ps `PHASE_STATUS` path needs none of this — it's the P0/P1 route.
+4. Cross-check the register addresses/layout against the Linux
+   `idt8a340`/`rsmu` driver or the Timebeat Go parser before writing live.
