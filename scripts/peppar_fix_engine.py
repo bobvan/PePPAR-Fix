@@ -5914,6 +5914,43 @@ def _set_clock_class(ctx, state):
         ctx['pmc_announced'] = state
 
 
+# Periodic runtime-save cadence + lock gate.  The persisted operating point
+# (freq offset + DAC code) is the warm-start seed; saving it regularly WHILE
+# LOCKED means a restart — clean OR crash/power-loss — seeds from the converged
+# operating point and nails the landing, instead of a stale bootstrap value
+# (Bob 2026-06-18: startup transients are exceptions to fix, not a daily event).
+# Gated on |err| < _RUNTIME_SAVE_MAX_ERR_NS so a transient excursion is never
+# persisted as the seed.  Atomic write (runtime_state_resolve), so the slow
+# cadence is harmless.
+_RUNTIME_SAVE_INTERVAL_S = 60.0
+_RUNTIME_SAVE_MAX_ERR_NS = 200.0
+
+
+def _persist_do_runtime(do_uid, adjfine_ppb, actuator, *, log_info=False):
+    """Persist the DO's operating point (freq offset + DAC code) to runtime
+    state.  Shared by the periodic in-loop save and the clean-shutdown save.
+    Returns True if the freq offset was written."""
+    if do_uid is None:
+        return False
+    ok = False
+    try:
+        from peppar_fix.runtime_state_resolve import update_runtime_freq
+        update_runtime_freq(do_uid, adjfine_ppb)
+        ok = True
+        if log_info:
+            log.info("Saved DO freq offset: adjfine=%.1f ppb (DO %s)",
+                     adjfine_ppb, do_uid)
+    except Exception as e:
+        log.warning("Failed to save DO freq offset: %s", e)
+    if actuator is not None and hasattr(actuator, 'current_code'):
+        try:
+            from peppar_fix.runtime_state_resolve import update_runtime_dac_code
+            update_runtime_dac_code(do_uid, actuator.current_code)
+        except Exception as e:
+            log.warning("Failed to save last DAC code: %s", e)
+    return ok
+
+
 def _save_osc_freq_corr(ctx):
     """Save refined oscillator frequency corrections on clean shutdown.
 
@@ -5936,24 +5973,9 @@ def _save_osc_freq_corr(ctx):
             and carrier_tracker.drift_rate_ppb != 0):
         tcxo_corr = adjfine - carrier_tracker.drift_rate_ppb
 
-    # Save DO freq offset + last DAC code
-    do_uid = ctx.get('do_unique_id')
-    if do_uid is not None:
-        try:
-            from peppar_fix.runtime_state_resolve import update_runtime_freq
-            update_runtime_freq(do_uid, adjfine)
-            log.info("Saved DO freq offset: adjfine=%.1f ppb (DO %s)",
-                     adjfine, do_uid)
-        except Exception as e:
-            log.warning("Failed to save DO state: %s", e)
-        _act = ctx.get('actuator')
-        if _act is not None and hasattr(_act, 'current_code'):
-            try:
-                from peppar_fix.runtime_state_resolve import (
-                    update_runtime_dac_code)
-                update_runtime_dac_code(do_uid, _act.current_code)
-            except Exception as e:
-                log.warning("Failed to save last DAC code: %s", e)
+    # Save DO freq offset + last DAC code (shared with the periodic in-loop save)
+    _persist_do_runtime(ctx.get('do_unique_id'), adjfine, ctx.get('actuator'),
+                        log_info=True)
 
     # Save rx TCXO offset + last known dt_rx to receiver state
     receiver_uid = ctx.get('receiver_unique_id')
@@ -9088,6 +9110,20 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         if _dfe is not None:
             _dfe.update_metrics(adj_ppb=adjfine_ppb, err_ns=avg_error,
                                 interval=scheduler.interval)
+
+        # Periodically persist the operating point so a restart warm-starts
+        # from the converged operating frequency (nail the landing), not a
+        # stale bootstrap value.  Gated on LOCKED (|err| small → never persist
+        # a transient excursion as the seed) + a slow cadence.  The clean-
+        # shutdown save still covers graceful exits; this covers crash/kill/
+        # power-loss between shutdowns.
+        if not args.freerun and abs(avg_error) < _RUNTIME_SAVE_MAX_ERR_NS:
+            _now_save = time.monotonic()
+            if (_now_save - ctx.get('_last_runtime_save', 0.0)
+                    >= _RUNTIME_SAVE_INTERVAL_S):
+                if _persist_do_runtime(ctx.get('do_unique_id'), adjfine_ppb,
+                                       ctx.get('actuator')):
+                    ctx['_last_runtime_save'] = _now_save
 
         # Output-side actuation history feeds physical-drift estimator
         # inside compute_adaptive_interval().  Long-window slope of
