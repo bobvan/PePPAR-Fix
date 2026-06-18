@@ -30,103 +30,119 @@ class DacActuator(FrequencyActuator):
         bus_num: I2C bus number (e.g. 1 for /dev/i2c-1)
         addr: I2C device address (e.g. 0x60 for MCP4725)
         bits: DAC resolution in bits (12 for MCP4725, 16 for AD5693R)
-        center_code: DAC code for nominal frequency (default: midscale)
         ppb_per_code: tuning sensitivity in ppb per DAC LSB.
             Positive = higher code → higher frequency.
             Must be characterized per-oscillator.
+        code_min, code_max: usable linear code range (commands clamp here).
+        ppb_at_code_min: OCXO pull (ppb from nominal) at code_min — the
+            edge anchor of the steering line.  Together with ppb_per_code +
+            code_min it fully defines code↔ppb; there is NO center_code.
+            Default 0.0 suits sweep utilities that only call _write_code.
         max_ppb: maximum frequency adjustment range (default: computed
-            from ppb_per_code × available codes from center)
+            from the linear range).
         dac_type: "mcp4725" or "ad5693r" or "generic"
     """
 
-    def __init__(self, bus_num, addr, bits=12, center_code=None,
+    def __init__(self, bus_num, addr, bits=12,
                  ppb_per_code=1.0, max_ppb=None, dac_type="mcp4725",
                  dac_gain=0, last_code=None,
-                 code_min=None, code_max=None):
+                 code_min=None, code_max=None, ppb_at_code_min=0.0):
         self._bus_num = bus_num
         self._addr = addr
         self._bits = bits
         self._max_code = (1 << bits) - 1
-        self._center_code = center_code if center_code is not None else self._max_code // 2
         self._ppb_per_code = ppb_per_code
         self._dac_type = dac_type
         # Usable LINEAR code range — outside this the OCXO EFC saturates
-        # (frequency clips and the ppb_per_code model is fiction).  When
-        # provided (from the cal's linear-region detection), commands are
-        # clamped to [code_min, code_max] instead of [0, max_code].  This
-        # produces an ASYMMETRIC reachable frequency range, which is the
-        # norm for any OCXO whose EFC curve has shifted under temperature.
-        # See feedback_ocxo_asymmetric_pull_range.  Default None → full
-        # 0..max_code range (backward-compatible).
+        # (frequency clips and the ppb_per_code model is fiction).  Commands
+        # clamp to [code_min, code_max].  Default None → full 0..max_code.
         self._code_min = 0 if code_min is None else max(0, int(code_min))
         self._code_max = (self._max_code if code_max is None
                           else min(self._max_code, int(code_max)))
+        # noMagicCenterCode: the steering line is anchored at the LOWER EDGE,
+        # never a privileged center.  ppb_at_code_min = the OCXO pull (ppb
+        # from nominal) at code_min, so:
+        #     ppb(code)  = ppb_at_code_min + (code − code_min)·ppb_per_code
+        #     code(ppb)  = code_min + round((ppb − ppb_at_code_min)/ppb_per_code)
+        # `ppb` here is the TRUE pull from nominal — identical in meaning to a
+        # PHC's adjfine command.  The DAC is just the affine adapter from that
+        # universal ppb correction to a code.  There is NO center_code: the old
+        # midscale default was the magic-center error (broke on PiFace's
+        # asymmetric 3.3 V DAC + CTI OCXO).  Default ppb_at_code_min=0.0 is the
+        # benign sweep-tool case (utilities that only call _write_code, never
+        # the servo mapping).
+        self._ppb_at_code_min = float(ppb_at_code_min)
         # AD5693R control-register GAIN bit: 0 = 1× output (0..Vref),
-        # 1 = 2× output (0..2×Vref).  POR default is 0; ignored on
-        # other DAC types.  Per-DO state JSON should carry this so
-        # the same wiring/code paths produce the right voltage on
-        # every restart.  Default 0 is backward-compatible with the
-        # existing CTI OSC5A2B02 calibration on PiFace; required = 1
-        # on hosts where the OCXO needs >0..Vref Vctrl range to
-        # reach GPS rate (e.g., clkPoC3 IsoTemp OCXO131-100).  See
-        # I-000711-main.
+        # 1 = 2× output (0..2×Vref).  POR default is 0; ignored on other DAC
+        # types.  Required = 1 where the OCXO needs >0..Vref Vctrl to reach
+        # GPS rate (e.g. clkPoC3 IsoTemp OCXO131-100).  See I-000711-main.
         self._dac_gain = int(dac_gain) if dac_gain is not None else 0
         self._bus = None
         self._last_code = last_code
-        self._current_code = self._center_code
-        self._current_ppb = 0.0
+        self._current_code = self._code_min
+        self._current_ppb = self._ppb_for_code(self._code_min)
         self._range_warned = False
 
-        # Reachable frequency range — ASYMMETRIC when the linear code
-        # range isn't centered on center_code.  ppb at each code-range
-        # limit (positive = DO fast; sign follows ppb_per_code).
-        ppb_at_min = (self._code_min - self._center_code) * ppb_per_code
-        ppb_at_max = (self._code_max - self._center_code) * ppb_per_code
-        self._ppb_fast = max(ppb_at_min, ppb_at_max)
-        self._ppb_slow = min(ppb_at_min, ppb_at_max)
-        # max_ppb kept for legacy callers (symmetric envelope = the
-        # smaller of the two one-sided ranges).  Explicit override wins.
+        # Reachable frequency range (ppb from nominal) at each code edge.
+        ppb_lo = self._ppb_for_code(self._code_min)
+        ppb_hi = self._ppb_for_code(self._code_max)
+        self._ppb_fast = max(ppb_lo, ppb_hi)
+        self._ppb_slow = min(ppb_lo, ppb_hi)
+        # max_ppb kept for legacy callers (symmetric envelope = the smaller of
+        # the two one-sided ranges about the GNSS-matching code).  But that
+        # symmetric framing assumes a centered operating point; the honest
+        # directional budget is _ppb_fast / _ppb_slow.  Explicit override wins.
         max_from_range = min(abs(self._ppb_fast), abs(self._ppb_slow))
         self._max_ppb = max_ppb if max_ppb is not None else max_from_range
         self._resolution_ppb = abs(ppb_per_code)
 
+    def _ppb_for_code(self, code):
+        """OCXO pull (ppb from nominal) the steering line predicts at ``code``."""
+        return self._ppb_at_code_min + (code - self._code_min) * self._ppb_per_code
+
+    def _code_for_ppb(self, ppb):
+        """DAC code that yields pull ``ppb`` (unclamped), edge-anchored."""
+        return self._code_min + round((ppb - self._ppb_at_code_min) / self._ppb_per_code)
+
     def setup(self):
         """Open I2C bus, configure control register (GAIN), set DAC.
 
-        When ``last_code`` was provided at construction, the DAC starts
-        there — the frequency the OCXO was last running at.  Otherwise
-        falls back to ``center_code`` (DAC midscale).
+        When ``last_code`` was provided at construction, the DAC starts there
+        — the frequency the OCXO was last running at (frame-independent: a raw
+        code, correct regardless of the steering frame).  This is the
+        warm-start seed.  Otherwise it parks at the NEUTRAL command — the code
+        for ppb = 0 (DO at nominal, ↔ adjfine = 0), clamped to the linear
+        range.  There is no magic midscale park.
         """
         try:
             import smbus2
             self._bus = smbus2.SMBus(self._bus_num)
         except ImportError:
             raise ImportError("smbus2 required for DAC actuator: pip install smbus2")
-        # Configure AD5693R control register before any data writes so
-        # the chip is in the correct mode when we set the center code.
-        # Other DAC types ignore this — POR-default behavior preserved.
+        # Configure AD5693R control register before any data writes so the
+        # chip is in the correct mode when we set the first code.  Other DAC
+        # types ignore this — POR-default behavior preserved.
         if self._dac_type == "ad5693r":
             self._write_ad5693r_control_register()
         if self._last_code is not None:
-            start_code = max(0, min(self._max_code, int(self._last_code)))
-            self._write_code(start_code)
-            self._current_code = start_code
-            self._current_ppb = (start_code - self._center_code) * self._ppb_per_code
-            log.info("DAC actuator: bus=%d addr=0x%02x bits=%d "
-                     "last_code=%d (%.1f ppb) ppb/code=%.4f gain=%d (%s mode)",
-                     self._bus_num, self._addr, self._bits,
-                     start_code, self._current_ppb,
-                     self._ppb_per_code, self._dac_gain,
-                     "2×" if self._dac_gain else "1×")
+            start_code = max(self._code_min,
+                             min(self._code_max, int(self._last_code)))
+            seed = "last_code (warm start)"
         else:
-            self._write_code(self._center_code)
-            self._current_code = self._center_code
-            self._current_ppb = 0.0
-            log.info("DAC actuator: bus=%d addr=0x%02x bits=%d center=%d "
-                     "ppb/code=%.4f gain=%d (%s mode)",
-                     self._bus_num, self._addr, self._bits, self._center_code,
-                     self._ppb_per_code, self._dac_gain,
-                     "2×" if self._dac_gain else "1×")
+            # Neutral command: ppb = 0 (nominal), clamped to the linear range.
+            start_code = max(self._code_min,
+                             min(self._code_max, self._code_for_ppb(0.0)))
+            seed = "neutral (ppb=0)"
+        self._write_code(start_code)
+        self._current_code = start_code
+        self._current_ppb = self._ppb_for_code(start_code)
+        log.info("DAC actuator: bus=%d addr=0x%02x bits=%d start=%d (%.1f ppb, "
+                 "%s) ppb/code=%.4f ppb@code_min=%.1f range=[%d,%d] "
+                 "gain=%d (%s mode)",
+                 self._bus_num, self._addr, self._bits, start_code,
+                 self._current_ppb, seed, self._ppb_per_code,
+                 self._ppb_at_code_min, self._code_min, self._code_max,
+                 self._dac_gain, "2×" if self._dac_gain else "1×")
 
     def teardown(self):
         """Close bus.  DAC holds its last code — the OCXO keeps running
@@ -138,15 +154,16 @@ class DacActuator(FrequencyActuator):
             self._bus = None
 
     def adjust_frequency_ppb(self, ppb):
-        """Set absolute frequency offset. Returns actual ppb applied.
+        """Set the DO's pull to ``ppb`` (true pull from nominal, ↔ adjfine).
+        Returns the actual ppb applied.
 
-        Clamps to the usable linear code range [code_min, code_max].
-        When a command would drive the code outside that range, it
-        saturates at the boundary and logs once — the OCXO physically
-        cannot reach the requested frequency (EFC out of linear range).
+        Edge-anchored: code = code_min + round((ppb − ppb_at_code_min)/slope),
+        clamped to the usable linear range [code_min, code_max].  A command
+        outside the range saturates at the boundary and logs once — the OCXO
+        physically cannot reach the requested frequency (EFC out of linear
+        range, normal for an asymmetric/temperature-shifted OCXO).
         """
-        code_offset = round(ppb / self._ppb_per_code)
-        code = self._center_code + code_offset
+        code = self._code_for_ppb(ppb)
         clamped = max(self._code_min, min(self._code_max, code))
         if clamped != code and not self._range_warned:
             log.warning(
@@ -158,9 +175,8 @@ class DacActuator(FrequencyActuator):
         code = clamped
         self._write_code(code)
         self._current_code = code
-        actual_ppb = (code - self._center_code) * self._ppb_per_code
-        self._current_ppb = actual_ppb
-        return actual_ppb
+        self._current_ppb = self._ppb_for_code(code)
+        return self._current_ppb
 
     @property
     def at_range_limit(self):

@@ -146,13 +146,17 @@ def resolve_dac_actuator_params(
     and gain mode.  (Previously the engine built the actuator from
     --dac-ppb-per-code and silently ignored the measured slope.)
 
-    Returns a dict of DacActuator kwargs (ppb_per_code, center_code, code_min,
-    code_max, and dac_gain when recorded) when the DO has measured steering.
+    Returns a dict of DacActuator kwargs (ppb_per_code, ppb_at_code_min,
+    code_min, code_max, and dac_gain when recorded) when the DO has measured
+    steering.  Edge-anchored (noMagicCenterCode): NO center_code — the line is
+    {code_min, code_max, ppb_per_code, ppb_at_code_min}, and `ppb` is true pull
+    from nominal (↔ adjfine).
 
     Raises SchemaError when the DO is a DAC actuator whose steering was never
     measured — the engine must STOP, not fall back to a default.  (Mirrors
     should_refuse_for_steering, but at actuator-construction time so no default
-    slope can reach the loop.)
+    slope can reach the loop.)  Also raises if ppb_at_code_min is unavailable
+    (neither stored nor derivable) — the edge anchor is mandatory.
 
     Returns None when the actuator is not a per-unit-measured type (PHC_adjfine
     / ClockMatrix_FCW have intrinsic constant gains) or when do_uid is None
@@ -171,10 +175,21 @@ def resolve_dac_actuator_params(
             f"scripts/do_steering_char.py first.  There is no default ppb/code: "
             f"an OCXO's pull range is per-unit, so a guessed slope is unsafe.")
     st = c.steering
-    params: dict = {"ppb_per_code": float(st["slope_ppb_per_code"])}
-    for key in ("parked_code", "code_min", "code_max"):
+    # ppb_at_code_min is the edge anchor (the loader derives it for legacy
+    # files from parked_code+intercept, so it is present for any measured
+    # steering).  Mandatory — no center fallback.
+    if st.get("ppb_at_code_min") is None:
+        raise do_schema.SchemaError(
+            f"DO {do_uid!r}: [steering] has no ppb_at_code_min and it could "
+            f"not be derived — cannot anchor the actuator.  Re-run "
+            f"scripts/do_steering_char.py.")
+    params: dict = {
+        "ppb_per_code": float(st["slope_ppb_per_code"]),
+        "ppb_at_code_min": float(st["ppb_at_code_min"]),
+    }
+    for key in ("code_min", "code_max"):
         if st.get(key) is not None:
-            params["center_code" if key == "parked_code" else key] = int(st[key])
+            params[key] = int(st[key])
     g = st.get("dac_gain")
     if g is not None:
         params["dac_gain"] = int(g)

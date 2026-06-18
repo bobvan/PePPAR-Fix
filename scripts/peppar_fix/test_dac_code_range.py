@@ -35,11 +35,15 @@ if "smbus2" not in sys.modules:
 from peppar_fix.dac_actuator import DacActuator  # noqa: E402
 
 
-# MadHat geometry: ppb_per_code=-0.008311, center=32768, linear
-# region 5000..42000, freerun +85 ppb at center.
+# MadHat geometry: ppb_per_code=-0.008311, linear region 5000..42000.
+# Edge-anchored (noMagicCenterCode): ppb_at_code_min is the pull at
+# code_min.  Chosen so ppb=0 lands at the old center 32768 — i.e. this
+# frame is identical to the retired center=32768 frame, so the clamp/
+# range assertions below are unchanged in meaning.
 _MADHAT = dict(
     bus_num=1, addr=0x4c, bits=16, ppb_per_code=-0.008311,
-    dac_type="ad5693r", dac_gain=1, center_code=32768,
+    dac_type="ad5693r", dac_gain=1,
+    ppb_at_code_min=(5000 - 32768) * -0.008311,
     code_min=5000, code_max=42000,
 )
 

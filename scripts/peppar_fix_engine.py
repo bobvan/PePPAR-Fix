@@ -6352,11 +6352,21 @@ def _dac_build_kwargs(args, do_uid):
     from peppar_fix import do_schema as _ds
     cfg = {
         "ppb_per_code": getattr(args, 'dac_ppb_per_code', None),
-        "center_code": getattr(args, 'dac_center_code', None),
         "code_min": getattr(args, 'dac_code_min', None),
         "code_max": getattr(args, 'dac_code_max', None),
         "dac_gain": getattr(args, 'dac_gain', 0) or 0,
     }
+    # noMagicCenterCode: the actuator is edge-anchored (no center_code).  For
+    # the legacy/unregistered config path, convert the old --dac-center-code
+    # into the edge anchor ppb_at_code_min in the legacy (center-relative)
+    # frame — pull at code_min = (code_min − center_code)·slope — so a
+    # config-only DAC keeps its prior behavior without center_code leaking
+    # into the actuator.  Registered DOs override this from measured steering.
+    _legacy_center = getattr(args, 'dac_center_code', None)
+    if (_legacy_center is not None and cfg["code_min"] is not None
+            and cfg["ppb_per_code"]):
+        cfg["ppb_at_code_min"] = (
+            (int(cfg["code_min"]) - int(_legacy_center)) * float(cfg["ppb_per_code"]))
     try:
         measured = resolve_dac_actuator_params(
             do_uid, config_ppb_per_code=cfg["ppb_per_code"])
@@ -6418,8 +6428,8 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
         bus_num=dac_bus,
         addr=dac_addr,
         bits=getattr(args, 'dac_bits', 12),
-        center_code=_dk.get("center_code"),
         ppb_per_code=_dk["ppb_per_code"],
+        ppb_at_code_min=_dk.get("ppb_at_code_min", 0.0),
         max_ppb=getattr(args, 'dac_max_ppb', None),
         dac_type=getattr(args, 'dac_type', 'mcp4725'),
         dac_gain=_dk.get("dac_gain", 0) or 0,
@@ -6753,13 +6763,17 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
                 addr=int(getattr(args, 'dac_addr', '0x60'), 0),
                 bits=getattr(args, 'dac_bits', 12),
                 ppb_per_code=_rk.get("ppb_per_code") or 1.0,
+                ppb_at_code_min=_rk.get("ppb_at_code_min", 0.0),
                 dac_type=getattr(args, 'dac_type', 'mcp4725'),
                 dac_gain=_rk.get("dac_gain", 0) or 0,
                 last_code=_pre_last,
+                code_min=_rk.get("code_min"),
+                code_max=_rk.get("code_max"),
             )
             _dac_reset.setup()
             _dac_reset.teardown()
-            log.info("DAC reset to center before TICC measurement")
+            # Park at last code / neutral before TICC measurement (no magic center)
+            log.info("DAC parked at warm-start code before TICC measurement")
         if _maybe_step_divider_on_phase(args):
             settle_s = 3
             log.info("Waiting %ds for post-ARM settling before TICC measurement...",
@@ -6936,8 +6950,8 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                     bus_num=args.dac_bus,
                     addr=dac_addr,
                     bits=getattr(args, 'dac_bits', 12),
-                    center_code=_dk.get("center_code"),
                     ppb_per_code=ppb_per_code,
+                    ppb_at_code_min=_dk.get("ppb_at_code_min", 0.0),
                     max_ppb=getattr(args, 'dac_max_ppb', None),
                     dac_type=getattr(args, 'dac_type', 'mcp4725'),
                     dac_gain=_dk.get("dac_gain", 0) or 0,
