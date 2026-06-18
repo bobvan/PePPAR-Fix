@@ -63,4 +63,15 @@ include = ["peppar_fix*", "peppar_mon*"]
 peppar_fix = ["*.toml"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# Both real test homes.  The bulk of the suite is co-located with the
+# modules under test in scripts/peppar_fix/ (test_foo.py next to foo.py —
+# the dominant convention here, ~121 files); tests/ holds the rest.
+# Listing BOTH makes a path-less invocation (`pytest`, `pytest -k foo`)
+# collect the whole suite — previously testpaths=["tests"] silently
+# dropped scripts/peppar_fix/ on any flagged run (the bin/test scope
+# gotcha that mis-scoped PR #187/#190 verification claims).
+# NOT "scripts": that dir also holds 3 stale, never-collected test files
+# (scripts/test_peer_*.py / test_lambda_ar.py) that fail to import
+# (peppar_bus) — wiring them in would turn the suite red.  Tracked
+# separately as orphanedScriptsTests.
+testpaths = ["scripts/peppar_fix", "tests"]

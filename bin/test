@@ -32,14 +32,14 @@ if [[ ! -x "$VENV_PYTEST" ]]; then
     exit 2
 fi
 
-# Default to running both top-level test dirs when invoked with no
-# args.  When the user passes args, pass through unchanged — they
-# may be scoping (`./bin/test path/to/test.py`), filtering
-# (`./bin/test -k pattern`), or both.  For flag-only invocation that
-# wants the full suite, pass the dirs explicitly:
-#   ./bin/test scripts/peppar_fix/ tests/ -v --tb=short
-if [[ $# -eq 0 ]]; then
-    exec "$VENV_PYTEST" scripts/peppar_fix/ tests/
-else
-    exec "$VENV_PYTEST" "$@"
-fi
+# Pass all args straight through to pytest; the full-suite scope lives
+# in ONE place — `testpaths` in pyproject.toml (= scripts/peppar_fix/ +
+# tests/).  So a path-less invocation collects the whole suite whether
+# or not flags are present:
+#   ./bin/test                                   # full suite (via testpaths)
+#   ./bin/test -k pattern                        # full suite, filtered
+#   ./bin/test scripts/peppar_fix/test_foo.py    # just that path
+# Previously this script hardcoded the no-arg dirs, which masked a stale
+# testpaths=["tests"] and let flagged runs silently skip
+# scripts/peppar_fix/.  Single source of truth avoids that recurring.
+exec "$VENV_PYTEST" "$@"
