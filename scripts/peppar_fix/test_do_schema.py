@@ -331,6 +331,65 @@ class TestSteeringValidation(unittest.TestCase):
                 self.assertEqual(c.steering["dac_gain"], g)
 
 
+class TestSteeringEdgeAnchor(unittest.TestCase):
+    """noMagicCenterCode: ppb_at_code_min + char_temp_* fields."""
+
+    def test_derives_ppb_at_code_min_for_legacy_file(self):
+        # GOOD_CHAR_TOML has parked_code/intercept but no ppb_at_code_min.
+        # The loader must derive it = the fitted line evaluated at code_min:
+        #   intercept_ppb_at_parked + slope·(code_min − parked_code)
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", GOOD_CHAR_TOML)
+            c = load_do_characterization("ocxo-test", dos_dir=td)
+            expected = 144.65 + 0.02569 * (1024 - 32768)
+            self.assertAlmostEqual(
+                c.steering["ppb_at_code_min"], expected, places=4)
+
+    def test_explicit_ppb_at_code_min_preserved(self):
+        # When the file already carries ppb_at_code_min, the loader must
+        # NOT overwrite it with a derivation.
+        toml = GOOD_CHAR_TOML.replace(
+            "slope_ppb_per_code = 0.02569",
+            "slope_ppb_per_code = 0.02569\nppb_at_code_min = -670.85")
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", toml)
+            c = load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertAlmostEqual(c.steering["ppb_at_code_min"], -670.85)
+
+    def test_reject_nonnumeric_ppb_at_code_min(self):
+        toml = GOOD_CHAR_TOML.replace(
+            "slope_ppb_per_code = 0.02569",
+            'slope_ppb_per_code = 0.02569\nppb_at_code_min = "nope"')
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", toml)
+            with self.assertRaises(SchemaError) as cm:
+                load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertIn("ppb_at_code_min", str(cm.exception))
+
+    def test_accepts_char_temps(self):
+        toml = GOOD_CHAR_TOML.replace(
+            "slope_ppb_per_code = 0.02569",
+            "slope_ppb_per_code = 0.02569\n"
+            "char_temp_ocxo_c = 41.2\nchar_temp_cpu_c = 58.7\n"
+            "char_temp_board_c = 55.0")
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", toml)
+            c = load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertAlmostEqual(c.steering["char_temp_ocxo_c"], 41.2)
+            self.assertAlmostEqual(c.steering["char_temp_cpu_c"], 58.7)
+            self.assertAlmostEqual(c.steering["char_temp_board_c"], 55.0)
+
+    def test_reject_out_of_range_char_temp(self):
+        toml = GOOD_CHAR_TOML.replace(
+            "slope_ppb_per_code = 0.02569",
+            "slope_ppb_per_code = 0.02569\nchar_temp_ocxo_c = 999")
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", toml)
+            with self.assertRaises(SchemaError) as cm:
+                load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertIn("char_temp_ocxo_c", str(cm.exception))
+
+
 class TestClassDefaults(unittest.TestCase):
 
     def test_all_classes_have_defaults(self):
