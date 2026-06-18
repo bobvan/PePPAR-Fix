@@ -220,7 +220,12 @@ run on PiFace (post-state-reset, fresh cold-start).
 
 - `config/piface.toml` — engine config for this rig
 - `state/dos/ocxo-clkpoc3.json` — calibration carry-over from
-  clkPoC3 (DAC ppb_per_code = 0.0361, midscale ≈ +149 ppb)
+  clkPoC3 (DAC ppb_per_code = 0.0361; "midscale ≈ +149 ppb" = the
+  OCXO's pull *at the midscale code* — midscale is the neutral DAC
+  command, not the GNSS-matching point, and the GNSS-matching code
+  drifts with temperature; see noMagicCenterCode /
+  `docs/do-characterization-architecture.md` §"Code symmetry vs pull
+  symmetry")
 - `docs/weak-antenna-doom-loop-2026-04-29.md` — this file
 - Capture: `~/peppar-fix/data/piface-smoke5.log` on PiFace
 - Engine commits: `75b8295` (σ default), `bad193f` (save floor)

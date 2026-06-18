@@ -89,6 +89,197 @@ receiver-side measurements *do* see the DO there).  Those are
 treated as black boxes from the PePPAR-Fix engine's perspective.
 
 
+## Code symmetry vs pull symmetry — the DO is an intersection (no magic center code)
+
+A DAC-steered DO is the **intersection of two independently-imperfect
+components**, and most of our DAC-control confusion has come from
+treating them as one thing:
+
+- the **DAC** — a code→voltage actuator, and
+- the **OCXO** — a voltage→frequency oscillator.
+
+Each has its own asymmetries and limits.  Two *separate* properties,
+which we must stop conflating:
+
+- **Code symmetry** is a property of the **DAC alone**: it produces
+  ~half its full control voltage at the center (midscale) code.  A
+  rail-to-rail DAC on a 5 V supply has it; PiFace's 3.3 V AD5693R in
+  2× mode does **not** (it clips against VDD before full scale).
+- **Pull symmetry** is a property of the **OCXO alone**: it matches
+  GNSS at half control voltage, i.e. its frequency pull is symmetric
+  around the GNSS-matching control point.  Any OCXO whose EFC curve
+  has shifted under temperature does **not** — and that shift is
+  normal, not a defect.
+
+**The center code is meaningful *only* under code symmetry.**  The
+moment you allow code asymmetry, *there is nothing special about the
+center code*.  And even with a perfect DAC, thermal drift moves the
+GNSS-matching point — a DO that matches GNSS at code C at 25 °C needs
+a different code at 30 °C.
+
+### The PHC analogy (why this is obvious for TimeHat and was hidden for the DAC hosts)
+
+The cleanest way to see it: a DAC-steered DO is exactly like a PHC
+steered by `adjfine`.
+
+| PHC (`adjfine`) | DAC + OCXO | meaning |
+|---|---|---|
+| `adjfine = 0 ppb` | **center code** (`max_code // 2`) | the actuator's *neutral* command — "apply no correction." No relationship to GNSS. |
+| the `adjfine` value that locks to GNSS (= −crystal free-run offset) | the **GNSS-matching code** | where the DO's frequency *equals* GNSS (pull = 0). |
+
+Nobody ever treats `adjfine = 0` as "where GNSS lives": to discipline
+a PHC you drive `adjfine` to whatever cancels the crystal's
+free-running offset, that value is essentially never 0 ppb, and it
+**drifts with temperature**.  The integral servo simply seeks it.  A
+DAC-steered DO is identical — the **center code is the neutral command
+(↔ `adjfine = 0`), and the GNSS-matching code is a measured,
+temperature-drifting operating point (↔ the locking `adjfine`)**.  We
+must stop anchoring DAC code math, clamps, and bootstrap seeds on the
+center code, exactly as we never anchored PHC control on `adjfine = 0`.
+
+If anything the center code is *even less* special than `adjfine = 0`:
+`adjfine = 0` is a true zero-correction (the PHC applies no rate offset),
+whereas the DAC center is merely an arbitrary midscale *voltage* — it has
+no privileged relationship to either GNSS *or* "no correction."  It is
+just the middle of the code axis.
+
+This conflation never bit the PHC hosts (TimeHat/MadHat-i226) for two
+reasons the DAC lacks: (1) nobody anchors PHC control on a "special"
+zero, and (2) a PHC has effectively no hard rails near its operating
+point.  A DAC has **both** — center-anchored math *and* hard
+`[code_min, code_max]` linear-region rails — so on an asymmetric host
+(PiFace) the assumptions break and a center-anchored seed lands on a
+rail (the `dacBootstrapSeedRail` / `detectLinearRegionOverClip`
+symptoms).
+
+### Correct model — a DAC is an affine ppb→code adapter, anchored at an edge
+
+A DAC-DO's steering is a straight line, which has exactly **two**
+degrees of freedom (a slope and one point).  The old schema stored
+*three* numbers for it — `slope`, `parked_code`, `intercept_ppb_at_parked`
+— which is over-specified, and the redundant `parked_code` is precisely
+the "magic center" wearing a different hat.  We already carry the range
+`{code_min, code_max}`, so **anchor the one point at `code_min`** and the
+description becomes minimal and non-redundant:
+
+```
+[steering] line = { code_min, code_max, slope_ppb_per_code, ppb_at_code_min }
+```
+
+- `ppb_at_code_min` is the OCXO's frequency pull at the lower edge — a
+  *measured property of the line*: always in-range, and it does **not**
+  drift (it's the fit's value at a fixed code).
+- `parked_code`, `intercept_ppb_at_parked`, and `center_code` are all
+  **gone** from the line description.  The GNSS-matching code (pull = 0)
+  is *derived*, not stored — it drifts with temperature and may even sit
+  outside `[code_min, code_max]` on a badly-offset OCXO, so it has no
+  business in characterization.
+
+The forward and inverse maps are a plain affine transform:
+
+```
+ppb(code) = ppb_at_code_min + slope · (code − code_min)
+code(ppb) = code_min + (ppb − ppb_at_code_min) / slope    # clamp to [code_min, code_max]
+```
+
+**The unification this buys: the servo controls a ppb correction, full
+stop — for every DO.**  The servo already does this for a PHC
+(`adjfine` *is* a ppb correction).  A DAC-DO is identical from the
+servo's side; the DAC is *just an affine adapter* (slope + intercept)
+that translates the servo's commanded ppb into a code via `code(ppb)`
+above.  `ppb = 0` is the neutral command (↔ `adjfine = 0` ↔ center
+code — **not** GNSS), and the servo's integral converges to the
+**GNSS-matching ppb wherever it currently sits** — for a PHC that's
+`−(crystal offset)`, for a DAC it's `ppb` at the GNSS-matching code,
+both drifting with temperature.  The only thing that differs across
+DOs is the actuator's translation: identity for PHC `adjfine`, the
+affine map above for a DAC, the FCW formula for ClockMatrix.  This is
+exactly the existing `FrequencyActuator.adjust_frequency_ppb(ppb)`
+contract — the DAC implementation just needs to anchor on `code_min`
+instead of `center_code`.
+
+Asymmetric pull is fine and expected.  What matters operationally is
+**directional headroom** — the distance from the GNSS-matching code to
+each rail:
+
+```
+# for positive slope (higher code → faster; true for all our DACs):
+headroom_fast = (code_max − gnss_matching_code) · slope     # ppb of "speed up" available
+headroom_slow = (gnss_matching_code − code_min) · slope     # ppb of "slow down" available
+# for negative slope the two swap — what matters is |headroom| toward
+# each rail; compute from the signed slope and take the side accordingly.
+```
+
+Combined with the OCXO's temperature coefficient (ppb/°C), the headroom
+predicts the **ambient-temperature band over which the servo keeps
+control** before the DO rails on one side.  This is the DAC-specific
+budget a PHC has no analog for.
+
+`center_code` is therefore neither the control anchor **nor** the
+startup seed.  It is at most a cosmetic, derivable midscale value; the
+control math anchors to `code_min + slope`, and where to *start* is a
+separate, runtime question handled below.
+
+### Where to start next time — warm-start seeding is universal, and it is not "parked"
+
+The genuinely useful "where to start the actuator" concept is **runtime
+state, not characterization**, and it lives one level above the DAC.
+
+The justification is physical and actuator-agnostic: ambient temperature
+at the next startup will be close to the temperature at the last
+shutdown, so **the correction (from a nominal 0 ppb) that was needed at
+shutdown is a good estimate of the correction needed at startup.**  That
+statement is true for *every* DO regardless of actuator — a DAC code, a
+PHC `adjfine` value, a ClockMatrix FCW word are all just realizations of
+one last-known **frequency correction in ppb**.
+
+The schema already expresses this at the right level, in runtime state
+(`<uid>.runtime.toml [operational_state]`):
+
+```
+last_known_freq_offset_ppb = +144.65   # universal: the correction itself
+last_known_dac_code        = 32768     # DAC-specific realization (convenience)
+```
+
+`last_known_freq_offset_ppb` is the portable truth (PHC seeds `adjfine`
+from it, ClockMatrix seeds FCW from it, a DAC re-derives a code from it
+via the anchor-to-edge formula).  `last_known_dac_code` is a convenience
+cache of the same point.  Warm-start seeding should be driven by the
+**ppb correction**, clamped to `[code_min, code_max]` for a DAC — never
+by a characterization field.
+
+**Why "parked" disappears entirely.**  `[steering].parked_code` (a
+*characterization* field) reads like "where the actuator parks on
+startup/shutdown," but its actual role is just the *reference code of the
+linear fit* — the code at which `intercept_ppb_at_parked` was measured,
+i.e. one (redundant) point on the line.  The name invites exactly the
+conflation this section purges: treating a fit anchor as a place to sit,
+or as a stand-in for the GNSS-matching point.  (The example file even has
+`intercept_ppb_at_parked` = `last_known_freq_offset_ppb` = +144.65 — the
+two got tangled because the fit happened to be anchored at the
+then-current operating code.)  The minimal line description above
+(`{code_min, code_max, slope, ppb_at_code_min}`) needs no such field, so
+PR2 of `noMagicCenterCode` **deletes `parked_code` and
+`intercept_ppb_at_parked` outright** rather than renaming them — the
+anchor is `ppb_at_code_min`, and "parked" leaves the vocabulary.  The
+only "where to start" state is the runtime last-known correction
+(`last_known_freq_offset_ppb`), better named `last_code` / `shutdown_code`
+on the DAC-cache side than "parked."
+
+> **Why this matters now**: MadHat / clkPoC3 (5 V DAC + IsoTemp OCXO)
+> are near-perfect, so the filter quietly absorbs implicit
+> center/symmetry assumptions.  PiFace (3.3 V DAC + CTI OCXO) has no
+> code symmetry, so the assumptions break — and the sloppy thinking
+> masks PiFace's *real* DO-hardware troubles.  Purging the magic center
+> code (tracked in dayplan `noMagicCenterCode`) is the prerequisite to
+> cleanly separating thinking artifacts from genuine DO-HW behaviour.
+> The `[steering]` schema below still records `parked_code` /
+> `intercept_ppb_at_parked`; PR2 of `noMagicCenterCode` **deletes** both
+> in favor of `ppb_at_code_min` (line = `{code_min, code_max, slope,
+> ppb_at_code_min}`), and the engine controls the DAC via a ppb
+> correction exactly as it does a PHC.
+
+
 ## Schema
 
 Two files per DO, with strict ownership.  The split is structural,
