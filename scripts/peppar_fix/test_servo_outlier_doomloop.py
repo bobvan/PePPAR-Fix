@@ -58,6 +58,43 @@ class ServoOutlierDoomLoopTest(unittest.TestCase):
         d = [_decide(self.ctx, -(600.0 + 14.0 * k))[0] for k in range(5)]
         self.assertEqual(d[4], "ramp_accept")
 
+    # --- rampReacquireDriftAware (DRAFT): drift-rate estimate ----------
+    def test_ramp_accept_estimates_drift_rate(self):
+        """With mono_time, ramp_accept returns the drift rate (ns/s = ppb):
+        slope of pps_err over the ramp baseline→now."""
+        ctx = {'consecutive_outliers': 0}
+        # 5 epochs, +20 ns/s ramp, 1 s apart: 600,620,...,680 at t=100..104.
+        out = None
+        for k in range(5):
+            out = _servo_outlier_decision(
+                ctx, outlier_observable_ns=600.0 + 20.0 * k,
+                track_outlier_ns=500.0, converging=False, gap_recovery=False,
+                ramp_accept_n=5, mono_time=100.0 + k)
+        decision, drift = out
+        self.assertEqual(decision, "ramp_accept")
+        # baseline (t=100,e=600) → now (t=104,e=680): 80/4 = +20 ppb
+        self.assertAlmostEqual(drift, 20.0, places=3)
+
+    def test_ramp_accept_drift_none_without_time(self):
+        """Back-compat: no mono_time → drift None (caller holds the freq)."""
+        ctx = {'consecutive_outliers': 0}
+        out = None
+        for k in range(5):
+            out = _decide(ctx, 600.0 + 20.0 * k)   # _decide passes no mono_time
+        self.assertEqual(out, ("ramp_accept", None))
+
+    def test_negative_ramp_drift_sign(self):
+        """A negative (DO-fast) ramp yields a negative drift estimate."""
+        ctx = {'consecutive_outliers': 0}
+        out = None
+        for k in range(5):
+            out = _servo_outlier_decision(
+                ctx, outlier_observable_ns=-(600.0 + 20.0 * k),
+                track_outlier_ns=500.0, converging=False, gap_recovery=False,
+                ramp_accept_n=5, mono_time=100.0 + k)
+        self.assertEqual(out[0], "ramp_accept")
+        self.assertAlmostEqual(out[1], -20.0, places=3)
+
     # --- spikes must still be skipped (not accepted) -------------------
     def test_isolated_spike_is_skipped_not_accepted(self):
         self.assertEqual(_decide(self.ctx, 9000.0)[0], "outlier")

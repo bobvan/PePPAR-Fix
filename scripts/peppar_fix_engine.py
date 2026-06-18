@@ -7987,7 +7987,8 @@ def _enter_obs_holdover(ctx, args, reason_code, detail):
     ctx['tracking_mode'] = 'ekf'
 
 
-def _request_servo_reset(ctx, reason, scope="servo", *, now=time.monotonic):
+def _request_servo_reset(ctx, reason, scope="servo", *, now=time.monotonic,
+                         initial_freq=None):
     """Consult the shared ResetBudget and either reset the servo in
     process or signal exit-5.  Returns ``"reset"`` (done in process) or
     ``"exit5"`` (caller should set ``phc_diverged`` / return 5).
@@ -8021,7 +8022,10 @@ def _request_servo_reset(ctx, reason, scope="servo", *, now=time.monotonic):
             budget.max_resets)
         return "exit5"
     servo = ctx['servo']
-    servo.reset()
+    # initial_freq != None → steer the actuator to the drift-corrected freq on
+    # re-acquire (rampReacquireDriftAware); default None preserves the held
+    # actuator command (legacy behavior for non-drift resets).
+    servo.reset(initial_freq=initial_freq) if initial_freq is not None else servo.reset()
     _conv = ctx.get('convergence')
     if _conv is not None:
         _conv.reset()
@@ -8212,8 +8216,16 @@ def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
     return "ok"
 
 
+# rampReacquireDriftAware (DRAFT — validate sign/gain/window vs a captured
+# pifaceDriftEpisode before deploy): clamp on the drift-cancel steer applied at
+# ramp re-acquire.  A real DO drift episode is a few ppb; a larger estimate is
+# implausible (or a wrong-sign hazard) → fall back to a plain held reset.
+_RAMP_DRIFT_MAX_PPB = 25.0
+
+
 def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
-                            converging, gap_recovery, ramp_accept_n=5):
+                            converging, gap_recovery, ramp_accept_n=5,
+                            mono_time=None):
     """Pure decision: does the servo PPS-side outlier check trip this epoch?
 
     Returns one of:
@@ -8289,16 +8301,32 @@ def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
     # signed run length: same sign extends it, a sign flip restarts it.
     sign = 1 if outlier_observable_ns > 0 else -1
     run = ctx.get('_outlier_ramp', 0)
-    run = run + sign if run * sign > 0 else sign
+    if run * sign > 0:
+        run = run + sign
+    else:
+        # Ramp (re)started — anchor the drift baseline (time + error) at the
+        # first same-sign outlier so a ramp_accept can estimate the DO drift
+        # RATE from baseline→now (rampReacquireDriftAware).
+        run = sign
+        ctx['_ramp_t0'] = mono_time
+        ctx['_ramp_e0'] = outlier_observable_ns
     ctx['_outlier_ramp'] = run
     if ramp_accept_n and abs(run) >= ramp_accept_n:
-        # Real, sustained divergence — stop skipping (which lets it run
-        # away to the exit-5 cascade) and let the EKF absorb it to arrest
-        # the ramp.  Catching it early (at ramp_accept_n epochs, a small
-        # error) is itself slew-limiting: the correction stays small.
+        # Real, sustained divergence (a continuing DO frequency drift, not a
+        # spike).  Estimate the drift RATE (ns/s = ppb) over the ramp so the
+        # caller can STEER the actuator to cancel it on re-acquire — holding
+        # the stale freq just re-assumes zero drift and the ramp resumes →
+        # cascade.  drift = Δ(pps_err)/Δt over baseline→now; None when no
+        # usable time delta (caller then falls back to a plain held reset).
+        drift_ppb = None
+        _t0 = ctx.get('_ramp_t0')
+        _e0 = ctx.get('_ramp_e0')
+        if (mono_time is not None and _t0 is not None
+                and (mono_time - _t0) > 0.0):
+            drift_ppb = (outlier_observable_ns - _e0) / (mono_time - _t0)
         ctx['consecutive_outliers'] = 0
         ctx['_outlier_ramp'] = 0
-        return ("ramp_accept", None)
+        return ("ramp_accept", drift_ppb)
     if ctx['consecutive_outliers'] >= 30:
         return ("outlier", True)
     return ("outlier", False)
@@ -8606,31 +8634,48 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         pps_err_ticc_ns if pps_err_ticc_ns is not None
         else pps_err_extts_ns
     )
-    _decision, _exit5 = _servo_outlier_decision(
+    _decision, _aux = _servo_outlier_decision(
         ctx,
         outlier_observable_ns=outlier_observable_ns,
         track_outlier_ns=TRACK_OUTLIER_NS,
         converging=scheduler._converging,
         gap_recovery=gap_recovery,
         ramp_accept_n=getattr(args, 'outlier_ramp_accept_n', 5),
+        mono_time=time.monotonic(),
     )
     if _decision == "ramp_accept":
         # servoOutlierDoomLoop fix (REWORKED 2026-06-09): a sustained
-        # same-sign ramp is a REAL divergence.  RE-ACQUIRE via a servo
-        # reset so the filter re-locks.  Do NOT let the measurement through
-        # (the original 2026-06-08 attempt): its large innovation is then
-        # rejected by the EKF chi² gate, so no correction is applied and
-        # the DO drifts — that let-through silently broke frequency lock
-        # (caught 2026-06-09 by chA-chB drift on the scope, hidden from the
-        # detrended-TDEV metric).  Catching the ramp at ramp_accept_n epochs
-        # (small error) keeps the re-acquire gentle; budget exhausted falls
-        # back to exit-5 (full re-bootstrap, which also re-locks).
-        if _request_servo_reset(ctx, 'ramp_reacquire') == "reset":
+        # same-sign ramp is a REAL divergence.  RE-ACQUIRE via a servo reset
+        # so the filter re-locks.  Do NOT just let the measurement through
+        # (the 2026-06-08 attempt): the EKF chi² gate rejects the large
+        # innovation, no correction lands, and the DO drifts.
+        #
+        # rampReacquireDriftAware (DRAFT, 2026-06-18): the plain re-acquire
+        # holds the actuator and resets x[3]=−freq (re-assumes ZERO drift).
+        # On a CONTINUING DO drift that re-assumption is wrong, so the ramp
+        # resumes → 6 resets/300s → exit-5 (the pifaceDriftEpisodes cascade).
+        # Fix: steer the actuator to CANCEL the estimated drift rate (_aux,
+        # ppb) on re-acquire, so the post-reset DO is no longer drifting vs
+        # the commanded freq.  Clamped + gated; falls back to a plain held
+        # reset when the estimate is absent/implausible.
+        # ⚠️ SIGN/GAIN/WINDOW to be VALIDATED against a captured episode
+        #    before this is deployed (a wrong sign would steer the wrong way).
+        _drift_ppb = _aux
+        _corrected_freq = None
+        if (_drift_ppb is not None
+                and 0.0 < abs(_drift_ppb) <= _RAMP_DRIFT_MAX_PPB):
+            # +pps_err = DO late (slow) → speed the DO up to cancel the drift.
+            _corrected_freq = ctx['servo'].freq + _drift_ppb
+        if _request_servo_reset(ctx, 'ramp_reacquire',
+                                initial_freq=_corrected_freq) == "reset":
             ctx['consecutive_outliers'] = 0
             log.warning(
-                "  Sustained same-sign outlier ramp (pps_err=%+.0fns) — "
-                "servo re-acquire to re-lock (servoOutlierDoomLoop)",
-                outlier_observable_ns)
+                "  Sustained same-sign outlier ramp (pps_err=%+.0fns, "
+                "drift=%s ppb) — drift-aware re-acquire (%s) (servoOutlierDoomLoop)",
+                outlier_observable_ns,
+                f"{_drift_ppb:+.2f}" if _drift_ppb is not None else "n/a",
+                f"steer→{_corrected_freq:+.2f}ppb" if _corrected_freq is not None
+                else "hold")
             return "outlier"
         log.error(
             "  Sustained same-sign outlier ramp (pps_err=%+.0fns) + reset "
@@ -8642,7 +8687,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         ctx['phc_diverged'] = True
         return "outlier"
     if _decision == "outlier":
-        if _exit5:
+        if _aux:  # exit5 flag (the "outlier" decision's aux payload)
             # exitFiveToServoReset site B (PHC/EKF outlier cascade):
             # try in-process reset before exit-5.  Within budget → reset
             # the EKF (actuator preserved), clear the counter, keep
