@@ -99,6 +99,19 @@ characterized.  Current adj = +140.5 ppb matches the 2026-05-13
 state-file value of +140.2 ppb (sub-ppb drift over 2 days).
 Residual after correction = -0.05 ppb, well within servo expectations.
 
+> ⚠️ **noMagicCenterCode (2026-06-18)**: the language below treats the
+> DAC *center* as a reference ("free-running at DAC center → −149 ppb",
+> sweeps anchored on `center ± N`).  That conflates the DAC's neutral
+> command (midscale, ↔ `adjfine = 0`) with the OCXO's GNSS-matching
+> point.  They coincide *only* under code+pull symmetry, which PiFace
+> (3.3 V DAC + CTI OCXO) lacks — and the GNSS-matching code drifts with
+> temperature regardless.  Read "center" here as "the parked/sweep
+> anchor of that run," not a privileged frequency reference.  Correct
+> model — linear region `{code_min, code_max, slope}` + the measured
+> GNSS-matching code, anchored to an edge — in
+> `docs/do-characterization-architecture.md` §"Code symmetry vs pull
+> symmetry".
+
 The TOML comment block records the canonical PiFace characterization:
 - ppb_per_code = 0.0361 (effective; gain factor 1.062 baked in)
 - Linearity < 5 ppb over ±200 ppb of adj range

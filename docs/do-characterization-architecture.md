@@ -89,6 +89,113 @@ receiver-side measurements *do* see the DO there).  Those are
 treated as black boxes from the PePPAR-Fix engine's perspective.
 
 
+## Code symmetry vs pull symmetry — the DO is an intersection (no magic center code)
+
+A DAC-steered DO is the **intersection of two independently-imperfect
+components**, and most of our DAC-control confusion has come from
+treating them as one thing:
+
+- the **DAC** — a code→voltage actuator, and
+- the **OCXO** — a voltage→frequency oscillator.
+
+Each has its own asymmetries and limits.  Two *separate* properties,
+which we must stop conflating:
+
+- **Code symmetry** is a property of the **DAC alone**: it produces
+  ~half its full control voltage at the center (midscale) code.  A
+  rail-to-rail DAC on a 5 V supply has it; PiFace's 3.3 V AD5693R in
+  2× mode does **not** (it clips against VDD before full scale).
+- **Pull symmetry** is a property of the **OCXO alone**: it matches
+  GNSS at half control voltage, i.e. its frequency pull is symmetric
+  around the GNSS-matching control point.  Any OCXO whose EFC curve
+  has shifted under temperature does **not** — and that shift is
+  normal, not a defect.
+
+**The center code is meaningful *only* under code symmetry.**  The
+moment you allow code asymmetry, *there is nothing special about the
+center code*.  And even with a perfect DAC, thermal drift moves the
+GNSS-matching point — a DO that matches GNSS at code C at 25 °C needs
+a different code at 30 °C.
+
+### The PHC analogy (why this is obvious for TimeHat and was hidden for the DAC hosts)
+
+The cleanest way to see it: a DAC-steered DO is exactly like a PHC
+steered by `adjfine`.
+
+| PHC (`adjfine`) | DAC + OCXO | meaning |
+|---|---|---|
+| `adjfine = 0 ppb` | **center code** (`max_code // 2`) | the actuator's *neutral* command — "apply no correction." No relationship to GNSS. |
+| the `adjfine` value that locks to GNSS (= −crystal free-run offset) | the **GNSS-matching code** | where the DO's frequency *equals* GNSS (pull = 0). |
+
+Nobody ever treats `adjfine = 0` as "where GNSS lives": to discipline
+a PHC you drive `adjfine` to whatever cancels the crystal's
+free-running offset, that value is essentially never 0 ppb, and it
+**drifts with temperature**.  The integral servo simply seeks it.  A
+DAC-steered DO is identical — the **center code is the neutral command
+(↔ `adjfine = 0`), and the GNSS-matching code is a measured,
+temperature-drifting operating point (↔ the locking `adjfine`)**.  We
+must stop anchoring DAC code math, clamps, and bootstrap seeds on the
+center code, exactly as we never anchored PHC control on `adjfine = 0`.
+
+This conflation never bit the PHC hosts (TimeHat/MadHat-i226) for two
+reasons the DAC lacks: (1) nobody anchors PHC control on a "special"
+zero, and (2) a PHC has effectively no hard rails near its operating
+point.  A DAC has **both** — center-anchored math *and* hard
+`[code_min, code_max]` linear-region rails — so on an asymmetric host
+(PiFace) the assumptions break and a center-anchored seed lands on a
+rail (the `dacBootstrapSeedRail` / `detectLinearRegionOverClip`
+symptoms).
+
+### Correct model — anchor to an edge, not a center
+
+A DAC-DO's steering is fully described by its **linear region** plus
+**one point on the line** — never a privileged center:
+
+```
+linear region   = { code_min, code_max, slope_ppb_per_code }
+anchor point    = the GNSS-matching code  (pull = 0), which may sit
+                  ANYWHERE in [code_min, code_max] (or be derived from
+                  any measured (code, ppb) pair)
+```
+
+Compute code from desired pull anchored to an **edge**, with no center
+in the equation:
+
+```
+code = code_min + (desired_pull_ppb − pull_at_code_min) / slope
+```
+
+Asymmetric pull is fine and expected.  What matters operationally is
+**directional headroom** — the distance from the GNSS-matching code to
+each rail:
+
+```
+headroom_fast = (code_max − gnss_matching_code) · slope     # ppb of "speed up" available
+headroom_slow = (gnss_matching_code − code_min) · slope     # ppb of "slow down" available
+```
+
+Combined with the OCXO's temperature coefficient (ppb/°C), the headroom
+predicts the **ambient-temperature band over which the servo keeps
+control** before the DO rails on one side.  This is the DAC-specific
+budget a PHC has no analog for.
+
+`center_code` survives in the schema only as an optional **startup sit
+point** (a benign place to park the DAC before a lock is acquired),
+explicitly *decoupled* from any notion of "where GNSS is."  It is never
+the control anchor.
+
+> **Why this matters now**: MadHat / clkPoC3 (5 V DAC + IsoTemp OCXO)
+> are near-perfect, so the filter quietly absorbs implicit
+> center/symmetry assumptions.  PiFace (3.3 V DAC + CTI OCXO) has no
+> code symmetry, so the assumptions break — and the sloppy thinking
+> masks PiFace's *real* DO-hardware troubles.  Purging the magic center
+> code (tracked in dayplan `noMagicCenterCode`) is the prerequisite to
+> cleanly separating thinking artifacts from genuine DO-HW behaviour.
+> The `[steering]` schema below still records `parked_code` /
+> `intercept_ppb_at_parked`; PR2 of `noMagicCenterCode` reframes those
+> to express the linear region + GNSS-matching code directly.
+
+
 ## Schema
 
 Two files per DO, with strict ownership.  The split is structural,

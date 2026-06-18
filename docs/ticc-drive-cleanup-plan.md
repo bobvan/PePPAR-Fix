@@ -31,6 +31,14 @@ lands.  They're marked with TODO comments in the code.
    - Why: stale DAC setting from prior run corrupts frequency estimate
    - Revert: the full cleanup should unify the DAC lifecycle so the
      actuator is set up BEFORE the frequency measurement, not after
+   - ⚠️ **noMagicCenterCode (2026-06-18)**: "reset to center" bakes in
+     the magic-center-code error — midscale is the actuator's *neutral*
+     command (↔ `adjfine = 0`), not a meaningful frequency reference.
+     On an asymmetric DAC (PiFace) parking at midscale sits the DO far
+     from GNSS.  The unified lifecycle should park at the **GNSS-matching
+     code** (or last-known code), not midscale.  See
+     `docs/do-characterization-architecture.md` §"Code symmetry vs pull
+     symmetry".
 
 ## Full refactor plan
 
