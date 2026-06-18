@@ -152,24 +152,51 @@ point.  A DAC has **both** — center-anchored math *and* hard
 rail (the `dacBootstrapSeedRail` / `detectLinearRegionOverClip`
 symptoms).
 
-### Correct model — anchor to an edge, not a center
+### Correct model — a DAC is an affine ppb→code adapter, anchored at an edge
 
-A DAC-DO's steering is fully described by its **linear region** plus
-**one point on the line** — never a privileged center:
-
-```
-linear region   = { code_min, code_max, slope_ppb_per_code }
-anchor point    = the GNSS-matching code  (pull = 0), which may sit
-                  ANYWHERE in [code_min, code_max] (or be derived from
-                  any measured (code, ppb) pair)
-```
-
-Compute code from desired pull anchored to an **edge**, with no center
-in the equation:
+A DAC-DO's steering is a straight line, which has exactly **two**
+degrees of freedom (a slope and one point).  The old schema stored
+*three* numbers for it — `slope`, `parked_code`, `intercept_ppb_at_parked`
+— which is over-specified, and the redundant `parked_code` is precisely
+the "magic center" wearing a different hat.  We already carry the range
+`{code_min, code_max}`, so **anchor the one point at `code_min`** and the
+description becomes minimal and non-redundant:
 
 ```
-code = code_min + (desired_pull_ppb − pull_at_code_min) / slope
+[steering] line = { code_min, code_max, slope_ppb_per_code, ppb_at_code_min }
 ```
+
+- `ppb_at_code_min` is the OCXO's frequency pull at the lower edge — a
+  *measured property of the line*: always in-range, and it does **not**
+  drift (it's the fit's value at a fixed code).
+- `parked_code`, `intercept_ppb_at_parked`, and `center_code` are all
+  **gone** from the line description.  The GNSS-matching code (pull = 0)
+  is *derived*, not stored — it drifts with temperature and may even sit
+  outside `[code_min, code_max]` on a badly-offset OCXO, so it has no
+  business in characterization.
+
+The forward and inverse maps are a plain affine transform:
+
+```
+ppb(code) = ppb_at_code_min + slope · (code − code_min)
+code(ppb) = code_min + (ppb − ppb_at_code_min) / slope    # clamp to [code_min, code_max]
+```
+
+**The unification this buys: the servo controls a ppb correction, full
+stop — for every DO.**  The servo already does this for a PHC
+(`adjfine` *is* a ppb correction).  A DAC-DO is identical from the
+servo's side; the DAC is *just an affine adapter* (slope + intercept)
+that translates the servo's commanded ppb into a code via `code(ppb)`
+above.  `ppb = 0` is the neutral command (↔ `adjfine = 0` ↔ center
+code — **not** GNSS), and the servo's integral converges to the
+**GNSS-matching ppb wherever it currently sits** — for a PHC that's
+`−(crystal offset)`, for a DAC it's `ppb` at the GNSS-matching code,
+both drifting with temperature.  The only thing that differs across
+DOs is the actuator's translation: identity for PHC `adjfine`, the
+affine map above for a DAC, the FCW formula for ClockMatrix.  This is
+exactly the existing `FrequencyActuator.adjust_frequency_ppb(ppb)`
+contract — the DAC implementation just needs to anchor on `code_min`
+instead of `center_code`.
 
 Asymmetric pull is fine and expected.  What matters operationally is
 **directional headroom** — the distance from the GNSS-matching code to
@@ -221,20 +248,23 @@ cache of the same point.  Warm-start seeding should be driven by the
 **ppb correction**, clamped to `[code_min, code_max]` for a DAC — never
 by a characterization field.
 
-**The danger in "parked".**  `[steering].parked_code` (a *characterization*
-field) reads like "where the actuator parks on startup/shutdown," but its
-actual role is the *reference code of the linear fit* — the code at which
-`intercept_ppb_at_parked` was measured, i.e. just one point on the line.
-The name invites exactly the conflation this whole section is purging:
-treating a fit anchor as a place to sit, or as a stand-in for the
-GNSS-matching point.  (Note the example file even has
+**Why "parked" disappears entirely.**  `[steering].parked_code` (a
+*characterization* field) reads like "where the actuator parks on
+startup/shutdown," but its actual role is just the *reference code of the
+linear fit* — the code at which `intercept_ppb_at_parked` was measured,
+i.e. one (redundant) point on the line.  The name invites exactly the
+conflation this section purges: treating a fit anchor as a place to sit,
+or as a stand-in for the GNSS-matching point.  (The example file even has
 `intercept_ppb_at_parked` = `last_known_freq_offset_ppb` = +144.65 — the
-two got tangled because the fit was anchored at the then-current
-operating code.)  PR2 of `noMagicCenterCode` removes `parked_code` from
-the line description (which needs only `{code_min, code_max, slope}` + a
-pull-reference such as the GNSS-matching code); the only "where to start"
-state is the runtime last-known correction, better named `last_code` /
-`shutdown_code` than "parked."
+two got tangled because the fit happened to be anchored at the
+then-current operating code.)  The minimal line description above
+(`{code_min, code_max, slope, ppb_at_code_min}`) needs no such field, so
+PR2 of `noMagicCenterCode` **deletes `parked_code` and
+`intercept_ppb_at_parked` outright** rather than renaming them — the
+anchor is `ppb_at_code_min`, and "parked" leaves the vocabulary.  The
+only "where to start" state is the runtime last-known correction
+(`last_known_freq_offset_ppb`), better named `last_code` / `shutdown_code`
+on the DAC-cache side than "parked."
 
 > **Why this matters now**: MadHat / clkPoC3 (5 V DAC + IsoTemp OCXO)
 > are near-perfect, so the filter quietly absorbs implicit
@@ -244,8 +274,10 @@ state is the runtime last-known correction, better named `last_code` /
 > code (tracked in dayplan `noMagicCenterCode`) is the prerequisite to
 > cleanly separating thinking artifacts from genuine DO-HW behaviour.
 > The `[steering]` schema below still records `parked_code` /
-> `intercept_ppb_at_parked`; PR2 of `noMagicCenterCode` reframes those
-> to express the linear region + GNSS-matching code directly.
+> `intercept_ppb_at_parked`; PR2 of `noMagicCenterCode` **deletes** both
+> in favor of `ppb_at_code_min` (line = `{code_min, code_max, slope,
+> ppb_at_code_min}`), and the engine controls the DAC via a ppb
+> correction exactly as it does a PHC.
 
 
 ## Schema
