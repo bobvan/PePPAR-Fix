@@ -45,7 +45,7 @@ class DacActuator(FrequencyActuator):
 
     def __init__(self, bus_num, addr, bits=12,
                  ppb_per_code=1.0, max_ppb=None, dac_type="mcp4725",
-                 dac_gain=0, last_code=None,
+                 dac_gain=0, last_code=None, last_ppb=None,
                  code_min=None, code_max=None, ppb_at_code_min=0.0):
         self._bus_num = bus_num
         self._addr = addr
@@ -79,6 +79,13 @@ class DacActuator(FrequencyActuator):
         self._dac_gain = int(dac_gain) if dac_gain is not None else 0
         self._bus = None
         self._last_code = last_code
+        # Warm-start seed, "up a layer" (Bob 2026-06-18): the last-saved
+        # frequency CORRECTION in ppb (true pull from nominal, ↔ adjfine).
+        # Preferred over last_code because it is the actuator-agnostic
+        # operating point — robust to a stale persisted dac_code (which on
+        # PiFace lagged the operating code and made seed-by-code jump the DO
+        # → glide blow-up).  Mapped to a code via the edge anchor at setup().
+        self._last_ppb = last_ppb
         self._current_code = self._code_min
         self._current_ppb = self._ppb_for_code(self._code_min)
         self._range_warned = False
@@ -107,12 +114,15 @@ class DacActuator(FrequencyActuator):
     def setup(self):
         """Open I2C bus, configure control register (GAIN), set DAC.
 
-        When ``last_code`` was provided at construction, the DAC starts there
-        — the frequency the OCXO was last running at (frame-independent: a raw
-        code, correct regardless of the steering frame).  This is the
-        warm-start seed.  Otherwise it parks at the NEUTRAL command — the code
-        for ppb = 0 (DO at nominal, ↔ adjfine = 0), clamped to the linear
-        range.  There is no magic midscale park.
+        Warm-start seed priority (no magic midscale park):
+          1. ``last_ppb`` — the last-saved frequency correction (true pull
+             from nominal, ↔ adjfine).  PREFERRED: it is the actuator-agnostic
+             operating point, mapped to a code via the edge anchor, and is
+             robust to a stale persisted dac_code.
+          2. ``last_code`` — the raw last code (frame-independent fallback when
+             no ppb is recorded, e.g. first boot after a code-only migration).
+          3. NEUTRAL — the code for ppb = 0 (DO at nominal, ↔ adjfine = 0),
+             clamped to the linear range.
         """
         try:
             import smbus2
@@ -124,7 +134,11 @@ class DacActuator(FrequencyActuator):
         # types ignore this — POR-default behavior preserved.
         if self._dac_type == "ad5693r":
             self._write_ad5693r_control_register()
-        if self._last_code is not None:
+        if self._last_ppb is not None:
+            start_code = max(self._code_min,
+                             min(self._code_max, self._code_for_ppb(self._last_ppb)))
+            seed = "last_ppb (warm start)"
+        elif self._last_code is not None:
             start_code = max(self._code_min,
                              min(self._code_max, int(self._last_code)))
             seed = "last_code (warm start)"

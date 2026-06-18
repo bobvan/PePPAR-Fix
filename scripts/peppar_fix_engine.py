@@ -6420,9 +6420,13 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
         return False
 
     from peppar_fix.runtime_state_resolve import resolve_runtime_state
-    _last_code = (resolve_runtime_state(do_label).dac_code
-                  if do_label else None)
-    if _last_code is not None:
+    _rt = resolve_runtime_state(do_label) if do_label else None
+    _last_code = _rt.dac_code if _rt else None
+    _last_ppb = _rt.freq_offset_ppb if _rt else None
+    if _last_ppb is not None:
+        log.info("Bootstrap: warm-start from last freq offset %.1f ppb for %s",
+                 _last_ppb, do_label)
+    elif _last_code is not None:
         log.info("Bootstrap: loaded last DAC code %d for %s", _last_code, do_label)
     dac = DacActuator(
         bus_num=dac_bus,
@@ -6434,6 +6438,7 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
         dac_type=getattr(args, 'dac_type', 'mcp4725'),
         dac_gain=_dk.get("dac_gain", 0) or 0,
         last_code=_last_code,
+        last_ppb=_last_ppb,
         code_min=_dk.get("code_min"),
         code_max=_dk.get("code_max"),
     )
@@ -6755,8 +6760,9 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
             from peppar_fix.dac_actuator import DacActuator
             from peppar_fix.runtime_state_resolve import resolve_runtime_state
             _do_lbl = getattr(args, 'do_label', None)
-            _pre_last = (resolve_runtime_state(_do_lbl).dac_code
-                         if _do_lbl else None)
+            _pre_rt = resolve_runtime_state(_do_lbl) if _do_lbl else None
+            _pre_last = _pre_rt.dac_code if _pre_rt else None
+            _pre_ppb = _pre_rt.freq_offset_ppb if _pre_rt else None
             _rk = _dac_build_kwargs(args, _resolve_do_uid(args))
             _dac_reset = DacActuator(
                 bus_num=dac_bus,
@@ -6767,6 +6773,7 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
                 dac_type=getattr(args, 'dac_type', 'mcp4725'),
                 dac_gain=_rk.get("dac_gain", 0) or 0,
                 last_code=_pre_last,
+                last_ppb=_pre_ppb,
                 code_min=_rk.get("code_min"),
                 code_max=_rk.get("code_max"),
             )
@@ -6941,9 +6948,15 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                           "for an unregistered DO")
             else:
                 _last_code = None
+                _last_ppb = None
                 if _dac_do_uid is not None:
-                    _last_code = resolve_runtime_state(_dac_do_uid).dac_code
-                    if _last_code is not None:
+                    _rt = resolve_runtime_state(_dac_do_uid)
+                    _last_code = _rt.dac_code
+                    _last_ppb = _rt.freq_offset_ppb
+                    if _last_ppb is not None:
+                        log.info("Warm-start from last freq offset %.1f ppb for %s",
+                                 _last_ppb, _dac_do_uid)
+                    elif _last_code is not None:
                         log.info("Loaded last DAC code %d for %s",
                                  _last_code, _dac_do_uid)
                 actuator = DacActuator(
@@ -6956,6 +6969,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                     dac_type=getattr(args, 'dac_type', 'mcp4725'),
                     dac_gain=_dk.get("dac_gain", 0) or 0,
                     last_code=_last_code,
+                    last_ppb=_last_ppb,
                     code_min=_dk.get("code_min"),
                     code_max=_dk.get("code_max"),
                 )
