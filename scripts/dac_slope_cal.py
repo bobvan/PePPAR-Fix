@@ -175,9 +175,19 @@ def detect_linear_region(valid, center_code=32768, min_slope_frac=0.6,
     if res is None:
         return None
     slope, intercept, rmse = res
+    code_min = linear[0][0]
+    code_max = linear[-1][0]
+    # noMagicCenterCode: emit the edge-anchored pull (the fitted line
+    # evaluated at code_min), so the [steering] schema can describe the
+    # line as {code_min, code_max, slope, ppb_at_code_min} with no
+    # privileged center.  center_code here is only the fit's intercept
+    # reference and cancels out — ppb_at_code_min is the same line value
+    # regardless of where the intercept was anchored.
+    ppb_at_code_min = intercept + slope * (code_min - center_code)
     return {
         'slope': slope, 'intercept': intercept, 'rmse': rmse,
-        'code_min': linear[0][0], 'code_max': linear[-1][0],
+        'code_min': code_min, 'code_max': code_max,
+        'ppb_at_code_min': ppb_at_code_min,
         'n_linear': len(linear),
     }
 

@@ -50,23 +50,67 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def read_char_temps(bus_num: int) -> dict:
+    """Read the temperatures the steering curve is being characterized at.
+
+    Returns a dict with any of ``char_temp_ocxo_c`` (OCXO oven, from an
+    ADT7410-class I2C sensor on the DAC's bus, if fitted) and
+    ``char_temp_cpu_c`` (the on-board CPU/SoC thermal zone — a universal
+    ambient proxy).  ``ppb_at_code_min`` is implicitly measured AT this
+    temperature (the GNSS-matching point drifts with it), so recording the
+    reference temp is what makes the headroom/temp-margin projection
+    possible (noMagicCenterCode, Bob 2026-06-18).  Best-effort: missing
+    sensors are simply absent from the dict.
+    """
+    out: dict = {}
+    try:
+        from peppar_fix.temp_sensor import TempSensor, read_onboard_temps
+    except Exception:  # noqa: BLE001
+        return out
+    try:
+        ts = TempSensor(bus_num=bus_num)
+        if ts.available:
+            t = ts.read_celsius()
+            if t is not None:
+                out["char_temp_ocxo_c"] = round(float(t), 3)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        zones = read_onboard_temps()
+        # Prefer the SoC/CPU zone; fall back to the hottest readable zone.
+        cpu = next((v for k, v in zones.items() if "cpu" in k.lower()), None)
+        if cpu is None and zones:
+            cpu = max(zones.values())
+        if cpu is not None:
+            out["char_temp_cpu_c"] = round(float(cpu), 3)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def steering_fields_from_fit(fit: dict, center_code: int,
-                             dac_gain: int = 0) -> dict:
+                             dac_gain: int = 0, temps: dict | None = None) -> dict:
     """Map a ``detect_linear_region`` result -> schema ``[steering]`` fields.
 
-    The fit is ppb = intercept + slope*(code - center_code), so the intercept
-    IS the freq offset at center_code -> parked_code = center_code,
-    intercept_ppb_at_parked = intercept.  ``asymmetry_factor`` defaults to 1.0
-    (ramp-rate asymmetry isn't measured by this sweep; a later revision can
-    fill it).  ``source`` is added by the schema writer, not here.
+    The line is described edge-anchored (noMagicCenterCode): ``code_min``,
+    ``code_max``, ``slope_ppb_per_code``, and ``ppb_at_code_min`` (the OCXO
+    pull at the lower edge) — no privileged center in the description.
+    ``parked_code`` / ``intercept_ppb_at_parked`` are still written for
+    backward compatibility with the current center-anchored actuator path;
+    PR3 of noMagicCenterCode switches the actuator to the edge anchor and
+    drops them.  ``asymmetry_factor`` defaults to 1.0 (ramp-rate asymmetry,
+    orthogonal to pull asymmetry, isn't measured by this sweep).  ``source``
+    is added by the schema writer, not here.
 
     ``dac_gain`` is the DAC output-stage gain bit the sweep ran at (0=1×,
-    1=2×).  It is recorded so the engine can set the DAC to the SAME gain at
-    runtime — a slope measured at 2× is wrong if applied at 1× (the volts/code,
-    and hence ppb/code, differ).  This closes the silent-gain-mismatch hole.
+    1=2×) — a slope measured at 2× is wrong if applied at 1×.  ``temps``
+    (from ``read_char_temps``) records the OCXO/CPU temperature the curve
+    was measured at, since ``ppb_at_code_min`` is implicitly at-char-temp.
     """
-    return {
+    fields = {
         "slope_ppb_per_code": float(fit["slope"]),
+        "ppb_at_code_min": float(fit["ppb_at_code_min"]),
+        # back-compat (center-anchored actuator path; dropped in PR3):
         "intercept_ppb_at_parked": float(fit["intercept"]),
         "parked_code": int(center_code),
         "code_min": int(fit["code_min"]),
@@ -76,6 +120,9 @@ def steering_fields_from_fit(fit: dict, center_code: int,
         "rmse_ppb": float(fit["rmse"]),
         "measured_at": _utcnow(),
     }
+    if temps:
+        fields.update(temps)
+    return fields
 
 
 def sweep(dac, codes, settle_s, measure_s, ticc_port, *, log=print):
@@ -159,13 +206,21 @@ def main(argv=None) -> int:
               "fully saturated).  No [steering] written.")
         return 1
 
-    fields = steering_fields_from_fit(fit, args.center_code, dac_gain=args.gain)
+    temps = read_char_temps(args.bus)
+    fields = steering_fields_from_fit(fit, args.center_code,
+                                      dac_gain=args.gain, temps=temps)
     print(f"\n[steering]  slope={fields['slope_ppb_per_code']:+.5f} ppb/code  "
-          f"intercept={fields['intercept_ppb_at_parked']:+.2f} ppb @ code "
-          f"{fields['parked_code']}  linear=[{fields['code_min']},"
-          f"{fields['code_max']}]  gain={fields['dac_gain']} "
-          f"({'2×' if fields['dac_gain'] else '1×'})  "
+          f"ppb@code_min={fields['ppb_at_code_min']:+.2f}  "
+          f"linear=[{fields['code_min']},{fields['code_max']}]  "
+          f"gain={fields['dac_gain']} ({'2×' if fields['dac_gain'] else '1×'})  "
           f"rmse={fields['rmse_ppb']:.2f} ppb")
+    _tparts = []
+    if "char_temp_ocxo_c" in fields:
+        _tparts.append(f"OCXO {fields['char_temp_ocxo_c']:.2f}°C")
+    if "char_temp_cpu_c" in fields:
+        _tparts.append(f"CPU {fields['char_temp_cpu_c']:.2f}°C")
+    print(f"  char temp: {', '.join(_tparts)}" if _tparts else
+          "  char temp: (no sensors readable — temp-margin projection unavailable)")
     print(f"  NOTE: the engine will set the DAC to gain={fields['dac_gain']} "
           f"({'2×' if fields['dac_gain'] else '1×'}) to match this measurement "
           f"— ensure that matches the hardware build.")

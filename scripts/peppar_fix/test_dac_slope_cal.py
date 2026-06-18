@@ -57,6 +57,20 @@ class DetectLinearRegionTest(unittest.TestCase):
         fit = detect_linear_region(clean, center_code=32768)
         self.assertEqual(fit['n_linear'], len(clean))
 
+    def test_emits_ppb_at_code_min(self):
+        """noMagicCenterCode: the fit reports the edge-anchored pull, and it
+        is independent of the (arbitrary) center_code passed in."""
+        clean = [{'code': c, 'ppb': (c - 32768) * -0.01, 'n_pairs': 30}
+                 for c in range(10000, 55000, 5000)]
+        fit = detect_linear_region(clean, center_code=32768)
+        # line is ppb = -0.01·(code - 32768) → at code_min=10000: +227.68
+        self.assertAlmostEqual(fit['ppb_at_code_min'],
+                               -0.01 * (fit['code_min'] - 32768), places=3)
+        # ppb_at_code_min must not depend on where the intercept was anchored:
+        fit2 = detect_linear_region(clean, center_code=0)
+        self.assertAlmostEqual(fit['ppb_at_code_min'],
+                               fit2['ppb_at_code_min'], places=6)
+
     def test_flat_data_returns_none(self):
         """DAC not steering the DO → all-flat → no region."""
         flat = [{'code': c, 'ppb': 5.0, 'n_pairs': 30}

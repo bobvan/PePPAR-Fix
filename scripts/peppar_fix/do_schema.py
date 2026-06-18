@@ -313,6 +313,31 @@ def validate_characterization(data: dict) -> list[str]:
                 f"[steering].dac_gain must be 0 (1× mode) or 1 (2× mode), "
                 f"got {g!r}"
             )
+        # ppb_at_code_min (optional in this schema rev; canonical going
+        # forward) — the OCXO pull at the lower code edge.  This is the
+        # edge-anchored replacement for parked_code/intercept_ppb_at_parked
+        # (noMagicCenterCode): a line is {code_min, code_max, slope,
+        # ppb_at_code_min}, no privileged center.  Validated as numeric when
+        # present; the loader derives it for legacy files (parked_code +
+        # intercept) so consumers can rely on it regardless of file vintage.
+        pmin = st.get("ppb_at_code_min")
+        if pmin is not None and not isinstance(pmin, (int, float)):
+            errors.append(
+                f"[steering].ppb_at_code_min must be numeric, got {pmin!r}")
+        # Characterization-temperature provenance (optional): the OCXO oven
+        # and on-board CPU temperatures the steering curve was MEASURED at.
+        # ppb_at_code_min is implicitly ppb_at_code_min_AT_CHAR_TEMP — the
+        # GNSS-matching code drifts with temperature, so the reference temp
+        # is needed to project headroom/temp-margin (Bob 2026-06-18).  Both
+        # optional (not every host has an OCXO oven sensor); plausible range
+        # matches temp_sensor.read_onboard_temps.
+        for tk in ("char_temp_ocxo_c", "char_temp_cpu_c"):
+            tv = st.get(tk)
+            if tv is not None and (not isinstance(tv, (int, float))
+                                   or not (-40.0 <= tv <= 150.0)):
+                errors.append(
+                    f"[steering].{tk} must be numeric in −40..150 °C, "
+                    f"got {tv!r}")
 
     return errors
 
@@ -428,6 +453,20 @@ def load_do_characterization(do_uid: str,
     if isinstance(steering_section, dict) and steering_section.get("source") == "measured":
         provenance["steering"] = "measured"
         steering = dict(steering_section)
+        # noMagicCenterCode back-compat: expose ppb_at_code_min so consumers
+        # can rely on the edge-anchored model regardless of file vintage.
+        # Derive it for legacy files (parked_code + intercept) that predate
+        # the field — evaluating the same fitted line at code_min:
+        #   ppb_at_code_min = intercept_ppb_at_parked
+        #                     + slope·(code_min − parked_code)
+        if steering.get("ppb_at_code_min") is None:
+            slope = steering.get("slope_ppb_per_code")
+            cmin = steering.get("code_min")
+            parked = steering.get("parked_code")
+            intercept = steering.get("intercept_ppb_at_parked")
+            if None not in (slope, cmin, parked, intercept):
+                steering["ppb_at_code_min"] = (
+                    float(intercept) + float(slope) * (float(cmin) - float(parked)))
     else:
         provenance["steering"] = "MISSING"
         steering = {}

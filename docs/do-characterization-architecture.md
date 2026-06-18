@@ -316,11 +316,27 @@ notes = ""
 [steering]                        # the actuator gain curve
 source = "measured"               # measured | class-default
 slope_ppb_per_code = +0.02569     # sign-correct, ppb per actuator unit
-intercept_ppb_at_parked = +144.65 # freq offset at parked_code
-parked_code = 32768
 code_min = 1024                   # linear range floor
 code_max = 64512                  # linear range ceiling
-asymmetry_factor = 1.0            # 1.0 = symmetric ramp rates
+ppb_at_code_min = -698.50         # OCXO pull at code_min — the edge anchor.
+                                  # The line is fully {code_min, code_max,
+                                  # slope, ppb_at_code_min}; no privileged
+                                  # center.  Implicitly ppb_at_code_min_AT
+                                  # _CHAR_TEMP (see char_temp_* below).
+char_temp_ocxo_c = 41.2           # OCXO-oven temp at characterization (if a
+                                  # sensor is fitted; absent otherwise).
+char_temp_cpu_c = 58.7            # on-board CPU/SoC temp at characterization —
+                                  # ambient proxy.  Needed to project how the
+                                  # GNSS-matching code drifts with temperature.
+asymmetry_factor = 1.0            # 1.0 = symmetric RAMP rates (slew up vs down;
+                                  # orthogonal to pull asymmetry, which the
+                                  # edge anchor already captures).
+# DEPRECATED (noMagicCenterCode): parked_code / intercept_ppb_at_parked are a
+# redundant center-anchored description of the same line.  Still WRITTEN for
+# the current center-anchored actuator path and DERIVED by the loader for
+# legacy files; PR3 switches the actuator to the edge anchor and deletes them.
+intercept_ppb_at_parked = +144.65 # freq offset at parked_code (deprecated)
+parked_code = 32768               # fit reference code (deprecated)
 measured_at = "2026-05-30T14:40:06Z"
 
 [freerun_noise]                   # the DO's open-loop noise
@@ -424,7 +440,7 @@ Strict 1:1 mapping between sections and tools.
 | Section | Tool | What it does |
 |---|---|---|
 | `[identity]` | `scripts/do_register.py <uid> <model>` | Creates a new DO file with class defaults filled in.  Mandatory before the engine will start with a new `do_label`. |
-| `[steering]` | `scripts/do_steering_char.py` | DAC sweep, linear fit, range detection.  Outputs slope, intercept, code_min, code_max. |
+| `[steering]` | `scripts/do_steering_char.py` | DAC sweep, linear fit, range detection.  Outputs `slope_ppb_per_code`, `code_min`, `code_max`, `ppb_at_code_min` (edge anchor), and the `char_temp_ocxo_c` / `char_temp_cpu_c` the curve was measured at.  (Also writes deprecated `parked_code` / `intercept_ppb_at_parked` until PR3.) |
 | `[freerun_noise]` | `scripts/do_freerun_char.py` | TICC chA observation against Rb (preferred) or against chB (acceptable fallback), computes ADEV/TDEV/PSD, derives σ_do_phase + σ_do_freq + coast_tdev_ref_ns + coast_tdev_slope.  Refuses any source label not in the allowed enum.  When both Rb and chB are available, `chA vs Rb` wins — chB carries rx-TCXO motion that contaminates the DO signal.  `coast_tdev_slope` is fit explicitly to the RWFM/flicker **rising tail** (positive-slope region), NOT a single global log-log LSQ — a global fit over a U-shaped TDEV curve can return a negative slope that silently disables the Goldilocks scheduler at runtime.  The schema validator rejects slope ≤ 0 at write time. |
 | `[actuation_noise]` | `scripts/do_actuator_char.py` | Holds adjfine constant, observes residual TDEV, derives σ_q. |
 | `[operational_state]` | engine (only) | Updates last_known_* on each save_do_state checkpoint. |
@@ -441,6 +457,10 @@ Out of scope (for this design):
 - `[thermal]` section.  Bob is adding temperature sensors to the
   OCXOs; revisit when there's data to populate it.  The schema
   reserves the section name; the loader accepts its absence.
+  (Distinct from the `char_temp_*_c` fields in `[steering]`: those
+  record the *measurement-time* temperature of one characterization
+  run — provenance for `ppb_at_code_min` — whereas a future
+  `[thermal]` section would model the *running* temp→freq behaviour.)
 
 
 ## Q[3,3] design change vs qFromCharPerActuator
