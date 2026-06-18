@@ -12,17 +12,19 @@ from peppar_fix.do_schema import SchemaError
 
 
 def _write_toml(dos_dir, uid, *, steering_measured=True,
-                freerun_measured=False):
+                freerun_measured=False, actuator="DAC", steering_extra=None):
     body = [
         'schema_version = "1"',
         "[identity]",
         f'do_uid = "{uid}"',
-        'model = "X"', 'class = "OCXO"', 'actuator_type = "DAC"',
+        'model = "X"', 'class = "OCXO"', f'actuator_type = "{actuator}"',
         "nominal_freq_hz = 10000000",
     ]
     if steering_measured:
         body += ['[steering]', 'source = "measured"',
                  "slope_ppb_per_code = 0.025"]
+        for k, v in (steering_extra or {}).items():
+            body.append(f"{k} = {v}")
     if freerun_measured:
         body += ['[freerun_noise]', 'source = "measured"',
                  'measurement_channel = "DO PPS (chA vs TICC Rb)"',
@@ -131,6 +133,53 @@ def test_phc_adjfine_never_refuses_even_missing():
 def test_clockmatrix_never_refuses_even_missing():
     assert not dcr.should_refuse_for_steering(
         _ec("MISSING", actuator="ClockMatrix_FCW"), has_servo=True)
+
+
+# ── resolve_dac_actuator_params: measured steering is authoritative ──── #
+
+def test_dac_params_from_measured_steering(tmp_path):
+    d = str(tmp_path)
+    _write_toml(d, "ocxo-p", steering_extra={
+        "parked_code": 32768, "code_min": 16000, "code_max": 50000,
+        "dac_gain": 1})
+    p = dcr.resolve_dac_actuator_params("ocxo-p", dos_dir=d)
+    assert p["ppb_per_code"] == pytest.approx(0.025)
+    assert p["center_code"] == 32768      # parked_code → center_code
+    assert p["code_min"] == 16000
+    assert p["code_max"] == 50000
+    assert p["dac_gain"] == 1
+
+
+def test_dac_params_refuse_when_not_measured(tmp_path):
+    # A DAC DO with no measured steering must STOP, not fall back to a default.
+    d = str(tmp_path)
+    _write_toml(d, "ocxo-q", steering_measured=False)
+    with pytest.raises(SchemaError) as e:
+        dcr.resolve_dac_actuator_params("ocxo-q", dos_dir=d)
+    assert "not 'measured'" in str(e.value)
+    assert "no default ppb/code" in str(e.value)
+
+
+def test_dac_params_none_when_no_do_uid():
+    # No registered DO → None (legacy config path still applies for that case).
+    assert dcr.resolve_dac_actuator_params(None) is None
+
+
+def test_dac_params_none_for_intrinsic_actuator(tmp_path):
+    # PHC_adjfine gain is an intrinsic constant — nothing to source from
+    # steering, so resolve returns None (no refuse) even with no [steering].
+    d = str(tmp_path)
+    _write_toml(d, "phc-r", steering_measured=False, actuator="PHC_adjfine")
+    assert dcr.resolve_dac_actuator_params("phc-r", dos_dir=d) is None
+
+
+def test_dac_params_gain_absent_omitted(tmp_path):
+    # No dac_gain recorded → key omitted (engine warns + uses config gain).
+    d = str(tmp_path)
+    _write_toml(d, "ocxo-s")  # measured slope, no dac_gain
+    p = dcr.resolve_dac_actuator_params("ocxo-s", dos_dir=d)
+    assert "dac_gain" not in p
+    assert p["ppb_per_code"] == pytest.approx(0.025)
 
 
 # ── provenance log formatting ───────────────────────────────────────── #

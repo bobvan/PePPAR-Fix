@@ -302,6 +302,17 @@ def validate_characterization(data: dict) -> list[str]:
                 "(measured slope of zero is a calibration failure, "
                 "not a valid DO)"
             )
+        # dac_gain (optional, back-compat): the DAC output-stage gain mode
+        # the slope was MEASURED at.  A slope is only valid at the same gain
+        # mode it was characterized under (1× vs 2× changes the volts/code,
+        # hence ppb/code).  Recording it lets the engine set the DAC to the
+        # matching gain instead of guessing — see measuredSteeringIsAuthoritative.
+        g = st.get("dac_gain")
+        if g is not None and g not in (0, 1):
+            errors.append(
+                f"[steering].dac_gain must be 0 (1× mode) or 1 (2× mode), "
+                f"got {g!r}"
+            )
 
     return errors
 

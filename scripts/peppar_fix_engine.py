@@ -6338,6 +6338,37 @@ def _maybe_step_divider_on_phase(args):
         return False
 
 
+def _dac_build_kwargs(args, do_uid):
+    """Resolve DacActuator gain/range kwargs, MEASURED [steering] authoritative.
+
+    measuredSteeringIsAuthoritative: a VCOCXO+DAC's EFC slope (ppb/code), code
+    range, and gain mode are sourced from the DO's measured [steering] section,
+    not from --dac-ppb-per-code.  A registered DAC DO with no measured steering
+    is fatal here (refuse to actuate on a guessed slope — no default).  Config
+    values fill only what steering doesn't supply, and apply wholesale only for
+    the legacy no-registered-DO path.
+    """
+    from peppar_fix.do_char_resolve import resolve_dac_actuator_params
+    from peppar_fix import do_schema as _ds
+    cfg = {
+        "ppb_per_code": getattr(args, 'dac_ppb_per_code', None),
+        "center_code": getattr(args, 'dac_center_code', None),
+        "code_min": getattr(args, 'dac_code_min', None),
+        "code_max": getattr(args, 'dac_code_max', None),
+        "dac_gain": getattr(args, 'dac_gain', 0) or 0,
+    }
+    try:
+        measured = resolve_dac_actuator_params(
+            do_uid, config_ppb_per_code=cfg["ppb_per_code"])
+    except _ds.SchemaError as e:
+        raise SystemExit(str(e))
+    if measured is None:
+        return cfg  # no registered DO / intrinsic actuator — config path
+    out = dict(cfg)
+    out.update({k: v for k, v in measured.items() if v is not None})
+    return out
+
+
 def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
                           dt_rx_ns, dt_rx_series, phi_end_ns=None):
     """Bootstrap an external VCOCXO: ARM TADD divider, seed DAC frequency.
@@ -6371,9 +6402,11 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
     from peppar_fix.dac_actuator import DacActuator
 
     dac_addr = int(getattr(args, 'dac_addr', '0x60'), 0)
-    ppb_per_code = getattr(args, 'dac_ppb_per_code', None)
-    if ppb_per_code is None:
-        log.error("VCOCXO bootstrap requires --dac-ppb-per-code")
+    _dk = _dac_build_kwargs(args, _resolve_do_uid(args))
+    if _dk.get("ppb_per_code") is None:
+        log.error("VCOCXO bootstrap requires a measured [steering] slope "
+                  "(run do_steering_char.py) — or --dac-ppb-per-code for an "
+                  "unregistered DO")
         return False
 
     from peppar_fix.runtime_state_resolve import resolve_runtime_state
@@ -6385,14 +6418,14 @@ def _do_bootstrap_vcocxo(args, ptp, pps_freq_ppb, pps_freq_unc,
         bus_num=dac_bus,
         addr=dac_addr,
         bits=getattr(args, 'dac_bits', 12),
-        center_code=getattr(args, 'dac_center_code', None),
-        ppb_per_code=ppb_per_code,
+        center_code=_dk.get("center_code"),
+        ppb_per_code=_dk["ppb_per_code"],
         max_ppb=getattr(args, 'dac_max_ppb', None),
         dac_type=getattr(args, 'dac_type', 'mcp4725'),
-        dac_gain=getattr(args, 'dac_gain', 0) or 0,
+        dac_gain=_dk.get("dac_gain", 0) or 0,
         last_code=_last_code,
-        code_min=getattr(args, 'dac_code_min', None),
-        code_max=getattr(args, 'dac_code_max', None),
+        code_min=_dk.get("code_min"),
+        code_max=_dk.get("code_max"),
     )
     dac.setup()
 
@@ -6714,13 +6747,14 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
             _do_lbl = getattr(args, 'do_label', None)
             _pre_last = (resolve_runtime_state(_do_lbl).dac_code
                          if _do_lbl else None)
+            _rk = _dac_build_kwargs(args, _resolve_do_uid(args))
             _dac_reset = DacActuator(
                 bus_num=dac_bus,
                 addr=int(getattr(args, 'dac_addr', '0x60'), 0),
                 bits=getattr(args, 'dac_bits', 12),
-                ppb_per_code=getattr(args, 'dac_ppb_per_code', 1.0),
+                ppb_per_code=_rk.get("ppb_per_code") or 1.0,
                 dac_type=getattr(args, 'dac_type', 'mcp4725'),
-                dac_gain=getattr(args, 'dac_gain', 0) or 0,
+                dac_gain=_rk.get("dac_gain", 0) or 0,
                 last_code=_pre_last,
             )
             _dac_reset.setup()
@@ -6884,12 +6918,15 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             from peppar_fix.dac_actuator import DacActuator
             from peppar_fix.runtime_state_resolve import resolve_runtime_state
             dac_addr = int(getattr(args, 'dac_addr', '0x60'), 0)
-            ppb_per_code = getattr(args, 'dac_ppb_per_code', None)
+            _dac_do_uid = _resolve_do_uid(args)
+            _dk = _dac_build_kwargs(args, _dac_do_uid)
+            ppb_per_code = _dk.get("ppb_per_code")
             if ppb_per_code is None:
-                log.error("--dac-ppb-per-code required for DAC actuator")
+                log.error("DAC actuator requires a measured [steering] slope "
+                          "(run do_steering_char.py) — or --dac-ppb-per-code "
+                          "for an unregistered DO")
             else:
                 _last_code = None
-                _dac_do_uid = _resolve_do_uid(args)
                 if _dac_do_uid is not None:
                     _last_code = resolve_runtime_state(_dac_do_uid).dac_code
                     if _last_code is not None:
@@ -6899,14 +6936,14 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                     bus_num=args.dac_bus,
                     addr=dac_addr,
                     bits=getattr(args, 'dac_bits', 12),
-                    center_code=getattr(args, 'dac_center_code', None),
+                    center_code=_dk.get("center_code"),
                     ppb_per_code=ppb_per_code,
                     max_ppb=getattr(args, 'dac_max_ppb', None),
                     dac_type=getattr(args, 'dac_type', 'mcp4725'),
-                    dac_gain=getattr(args, 'dac_gain', 0) or 0,
+                    dac_gain=_dk.get("dac_gain", 0) or 0,
                     last_code=_last_code,
-                    code_min=getattr(args, 'dac_code_min', None),
-                    code_max=getattr(args, 'dac_code_max', None),
+                    code_min=_dk.get("code_min"),
+                    code_max=_dk.get("code_max"),
                 )
                 actuator_type = "dac"
                 log.info("Using DAC actuator: bus=%d addr=0x%02x bits=%d ppb/code=%.4f",
