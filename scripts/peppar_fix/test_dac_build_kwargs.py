@@ -40,15 +40,30 @@ def _args(**kw):
 class TestDacBuildKwargs(unittest.TestCase):
 
     def test_measured_overrides_config_and_fills_range(self):
-        measured = {"ppb_per_code": 0.025, "center_code": 32768,
+        # noMagicCenterCode: resolve returns the edge anchor ppb_at_code_min,
+        # not center_code.
+        measured = {"ppb_per_code": 0.025, "ppb_at_code_min": -200.0,
                     "code_min": 16000, "code_max": 50000, "dac_gain": 1}
         with mock.patch(_RESOLVE, return_value=measured):
             out = _dac_build_kwargs(_args(), "ocxo-x")
         self.assertEqual(out["ppb_per_code"], 0.025)   # measured wins over 0.0346
-        self.assertEqual(out["center_code"], 32768)
+        self.assertEqual(out["ppb_at_code_min"], -200.0)
         self.assertEqual(out["code_min"], 16000)
         self.assertEqual(out["code_max"], 50000)
         self.assertEqual(out["dac_gain"], 1)
+        self.assertNotIn("center_code", out)           # no magic center reaches the actuator
+
+    def test_legacy_center_config_becomes_edge_anchor(self):
+        # No registered DO (resolve None) + a legacy --dac-center-code config:
+        # _dac_build_kwargs converts it to ppb_at_code_min in the center-
+        # relative frame so center_code never reaches the actuator.
+        with mock.patch(_RESOLVE, return_value=None):
+            out = _dac_build_kwargs(
+                _args(dac_ppb_per_code=0.01, dac_center_code=30000,
+                      dac_code_min=5000), None)
+        # ppb_at_code_min = (code_min − center)·slope = (5000−30000)·0.01
+        self.assertAlmostEqual(out["ppb_at_code_min"], (5000 - 30000) * 0.01)
+        self.assertNotIn("center_code", out)
 
     def test_measured_without_gain_keeps_config_gain(self):
         # Back-compat: [steering] lacking dac_gain → config gain survives the

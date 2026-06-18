@@ -22,7 +22,9 @@ def _write_toml(dos_dir, uid, *, steering_measured=True,
     ]
     if steering_measured:
         body += ['[steering]', 'source = "measured"',
-                 "slope_ppb_per_code = 0.025"]
+                 "slope_ppb_per_code = 0.025",
+                 "code_min = 1000", "code_max = 60000",
+                 "ppb_at_code_min = -200.0"]
         for k, v in (steering_extra or {}).items():
             body.append(f"{k} = {v}")
     if freerun_measured:
@@ -139,15 +141,34 @@ def test_clockmatrix_never_refuses_even_missing():
 
 def test_dac_params_from_measured_steering(tmp_path):
     d = str(tmp_path)
-    _write_toml(d, "ocxo-p", steering_extra={
-        "parked_code": 32768, "code_min": 16000, "code_max": 50000,
-        "dac_gain": 1})
+    _write_toml(d, "ocxo-p", steering_extra={"dac_gain": 1})
     p = dcr.resolve_dac_actuator_params("ocxo-p", dos_dir=d)
     assert p["ppb_per_code"] == pytest.approx(0.025)
-    assert p["center_code"] == 32768      # parked_code → center_code
-    assert p["code_min"] == 16000
-    assert p["code_max"] == 50000
+    assert p["ppb_at_code_min"] == pytest.approx(-200.0)  # edge anchor
+    assert p["code_min"] == 1000
+    assert p["code_max"] == 60000
     assert p["dac_gain"] == 1
+    assert "center_code" not in p           # no magic center
+
+
+def test_dac_params_derives_edge_anchor_from_legacy_parked(tmp_path):
+    # A legacy file with parked_code/intercept but no ppb_at_code_min: the
+    # loader derives the edge anchor, so resolve still yields it.
+    d = str(tmp_path)
+    body = [
+        'schema_version = "1"', "[identity]", 'do_uid = "ocxo-leg"',
+        'model = "X"', 'class = "OCXO"', 'actuator_type = "DAC"',
+        "nominal_freq_hz = 10000000",
+        '[steering]', 'source = "measured"', "slope_ppb_per_code = 0.025",
+        "intercept_ppb_at_parked = 144.65", "parked_code = 32768",
+        "code_min = 1000", "code_max = 60000",
+    ]
+    with open(os.path.join(d, "ocxo-leg.toml"), "w") as f:
+        f.write("\n".join(body) + "\n")
+    p = dcr.resolve_dac_actuator_params("ocxo-leg", dos_dir=d)
+    # ppb_at_code_min = 144.65 + 0.025·(1000 − 32768)
+    assert p["ppb_at_code_min"] == pytest.approx(144.65 + 0.025 * (1000 - 32768))
+    assert "center_code" not in p
 
 
 def test_dac_params_refuse_when_not_measured(tmp_path):
