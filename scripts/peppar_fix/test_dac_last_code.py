@@ -73,6 +73,32 @@ class DacLastCodeStartupTest(unittest.TestCase):
         self.assertAlmostEqual(act.read_frequency_ppb(),
                                200.0 + (36843 - 5000) * -0.008311, places=3)
 
+    def test_last_ppb_seeds_at_operating_code(self):
+        """Warm-start 'up a layer': last_ppb (saved freq offset) maps to the
+        operating code via the edge anchor, and takes PRIORITY over a (possibly
+        stale) last_code."""
+        act = DacActuator(
+            bus_num=1, addr=0x4c, bits=16, ppb_per_code=-0.008311,
+            dac_type="ad5693r", dac_gain=1,
+            code_min=5000, code_max=60000, ppb_at_code_min=200.0,
+            last_ppb=50.0, last_code=12345)   # last_code is STALE / ignored
+        act.setup()
+        expected = max(5000, min(60000,
+                                 5000 + round((50.0 - 200.0) / -0.008311)))
+        self.assertEqual(act.current_code, expected)
+        self.assertNotEqual(act.current_code, 12345)   # last_code did NOT win
+        self.assertAlmostEqual(act.read_frequency_ppb(), 50.0, delta=0.01)
+
+    def test_last_code_used_when_no_ppb(self):
+        """Falls back to last_code (frame-independent) when no ppb recorded."""
+        act = DacActuator(
+            bus_num=1, addr=0x4c, bits=16, ppb_per_code=-0.008311,
+            dac_type="ad5693r", dac_gain=1,
+            code_min=5000, code_max=60000, ppb_at_code_min=200.0,
+            last_code=36843)
+        act.setup()
+        self.assertEqual(act.current_code, 36843)
+
     def test_no_last_code_parks_at_neutral(self):
         """Absent last_code, the DAC parks at the NEUTRAL command (ppb=0,
         ↔ adjfine=0) — not a magic center."""
