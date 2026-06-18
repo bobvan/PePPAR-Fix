@@ -38,8 +38,10 @@ lower noise floor without touching the ClockMatrix at all.
 1. Stop Timebeat
 2. Switch DPLL_2 to write_freq mode:
    ```python
-   # Write pll_mode=2 (write_freq), state=automatic
-   write16(0xC46F, [0x02])
+   # Write pll_mode=2 (write_freq).  pll_mode is MODE bits[5:3], so the
+   # byte value is 0x10, NOT 0x02 (0x02 = pll_mode 0 = PLL).  See the
+   # "CRITICAL BIT FIX" below; ground truth: clockmatrix_actuator.py.
+   write16(0xC46F, [0x10])
    ```
 3. Read phase error from DPLL_0 or DPLL_2 phase status registers
 4. Write frequency corrections to DPLL_CTRL_2.FOD_FREQ (0xC69C) or
@@ -75,8 +77,15 @@ for initial experiments, or ensure the mode transition is glitch-free.
 - **No mode change needed** — steer via FOD_FREQ in PLL mode, read
   phase from DPLL_0 phase status. This is the safe, confirmed path.
 
-**write_freq mode confirmed working (2026-04-04)**:
-- Switched DPLL_3 from PLL (0x00) to write_freq (0x02) at nominal FOD_FREQ
+**write_freq mode confirmed working (2026-04-04)** — ⚠️ SUPERSEDED / value
+mislabeled (reconciled per #185 review): the `0x02` written here is `pll_mode=0`
+(PLL) at the correct MODE bits `[5:3]`, **not** write_freq. So what this section
+actually exercised was **FOD_FREQ in PLL mode** (the ±8 ppb wrong-register path,
+retracted under "FCW steering confirmed" below), not true write_freq. The real
+write_freq/FCW path is `DPLL_FREQ_3` (0xC850) with MODE byte **0x10** — see the
+"CRITICAL BIT FIX". Kept for history; **do not copy the 0x02 values.**
+- Switched DPLL_3 from PLL (0x00) to "write_freq" (wrote `0x02` = PLL at `[5:3]`;
+  true write_freq is `0x10`) at nominal FOD_FREQ
 - Host survived, TICC continued seeing PPS (phase step but no loss)
 - +100 ppb FOD_FREQ → +8,736 ps/s TICC drift (same gain as PLL mode)
 - Gain factor: **0.0874** (commanded FOD ppb × 0.0874 = output ppb)
@@ -90,7 +99,8 @@ Resolution: 0.0874 / 327675 ≈ 0.27 ppt per M count — extraordinary.
 
 **Safe mode switch procedure**:
 1. Write nominal M to FOD_FREQ (ensure frequency matches current output)
-2. Switch MODE from PLL (0x00) to write_freq (0x02)
+2. Switch MODE from PLL (0x00) to write_freq (`0x10` — NOT `0x02`; pll_mode is
+   bits[5:3])
 3. Phase step occurs but no frequency discontinuity — host survives
 4. To restore: write nominal FOD, switch back to PLL mode (0x00)
 
@@ -160,7 +170,7 @@ live TDC measurement without touching any mode registers.
    and steer the ClockMatrix directly
 5. If frozen: switch DPLL_0 to phase_meas mode (pll_mode=5):
    ```python
-   write16(0xC3E7, [0x05])  # phase_meas, automatic
+   write16(0xC3E7, [0x28])  # phase_meas (pll_mode=5 at bits[5:3]); NOT 0x05
    ```
 
 **Unknowns**:
