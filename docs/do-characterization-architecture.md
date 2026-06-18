@@ -137,6 +137,12 @@ temperature-drifting operating point (↔ the locking `adjfine`)**.  We
 must stop anchoring DAC code math, clamps, and bootstrap seeds on the
 center code, exactly as we never anchored PHC control on `adjfine = 0`.
 
+If anything the center code is *even less* special than `adjfine = 0`:
+`adjfine = 0` is a true zero-correction (the PHC applies no rate offset),
+whereas the DAC center is merely an arbitrary midscale *voltage* — it has
+no privileged relationship to either GNSS *or* "no correction."  It is
+just the middle of the code axis.
+
 This conflation never bit the PHC hosts (TimeHat/MadHat-i226) for two
 reasons the DAC lacks: (1) nobody anchors PHC control on a "special"
 zero, and (2) a PHC has effectively no hard rails near its operating
@@ -170,8 +176,11 @@ Asymmetric pull is fine and expected.  What matters operationally is
 each rail:
 
 ```
+# for positive slope (higher code → faster; true for all our DACs):
 headroom_fast = (code_max − gnss_matching_code) · slope     # ppb of "speed up" available
 headroom_slow = (gnss_matching_code − code_min) · slope     # ppb of "slow down" available
+# for negative slope the two swap — what matters is |headroom| toward
+# each rail; compute from the signed slope and take the side accordingly.
 ```
 
 Combined with the OCXO's temperature coefficient (ppb/°C), the headroom
@@ -179,10 +188,53 @@ predicts the **ambient-temperature band over which the servo keeps
 control** before the DO rails on one side.  This is the DAC-specific
 budget a PHC has no analog for.
 
-`center_code` survives in the schema only as an optional **startup sit
-point** (a benign place to park the DAC before a lock is acquired),
-explicitly *decoupled* from any notion of "where GNSS is."  It is never
-the control anchor.
+`center_code` is therefore neither the control anchor **nor** the
+startup seed.  It is at most a cosmetic, derivable midscale value; the
+control math anchors to `code_min + slope`, and where to *start* is a
+separate, runtime question handled below.
+
+### Where to start next time — warm-start seeding is universal, and it is not "parked"
+
+The genuinely useful "where to start the actuator" concept is **runtime
+state, not characterization**, and it lives one level above the DAC.
+
+The justification is physical and actuator-agnostic: ambient temperature
+at the next startup will be close to the temperature at the last
+shutdown, so **the correction (from a nominal 0 ppb) that was needed at
+shutdown is a good estimate of the correction needed at startup.**  That
+statement is true for *every* DO regardless of actuator — a DAC code, a
+PHC `adjfine` value, a ClockMatrix FCW word are all just realizations of
+one last-known **frequency correction in ppb**.
+
+The schema already expresses this at the right level, in runtime state
+(`<uid>.runtime.toml [operational_state]`):
+
+```
+last_known_freq_offset_ppb = +144.65   # universal: the correction itself
+last_known_dac_code        = 32768     # DAC-specific realization (convenience)
+```
+
+`last_known_freq_offset_ppb` is the portable truth (PHC seeds `adjfine`
+from it, ClockMatrix seeds FCW from it, a DAC re-derives a code from it
+via the anchor-to-edge formula).  `last_known_dac_code` is a convenience
+cache of the same point.  Warm-start seeding should be driven by the
+**ppb correction**, clamped to `[code_min, code_max]` for a DAC — never
+by a characterization field.
+
+**The danger in "parked".**  `[steering].parked_code` (a *characterization*
+field) reads like "where the actuator parks on startup/shutdown," but its
+actual role is the *reference code of the linear fit* — the code at which
+`intercept_ppb_at_parked` was measured, i.e. just one point on the line.
+The name invites exactly the conflation this whole section is purging:
+treating a fit anchor as a place to sit, or as a stand-in for the
+GNSS-matching point.  (Note the example file even has
+`intercept_ppb_at_parked` = `last_known_freq_offset_ppb` = +144.65 — the
+two got tangled because the fit was anchored at the then-current
+operating code.)  PR2 of `noMagicCenterCode` removes `parked_code` from
+the line description (which needs only `{code_min, code_max, slope}` + a
+pull-reference such as the GNSS-matching code); the only "where to start"
+state is the runtime last-known correction, better named `last_code` /
+`shutdown_code` than "parked."
 
 > **Why this matters now**: MadHat / clkPoC3 (5 V DAC + IsoTemp OCXO)
 > are near-perfect, so the filter quietly absorbs implicit
