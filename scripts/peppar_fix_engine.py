@@ -8212,15 +8212,31 @@ def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
     return "ok"
 
 
+# rampReacquireCooldown: after a confirmed discontinuity triggers ONE
+# ramp re-acquire, suppress further outlier/ramp tripping for this long so the
+# EKF (wide post-reset covariance → loose chi² gate) can actually drive the
+# actuator back to lock at the new operating point.  Without it, ramp_accept
+# re-fires every ramp_accept_n epochs and each reset re-holds the actuator, so
+# the filter never re-locks → 6 resets/300s → exit-5 (the pifaceDriftEpisodes
+# cascade — amplifying a DO discontinuity into a full re-bootstrap).  One
+# re-acquire + this cooldown absorbs ANY jump size/sign in-process; a genuinely
+# persistent pathology still degrades gracefully (re-acquires at cooldown
+# cadence, not every 5 s, so the reset budget lasts ~6× longer).
+_RAMP_COOLDOWN_S = 30.0
+
+
 def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
-                            converging, gap_recovery, ramp_accept_n=5):
+                            converging, gap_recovery, ramp_accept_n=5,
+                            mono_time=None):
     """Pure decision: does the servo PPS-side outlier check trip this epoch?
 
     Returns one of:
       ``("ok", None)``      — observable in range, scheduler converging,
-                              threshold disabled, OR gap_recovery is
-                              active (post-gap measurement let through
-                              so the EKF can absorb the offset).
+                              threshold disabled, gap_recovery is active, OR
+                              inside a post-re-acquire cooldown window
+                              (``mono_time < ctx['_ramp_cooldown_until']``).
+                              In every case the measurement is let through so
+                              the EKF can absorb the offset / re-lock.
       ``("ramp_accept", None)`` — a SUSTAINED SAME-SIGN outlier ramp
                               (>= ``ramp_accept_n`` consecutive outliers all
                               the same sign).  This is a REAL DO divergence,
@@ -8259,6 +8275,16 @@ def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
     than skipping the update each epoch.
     """
     if gap_recovery:
+        ctx['consecutive_outliers'] = 0
+        ctx['_outlier_ramp'] = 0
+        return ("ok", None)
+    # rampReacquireCooldown: within the cooldown window after a ramp re-acquire,
+    # let the (large) observable through to the wide-P EKF so it can re-lock,
+    # instead of tripping the outlier/ramp detector again and resetting (which
+    # re-holds the actuator → never re-locks → cascade).  Same "let the EKF
+    # absorb it" intent as gap_recovery, time-boxed.
+    _cd = ctx.get('_ramp_cooldown_until')
+    if _cd is not None and mono_time is not None and mono_time < _cd:
         ctx['consecutive_outliers'] = 0
         ctx['_outlier_ramp'] = 0
         return ("ok", None)
@@ -8606,6 +8632,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         pps_err_ticc_ns if pps_err_ticc_ns is not None
         else pps_err_extts_ns
     )
+    _now_mono = time.monotonic()
     _decision, _exit5 = _servo_outlier_decision(
         ctx,
         outlier_observable_ns=outlier_observable_ns,
@@ -8613,24 +8640,32 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         converging=scheduler._converging,
         gap_recovery=gap_recovery,
         ramp_accept_n=getattr(args, 'outlier_ramp_accept_n', 5),
+        mono_time=_now_mono,
     )
     if _decision == "ramp_accept":
-        # servoOutlierDoomLoop fix (REWORKED 2026-06-09): a sustained
-        # same-sign ramp is a REAL divergence.  RE-ACQUIRE via a servo
-        # reset so the filter re-locks.  Do NOT let the measurement through
-        # (the original 2026-06-08 attempt): its large innovation is then
-        # rejected by the EKF chi² gate, so no correction is applied and
-        # the DO drifts — that let-through silently broke frequency lock
-        # (caught 2026-06-09 by chA-chB drift on the scope, hidden from the
-        # detrended-TDEV metric).  Catching the ramp at ramp_accept_n epochs
-        # (small error) keeps the re-acquire gentle; budget exhausted falls
-        # back to exit-5 (full re-bootstrap, which also re-locks).
+        # servoOutlierDoomLoop fix (REWORKED 2026-06-09): a sustained same-sign
+        # ramp is a REAL divergence (a DO discontinuity).  RE-ACQUIRE via a
+        # servo reset so the filter re-locks.  Do NOT just let the measurement
+        # through (the 2026-06-08 attempt): the EKF chi² gate rejects the large
+        # innovation and the DO drifts.
+        #
+        # rampReacquireCooldown (2026-06-18): a single re-acquire isn't enough
+        # if the detector re-fires every ramp_accept_n epochs — each reset
+        # re-holds the actuator, so the wide-P EKF never gets to drive it back
+        # to lock → 6 resets/300s → exit-5 (pifaceDriftEpisodes cascade,
+        # confirmed amplifying a +120 ppb DO jump).  Fix: arm a cooldown so the
+        # next ~_RAMP_COOLDOWN_S of (large) observables flow through to the EKF
+        # (see the cooldown branch in _servo_outlier_decision), letting it
+        # re-lock at the new operating point in-process — magnitude/sign-
+        # independent, no drift estimate.  Budget-exhausted still falls back to
+        # exit-5 (full re-bootstrap, which also re-locks).
         if _request_servo_reset(ctx, 'ramp_reacquire') == "reset":
             ctx['consecutive_outliers'] = 0
+            ctx['_ramp_cooldown_until'] = _now_mono + _RAMP_COOLDOWN_S
             log.warning(
-                "  Sustained same-sign outlier ramp (pps_err=%+.0fns) — "
-                "servo re-acquire to re-lock (servoOutlierDoomLoop)",
-                outlier_observable_ns)
+                "  Sustained same-sign outlier ramp (pps_err=%+.0fns) — servo "
+                "re-acquire + %.0fs cooldown to re-lock (servoOutlierDoomLoop)",
+                outlier_observable_ns, _RAMP_COOLDOWN_S)
             return "outlier"
         log.error(
             "  Sustained same-sign outlier ramp (pps_err=%+.0fns) + reset "
