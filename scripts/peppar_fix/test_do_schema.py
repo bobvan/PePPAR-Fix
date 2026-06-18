@@ -306,6 +306,30 @@ class TestSteeringValidation(unittest.TestCase):
                 load_do_characterization("ocxo-test", dos_dir=td)
             self.assertIn("slope_ppb_per_code", str(cm.exception))
 
+    def test_reject_out_of_range_dac_gain(self):
+        # dac_gain records the DAC output-stage gain mode the slope was
+        # measured at; only 0 (1×) and 1 (2×) are valid.  (Charlie #187
+        # finding 1: the reject branch was untested.)
+        toml = GOOD_CHAR_TOML.replace(
+            "slope_ppb_per_code = 0.02569",
+            "slope_ppb_per_code = 0.02569\ndac_gain = 2")
+        with _TempDir() as td:
+            _write_char(td, "ocxo-test", toml)
+            with self.assertRaises(SchemaError) as cm:
+                load_do_characterization("ocxo-test", dos_dir=td)
+            self.assertIn("dac_gain", str(cm.exception))
+
+    def test_accepts_valid_dac_gain(self):
+        # Both 0 and 1 must pass (sanity-bracket the reject test).
+        for g in (0, 1):
+            toml = GOOD_CHAR_TOML.replace(
+                "slope_ppb_per_code = 0.02569",
+                f"slope_ppb_per_code = 0.02569\ndac_gain = {g}")
+            with _TempDir() as td:
+                _write_char(td, "ocxo-test", toml)
+                c = load_do_characterization("ocxo-test", dos_dir=td)
+                self.assertEqual(c.steering["dac_gain"], g)
+
 
 class TestClassDefaults(unittest.TestCase):
 
