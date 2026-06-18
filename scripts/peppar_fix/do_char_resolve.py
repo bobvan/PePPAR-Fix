@@ -134,6 +134,66 @@ def should_refuse_for_steering(ec: EngineCharacterization, *,
             and ec.steering_provenance != "measured")
 
 
+def resolve_dac_actuator_params(
+        do_uid: Optional[str], *, dos_dir: Optional[str] = None,
+        config_ppb_per_code: Optional[float] = None) -> Optional[dict]:
+    """Source DAC actuator parameters from the DO's MEASURED [steering].
+
+    The EFC slope (ppb/code) of a VCOCXO+DAC is a PER-UNIT quantity — an
+    OCXO's pull range is configurable over a wide range, so a guessed/default
+    slope is an accident waiting to happen.  This function makes the measured
+    [steering] the single source of truth for the actuator's gain, code range,
+    and gain mode.  (Previously the engine built the actuator from
+    --dac-ppb-per-code and silently ignored the measured slope.)
+
+    Returns a dict of DacActuator kwargs (ppb_per_code, center_code, code_min,
+    code_max, and dac_gain when recorded) when the DO has measured steering.
+
+    Raises SchemaError when the DO is a DAC actuator whose steering was never
+    measured — the engine must STOP, not fall back to a default.  (Mirrors
+    should_refuse_for_steering, but at actuator-construction time so no default
+    slope can reach the loop.)
+
+    Returns None when the actuator is not a per-unit-measured type (PHC_adjfine
+    / ClockMatrix_FCW have intrinsic constant gains) or when do_uid is None
+    (no registered DO — the legacy config path still applies for that case).
+    """
+    if do_uid is None:
+        return None
+    c = do_schema.load_do_characterization(do_uid, dos_dir=dos_dir)
+    if c.identity.get("actuator_type") not in STEERING_MEASURED_REQUIRED:
+        return None  # intrinsic-gain actuator — nothing to source from steering
+    if c.provenance.get("steering") != "measured":
+        raise do_schema.SchemaError(
+            f"DO {do_uid!r}: [steering] provenance is "
+            f"{c.provenance.get('steering', 'absent')!r}, not 'measured' — "
+            f"refusing to discipline a DAC on a non-measured EFC slope.  Run "
+            f"scripts/do_steering_char.py first.  There is no default ppb/code: "
+            f"an OCXO's pull range is per-unit, so a guessed slope is unsafe.")
+    st = c.steering
+    params: dict = {"ppb_per_code": float(st["slope_ppb_per_code"])}
+    for key in ("parked_code", "code_min", "code_max"):
+        if st.get(key) is not None:
+            params["center_code" if key == "parked_code" else key] = int(st[key])
+    g = st.get("dac_gain")
+    if g is not None:
+        params["dac_gain"] = int(g)
+    else:
+        log.warning(
+            "DO %s: [steering] has no dac_gain — cannot verify the slope was "
+            "measured at the runtime DAC gain mode.  Re-run do_steering_char "
+            "to record it; using the config/default gain meanwhile.", do_uid)
+    slope = params["ppb_per_code"]
+    if (config_ppb_per_code is not None and config_ppb_per_code != 0.0
+            and abs(config_ppb_per_code - slope) > 0.1 * abs(slope)):
+        log.warning(
+            "DO %s: config --dac-ppb-per-code=%.5f disagrees with measured "
+            "[steering] slope=%.5f (>10%%).  USING THE MEASURED value; remove "
+            "dac_ppb_per_code from the host config to avoid confusion.",
+            do_uid, config_ppb_per_code, slope)
+    return params
+
+
 def format_provenance_log(do_uid: str, ec: EngineCharacterization) -> list[str]:
     """Operator-facing provenance lines for engine startup.
 

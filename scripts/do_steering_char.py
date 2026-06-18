@@ -50,7 +50,8 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def steering_fields_from_fit(fit: dict, center_code: int) -> dict:
+def steering_fields_from_fit(fit: dict, center_code: int,
+                             dac_gain: int = 0) -> dict:
     """Map a ``detect_linear_region`` result -> schema ``[steering]`` fields.
 
     The fit is ppb = intercept + slope*(code - center_code), so the intercept
@@ -58,6 +59,11 @@ def steering_fields_from_fit(fit: dict, center_code: int) -> dict:
     intercept_ppb_at_parked = intercept.  ``asymmetry_factor`` defaults to 1.0
     (ramp-rate asymmetry isn't measured by this sweep; a later revision can
     fill it).  ``source`` is added by the schema writer, not here.
+
+    ``dac_gain`` is the DAC output-stage gain bit the sweep ran at (0=1×,
+    1=2×).  It is recorded so the engine can set the DAC to the SAME gain at
+    runtime — a slope measured at 2× is wrong if applied at 1× (the volts/code,
+    and hence ppb/code, differ).  This closes the silent-gain-mismatch hole.
     """
     return {
         "slope_ppb_per_code": float(fit["slope"]),
@@ -66,6 +72,7 @@ def steering_fields_from_fit(fit: dict, center_code: int) -> dict:
         "code_min": int(fit["code_min"]),
         "code_max": int(fit["code_max"]),
         "asymmetry_factor": 1.0,
+        "dac_gain": int(dac_gain),
         "rmse_ppb": float(fit["rmse"]),
         "measured_at": _utcnow(),
     }
@@ -152,11 +159,16 @@ def main(argv=None) -> int:
               "fully saturated).  No [steering] written.")
         return 1
 
-    fields = steering_fields_from_fit(fit, args.center_code)
+    fields = steering_fields_from_fit(fit, args.center_code, dac_gain=args.gain)
     print(f"\n[steering]  slope={fields['slope_ppb_per_code']:+.5f} ppb/code  "
           f"intercept={fields['intercept_ppb_at_parked']:+.2f} ppb @ code "
           f"{fields['parked_code']}  linear=[{fields['code_min']},"
-          f"{fields['code_max']}]  rmse={fields['rmse_ppb']:.2f} ppb")
+          f"{fields['code_max']}]  gain={fields['dac_gain']} "
+          f"({'2×' if fields['dac_gain'] else '1×'})  "
+          f"rmse={fields['rmse_ppb']:.2f} ppb")
+    print(f"  NOTE: the engine will set the DAC to gain={fields['dac_gain']} "
+          f"({'2×' if fields['dac_gain'] else '1×'}) to match this measurement "
+          f"— ensure that matches the hardware build.")
 
     if args.dry_run:
         with open(char_path, "rb") as f:
