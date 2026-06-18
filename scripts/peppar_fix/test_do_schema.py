@@ -370,12 +370,14 @@ class TestSteeringEdgeAnchor(unittest.TestCase):
         toml = GOOD_CHAR_TOML.replace(
             "slope_ppb_per_code = 0.02569",
             "slope_ppb_per_code = 0.02569\n"
-            "char_temp_ocxo_c = 41.2\nchar_temp_cpu_c = 58.7")
+            "char_temp_ocxo_c = 41.2\nchar_temp_cpu_c = 58.7\n"
+            "char_temp_board_c = 55.0")
         with _TempDir() as td:
             _write_char(td, "ocxo-test", toml)
             c = load_do_characterization("ocxo-test", dos_dir=td)
             self.assertAlmostEqual(c.steering["char_temp_ocxo_c"], 41.2)
             self.assertAlmostEqual(c.steering["char_temp_cpu_c"], 58.7)
+            self.assertAlmostEqual(c.steering["char_temp_board_c"], 55.0)
 
     def test_reject_out_of_range_char_temp(self):
         toml = GOOD_CHAR_TOML.replace(

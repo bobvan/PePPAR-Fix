@@ -325,9 +325,12 @@ ppb_at_code_min = -698.50         # OCXO pull at code_min — the edge anchor.
                                   # _CHAR_TEMP (see char_temp_* below).
 char_temp_ocxo_c = 41.2           # OCXO-oven temp at characterization (if a
                                   # sensor is fitted; absent otherwise).
-char_temp_cpu_c = 58.7            # on-board CPU/SoC temp at characterization —
+char_temp_cpu_c = 58.7            # CPU/SoC-labelled thermal zone at char time —
                                   # ambient proxy.  Needed to project how the
                                   # GNSS-matching code drifts with temperature.
+                                  # (char_temp_board_c is the honest fallback
+                                  # when no zone is CPU-labelled: hottest zone,
+                                  # not necessarily the CPU.)
 asymmetry_factor = 1.0            # 1.0 = symmetric RAMP rates (slew up vs down;
                                   # orthogonal to pull asymmetry, which the
                                   # edge anchor already captures).

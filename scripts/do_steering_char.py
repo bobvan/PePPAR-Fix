@@ -54,11 +54,13 @@ def read_char_temps(bus_num: int) -> dict:
     """Read the temperatures the steering curve is being characterized at.
 
     Returns a dict with any of ``char_temp_ocxo_c`` (OCXO oven, from an
-    ADT7410-class I2C sensor on the DAC's bus, if fitted) and
-    ``char_temp_cpu_c`` (the on-board CPU/SoC thermal zone — a universal
-    ambient proxy).  ``ppb_at_code_min`` is implicitly measured AT this
-    temperature (the GNSS-matching point drifts with it), so recording the
-    reference temp is what makes the headroom/temp-margin projection
+    ADT7410-class I2C sensor on the DAC's bus, if fitted), ``char_temp_cpu_c``
+    (a thermal zone whose label identifies it as the SoC/CPU), or
+    ``char_temp_board_c`` (the hottest readable zone when NO zone is
+    CPU-labelled — an honest fallback ambient proxy, since the hottest zone
+    is not necessarily the CPU).  ``ppb_at_code_min`` is implicitly measured
+    AT this temperature (the GNSS-matching point drifts with it), so recording
+    the reference temp is what makes the headroom/temp-margin projection
     possible (noMagicCenterCode, Bob 2026-06-18).  Best-effort: missing
     sensors are simply absent from the dict.
     """
@@ -77,12 +79,14 @@ def read_char_temps(bus_num: int) -> dict:
         pass
     try:
         zones = read_onboard_temps()
-        # Prefer the SoC/CPU zone; fall back to the hottest readable zone.
+        # Use a CPU/SoC-labelled zone when one exists; otherwise record the
+        # hottest readable zone under a HONEST name — char_temp_board_c —
+        # rather than mislabelling an unknown zone as the CPU (main #190 note).
         cpu = next((v for k, v in zones.items() if "cpu" in k.lower()), None)
-        if cpu is None and zones:
-            cpu = max(zones.values())
         if cpu is not None:
             out["char_temp_cpu_c"] = round(float(cpu), 3)
+        elif zones:
+            out["char_temp_board_c"] = round(float(max(zones.values())), 3)
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -219,6 +223,8 @@ def main(argv=None) -> int:
         _tparts.append(f"OCXO {fields['char_temp_ocxo_c']:.2f}°C")
     if "char_temp_cpu_c" in fields:
         _tparts.append(f"CPU {fields['char_temp_cpu_c']:.2f}°C")
+    if "char_temp_board_c" in fields:
+        _tparts.append(f"board {fields['char_temp_board_c']:.2f}°C")
     print(f"  char temp: {', '.join(_tparts)}" if _tparts else
           "  char temp: (no sensors readable — temp-margin projection unavailable)")
     print(f"  NOTE: the engine will set the DAC to gain={fields['dac_gain']} "

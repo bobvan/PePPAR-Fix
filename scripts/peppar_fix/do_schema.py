@@ -325,13 +325,14 @@ def validate_characterization(data: dict) -> list[str]:
             errors.append(
                 f"[steering].ppb_at_code_min must be numeric, got {pmin!r}")
         # Characterization-temperature provenance (optional): the OCXO oven
-        # and on-board CPU temperatures the steering curve was MEASURED at.
-        # ppb_at_code_min is implicitly ppb_at_code_min_AT_CHAR_TEMP — the
-        # GNSS-matching code drifts with temperature, so the reference temp
-        # is needed to project headroom/temp-margin (Bob 2026-06-18).  Both
-        # optional (not every host has an OCXO oven sensor); plausible range
+        # (char_temp_ocxo_c), a CPU/SoC-labelled thermal zone (char_temp_cpu_c),
+        # or — when no zone is CPU-labelled — the hottest readable zone as an
+        # honest ambient proxy (char_temp_board_c).  ppb_at_code_min is
+        # implicitly ppb_at_code_min_AT_CHAR_TEMP — the GNSS-matching code
+        # drifts with temperature, so the reference temp is needed to project
+        # headroom/temp-margin (Bob 2026-06-18).  All optional; plausible range
         # matches temp_sensor.read_onboard_temps.
-        for tk in ("char_temp_ocxo_c", "char_temp_cpu_c"):
+        for tk in ("char_temp_ocxo_c", "char_temp_cpu_c", "char_temp_board_c"):
             tv = st.get(tk)
             if tv is not None and (not isinstance(tv, (int, float))
                                    or not (-40.0 <= tv <= 150.0)):

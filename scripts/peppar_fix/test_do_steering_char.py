@@ -18,7 +18,9 @@ _SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from do_steering_char import steering_fields_from_fit  # noqa: E402
+from unittest import mock  # noqa: E402
+
+from do_steering_char import read_char_temps, steering_fields_from_fit  # noqa: E402
 from peppar_fix import do_schema  # noqa: E402
 from peppar_fix.do_schema import SchemaError, load_do_characterization  # noqa: E402
 
@@ -122,6 +124,48 @@ class TestSteeringFieldsFromFit(unittest.TestCase):
             with self.assertRaises(SchemaError):
                 do_schema.update_characterization_section(
                     "ocxo-test", "steering", bad, dos_dir=d)
+
+
+class TestReadCharTemps(unittest.TestCase):
+    """noMagicCenterCode: honest temp provenance — a non-CPU hottest zone
+    is recorded as char_temp_board_c, not mislabelled as the CPU (main #190)."""
+
+    def _patch(self, *, ocxo_avail=False, zones=None):
+        # TempSensor stub (no OCXO oven by default); read_onboard_temps stub.
+        ts = mock.Mock()
+        ts.available = ocxo_avail
+        ts.read_celsius.return_value = 41.2 if ocxo_avail else None
+        return (mock.patch("peppar_fix.temp_sensor.TempSensor",
+                           return_value=ts),
+                mock.patch("peppar_fix.temp_sensor.read_onboard_temps",
+                           return_value=(zones or {})))
+
+    def test_cpu_zone_recorded_as_cpu(self):
+        p1, p2 = self._patch(zones={"cpu-thermal": 48.0, "rp1_adc": 55.0})
+        with p1, p2:
+            out = read_char_temps(1)
+        self.assertAlmostEqual(out["char_temp_cpu_c"], 48.0)
+        self.assertNotIn("char_temp_board_c", out)  # cpu found → no fallback
+
+    def test_no_cpu_zone_falls_back_to_board(self):
+        # No 'cpu'-labelled zone → hottest zone recorded HONESTLY as board.
+        p1, p2 = self._patch(zones={"rp1_adc": 50.0, "gpu_thermal": 57.0})
+        with p1, p2:
+            out = read_char_temps(1)
+        self.assertNotIn("char_temp_cpu_c", out)
+        self.assertAlmostEqual(out["char_temp_board_c"], 57.0)
+
+    def test_ocxo_recorded_when_sensor_present(self):
+        p1, p2 = self._patch(ocxo_avail=True, zones={"cpu-thermal": 48.0})
+        with p1, p2:
+            out = read_char_temps(1)
+        self.assertAlmostEqual(out["char_temp_ocxo_c"], 41.2)
+
+    def test_no_sensors_empty(self):
+        p1, p2 = self._patch(zones={})
+        with p1, p2:
+            out = read_char_temps(1)
+        self.assertEqual(out, {})
 
 
 if __name__ == "__main__":
