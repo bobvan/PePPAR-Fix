@@ -104,7 +104,11 @@ Steering DPLL (the output channel): FCW via `DPLL_FREQ` write-frequency
 
 DPLL bases (8A34002): DPLL_0 `0xC3B0`, DPLL_1 `0xC400`, DPLL_2 `0xC438`,
 DPLL_3 `0xC480`. **DPLL_3 feeds the i226** (do not use as the measurement
-channel). On ptBoat, DPLL_1/DPLL_2 are freerun → good measurement candidates.
+channel) — confirmed by the OUTPUT-CTRL register trace (`timebeat-integration-
+paths`: OUTPUT_1 25 MHz `CTRL_0 = 0x03 = DPLL_3`). This **supersedes** the older
+`project_clockmatrix_fcw_discovery` "DPLL_0 generates the i226 25 MHz" claim,
+which was wrong — don't reintroduce it. On ptBoat, DPLL_1/DPLL_2 are freerun →
+good measurement candidates.
 
 
 ## Phased plan (low-risk first)
@@ -136,27 +140,53 @@ two-host PPS-agreement goal (each box measures its own output internally).
 For GPS-PPS-vs-output the F9T PPS noise (~ns) dominates the 0.39 ps TDC floor,
 so the win is *removing the box*, not better resolution per se.
 
+**Why this beats the earlier dead-ends** (2026-04-05/06) — and the plan's real
+payoff: the Output TDC can't see CLK inputs at all; the on-chip DPLL phase
+*freezes* at lock (it measures its own PFD → 0); and — the killer — **FCW was
+invisible to EXTTS**, because the PHC counts the same 25 MHz the FCW shifts, so
+the earlier "standalone servo" was an illusion (it could not observe its own
+actuation). The Input-TDC + PPS-OUT→CLK-IN loopback reads CLK5 (GPS) against
+the *physical* output PPS — the same edge a TICC would see — which **does**
+reflect FCW. That is exactly the EXTTS-blindness it sidesteps, and it's the
+reason this path is worth the jumper.
+
 
 ## Open items
 
-**Register decode is now resolved** from AN-1010 (rendered table images,
-2026-06-17):
+**Register decode — the prior *conflict* is now resolved** from AN-1010
+(rendered table images, 2026-06-17), with
+`scripts/peppar_fix/clockmatrix_actuator.py` as the empirical ground-truth
+anchor for the MODE bitfield:
 - `PHASE_MEASUREMENT_CFG` = `PFD_REF_CLK_SEL[3:0]` + `PFD_FB_CLK_SEL[3:0]`
   (CLK0–CLK15 each).
-- `PHASE_STATUS` = signed 36-bit × 50 ps; `FILTER_STATUS` = signed 43-bit ×
-  0.390625 ps (50/128); +ve ⇒ feedback leads reference.
+- `PHASE_STATUS` = signed **36-bit** × 50 ps per AN-1010 (Table 3);
+  `FILTER_STATUS` = signed 43-bit × 0.390625 ps (50/128); +ve ⇒ feedback leads
+  reference. ⚠️ See open item 1 — the live `servo_bringup` decode read this as
+  32-bit + flag bytes, which conflicts with the 36-bit width.
 - `PLL_MODE` phase-measurement = field value **5** (Table 4) → `0x28` at the
-  MODE byte's `[5:3]` (matches our FCW-write finding: write_freq=2 → `0x10`).
+  MODE byte's `[5:3]`. This is *inferred* from the proven write_freq=2 → `0x10`
+  field (same `[5:3]` location, verified live in `clockmatrix_actuator.py`), not
+  yet independently confirmed for mode 5 — P0 must read-back-verify.
 
 Remaining (none block P0/P1 on the 50 ps low-precision path):
-1. **Byte layout of `PHASE_MEASUREMENT_CFG`** at `+0x36` (`REF[7:4]|FB[3:0]`
+1. **`PHASE_STATUS` width conflict — reconcile before trusting sign/large
+   offsets.** AN-1010 Table 3 says signed 36-bit; the live `servo_bringup`
+   decode (2026-04-05) read it as signed **32-bit** (lower 4 bytes) + flag
+   bytes (upper 4), "explicitly NOT 36-bit." A 36-vs-32 mis-parse corrupts the
+   sign and large values — it's the source of the old "23 s" / "68 billion"
+   reads. P0's decode must reconcile BOTH the appnote width and the prior
+   32-bit+flags empirical finding, not just trust Table 3.
+2. **Byte layout of `PHASE_MEASUREMENT_CFG`** at `+0x36` (`REF[7:4]|FB[3:0]`
    vs two adjacent bytes) — verify by read-back in P0.
-2. **Which CLK inputs are spare** on ptBoat for the PPS-OUT loopback, and
+3. **Which CLK inputs are spare** on ptBoat for the PPS-OUT loopback, and
    confirm `CLK5` (F9T PPS) is selectable as `PFD_REF_CLK_SEL`.
-3. **`tdc_clk` divider for 1 Hz** (high-precision / P2 only):
+4. **`tdc_clk` divider for 1 Hz** (high-precision / P2 only):
    `tdc_clk = fref·(w + n/d)` with `w = 0xCD24[6:0]`, `n = 0xCD20:0xCD21`,
    `d = 0xCD22:0xCD23`, chosen so `tdc_clk` is **not** an integer multiple of
    1 Hz (redo AN-1010's 8 kHz "Fine Measurement Example" for 1 PPS). The
    50 ps `PHASE_STATUS` path needs none of this — it's the P0/P1 route.
-4. Cross-check the register addresses/layout against the Linux
+5. **`PHASE_STATUS` resolution** — live logs showed ~25 ps/count while AN-1010's
+   default is 50 ps (likely high-precision already engaged, or a /2). Reconcile
+   in P0.
+6. Cross-check the register addresses/layout against the Linux
    `idt8a340`/`rsmu` driver or the Timebeat Go parser before writing live.
