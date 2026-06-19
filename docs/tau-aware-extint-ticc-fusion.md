@@ -99,7 +99,11 @@ roughly increasing complexity:
 2. **Complementary filter on the two DO-phase arms.** Low-pass the TICC
    estimate of x2 and high-pass the EXTINT estimate (or vice-versa by τ),
    blending at the crossover. Classic two-sensor fusion; needs the crossover
-   pinned by a long capture first.
+   pinned by a long capture first. **Caveat:** a single fused EKF exposes only
+   one x2 — there is no separate "TICC estimate of x2" vs "EXTINT estimate of
+   x2" to blend. This option therefore requires **parallel per-arm estimators**
+   (or an equivalent decomposition), which is materially heavier than options
+   (1) and (3); it is listed for completeness, not as the cheap path.
 3. **Confidence-driven dynamic R.** Drive each arm's R from a live noise
    estimate (e.g. EXTINT's running jitter post-filter, TICC's qVIR/chB
    activity) so the fusion adapts per-host without a hard-coded crossover.
@@ -135,5 +139,8 @@ clkPoC3 before considering (3).
 - `docs/pps-ppp-error-source.md` — the synthetic-qErr (125 MHz tick) model.
 - `docs/ticc-vs-extint-do-observer-experiment.md` — the per-clock-TICC vs
   EXTINT vs TDCP arm comparison this builds on.
-- `scripts/tdev_threearm_clkpoc3.py`, `scripts/analyze_extint_ringing.py` —
-  the measurements behind these notes.
+- `scripts/tdev_threearm_clkpoc3.py` — the χ²-banded per-arm TDEV analysis
+  (ships with these notes; hardcodes `gt:~/gt/...` paths — one-off artifact).
+- `scripts/analyze_extint_ringing.py` — the EXTINT ringing characterization.
+  **Lands with the filter in PR #198, not on main yet** — present once #198
+  merges.
