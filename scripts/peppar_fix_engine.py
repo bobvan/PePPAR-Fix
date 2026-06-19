@@ -9798,8 +9798,20 @@ def run(args):
                 log.error("Failed to open extint_log %s: %s", args.extint_log, e)
                 _ext_log_writer = None
                 extint_log_f = None
+        if getattr(args, 'no_extint_late_filter', False):
+            _late_filter = None
+            log.info("EXTINT ringing late-edge filter DISABLED "
+                     "(--no-extint-late-filter)")
+        else:
+            from peppar_fix.extint_reader import ExtintLateEdgeFilter
+            _late_filter = ExtintLateEdgeFilter(
+                reject_ns=getattr(args, 'extint_late_reject_ns', 50.0))
+            log.info("EXTINT ringing late-edge filter ON: reject edges "
+                     ">%.0f ns late vs running trend (one-sided)",
+                     _late_filter.reject_ns)
         extint_store = TimTm2Store(log_writer=_ext_log_writer,
-                                   log_file=extint_log_f)
+                                   log_file=extint_log_f,
+                                   late_edge_filter=_late_filter)
 
     # Enable NAV2 + diagnostic UBX messages on the F9T.  This is done
     # here (before serial_reader starts) because the ensure_receiver
@@ -11471,6 +11483,19 @@ Two-phase operation:
                             "useful for ablation runs comparing PPP-only "
                             "to PPP+EXTINT performance.  See "
                             "docs/dofreq-est-measurement-ladder.md.")
+    servo.add_argument("--extint-late-reject-ns", type=float, default=50.0,
+                       help="EXTINT ringing late-edge rejection threshold "
+                            "(ns).  The F9P EXTINT input network can ring and "
+                            "produce a spurious SECOND edge one ringing-period "
+                            "later (~180-400 ns on PiFace) that trumps the "
+                            "real edge and mis-steers the DO.  Edges later "
+                            "than the running trend by more than this are "
+                            "dropped (one-sided; jitter ~±10 ns sets the "
+                            "floor).  Default 50.  See ExtintLateEdgeFilter.")
+    servo.add_argument("--no-extint-late-filter", action="store_true",
+                       help="Disable the EXTINT ringing late-edge filter "
+                            "(A/B testing only — leaves the ringing double-"
+                            "edge un-rejected, as before the 2026-06-19 fix).")
     servo.add_argument("--no-ticc", action="store_true",
                        help="Disable DOFreqEst Arm 4 (TICC chA-chB → "
                             "couple x[0] and x[2]).  When set, the EKF "
