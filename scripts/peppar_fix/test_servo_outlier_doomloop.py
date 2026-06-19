@@ -26,10 +26,11 @@ if _SCRIPTS_DIR not in sys.path:
 from peppar_fix_engine import _servo_outlier_decision  # noqa: E402
 
 
-def _decide(ctx, obs, n=5, thresh=500.0):
+def _decide(ctx, obs, n=5, thresh=500.0, mono_time=None):
     return _servo_outlier_decision(
         ctx, outlier_observable_ns=obs, track_outlier_ns=thresh,
-        converging=False, gap_recovery=False, ramp_accept_n=n)
+        converging=False, gap_recovery=False, ramp_accept_n=n,
+        mono_time=mono_time)
 
 
 class ServoOutlierDoomLoopTest(unittest.TestCase):
@@ -111,6 +112,49 @@ class ServoOutlierDoomLoopTest(unittest.TestCase):
             converging=False, gap_recovery=True, ramp_accept_n=5)
         self.assertEqual(d, "ok")
         self.assertEqual(self.ctx.get('_outlier_ramp', 0), 0)
+
+    # --- rampReacquireCooldown (2026-06-18) ----------------------------
+    # After ONE ramp re-acquire the caller arms ctx['_ramp_cooldown_until'].
+    # While the cooldown is active, even large same-sign observables must be
+    # let through (decision "ok") so the wide-P EKF re-locks — they must NOT
+    # re-trip ramp_accept (which would re-hold the actuator → cascade).
+    def test_cooldown_lets_large_observable_through(self):
+        """A big observable inside the cooldown window returns ok, not
+        outlier/ramp_accept, and clears the ramp counters."""
+        self.ctx['_ramp_cooldown_until'] = 100.0
+        d, e5 = _decide(self.ctx, 9000.0, mono_time=50.0)   # well inside
+        self.assertEqual(d, "ok")
+        self.assertIsNone(e5)
+        self.assertEqual(self.ctx['consecutive_outliers'], 0)
+        self.assertEqual(self.ctx.get('_outlier_ramp', 0), 0)
+
+    def test_cooldown_suppresses_ramp_reacquire(self):
+        """During cooldown a full same-sign ramp NEVER reaches ramp_accept —
+        every epoch is absorbed by the EKF instead of re-acquiring."""
+        self.ctx['_ramp_cooldown_until'] = 100.0
+        for k in range(20):                               # 4× ramp_accept_n
+            d, _ = _decide(self.ctx, 600.0 + 14.0 * k, mono_time=10.0 + k)
+            self.assertEqual(d, "ok")
+
+    def test_ramp_reacquire_rearms_after_cooldown_expires(self):
+        """Once mono_time passes the deadline the detector re-arms: a fresh
+        sustained ramp trips ramp_accept again (so a persistent pathology
+        still re-acquires, at cooldown cadence not every epoch)."""
+        self.ctx['_ramp_cooldown_until'] = 100.0
+        # past the deadline → normal detection resumes
+        decisions = [
+            _decide(self.ctx, 600.0 + 14.0 * k, mono_time=200.0)[0]
+            for k in range(5)
+        ]
+        self.assertEqual(decisions[:4], ["outlier"] * 4)
+        self.assertEqual(decisions[4], "ramp_accept")
+
+    def test_no_cooldown_field_behaves_normally(self):
+        """Absent the cooldown field (or mono_time), detection is unchanged —
+        the cooldown is purely additive."""
+        d = [_decide(self.ctx, 600.0 + 14.0 * k, mono_time=5.0)[0]
+             for k in range(5)]
+        self.assertEqual(d[4], "ramp_accept")
 
 
 if __name__ == "__main__":
