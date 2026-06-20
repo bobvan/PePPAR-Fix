@@ -49,16 +49,44 @@ receiver reports in GPS time      = round((x2 + x0)/8ns) · 8ns − x0
   ⇒  z_extint = x2 − qerr(x2 + x0)
 ```
 
-So define **DOqErr ≡ qerr(x2 + x0)** = `(x2 + x0) mod 8ns`, centered to ±4 ns,
-and the tick-aware EXTINT model is:
+So define **DOqErr ≡ qerr(x2 + x0)** = `(x2 + x0) mod 8ns`, centered to ±4 ns.
+Conceptually the de-quantized measurement is `x2 = z_extint + DOqErr`.
+
+### ⚠️ Why you can NOT just write it as a nonlinear `h` (the TICC arm's trick fails here)
+
+It is tempting to mirror the TICC arm with `h_extint(x) = x2 − qerr(x2 + x0)`.
+**Do not** — it silently produces zero EKF gain on `x2` (Main, PR #200 review).
+The quantizer argument contains the *target* state `x2`, so:
 
 ```
-h_extint(x) = x2 − qerr(x2 + x0)
+h = x2 − qerr(x2 + x0) = −x0 + 8·round((x2 + x0)/8)
+∂h/∂x2 = 0   almost everywhere   (round() is piecewise-constant)
 ```
 
-— structurally identical to `h_ticc = −x2 − qerr(x0)`, with the DO edge
-position `x2` folded into the tick argument. The EKF then models the
-quantization (and its tick-boundary Jacobian) instead of eating it.
+The only `x2` sensitivity sits exactly at tick boundaries — which is precisely
+where `R_lin` inflates the variance — so the filter would extract almost
+nothing. This is the opposite of "lean on EXTINT harder." The TICC arm gets to
+keep its nonlinear `h` only because *its* quantizer argument is `x0` (the
+**other** state): `h_ticc = −x2 − qerr(x0)` ⇒ `∂h_ticc/∂x2 = −1`, full
+sensitivity. EXTINT's quantizer is over `x2` itself, so the same structure
+cancels.
+
+### The working form — prior-evaluated dither offset
+
+Evaluate the dither at the **prior** state `x2⁻`, treat it as a known
+per-epoch additive constant, and keep a **linear** measurement:
+
+```
+c = qerr(x2⁻ + x0)               # computed once per epoch from the prior
+z_corr = z_extint + c            # de-quantized measurement of x2
+h(x) = x2,   H_extint = [0,0,1,0],   R = sub-ns (residual model below)
+```
+
+`∂h/∂x2 = 1` (full sensitivity) and `z_corr` is de-quantized to sub-ns. The
+innovation `z_corr − x2⁻ ≈ (x2_true − x2⁻)` when `x2⁻` is within a tick of
+truth, so the EKF gets a clean, fully-weighted correction. This is — and must
+be — the **"correct z with the prior, then feed"** pattern; see the sharpened
+caveat 4 below for why that's the *right* thing here, not a hazard.
 
 ## Why it's worth doing
 
@@ -76,19 +104,22 @@ quantization (and its tick-boundary Jacobian) instead of eating it.
 
 ## Implementation
 
-Mirror the TICC arm in `peppar_fix/do_freq_est.py`:
+In `peppar_fix/do_freq_est.py`, Arm 3 (EXTINT) stays a **linear** update on
+`x2` (`H_extint = [0,0,1,0]`) — but with a prior-evaluated dither correction
+applied to the measurement, NOT a nonlinear `h` (see the gotcha above):
 
-1. Make Arm 3 (EXTINT) a **nonlinear** update: `h_extint = x2 − qerr(x2 + x0)`,
-   with the Jacobian linearized at the post-PPP state (run after Arm 1 so `x0`
-   is tight, exactly like the TICC arm's ordering contract).
-2. **R floor + R_lin inflation near tick boundaries** — reuse the TICC arm's
-   state-dependent linearization-error inflation: when `σ(x2 + x0)` is well
-   below the tick, `R_lin → 0` and the de-quantized EXTINT is sub-ns; when it
-   approaches the tick, `R_lin → (tick/2)²` so a wrong-tick can't poison the
-   update (graceful degrade to ~tick-floor, i.e. today's behavior).
-3. **Convergence gate:** only engage the tick model once `x2` is known to
-   < ~4 ns (else use the raw linear EXTINT). Cold-start uses raw EXTINT to
-   acquire, then switches to tick-aware once locked.
+1. After Arm 1 (so `x0` is tight — reuse the TICC arm's sequential-ordering
+   contract), compute `c = qerr(x2⁻ + x0)` from the **prior** `x2⁻` and feed
+   `z_corr = z_extint + c` as a linear measurement of `x2` with `H = [0,0,1,0]`.
+2. **R model for `z_corr`** — this is where the rigor lives, since the literal
+   `R_lin`-on-nonlinear-`h` reasoning does not apply. `R` must cover:
+   `σ(x0)²` (PPP rx-phase error) + `σ(x2⁻ within-tick)²` (prior sub-tick
+   uncertainty) + a **wrong-tick tail** (a `(tick/2)²`-weighted term that grows
+   as `σ(x2⁻ + x0)` approaches the tick). When converged, `R` → sub-ns; near a
+   tick boundary `R` → ~tick-floor (graceful degrade to today's behavior).
+3. **Convergence gate:** only apply `c` once `x2` is known to < ~4 ns (else use
+   the raw linear EXTINT). Cold-start acquires on raw EXTINT, then switches to
+   dither-corrected once locked.
 4. **CLI flag** `--extint-tick-model` (default off initially) for clean A/B,
    matching how `--router-qvir` gates the TICC hardware-qErr path.
 
@@ -102,11 +133,16 @@ Mirror the TICC arm in `peppar_fix/do_freq_est.py`:
    **not** fix the long-τ nav-clock drift (e.g. the X20P `no-ticc` → 225 ns
    over 3 h on 2026-06-19). That's the reference itself wandering — a separate
    floor that only a better receiver clock or TICC anchoring addresses.
-4. **Must be the measurement *model*, not "correct z then feed as independent
-   sub-ns."** The de-quantized value borrows its sub-tick from `x2_prior`, so
-   feeding it as an independent sub-ns measurement would double-count the prior
-   and make the filter overconfident. The nonlinear-h form (what the TICC arm
-   already does) handles the correlation correctly.
+4. **It MUST be "correct z with the prior, then feed" — and that's fine here**
+   (corrected per Main's PR #200 review; the earlier draft had this backwards).
+   The literal nonlinear-`h` form *silently fails* via the Jacobian
+   cancellation above; the prior-evaluated dither (`z_corr = z + qerr(x2⁻+x0)`,
+   `H_x2 = 1`) is the working form. The sub-tick correction borrowed from the
+   prior is **benign** — it's a ±4 ns, slowly-varying offset, so the
+   correlation with the prior is negligible and must simply be *accepted*. The
+   real hazard is **not** the correlation; it's setting `R` too tight —
+   ignoring the residual `σ(x0)` / `σ(x2⁻ within-tick)` and the wrong-tick tail
+   (item 2). Get `R` right and the filter is neither overconfident nor blind.
 
 ## Validation plan
 
@@ -114,8 +150,12 @@ Mirror the TICC arm in `peppar_fix/do_freq_est.py`:
    has raw-EXTINT arms (`no-ticc`, filter-off) on both hosts — the de-quantized
    version should be compared against these (chA-alone detrended TDEV vs τ).
 2. **Sim** in `scripts/servo_sim.py`: inject 8 ns quantization on the EXTINT
-   arm with/without the tick model; confirm short-τ TDEV drops toward the
-   sub-ns floor and the loop stays stable through tick boundaries.
+   arm with/without the tick model. The acceptance assertion is that **the EKF
+   actually realizes sub-ns gain on `x2`** (e.g. `P[2,2]` / the EXTINT Kalman
+   gain on `x2` reaches the sub-ns regime), not merely that `z_corr` is
+   algebraically de-quantized — this is the specific failure mode the Jacobian
+   cancellation would hide. Also confirm short-τ TDEV drops toward the sub-ns
+   floor and the loop stays stable through tick boundaries.
 3. **Lab A/B** on PiFace (F9T, has PPP): `--no-ticc` with vs without
    `--extint-tick-model`; metric = detrended chA TDEV. Expect short/mid-τ
    improvement, long-τ unchanged (nav-clock floor).
