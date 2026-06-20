@@ -385,6 +385,65 @@ class DOFreqEst:
         self._state_corrupted = False
         self._state_sanity_consec = 0
 
+    def realign_rx_clock(self, step_ns, *, post_step_sigma_ns=100.0):
+        """Step the rx-clock PHASE state by a known, self-inflicted offset.
+
+        clkResetRealignsEkfRxState — a GNSS receiver clock reset (e.g.
+        F9T RXM-RAWX recStat.clkReset, an integer-ms realignment) steps
+        the receiver's local clock by a known amount.  The PPP filter
+        absorbs that step into its dt_rx state, so the dt_rx value the
+        servo consumes via Arm 1 jumps by ``step_ns``.  Without a matching
+        realign here the EKF sees a spurious ~21 ms innovation, splits it
+        across the rx states (x[1] = f_rx spiked to ~1e6 on the MadHat
+        2026-06-20 03:19:15Z event), and the state-sanity guard fires a
+        needless [SERVO_RESET] reason=state_sanity.
+
+        This is a CLEAN HANDOFF, not a fault: step the rx-TCXO PHASE
+        state (x[0]) by exactly the same offset the dt_rx feed jumped, so
+        the next PPP innovation is back to baseline noise.  ``step_ns``
+        is the SIGNED change in dt_rx_ns (= +offset_m/c in ns), i.e. add
+        it directly to x[0].
+
+        Deliberately scoped:
+
+        - x[0] (φ_rx): stepped by ``step_ns`` — it tracks dt_rx 1:1.
+        - x[1] (f_rx): UNCHANGED — a clock reset is a phase step, not a
+          frequency change; the rx-TCXO drift rate is physically the
+          same.  Its covariance cross-term with x[0] is cleared so the
+          inflated x[0] uncertainty doesn't bleed into f_rx on the next
+          update.
+        - x[2], x[3] (DO phase/freq): UNCHANGED.  The DO is physically
+          unaffected by a receiver clock reset; injecting a step here
+          would be a real, wrong disturbance.
+
+        Covariance: inflate ONLY P[0,0] to ``post_step_sigma_ns²`` and
+        zero x[0]'s cross-covariances (mirrors the constructor's
+        bootstrap σ_x0 = 100 ns and the WNO clock-prior reset pattern in
+        FixedPosFilter) — the discrete realign breaks the smooth
+        rx-TCXO phase model, so post-step phase uncertainty is widened
+        while the DO-state block of P is left untouched.
+
+        No-op when ``step_ns`` is falsy (0 or None) so the engine can
+        call this unconditionally each epoch.
+        """
+        if not step_ns:
+            return
+        self.x[0] += float(step_ns)
+        # Clear x[0] cross-covariances, then set its variance to the
+        # post-step uncertainty.  Leaves the x[1:]×x[1:] block intact —
+        # the DO states (and f_rx) keep their pre-realign covariance.
+        self.P[0, :] = 0.0
+        self.P[:, 0] = 0.0
+        self.P[0, 0] = float(post_step_sigma_ns) ** 2
+        # If the rx-TCXO state was never initialized (no PPP dt_rx at
+        # construction) the realign still anchors x[0] for any later
+        # transition; harmless because Arm 1 / the coupled TICC arm only
+        # consult x[0] once dt_rx is flowing.
+        log.info(
+            "[EKF] rx-clock realign: x[0] += %.1f ns (clkReset handoff), "
+            "P[0,0] inflated to (%.0f ns)² — DO states x[2]/x[3] "
+            "untouched", float(step_ns), float(post_step_sigma_ns))
+
     def is_state_corrupted(self) -> bool:
         """True iff sustained state-sanity violations have crossed the
         consecutive-threshold and the engine should request a reset
