@@ -18,10 +18,10 @@
 #   baud = 115200
 #   ubx_port = "USB"
 #   receiver = "f9t-l5"
-serial = "/dev/ttyACM1"  # F9P, 2026-05-31 swap-in
-baud = 115200  # F9P default; was 38400 for F10T
-ubx_port = "USB"  # F9P over CDC ACM; was UART for F10T
-receiver = "f9p"
+serial = "/dev/ttyACM1"  # F9T-20, 2026-06-20 swap-in (u-blox by-id -if00; only u-blox on bus)
+baud = 115200  # F9T-20 default 115200
+ubx_port = "USB"  # F9T-20 over CDC ACM
+receiver = "f9t-l5"  # F9T-20, L5-tracking (F9TL5Driver) — hw qErr available (TIM fw)
 # ptp_profile = "i226"  # disabled 2026-05-24: i226 removed, IsoTemp OCXO-33 + AD5693R DAC instead
 # ptp_dev = "/dev/ptp_i226"  # disabled 2026-05-24
 
