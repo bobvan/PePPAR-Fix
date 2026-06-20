@@ -8883,6 +8883,27 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         else:
             dt_rx_ns_arg = dt_rx_ns
             dt_rx_sigma_arg = dt_rx_sigma
+
+        # clkResetRealignsEkfRxState: a receiver clock reset (F9T
+        # clkReset integer-ms realignment) or a post-gap re-anchor was
+        # absorbed into the PPP filter's dt_rx state this epoch
+        # (FixedPosFilter.last_clk_realign_m, in metres).  The dt_rx the
+        # servo consumes via Arm 1 jumped by the same amount, so step the
+        # DOFreqEst EKF's rx-clock PHASE state by the matching ns offset
+        # BEFORE servo.update().  Without this the EKF sees a spurious
+        # ~21 ms innovation, the rx-freq state spikes past the
+        # state-sanity bound, and a needless [SERVO_RESET]
+        # reason=state_sanity fires (MadHat 2026-06-20 03:19:15Z).  The
+        # DO is physically unaffected by a receiver clock reset; the
+        # realign touches only the rx-clock states (see
+        # DOFreqEst.realign_rx_clock).  No-op when no realign occurred.
+        _clk_realign_m = getattr(filt, 'last_clk_realign_m', 0.0)
+        if _clk_realign_m and hasattr(servo, 'realign_rx_clock'):
+            _clk_realign_ns = _clk_realign_m / C * 1e9
+            log.info(
+                "[CLK_REALIGN] forwarding %+.0f ns rx-clock step to servo "
+                "EKF (clean handoff, no servo reset)", _clk_realign_ns)
+            servo.realign_rx_clock(_clk_realign_ns)
         # ── Arm 5: TDCP ensemble frequency (consume + clear) ────────
         # Latest gate-approved observation is stashed by the obs loop
         # at observation rate (1 Hz typically).  Consume at most once

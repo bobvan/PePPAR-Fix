@@ -1443,6 +1443,18 @@ class FixedPosFilter:
         # update history so the baseline stays clean across bursts.
         self._pr_median_history = deque(maxlen=self.CATASTROPHIC_HISTORY_MAX)
         self._consecutive_catastrophic_rejects = 0
+        # Signed clock realignment (metres) absorbed into IDX_CLK this
+        # epoch by a documented step mechanism — F9T clkReset integer-ms
+        # realignment OR gap-recovery re-anchor.  Reset to 0.0 at the top
+        # of every update(); set to the applied offset when either branch
+        # fires.  The engine reads this AFTER update() and forwards the
+        # ns-equivalent to DOFreqEst.realign_rx_clock() so the servo EKF's
+        # rx-clock phase state is stepped by the SAME amount the PPP
+        # clock state was — without it the EKF sees a spurious ~21 ms
+        # innovation, the rx-freq state spikes, and the state-sanity
+        # guard fires a needless servo reset (clkResetRealignsEkfRxState,
+        # MadHat 2026-06-20 03:19:15Z).
+        self.last_clk_realign_m = 0.0
 
     def predict(self, dt):
         if dt <= 0:
@@ -1573,6 +1585,10 @@ class FixedPosFilter:
                 docs/clkpoc3-f9t-input-reboot-2026-05-29.md +
                 dayplan clkpoc3GapAbsorb.
         """
+        # Reset the per-epoch realign signal.  Set below if the clkReset
+        # or gap-recovery branch absorbs a step into IDX_CLK; the engine
+        # forwards it to the servo EKF (clkResetRealignsEkfRxState).
+        self.last_clk_realign_m = 0.0
         # After a long gap the previous-epoch carrier-phase baseline is
         # stale (it predates the gap), so any TD-CP formed against it
         # would span the whole gap and may hide cycle slips.  Drop it;
@@ -1788,6 +1804,10 @@ class FixedPosFilter:
                 # rebasing z, the gain would re-apply the offset on top
                 # of our shift (verified empirically: 2× compensation).
                 self.x[self.IDX_CLK] += offset_m
+                # Record the applied step so the engine can realign the
+                # servo EKF's rx-clock state by the same amount
+                # (clkResetRealignsEkfRxState).
+                self.last_clk_realign_m = offset_m
                 z[pr_idx] = z[pr_idx] - offset_m
                 # TD-CP rows also see the F9T's CP shift in delta_phi;
                 # rebase them too.  z_td = delta_phi - delta_rho -
@@ -1830,6 +1850,10 @@ class FixedPosFilter:
         if gap_recovery and pr_idx:
             offset_m = float(np.median(z[pr_idx]))
             self.x[self.IDX_CLK] += offset_m
+            # Same handoff as the clkReset path: forward the absorbed
+            # step to the servo EKF so its rx-clock state tracks the
+            # re-anchor instead of seeing a spurious innovation.
+            self.last_clk_realign_m = offset_m
             z[pr_idx] = z[pr_idx] - offset_m
             self._pr_median_history.clear()
             self._consecutive_catastrophic_rejects = 0
