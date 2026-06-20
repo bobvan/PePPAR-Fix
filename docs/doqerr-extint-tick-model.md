@@ -1,9 +1,12 @@
 # DOqErr — de-quantize the EXTINT (DO-phase) measurement with a tick model
 
-**Status:** design / backlog (dayplan `doQErrExtintTickModel`).
+**Status:** design / **LOW-PRIORITY refinement** — 1-D EKF scoping shows only a
+~15% benefit (not the sub-ns first claimed); **gate engine work on a full
+`servo_sim` confirmation** before implementing. Dayplan `doQErrExtintTickModel`.
 **Owner:** charlie. **Origin:** Bob, 2026-06-19.
 **Relationship:** the EXTINT-arm analogue of the existing TICC-arm software qErr;
-a precision lever for [`tau-aware-extint-ticc-fusion`](tau-aware-extint-ticc-fusion.md).
+a *minor* precision refinement for [`tau-aware-extint-ticc-fusion`](tau-aware-extint-ticc-fusion.md)
+(does NOT move the EXTINT-vs-TICC crossover much — see "Expected benefit").
 
 ## The problem
 
@@ -88,19 +91,42 @@ truth, so the EKF gets a clean, fully-weighted correction. This is — and must
 be — the **"correct z with the prior, then feed"** pattern; see the sharpened
 caveat 4 below for why that's the *right* thing here, not a hazard.
 
-## Why it's worth doing
+## Expected benefit — MODEST (~15%), not the sub-ns the first draft claimed
 
-- **EXTINT effective noise drops from ~8 ns quantization (~2.3 ns RMS) toward
-  sub-ns** → the EKF can weight EXTINT far more heavily (lower R), tracking the
-  DO tighter and converging faster.
-- **Biggest win where we need it:** EXTINT-only / no-per-clock-TICC hosts, and
-  the `tauAwareExtintTiccFusion` crossover — a de-quantized EXTINT could reach
-  TICC-class short-τ *without* a per-clock TICC, and it pushes the
-  EXTINT-vs-TICC crossover to shorter τ.
-- **Bonus de-contamination:** because DOqErr uses our PPP `x0` (sub-ns), it
-  folds in our precise rx-clock-phase knowledge, partly cleaning the rx-clock
-  contribution the receiver baked into the timestamp — the same "use PPP/TDCP
-  to clean the references" idea from the fusion doc.
+⚠️ **Corrected 2026-06-19 (charlie scoping + 1-D EKF go/no-go).** The original
+"8 ns → sub-ns, lean on EXTINT much harder (lower R)" pitch was wrong on both
+counts. A 1-D closed-loop EKF (DO phase with random-walk frequency, wandering
+rx TCXO, PPP `x0` at 0.1 ns) gives:
+
+| EXTINT arm | meas σ | x2 RMSE |
+|---|---|---|
+| raw (quantized) | 2.31 ns | **0.361 ns** |
+| de-quant | 0.1 ns (tight) | **1.606 ns** ❌ |
+| de-quant | 0.5 ns | 0.473 ns ❌ |
+| de-quant | 1.0 ns | 0.330 ns |
+| de-quant | 2.3 ns | **0.308 ns** ✅ |
+
+Two hard lessons:
+
+1. **The win is ~15%** (0.361 → 0.308 ns x2 RMSE), at **the same conservative
+   R as raw** — "a somewhat cleaner measurement at the same trust," NOT "trust
+   it far more." It does **not** make EXTINT-only rival a per-clock TICC.
+2. **A tight (sub-ns) R backfires** — it makes the arm *worse than raw*
+   (1.6 ns). So "lower R to lean harder" is actively harmful here.
+
+**Why it's capped:** the receiver discarded the sub-tick; we resupply it from
+the prior + PPP, but the **prior's own ~0.3 ns error interacts with the 8 ns
+tick grid** — near tick boundaries prior and truth disagree on *which* tick,
+injecting ~8 ns errors. That **wrong-tick tail (item 2 below) is the dominant
+residual**, capping the de-quantized measurement at ~1.4 ns (not sub-ns) and
+forcing a conservative R.
+
+**Net positioning:** a **low-priority refinement** (cheap, flag-gated, ~15% on
+EXTINT-limited hosts), *not* a moonshot lever. The real EXTINT-precision lever
+is a finer *measurement* (TICC, or a receiver that reports sub-tick EXTINT) —
+software de-quantization can't recover information the receiver threw away. The
+"bonus rx-clock de-contamination" via PPP `x0` is the same effect, also bounded
+by the wrong-tick tail.
 
 ## Implementation
 
@@ -146,19 +172,24 @@ applied to the measurement, NOT a nonlinear `h` (see the gotcha above):
 
 ## Validation plan
 
-1. **Before baseline already captured:** the 2026-06-19 four-arm F9T/X20P run
-   has raw-EXTINT arms (`no-ticc`, filter-off) on both hosts — the de-quantized
-   version should be compared against these (chA-alone detrended TDEV vs τ).
-2. **Sim** in `scripts/servo_sim.py`: inject 8 ns quantization on the EXTINT
-   arm with/without the tick model. The acceptance assertion is that **the EKF
-   actually realizes sub-ns gain on `x2`** (e.g. `P[2,2]` / the EXTINT Kalman
-   gain on `x2` reaches the sub-ns regime), not merely that `z_corr` is
-   algebraically de-quantized — this is the specific failure mode the Jacobian
-   cancellation would hide. Also confirm short-τ TDEV drops toward the sub-ns
-   floor and the loop stays stable through tick boundaries.
-3. **Lab A/B** on PiFace (F9T, has PPP): `--no-ticc` with vs without
-   `--extint-tick-model`; metric = detrended chA TDEV. Expect short/mid-τ
-   improvement, long-τ unchanged (nav-clock floor).
+**Step 0 already done (1-D EKF, charlie 2026-06-19):** confirmed the prior-dither
+form (H=1) works, but the benefit is only ~15% and **requires conservative R**
+(σ ≈ raw's; a sub-ns R makes it worse than raw — see the table above). This is
+the go/no-go that demotes it to a low-priority refinement.
+
+1. **`servo_sim` GO/NO-GO before any engine change** (`scripts/servo_sim.py`):
+   reproduce the ~15% in the *full* closed loop with a realistic R model
+   (`σ(x0)² + σ(x2⁻ within-tick)² + wrong-tick tail`). If the full-loop benefit
+   is < the 1-D ~15% (it may be, with the real frequency state and gate), **do
+   not implement** — the complexity isn't worth it. Assert the EKF realizes the
+   modeled gain on `x2` (not a tight-R overconfidence), and that tick-boundary
+   crossings stay stable.
+2. **Before baseline already captured:** the 2026-06-19 four-arm F9T/X20P run
+   has raw-EXTINT arms (`no-ticc`, filter-off) on both hosts — compare any
+   de-quantized version against these (chA-alone detrended TDEV vs τ).
+3. **Lab A/B** (only if step 1 passes) on PiFace (F9T, has PPP): `--no-ticc`
+   with vs without `--extint-tick-model`; metric = detrended chA TDEV. Expect a
+   modest short/mid-τ improvement, long-τ unchanged (nav-clock floor).
 4. Cross-check the wrong-tick guard during a deliberate cold start.
 
 ## Related
