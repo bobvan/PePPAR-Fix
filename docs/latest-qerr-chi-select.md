@@ -36,6 +36,27 @@ consistency test select** between it and the raw TICC candidate:
 The filter's own innovation test does continuously, per-edge, what qVIR tried to
 do with a windowed variance ratio — and it needs no host-specific tuning.
 
+**Why pure-latest is enough (Bob, 2026-06-20):** at the 1 Hz PPS cadence,
+applying the most recent qErr message to the *following* PPS edge is right the
+large majority of the time — call it ~99%. Much of the existing queue/correlation
+machinery was built to eke the last bit of information out of *buffered* qErr
+readings during the cases where "latest" is briefly wrong: **startup** (no edge
+correlated yet) and **CPU starvation** (the read thread fell behind and the
+"latest" message is stale by one or more edges). Those are exactly the cases the
+χ² test rejects on its own — so we don't need to *match* through them, we just
+need to *not trust* the corrected candidate during them. Pure-latest + χ²
+selection covers the 99% directly and degrades gracefully on the ~1%.
+
+### qErr path scope — TICC arm only (NOT the EXTINT/EXTTS path)
+
+This changes the **TICC-arm** qErr (the `ext` candidate in `_route_ticc_arm`,
+where qErr removes the 8 ns sawtooth from a 60 ps-resolution chA−chB reading —
+the qVIR-meaningful path; MadHat 75–130, PiFace 28–80). It does **not** touch the
+**EXTINT/EXTTS-path** qErr. The "EXTTS qVIR = 0.00" seen on hosts (incl. MadHat
+F9T-20B, 2026-06-20) is a *different path* and is expected, not broken: EXTINT/
+EXTTS are themselves ~8 ns-quantized, so qErr can't reduce their variance and
+qVIR≈0 there on every host. #203 neither addresses nor needs that.
+
 ## Two things that must be right (or it backfires)
 
 ### 1. Do NOT feed raw AND corrected as two independent arms
@@ -57,21 +78,48 @@ corrected candidate by its own normalized innovation. That is the active
 ingredient; without it, a stale qErr is trusted at full weight. So this is
 *not* "feed corrected with a fixed R and hope" — it's "select/weight by χ²."
 
-## Implementation — a small change to the existing v1 router
+## Implementation — change the existing v1 router, including its gate
 
-`--routed-qerr-arm` (v1, χ²) in `peppar_fix/do_freq_est.py` already does per-edge
-χ² selection between `ext` (external qErr), `internal` (qerr(x0) model), and
-`raw`, feeding one. The change:
+`--routed-qerr-arm` (v1, χ²) in `peppar_fix/do_freq_est.py` (`_route_ticc_arm`)
+already does per-edge selection between `ext` (external qErr), `internal`
+(qerr(x0) model), and `raw`, feeding one. The change:
 
 1. Supply the **latest** TIM-TP qErr as the `ext` candidate's correction —
    **no edge matching, no expected-offset window, no queue**. Just "most recent
    message received."
-2. Keep the χ² selection that already exists. (Optionally retire the `internal`
-   candidate or keep it as a third option — it costs nothing.)
-3. Retire the qVIR gate and the qErr matching/queue code from the qErr path once
-   this is validated. (qVIR remains useful as an *offline diagnostic* — it's how
-   we'd still characterize a host's qErr quality.)
-4. CLI: `--qerr-latest-chi` (default off initially) for clean A/B vs the matched
+
+2. ⚠️ **Make `ext` acceptance COMPARATIVE, not absolute (Main's must-resolve,
+   PR #203 review).** The current v1 gate is *absolute*:
+   `if name == 'raw' or chi2 <= _CHI2_GATE_THRESHOLD` (~100) — it accepts `ext`
+   merely for clearing 100, it does not require `ext` to *beat* `raw`. That is
+   fine for the **matched** router (matching keeps `ext` almost always correct,
+   so it rarely sees a mis-correlated `ext`), but it **fails for pure-latest**:
+   an off-by-edge qErr is the difference of two ±4 ns sawtooth values ≈ **3.3 ns
+   RMS** (up to 8 ns). At lock √S ≈ 0.8 ns on the small-`R_base` `ext` candidate
+   → `chi² ≈ (3.3/0.8)² ≈ 17`, reaching ~100 only at the 8 ns worst case. So a
+   mis-correlated latest-qErr **passes the absolute-100 gate most of the time** →
+   `ext` accepted → poisons `z` → the exact qVIR=0 / "TDEV worse than raw"
+   failure. The no-harm property therefore **requires** the gate change: `ext`
+   wins only if `chi²(ext)` beats `chi²(raw)` by a margin; otherwise route `raw`.
+
+   | candidate | innovation | R | √S | χ² | vs raw |
+   |---|---|---|---|---|---|
+   | ext, correct | ~0.1 ns | `R_base` | ~0.8 ns | ~0.02 | **wins** ✅ |
+   | raw | ~2.3 ns (sawtooth) | `R_base + tick²/12` | ~2.4 ns | ~0.9 | — |
+   | ext, wrong | ~3.3 ns | `R_base` | ~0.8 ns | ~17 | **loses → raw** ❌ |
+
+   Without this change "reuse v1 as-is" is unsafe; *with* it, the comparative
+   χ² is the whole no-harm mechanism. Also fix the `_route_ticc_arm` docstring,
+   which currently overstates the absolute gate's robustness
+   ("conspicuous chi² outlier" — true vs the 8 ns worst case, false at the ~3.3
+   ns typical mis-correlation that lands at χ²≈17 < 100).
+
+3. Keep the `internal` (qerr(x0)) candidate as a third option — it costs nothing
+   and gives a no-PPP-free fallback.
+4. Retire the qVIR gate and the qErr matching/queue code from the qErr path once
+   the A/B proves parity. (qVIR remains useful as an *offline diagnostic* — it's
+   how we'd still characterize a host's qErr quality.)
+5. CLI: `--qerr-latest-chi` (default off initially) for clean A/B vs the matched
    path.
 
 ## Why it's attractive now
@@ -110,14 +158,32 @@ ingredient; without it, a stale qErr is trusted at full weight. So this is
    (a) χ²-selection recovers the full qErr benefit when the qErr is matchable,
    (b) it cleanly ignores a wrong qErr with **no covariance collapse** (assert
    P stays sane; no overconfidence), (c) exactly one candidate is fed per epoch
-   (no double-count).
-2. **Replay** the MadHat / PiFace four-arm `ticc-hwqerr` captures (which logged
-   the matched-router decision) — does latest-qErr-χ² reach the same routing /
-   chA-TDEV as the matched path? (MadHat qVIR 75–130 and PiFace 28–80 are the
-   matchable references; both should be recovered.)
+   (no double-count). **The off-by-one injection is the key test of the
+   comparative gate** (item 2 in Implementation): with an absolute-100 gate the
+   poisoned `ext` is accepted (χ²≈17) and TDEV degrades; with the comparative
+   gate `ext` loses to raw and TDEV is unharmed. This is the *proof* of no-harm,
+   not just recovery-of-benefit.
+2. **Replay both halves** (Main's ask — don't only prove recovery):
+   - *Recovery:* the MadHat / PiFace four-arm `ticc-hwqerr` captures (matched,
+     qVIR 75–130 / 28–80) — latest-qErr-χ² should reach the same routing /
+     chA-TDEV as the matched path.
+   - *Graceful fallback:* a **genuinely-broken** qErr case — synthetic off-by-one
+     in the sim (above) and/or a host where the TICC qErr does not correlate —
+     must route to raw with **no TDEV penalty vs raw-only**. "No harm when
+     matching fails" must be *demonstrated*, not assumed.
 3. **Lab A/B**: `--qerr-latest-chi` vs the matched `--router-qvir` path on PiFace
    and MadHat (F9T, valid qErr); metric = detrended chA TDEV. Expect parity
    where matching already works, and graceful raw-fallback where it doesn't.
+
+## Optional middle ground — coarse time-of-week pick (no queue)
+
+Pure-latest gives up only the *systematically* off-by-one host (caveat 1). The
+TIM-TP message carries its own edge time-of-week; a single coarse compare of
+that field against the expected PPS second (no queue, no CLOCK_MONOTONIC window,
+no expected-offset tuning) could pick the right edge for those hosts nearly free
+— a middle ground between full-queue matching and pure-latest. Optional;
+pure-latest + comparative-χ² is a fine v1, and this can be layered on later if a
+systematically-off host turns up.
 
 ## Related
 
