@@ -133,6 +133,55 @@ time-domain**.  TD-CP epoch-to-epoch is at this floor.
 **σ_meas ≈ 5-10 ps.** ✓ Well under the 354 ps per-clock budget;
 fundamentally not the limiter.
 
+#### 3.1.1 The Rb-reference floor — single-clock vs differential
+
+The TICC timestamps every PPS edge against the lab Rb standard
+(FE-5680A) as its timebase, so the Rb's own instability enters the
+measurement — but **only in single-clock mode, not in the differential
+the budget is actually written against** (§2).  This distinction
+governs how we can measure the random-walk budget.
+
+**Single-clock (chA vs Rb).**  The Rb's wander adds in quadrature, so a
+clock's random walk is attributable only *above* the Rb's TDEV at that
+τ.  For the FE-5680A (≈ white-FM `ADEV ≈ 2e-11/√τ` out to ~100 s, a
+flicker floor of ~1-3e-12 at 100-1000 s, then its own RWFM + drift
+rising beyond ~1000-3000 s), with `TDEV(τ) ≈ τ·ADEV(τ)/√3`:
+
+| τ | Rb TDEV (single-clock floor) | per-clock budget |
+|---|---|---|
+| 1 s | ~12 ps | 354 ps |
+| 10 s | ~37 ps | 354 ps |
+| 100 s | ~120 ps | 354 ps |
+| 1000 s | ~0.3-1 ns (RWFM emerging) | 354 ps |
+
+So single-clock chA-vs-Rb can verify the per-clock budget at short/mid
+τ with healthy margin, and — because the FE-5680A has *no RWFM of its
+own below ~1000 s* — it is just good enough to confirm the budget's
+**"no positive-slope (RWFM) region below τ ≈ 1000 s"** requirement: any
+positive slope you see below 1000 s is the clock's, not the reference's.
+But past ~1000 s the Rb's own RWFM/drift climbs to and beyond the
+budget, so a long-τ chA TDEV bulge there **cannot be cleanly attributed**
+to the clock vs the Rb.  *Corollary: do not grade the moonshot on
+single-clock chA-vs-Rb TDEV at long τ — you would be measuring the
+FE-5680A as much as the clock.*
+
+**Differential (chA − chB on one shared TICC).**  The Rb is the common
+timebase for *both* channels, so its instability — **including its
+random walk** — is a common-mode term (§2) that **cancels** in
+chA − chB.  The shared-reference differential is therefore *immune to
+the Rb's random walk*: its floor is `σ_meas ≈ 5-10 ps`, not the Rb's
+~12 ps→1 ns TDEV.  The Rb only has to hold over the sub-second interval
+between the two edges the TICC timestamps within a given second, where
+it is sub-picosecond, so the cancellation is essentially perfect.
+
+**This is the reason the budget is written as σ_Δ measured on a shared
+TICC** (§6.3 / §7): the random-walk budget is measurable down to the
+carrier-phase floor *regardless of the reference's own random walk*.
+The Rb's long-term stability is therefore almost a red herring for the
+budget — it would become the limiter only if we tried to characterize
+one clock's *absolute* random walk past ~1000 s, which the differential
+budget never asks for.
+
 ### 3.2 Servo residual σ_servo_residual(τ)
 
 The loop's ability to drive innovation to zero at τ.  For a
