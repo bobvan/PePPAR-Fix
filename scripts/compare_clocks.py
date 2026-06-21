@@ -55,6 +55,7 @@ sys.path.insert(0, str(_SCRIPT_DIR.parent / "tools"))
 from analysis_provenance import provenance_line  # noqa: E402
 from plot_xhost_agreement_cdf import load_pairs, render_cdf  # noqa: E402
 from plot_clock_stability_stack import render_pair_stability  # noqa: E402
+from plot_tch import render_tch, summary_table  # noqa: E402
 
 
 _TOOLNAME = "compare_clocks.py"
@@ -152,6 +153,16 @@ def main() -> int:
     ap.add_argument("--skip-before", default=None,
                     help="ISO-8601 UTC; drop earlier rows (bootstrap trim) "
                          "from the stability overlay.")
+    ap.add_argument("--tch", action="store_true",
+                    help="Also run the three-cornered-hat decomposition over "
+                         "{chA, chB, Rb}: recovers each node's INDIVIDUAL "
+                         "stability past the Rb-reference floor (see "
+                         "tools/plot_tch.py).  Requires chA, chB AND that "
+                         "the three be mutually uncorrelated for an unbiased "
+                         "split.")
+    ap.add_argument("--groslambert", action="store_true",
+                    help="With --tch: use the Groslambert-covariance "
+                         "estimator instead of the simple closed form.")
     args = ap.parse_args()
 
     print(provenance_line(_TOOLNAME), file=sys.stderr)
@@ -203,6 +214,26 @@ def main() -> int:
         title=f"{args.label_a} vs {args.label_b} — stability head-to-head")
     stab_sentence = _stability_verdict(stab, args.label_a, args.label_b)
 
+    # --- Three-cornered hat (optional) ---------------------------------
+    # The SAME two-channel CSV contains a complete 3CH over {chA, chB, Rb}.
+    # When --tch is set, decompose each node's individual stability and
+    # append a summary block to the verdict.  Additive — leaves CDF/TDEV
+    # numerically unchanged.
+    tch_lines: list[str] = []
+    if args.tch:
+        tch_png = out_dir / "tch.png"
+        tch_res = render_tch(
+            csv_path, tch_png, args.label_a, args.label_b,
+            skip_before=skip_dt, groslambert=args.groslambert,
+            title=f"{args.label_a} / {args.label_b} / Rb — "
+                  f"three-cornered hat")
+        if len(tch_res.get("taus", [])):
+            tch_lines = (["", "three-cornered hat (individual node TDEV, ns):"]
+                         + summary_table(tch_res, args.label_a, args.label_b)
+                         + [f"figure: {tch_png}"])
+        else:
+            tch_lines = ["", "three-cornered hat: insufficient aligned data."]
+
     # --- Verdict -------------------------------------------------------
     prov = provenance_line(_TOOLNAME)
     lines = [
@@ -215,7 +246,7 @@ def main() -> int:
         f"VERDICT: p95 |Δ| = {p95_ps / 1000.0:.3f} ns vs "
         f"{args.budget_ns:g} ns target → {verdict}; {stab_sentence}",
         f"figures: {cdf_png}  {stab_png}",
-    ]
+    ] + tch_lines
     result_txt = out_dir / "verdict.txt"
     result_txt.write_text("\n".join(lines) + "\n")
 
