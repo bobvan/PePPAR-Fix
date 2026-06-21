@@ -13,6 +13,54 @@ engineering (`timebeat-otc-register-map.md`, `timebeat-integration-paths.md`,
 `timebeat-status-2026-04-06.md`, memory `project_8a34012_register_map`).
 
 
+## 2026-06-21 — Timebeat pushback + P0 result (tie-breaker)
+
+Timebeat pushed back on two points: (1) "I can't write FCW while reading a
+DPLL input's phase discriminator — can't be true"; (2) "output-vs-GPIO or
+loopback+2nd-DPLL can't be the only options." Checked against the primary
+sources (AN-1010 app note, 8A34002 datasheet, ClockMatrix TDC Manual
+R31UZ0005EU) + a firsthand ptBoat register read (the P0 step).
+
+**#1 — CONCEDED (Timebeat right; this doc already said so).** AN-1010 / TDC
+Manual, verbatim: the channel "can also be used in Write Frequency Mode (FCW)
+when in Phase Measurement Mode … FCW can only be used in low precision mode
+(Phase Status), and not high precision mode." → FCW + 50 ps Phase Status
+coexist on one channel; only the 0.39 ps Filter Status mode forbids FCW.
+
+**#2 — the loopback stands (structural + measured).** All three Renesas docs
+describe Phase Measurement Mode (the Input TDC / PFD) as measuring **two CLK
+inputs of the same frequency** — TDC Manual: "the phase difference between CLK0
+and CLK1"; ref AND fb "selected from inputs CLK0 to CLK15." It does NOT measure
+input-vs-the-channel's-own-output. Input-vs-own-output phase DOES exist — but
+only in **normal PLL/lock mode**, where the *hardware* loop (not software FCW)
+controls frequency. `pll_mode` is a single 3-bit field [5:3], so lock(0) /
+write_freq-FCW(2) / phase_meas(5) are **mutually exclusive**.
+
+P0 firsthand read (ptBoat, 2026-06-21, timebeat stopped briefly, read-only,
+restarted clean):
+- DPLL3 (ref=CLK5=F9T PPS): `MODE=0x40` → pll_mode=0 (PLL); `PHASE_STATUS` LIVE
+  (−2.70 → −4.05 ns, tracking) = CLK5 vs DPLL3's *own output*. Confirms
+  input-vs-own-output phase exists — **in lock mode**.
+- Spare DPLL1: pll_mode=4 (freerun). Mode-field semantics confirmed.
+
+**Conclusion:** to combine SOFTWARE FCW with phase-vs-the-disciplined-output on
+one channel, the loopback (PPS OUT → spare CLK IN; phase_meas reads CLK5 vs the
+looped-back output) is required — because the only FCW-compatible phase mode
+(phase_meas, mode 5) measures input-vs-input, and the input-vs-output mode (PLL
+lock, mode 0) precludes software FCW. The chip is **not** poorly designed; it
+separates "hardware-lock + internal-feedback phase" (mode 0) from "software-FCW
++ input-vs-input phase" (mode 5). The one UNVERIFIED escape is the
+`ext_fb_en`/`int_fb_clk` selector in AN-1010's Input-TDC block diagram: IF
+phase_meas mode can take the channel's INTERNAL feedback as `fb` (instead of a
+CLK input), a single channel could do FCW + input-vs-own-output with no jumper.
+That bit is NOT in AN-1010, the datasheet, or the TDC Manual (all usage/GUI
+level), and we couldn't test it (register location unknown; DPLL3
+`PHASE_MEASUREMENT_CFG` read 0x00). **Action: ask Timebeat for the
+`DPLL_PHASE_MEASUREMENT_CFG` / feedback-select bit definition (ClockMatrix
+family register-descriptions doc); if internal feedback is selectable in
+phase_meas, retest and drop the jumper.**
+
+
 ## Where we got stuck before (confirmed)
 
 1. **The TDC never produced usable phase.** Output `TDC_0` was EEPROM-frozen
