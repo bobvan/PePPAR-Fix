@@ -31,8 +31,30 @@ from pathlib import Path
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 sys.path.insert(0, str(_SCRIPT_DIR / "peppar_fix"))
+sys.path.insert(0, str(_SCRIPT_DIR.parent / "tools"))
 
 from ticc import Ticc  # noqa: E402
+
+# CAPTURE_VERSION defines the DATA contract (timestamping, edge handling,
+# channel mapping).  A bump means cross-run comparability is broken and
+# all comparable datasets must be RE-CAPTURED — capture data cannot be
+# re-derived from old captures.  Bump deliberately and rarely.  See the
+# feedback memo feedback_capture_recapture_analysis_version_stamp and
+# tools/analysis_provenance.py (the analysis-side counterpart).
+CAPTURE_VERSION = 1
+
+
+def _git_descriptor() -> str:
+    """Short git descriptor (``<sha>`` / ``<sha>-dirty`` / ``nogit``).
+
+    Reuses tools/analysis_provenance so the capture header and the
+    analysis stamps speak the same dialect.  Degrades to ``nogit`` if
+    that import isn't available."""
+    try:
+        from analysis_provenance import _git_descriptor as _gd
+        return _gd()
+    except Exception:
+        return "nogit"
 
 
 def main() -> int:
@@ -87,6 +109,17 @@ def main() -> int:
                     f = open(path, "a", newline="", buffering=1)
                     w = csv.writer(f)
                     if new_file:
+                        # Capture-provenance comment line BEFORE the column
+                        # header.  Leading '#' lines are skipped by every
+                        # analysis reader (np.genfromtxt by default; the
+                        # csv-based readers filter '#' explicitly).  This
+                        # makes a capture file's recapture-trigger
+                        # provenance self-evident.
+                        f.write(
+                            f"# capture_tool=ticc_capture.py "
+                            f"capture_version={CAPTURE_VERSION} "
+                            f"git={_git_descriptor()} "
+                            f"utc={now_utc.isoformat(timespec='seconds')}\n")
                         w.writerow(["ts_iso", "channel",
                                     "ref_sec", "ref_ps", "recv_mono"])
                     current_date = day

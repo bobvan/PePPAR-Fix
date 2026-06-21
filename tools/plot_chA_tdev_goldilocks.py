@@ -38,6 +38,12 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+# Provenance stamp (analysis versioning + git-hash footer).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from analysis_provenance import (stamp, provenance_line,  # noqa: E402
+                                 skip_comment_lines)
+
+_TOOLNAME = 'plot_chA_tdev_goldilocks.py'
 
 _PS_PER_S = 10 ** 12
 
@@ -50,7 +56,7 @@ def load_chA_phase_s(path: Path, skip_before: datetime | None) -> np.ndarray:
     secs: list[int] = []
     totals: list[int] = []
     with open(path) as f:
-        r = csv.DictReader(f)
+        r = csv.DictReader(skip_comment_lines(f))
         ts_col = 'host_timestamp' if 'host_timestamp' in r.fieldnames else 'ts_iso'
         for row in r:
             if row['channel'] != 'chA':
@@ -90,6 +96,8 @@ def main():
                    help='UTC ISO time; ignore samples before this epoch')
     p.add_argument('--rate-hz', type=float, default=1.0)
     args = p.parse_args()
+
+    print(provenance_line(_TOOLNAME), file=sys.stderr)
 
     skip_before = (datetime.fromisoformat(
         args.skip_before.replace('Z', '+00:00')) if args.skip_before else None)
@@ -186,6 +194,7 @@ def main():
 
     plt.tight_layout()
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    stamp(fig, _TOOLNAME)
     plt.savefig(args.out, dpi=120)
     print(f'\nWrote {args.out}', file=sys.stderr)
 

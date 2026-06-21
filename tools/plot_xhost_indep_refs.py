@@ -63,6 +63,12 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+# Provenance stamp (analysis versioning + git-hash footer).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from analysis_provenance import (stamp, provenance_line,  # noqa: E402
+                                 skip_comment_lines)
+
+_TOOLNAME = 'plot_xhost_indep_refs.py'
 
 _PS_PER_S = 10 ** 12
 _PAIR_KEY_RESOLUTION_S = 0.5
@@ -98,7 +104,7 @@ def load_per_host_residuals(
     a_by_sec: dict[int, Sample] = {}
     b_by_sec: dict[int, Sample] = {}
     with open(path) as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(skip_comment_lines(f))
         if 'ts_iso' in reader.fieldnames:
             ts_col = 'ts_iso'
         elif 'host_timestamp' in reader.fieldnames:
@@ -180,6 +186,8 @@ def main():
     p.add_argument('--skip-before', default=None,
                    help='UTC ISO time; ignore samples before this epoch')
     args = p.parse_args()
+
+    print(provenance_line(_TOOLNAME), file=sys.stderr)
 
     skip_before = None
     if args.skip_before:
@@ -291,6 +299,7 @@ def main():
 
     plt.tight_layout()
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    stamp(fig, _TOOLNAME)
     plt.savefig(args.output, dpi=120)
     print(f'\nWrote {args.output}', file=sys.stderr)
 

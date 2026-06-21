@@ -69,6 +69,12 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+# Provenance stamp (analysis versioning + git-hash footer).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from analysis_provenance import (stamp, provenance_line,  # noqa: E402
+                                 skip_comment_lines)
+
+_TOOLNAME = 'plot_xhost_virtual.py'
 
 _PS_PER_S = 10 ** 12
 _PAIR_TOLERANCE_PS = 5 * 10 ** 11
@@ -91,7 +97,7 @@ def load_ticc_cha(path: Path,
     """Read chA samples — schema-agnostic across ticc_capture.py and engine logs."""
     samples: list[Sample] = []
     with open(path) as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(skip_comment_lines(f))
         if 'ts_iso' in reader.fieldnames:
             ts_col = 'ts_iso'
         elif 'host_timestamp' in reader.fieldnames:
@@ -146,7 +152,7 @@ def load_direct_xhost_diff(path: Path,
     chA: list[Sample] = []
     chB: list[Sample] = []
     with open(path) as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(skip_comment_lines(f))
         ts_col = ('ts_iso' if 'ts_iso' in reader.fieldnames
                   else 'host_timestamp')
         for row in reader:
@@ -274,7 +280,7 @@ def load_scheduler_interval(arm_state_path: Path | None,
     times: list[datetime] = []
     intervals: list[float] = []
     with open(arm_state_path) as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(skip_comment_lines(f))
         for row in reader:
             ts_raw = row.get('host_timestamp', '').strip()
             if not ts_raw:
@@ -333,6 +339,8 @@ def main() -> int:
     ap.add_argument('--arm-state-B', default=None, type=Path,
                     help='Per-host arm-state.csv for host B (see --arm-state-A).')
     args = ap.parse_args()
+
+    print(provenance_line(_TOOLNAME), file=sys.stderr)
 
     # Auto-infer arm-state paths if not given.
     if args.arm_state_A is None:
@@ -502,6 +510,7 @@ def main() -> int:
         ax.grid(True, which='both', alpha=0.3)
 
     fig.tight_layout()
+    stamp(fig, _TOOLNAME)
     fig.savefig(args.output, dpi=130)
     print(f'\nWrote {args.output}', file=sys.stderr)
     return 0
