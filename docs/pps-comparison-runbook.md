@@ -83,16 +83,57 @@ Outputs in `--out-dir`:
 
 - `agreement_cdf.png` — the excursion CDF (pass/fail metric).
 - `stability_stack.png` — TDEV/ADEV overlay (the "why / at which τ").
+- `tch.png` — three-cornered-hat individual-node stability (only with
+  `--tch`; see §2.1).
 - `verdict.txt` — one-line VERDICT plus stats, carrying the provenance
   stamp.
 
 `compare_clocks.py` does **not** reimplement any math: it imports
 `render_cdf` from
-[`plot_xhost_agreement_cdf.py`](../tools/plot_xhost_agreement_cdf.py) and
+[`plot_xhost_agreement_cdf.py`](../tools/plot_xhost_agreement_cdf.py),
 `render_pair_stability` from
-[`plot_clock_stability_stack.py`](../tools/plot_clock_stability_stack.py).
+[`plot_clock_stability_stack.py`](../tools/plot_clock_stability_stack.py),
+and `render_tch` from [`plot_tch.py`](../tools/plot_tch.py).
 Consistency is the whole point — the head-to-head and the standalone
 plots compute identical numbers.
+
+### 2.1 Three-cornered hat (`--tch`) — recovering individual stability past the Rb floor
+
+The very same two-channel capture contains a **complete three-cornered
+hat** over the three nodes `{chA, chB, Rb}`. The TICC measures two legs
+directly — `chA − Rb` (the chA rows) and `chB − Rb` (the chB rows) — and
+the third leg `chA − chB` is their per-second difference (the Rb cancels).
+With all three pairwise differences the standard 3CH closed form solves
+for each node's **individual** ADEV/TDEV at every τ, without needing a
+reference better than the devices under test.
+
+```bash
+scripts/compare_clocks.py --from-csv data/run.csv \
+    --label-a 'DO-A' --label-b 'GNSS PPS' \
+    --out-dir data/run --tch            # add --groslambert for the
+                                        # covariance estimator
+# or standalone:
+python3 tools/plot_tch.py --from-csv data/run.csv \
+    --label-a 'DO-A' --label-b 'GNSS PPS' --output data/run/tch.png
+```
+
+Why it matters: per §3.1.1 of
+[`two-site-sync-budget.md`](two-site-sync-budget.md), the single-clock
+`chA − Rb` curve **cannot** attribute a long-τ TDEV bulge to the clock vs
+the Rb's own random walk (the FE-5680A's RWFM climbs past the per-clock
+budget beyond ~1000 s). TCH recovers each clock's own stability past that
+Rb floor, and identifies the **free-runner** as the node whose individual
+TDEV *ramps* at long τ while a locked node stays bounded.
+
+**Independence caveat (load-bearing).** The closed form is unbiased only
+if the three nodes are **mutually uncorrelated**. Two GNSS-locked clocks
+sharing one antenna are correlated (common SSR/atmosphere/multipath), and
+the shared noise leaks into the Rb estimate — the split is biased. Use two
+**independent** disciplined oscillators (or one disciplined clock vs an
+independent GNSS PPS) for a clean decomposition. When a solved component
+variance goes negative (one node dominates, correlation, or too few
+samples), that point is set **NaN and counted** rather than clamped to
+zero — the count in `verdict.txt` flags assumption violations.
 
 ## 3. The metric
 
@@ -170,3 +211,5 @@ bump `ANALYSIS_VERSION`:
   `ANALYSIS_VERSION`, `stamp`, `provenance_line`, `skip_comment_lines`.
 - [`scripts/ticc_capture.py`](../scripts/ticc_capture.py) —
   `CAPTURE_VERSION` and the CSV header.
+- [`tools/plot_tch.py`](../tools/plot_tch.py) — the three-cornered-hat
+  decomposition over `{chA, chB, Rb}` (the `--tch` mode, §2.1).

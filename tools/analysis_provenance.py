@@ -49,7 +49,17 @@ from pathlib import Path
 
 # Deliberate analysis-math version.  BUMP BY HAND on any analysis-logic
 # change.  See module docstring.
-ANALYSIS_VERSION = 1
+#
+# Bump log:
+#   v1 — initial campaign metrics (excursion CDF, per-clock TDEV/ADEV
+#        stability stack, detrend + clean-window selection).
+#   v2 — added the three-cornered-hat (TCH) decomposition (tools/plot_tch.py,
+#        compare_clocks.py --tch): a new gradeable analysis method that
+#        recovers each of {chA, chB, Rb}'s INDIVIDUAL stability past the
+#        Rb-reference floor.  Pre-existing metrics are numerically
+#        unchanged; the bump marks that a new analysis-math path now ships
+#        under this provenance stamp.
+ANALYSIS_VERSION = 2
 
 # Repo root = parent of this module's directory (tools/ -> repo root).
 _REPO_ROOT = Path(__file__).resolve().parent.parent
