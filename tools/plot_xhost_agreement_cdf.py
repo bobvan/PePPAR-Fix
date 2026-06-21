@@ -41,6 +41,13 @@ import matplotlib
 matplotlib.use('Agg')   # headless: lab + CI safe
 import matplotlib.pyplot as plt
 
+# Provenance stamp (analysis versioning + git-hash footer).  Import works
+# whether this file is run as a script or imported as a module.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from analysis_provenance import (stamp, provenance_line,  # noqa: E402
+                                 skip_comment_lines)
+
+_TOOLNAME = 'plot_xhost_agreement_cdf.py'
 
 _PS_PER_S = 10 ** 12
 _PAIR_TOLERANCE_PS = 5 * 10 ** 11   # 500 ms — anything beyond is not a pair
@@ -98,7 +105,7 @@ def load_pairs(path: Path, skip_before=None) -> tuple[np.ndarray, np.ndarray]:
     chA_list: list[int] = []
     chB_list: list[int] = []
     with open(path) as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(skip_comment_lines(f))
         ts_col = ('ts_iso' if 'ts_iso' in reader.fieldnames
                   else 'host_timestamp' if 'host_timestamp' in reader.fieldnames
                   else None)
@@ -188,7 +195,7 @@ def _virtual_pair_load(path_a: Path, path_b: Path, skip_before=None
     def _load_cha(path: Path) -> list[tuple[float, int]]:
         samples: list[tuple[float, int]] = []
         with open(path) as f:
-            reader = csv.DictReader(f)
+            reader = csv.DictReader(skip_comment_lines(f))
             ts_col = ('ts_iso' if 'ts_iso' in reader.fieldnames
                       else 'host_timestamp')
             for row in reader:
@@ -211,6 +218,92 @@ def _virtual_pair_load(path_a: Path, path_b: Path, skip_before=None
     deltas = [A[k] - B[k] for k in common]
     return (np.arange(len(deltas), dtype=np.int64),
             np.array(deltas, dtype=np.int64))
+
+
+def render_cdf(curves: list[tuple[str, callable]], output: Path,
+               title: str = 'Two-clock phase-agreement CDF',
+               xmin_ps: float = 60.0, xmax_ps: float | None = None,
+               ) -> dict:
+    """Build the agreement-CDF figure from a list of (label, loader)
+    curves and write it (stamped) to ``output``.
+
+    Each ``loader`` is a zero-arg callable returning ``(t_idx, delta_ps)``
+    exactly as ``load_pairs`` / ``_virtual_pair_load`` do.  Returns a
+    per-curve stats dict ``{label: {n, p50, p95, p99, max}}`` (ps).
+
+    This is the shared core used both by this tool's ``main()`` and by
+    ``scripts/compare_clocks.py`` — keeping the excursion-metric math in
+    ONE place so head-to-heads stay apples-to-apples (the whole point of
+    the provenance/versioning work).
+    """
+    fig, ax = plt.subplots(figsize=(9, 6))
+    max_x_seen = xmin_ps
+    rows_printed = False
+    stats: dict = {}
+    for label, loader in curves:
+        t, delta = loader()
+        n = len(delta)
+        if n < 60:
+            print(f'WARN: {label} has only {n} paired samples — skipping',
+                  file=sys.stderr)
+            continue
+        abs_r = detrend_and_abs(t, delta)
+        sorted_x, y_pct = cdf_xy(abs_r)
+        max_x_seen = max(max_x_seen, float(sorted_x[-1]))
+        p50 = float(np.percentile(abs_r, 50))
+        p95 = float(np.percentile(abs_r, 95))
+        p99 = float(np.percentile(abs_r, 99))
+        if not rows_printed:
+            print(f'{"label":<40s} {"n":>7s} {"p50":>10s} {"p95":>10s} '
+                  f'{"p99":>10s} {"max":>10s}', file=sys.stderr)
+            print('-' * 92, file=sys.stderr)
+            rows_printed = True
+        print(f'{label:<40s} {n:>7d} {p50:>10.1f} {p95:>10.1f} '
+              f'{p99:>10.1f} {sorted_x[-1]:>10.1f}', file=sys.stderr)
+        ax.plot(sorted_x, y_pct, label=f'{label} (n={n})', lw=1.8)
+        stats[label] = {'n': n, 'p50': p50, 'p95': p95, 'p99': p99,
+                        'max': float(sorted_x[-1])}
+
+    if not rows_printed:
+        print('No usable inputs.', file=sys.stderr)
+        plt.close(fig)
+        return stats
+
+    xmax = xmax_ps if xmax_ps is not None else max_x_seen * 1.2
+    ax.set_xscale('log')
+    ax.set_xlim(xmin_ps, xmax)
+    ax.set_ylim(0, 100)
+    ax.set_xlabel('|Δ| (ps) — log scale')
+    ax.set_ylabel('Cumulative % of paired epochs (P(|Δ| ≤ T))')
+    ax.set_title(title)
+    ax.grid(True, which='both', ls=':', alpha=0.4)
+
+    # Reference verticals
+    if xmin_ps <= 60 <= xmax:
+        ax.axvline(60, color='red', ls=':', alpha=0.65, lw=1.0)
+        ax.text(60, 1.5, ' TICC res\n (60 ps)',
+                fontsize=8, color='red', va='bottom')
+    if xmin_ps <= 1000 <= xmax:
+        ax.axvline(1000, color='darkgreen', ls=':', alpha=0.65, lw=1.0)
+        ax.text(1000, 1.5, ' shared-ant\n (1 ns)',
+                fontsize=8, color='darkgreen', va='bottom')
+    if xmin_ps <= 2000 <= xmax:
+        ax.axvline(2000, color='blue', ls=':', alpha=0.65, lw=1.0)
+        ax.text(2000, 1.5, ' separate-ant\n (2 ns)',
+                fontsize=8, color='blue', va='bottom')
+
+    # Reference horizontals at common percentile bands
+    for q in (50, 95, 99):
+        ax.axhline(q, color='gray', ls=':', alpha=0.55, lw=0.8)
+        ax.text(xmin_ps * 1.04, q + 0.7, f'{q}%',
+                fontsize=8, color='gray')
+
+    ax.legend(loc='lower right', fontsize=9)
+    fig.tight_layout()
+    stamp(fig, _TOOLNAME)
+    fig.savefig(output, dpi=130)
+    print(f'\nWrote {output}', file=sys.stderr)
+    return stats
 
 
 def main() -> int:
@@ -269,69 +362,12 @@ def main() -> int:
         ap.error(f'--label count ({len(labels)}) != total curves '
                  f'({len(curves)})')
 
-    fig, ax = plt.subplots(figsize=(9, 6))
-    max_x_seen = args.xmin_ps
-    rows_printed = False
-    for label, (_, _, loader) in zip(labels, curves):
-        t, delta = loader()
-        n = len(delta)
-        if n < 60:
-            print(f'WARN: {label} has only {n} paired samples — skipping',
-                  file=sys.stderr)
-            continue
-        abs_r = detrend_and_abs(t, delta)
-        sorted_x, y_pct = cdf_xy(abs_r)
-        max_x_seen = max(max_x_seen, float(sorted_x[-1]))
-        p50 = float(np.percentile(abs_r, 50))
-        p95 = float(np.percentile(abs_r, 95))
-        p99 = float(np.percentile(abs_r, 99))
-        if not rows_printed:
-            print(f'{"label":<40s} {"n":>7s} {"p50":>10s} {"p95":>10s} '
-                  f'{"p99":>10s} {"max":>10s}', file=sys.stderr)
-            print('-' * 92, file=sys.stderr)
-            rows_printed = True
-        print(f'{label:<40s} {n:>7d} {p50:>10.1f} {p95:>10.1f} '
-              f'{p99:>10.1f} {sorted_x[-1]:>10.1f}', file=sys.stderr)
-        ax.plot(sorted_x, y_pct, label=f'{label} (n={n})', lw=1.8)
-
-    if not rows_printed:
-        print('No usable inputs.', file=sys.stderr)
-        return 1
-
-    xmax = args.xmax_ps if args.xmax_ps is not None else max_x_seen * 1.2
-    ax.set_xscale('log')
-    ax.set_xlim(args.xmin_ps, xmax)
-    ax.set_ylim(0, 100)
-    ax.set_xlabel('|Δ| (ps) — log scale')
-    ax.set_ylabel('Cumulative % of paired epochs (P(|Δ| ≤ T))')
-    ax.set_title(args.title)
-    ax.grid(True, which='both', ls=':', alpha=0.4)
-
-    # Reference verticals
-    if args.xmin_ps <= 60 <= xmax:
-        ax.axvline(60, color='red', ls=':', alpha=0.65, lw=1.0)
-        ax.text(60, 1.5, ' TICC res\n (60 ps)',
-                fontsize=8, color='red', va='bottom')
-    if args.xmin_ps <= 1000 <= xmax:
-        ax.axvline(1000, color='darkgreen', ls=':', alpha=0.65, lw=1.0)
-        ax.text(1000, 1.5, ' shared-ant\n (1 ns)',
-                fontsize=8, color='darkgreen', va='bottom')
-    if args.xmin_ps <= 2000 <= xmax:
-        ax.axvline(2000, color='blue', ls=':', alpha=0.65, lw=1.0)
-        ax.text(2000, 1.5, ' separate-ant\n (2 ns)',
-                fontsize=8, color='blue', va='bottom')
-
-    # Reference horizontals at common percentile bands
-    for q in (50, 95, 99):
-        ax.axhline(q, color='gray', ls=':', alpha=0.55, lw=0.8)
-        ax.text(args.xmin_ps * 1.04, q + 0.7, f'{q}%',
-                fontsize=8, color='gray')
-
-    ax.legend(loc='lower right', fontsize=9)
-    fig.tight_layout()
-    fig.savefig(args.output, dpi=130)
-    print(f'\nWrote {args.output}', file=sys.stderr)
-    return 0
+    print(provenance_line(_TOOLNAME), file=sys.stderr)
+    labelled_curves = [(label, loader)
+                       for label, (_, _, loader) in zip(labels, curves)]
+    stats = render_cdf(labelled_curves, args.output, title=args.title,
+                       xmin_ps=args.xmin_ps, xmax_ps=args.xmax_ps)
+    return 0 if stats else 1
 
 
 if __name__ == '__main__':

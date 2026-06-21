@@ -54,6 +54,12 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import allantools
 
+# Provenance stamp (analysis versioning + git-hash footer).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from analysis_provenance import (stamp, provenance_line,  # noqa: E402
+                                 skip_comment_lines)
+
+_TOOLNAME = 'plot_clock_stability_stack.py'
 
 _PS_PER_S = 10 ** 12
 _HOST_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
@@ -77,7 +83,7 @@ def load_chA_phase(path: Path, skip_before: datetime | None = None,
     """
     samples: list[tuple[int, int]] = []
     with open(path) as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(skip_comment_lines(f))
         ts_col = ('ts_iso' if 'ts_iso' in reader.fieldnames
                   else 'host_timestamp' if 'host_timestamp' in reader.fieldnames
                   else None)
@@ -210,7 +216,7 @@ def load_tdcp_freq_ppb(arm_state_path: Path | None,
         return np.array([])
     samples: list[float] = []
     with open(arm_state_path) as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(skip_comment_lines(f))
         for row in reader:
             if row.get('arm_tdcp_used') != '1':
                 continue
@@ -281,6 +287,8 @@ def main() -> int:
     ap.add_argument('--output', required=True, type=Path)
     ap.add_argument('--title', default='Clock-pair stability overlay')
     args = ap.parse_args()
+
+    print(provenance_line(_TOOLNAME), file=sys.stderr)
 
     skip_dt = None
     if args.skip_before:
@@ -387,9 +395,74 @@ def main() -> int:
 
     fig.suptitle(args.title, fontsize=11)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
+    stamp(fig, _TOOLNAME)
     fig.savefig(args.output, dpi=130)
     print(f'\nWrote {args.output}', file=sys.stderr)
     return 0
+
+
+def render_pair_stability(ticc_csv: Path, label_a: str, label_b: str,
+                          output: Path,
+                          skip_before: datetime | None = None,
+                          title: str | None = None) -> dict:
+    """Head-to-head TDEV/ADEV overlay for a two-channel TICC capture.
+
+    chA = clock A, chB = clock B on the SAME shared-reference TICC (the
+    ref-immune differential measurement).  Reuses ``load_chA_phase`` and
+    ``adev_tdev_from_phase`` — the SAME stability math the per-host stack
+    uses — so compare_clocks.py stays consistent with the campaign tools.
+
+    Returns ``{label: {'tdev': {τ: ns}, 'adev': {τ: dimensionless}}}``.
+    """
+    chA = load_chA_phase(ticc_csv, skip_before, channel='chA')
+    chB = load_chA_phase(ticc_csv, skip_before, channel='chB')
+    adev_a, tdev_a = adev_tdev_from_phase(chA)
+    adev_b, tdev_b = adev_tdev_from_phase(chB)
+
+    print(f'{"clock":<24s} {"n":>8s} {"tdev(1s) ns":>14s}', file=sys.stderr)
+    print('-' * 48, file=sys.stderr)
+    print(f'{label_a:<24s} {len(chA):>8d} '
+          f'{tdev_a.get(1.0, float("nan")):>14.3f}', file=sys.stderr)
+    print(f'{label_b:<24s} {len(chB):>8d} '
+          f'{tdev_b.get(1.0, float("nan")):>14.3f}', file=sys.stderr)
+
+    fig, (ax_tdev, ax_adev) = plt.subplots(1, 2, figsize=(13, 6))
+    _plot_map(ax_tdev, _TAUS, tdev_a, _HOST_COLORS[0], '-',
+              f'{label_a} (chA)', lw=2.0, marker='o')
+    _plot_map(ax_tdev, _TAUS, tdev_b, _HOST_COLORS[1], '-',
+              f'{label_b} (chB)', lw=2.0, marker='s')
+    _plot_map(ax_adev, _TAUS, adev_a, _HOST_COLORS[0], '-',
+              f'{label_a} (chA)', lw=2.0, marker='o')
+    _plot_map(ax_adev, _TAUS, adev_b, _HOST_COLORS[1], '-',
+              f'{label_b} (chB)', lw=2.0, marker='s')
+
+    for ax, ylabel, subtitle, legend_loc in [
+            (ax_tdev, 'TDEV (ns)', 'TDEV(τ)', 'lower right'),
+            (ax_adev, 'ADEV (dimensionless)', 'ADEV(τ)', 'upper right')]:
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.set_xlabel('τ (s)')
+        ax.set_ylabel(ylabel)
+        ax.set_title(subtitle)
+        ax.grid(True, which='both', ls=':', alpha=0.4)
+        ax.legend(loc=legend_loc, fontsize=8)
+
+    if ax_tdev.get_ylim()[0] < 0.35 < ax_tdev.get_ylim()[1]:
+        ax_tdev.axhline(0.35, color='darkgreen', ls=':', alpha=0.55, lw=1.0)
+        ax_tdev.text(_TAUS[0], 0.36, ' moonshot per-clock budget (350 ps)',
+                     fontsize=8, color='darkgreen', va='bottom')
+    ax_tdev.axhline(0.060, color='red', ls=':', alpha=0.55, lw=1.0)
+    ax_tdev.text(_TAUS[0], 0.062, ' TICC single-shot resolution (60 ps)',
+                 fontsize=8, color='red', va='bottom')
+
+    fig.suptitle(title or f'{label_a} vs {label_b} — stability head-to-head',
+                 fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    stamp(fig, _TOOLNAME)
+    fig.savefig(output, dpi=130)
+    print(f'\nWrote {output}', file=sys.stderr)
+    return {label_a: {'tdev': tdev_a, 'adev': adev_a},
+            label_b: {'tdev': tdev_b, 'adev': adev_b}}
 
 
 if __name__ == '__main__':
