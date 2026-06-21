@@ -12,14 +12,21 @@ how trustworthy each TDEV point is:
      few independent windows remain — that widening is the point: it
      tells the reader not to over-read a long-τ bump.
 
-  2. Rb + TICC measurement floor, two clearly labelled components:
+  2. Measurement floor — shown TWO ways so a-priori model and empirical
+     estimate can be contrasted (the spec-vs-measured contrast):
+       * SPEC floor — a smooth shaded grey band from the a-priori model
+         (TICC single-shot white-PM ⊕ FE-5680A Rb, shared with
+         tools/plot_stability_slide via measurement_floor_model).  It is
+         IDEALIZED: it omits the Rb long-τ random-walk-FM upturn, so it is
+         OPTIMISTIC at long τ.  Labelled
+         "spec floor (TICC + FE-5680A Rb, model)".
        * TICC instrument floor — a flat reference at ~60 ps
          (docs/ticc-baseline-2026-04-01.md / ticc-calibration-2026-03-19.md
          report ~52–60 ps single-shot resolution).  Labelled
          "TICC floor ~60 ps".
-       * Rb floor estimate — the three-cornered-hat (TCH) Rb-node TDEV
-         for THIS dataset (tools/plot_tch solver), dashed, labelled
-         "Rb (TCH estimate)".  The TCH split is ILL-CONDITIONED when the
+       * Rb floor estimate — the MEASURED three-cornered-hat (TCH) Rb-node
+         TDEV for THIS dataset (tools/plot_tch solver), dashed, labelled
+         "Rb (TCH, measured)".  The TCH split is ILL-CONDITIONED when the
          two clocks are very disparate (negative-variance → NaN); those
          τ points are left as GAPS and the caveat is carried in the
          title/legend.
@@ -67,6 +74,11 @@ from analysis_provenance import (stamp, provenance_line,  # noqa: E402
 from plot_clock_stability_stack import (load_chA_phase,  # noqa: E402
                                         adev_tdev_from_phase)
 from plot_tch import compute_tch  # noqa: E402
+# A-priori SPEC measurement-floor model (shared with plot_stability_slide).
+# Drawn as a smooth shaded band alongside the MEASURED (TCH Rb-node) floor so
+# the reader sees both the idealized model and the empirical estimate.  The
+# math/constants are NOT changed here — single source of truth.
+from measurement_floor_model import measurement_floor  # noqa: E402
 
 _TOOLNAME = 'plot_stability_floor.py'
 
@@ -81,6 +93,25 @@ _RATE = 1.0
 _COLOR_A = '#1f77b4'
 _COLOR_B = '#ff7f0e'
 _COLOR_RB = '#2ca02c'
+
+# τ grid for the smooth spec-floor band (0.1 s … 1e4 s, log-spaced).
+_SPEC_TAU_LO = 0.1
+_SPEC_TAU_HI = 1e4
+_SPEC_TAU_N = 240
+
+
+def spec_floor_curve(tau_lo: float = _SPEC_TAU_LO, tau_hi: float = _SPEC_TAU_HI,
+                     n: int = _SPEC_TAU_N) -> tuple[np.ndarray, np.ndarray]:
+    """Smooth a-priori SPEC measurement floor (TDEV, ns) on a log τ grid.
+
+    Returns ``(tau_grid, tdev_ns)`` from the shared ``measurement_floor``
+    model (TICC single-shot white-PM ⊕ FE-5680A Rb).  This is the IDEALIZED
+    model — it omits the Rb long-τ RWFM upturn, so it is OPTIMISTIC at long τ.
+    The math is not changed here; this only samples it on a smooth grid for a
+    shaded band.
+    """
+    tau = np.logspace(np.log10(tau_lo), np.log10(tau_hi), n)
+    return tau, np.asarray(measurement_floor(tau, 'tdev'), dtype=np.float64)
 
 
 def chi2_tdev_ci(tdev: np.ndarray, edf: np.ndarray, ci: float = 0.6827
@@ -212,22 +243,37 @@ def render_stability_floor(csv_path: Path, output: Path,
 
     fig, ax = plt.subplots(figsize=(10, 7))
 
+    # SPEC measurement floor — smooth shaded grey band BEHIND the data, filled
+    # from the axis bottom up to the model floor (peppar-stability-win style).
+    # This is the a-priori model (idealized; omits the Rb long-τ RWFM upturn so
+    # it is optimistic at long τ) — contrast it with the MEASURED Rb (TCH) line.
+    spec_tau, spec_tdev = spec_floor_curve()
+    spec_at_1s = float(np.interp(1.0, spec_tau, spec_tdev))
+    spec_at_100s = float(np.interp(100.0, spec_tau, spec_tdev))
+    _spec_bottom = max(1e-4, float(np.nanmin(spec_tdev)) / 10.0)
+    ax.fill_between(spec_tau, _spec_bottom, spec_tdev, color='0.82', alpha=0.6,
+                    zorder=0, lw=0,
+                    label='spec floor (TICC + FE-5680A Rb, model)')
+    ax.plot(spec_tau, spec_tdev, color='0.5', lw=1.0, zorder=1)
+
     _plot_with_band(ax, taus_a, tdev_a, lo_a, hi_a, _COLOR_A,
                     f'{label_a} (chA)', 'o')
     _plot_with_band(ax, taus_b, tdev_b, lo_b, hi_b, _COLOR_B,
                     f'{label_b} (chB)', 's')
 
-    # Rb floor — TCH estimate, dashed; NaN-guarded points left as gaps.
+    # Rb floor — MEASURED, three-cornered-hat (TCH) estimate, dashed;
+    # NaN-guarded points left as gaps.  Real but ill-conditioned on disparate
+    # clocks (negative-variance → NaN), in contrast to the smooth spec model.
     rb_good = np.isfinite(rb_tdev) & (rb_tdev > 0)
     if np.any(rb_good):
         ax.plot(rb_taus[rb_good], rb_tdev[rb_good], color=_COLOR_RB, ls='--',
                 lw=1.8, marker='^', ms=5, alpha=0.9,
-                label='Rb (TCH estimate)')
+                label='Rb (TCH, measured)')
     else:
         # No usable Rb points at all (fully ill-conditioned) — still note it
         # in the legend via an invisible proxy handle.
         ax.plot([], [], color=_COLOR_RB, ls='--', lw=1.8, marker='^',
-                label='Rb (TCH estimate — all NaN, ill-conditioned)')
+                label='Rb (TCH, measured — all NaN, ill-conditioned)')
 
     # TICC instrument floor — flat reference.
     ax.axhline(_TICC_FLOOR_NS, color='red', ls=':', alpha=0.7, lw=1.2,
@@ -250,12 +296,23 @@ def render_stability_floor(csv_path: Path, output: Path,
         caveat = (f'  ·  Rb-TCH ill-conditioned at {neg_count} τ '
                   f'(disparate clocks → neg-var NaN gaps)')
     default_title = (f'{label_a} vs {label_b} — TDEV (ns) with χ² bands + '
-                     f'Rb/TICC floor\n{ds}  ·  analysis '
+                     f'spec & measured floor\n{ds}  ·  analysis '
                      f'{analysis_provenance()}{caveat}')
     ax.set_title(title or default_title, fontsize=10)
     ax.legend(loc='best', fontsize=8)
 
-    fig.tight_layout()
+    # Caption: make the two floors unmistakably distinct.  SPEC = smooth
+    # a-priori model (idealized; omits the Rb long-τ RWFM upturn → optimistic
+    # at long τ).  MEASURED = TCH Rb-node, real but ill-conditioned on
+    # disparate clocks (NaN gaps).
+    fig.text(0.01, 0.005,
+             'SPEC floor = smooth model (idealized; omits Rb long-τ RWFM '
+             'upturn → optimistic at long τ).   '
+             'MEASURED Rb (TCH) = real but ill-conditioned on disparate '
+             'clocks.   All in ns.',
+             fontsize=7, color='0.35', ha='left', va='bottom')
+
+    fig.tight_layout(rect=(0, 0.02, 1, 1))
     stamp(fig, _TOOLNAME)
     fig.savefig(output, dpi=130)
     print(f'\nWrote {output}', file=sys.stderr)
@@ -264,6 +321,8 @@ def render_stability_floor(csv_path: Path, output: Path,
         label_a: {'taus': taus_a, 'tdev': tdev_a, 'lo': lo_a, 'hi': hi_a},
         label_b: {'taus': taus_b, 'tdev': tdev_b, 'lo': lo_b, 'hi': hi_b},
         'rb': {'taus': rb_taus, 'tdev': rb_tdev, 'neg_count': neg_count},
+        'spec_floor': {'taus': spec_tau, 'tdev': spec_tdev,
+                       'tdev_1s_ns': spec_at_1s, 'tdev_100s_ns': spec_at_100s},
         'ticc_floor_ns': _TICC_FLOOR_NS,
         'budget_ns': _BUDGET_NS,
     }

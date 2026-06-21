@@ -112,6 +112,33 @@ def test_tdev_with_band_empty_on_short():
     assert len(taus) == 0 and len(tdev) == 0 and len(lo) == 0 and len(hi) == 0
 
 
+# --- spec-floor band ------------------------------------------------------
+
+def test_spec_floor_curve_finite_and_positive():
+    """The a-priori SPEC floor curve is finite, positive, and aligned."""
+    tau, tdev = psf.spec_floor_curve()
+    assert len(tau) == len(tdev) > 0
+    assert np.all(np.isfinite(tdev))
+    assert np.all(tdev > 0)
+    # Monotonic increasing τ grid.
+    assert np.all(np.diff(tau) > 0)
+
+
+def test_spec_floor_curve_matches_shared_model():
+    """spec_floor_curve must reproduce the shared measurement_floor model
+    verbatim (no math drift) — sanity anchors at τ=1 s and τ=100 s."""
+    import measurement_floor_model as mfm
+    tau, tdev = psf.spec_floor_curve()
+    # ~60 ps TICC floor dominates at τ=1 s; Rb white-FM lifts it by τ=100 s.
+    s1 = float(np.interp(1.0, tau, tdev))
+    s100 = float(np.interp(100.0, tau, tdev))
+    assert 0.05 < s1 < 0.08            # ≈ 60 ps
+    assert s100 > s1                    # Rb white-FM rises with τ
+    # Exact-grid value matches the shared model directly.
+    assert tdev[0] == pytest.approx(
+        float(mfm.measurement_floor(tau[0], 'tdev')))
+
+
 # --- render + Rb overlay --------------------------------------------------
 
 def test_render_writes_stamped_png_and_summary(tmp_path):
@@ -137,6 +164,13 @@ def test_render_writes_stamped_png_and_summary(tmp_path):
     assert len(res["DO-A"]["lo"]) == len(res["DO-A"]["tdev"])
     # Rb curve present (may carry NaN gaps); arrays are aligned.
     assert len(res["rb"]["taus"]) == len(res["rb"]["tdev"])
+    # SPEC-model floor band present, finite, and aligned (the contrast vs the
+    # measured TCH Rb estimate).
+    spec = res["spec_floor"]
+    assert len(spec["taus"]) == len(spec["tdev"]) > 0
+    assert np.all(np.isfinite(spec["tdev"])) and np.all(spec["tdev"] > 0)
+    assert 0.05 < spec["tdev_1s_ns"] < 0.08      # ≈ 60 ps a-priori floor
+    assert spec["tdev_100s_ns"] > spec["tdev_1s_ns"]
 
 
 def test_render_handles_nan_rb_ill_conditioned(tmp_path):
