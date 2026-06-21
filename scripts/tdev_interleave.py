@@ -65,7 +65,10 @@ for host, base in HOSTS.items():
         if not curves:
             continue
         arr = np.vstack(curves)
-        res[(host, arm)] = (np.nanmean(arr, axis=0), len(curves))
+        # mean + per-segment std (the reproducibility band — load-bearing at
+        # nseg=2 on the F9T hosts, where the Q1 effect is modest; bravo #209).
+        std = np.nanstd(arr, axis=0) if len(curves) > 1 else np.full(arr.shape[1], np.nan)
+        res[(host, arm)] = (np.nanmean(arr, axis=0), len(curves), std)
 
 # table
 for host in HOSTS:
@@ -76,10 +79,14 @@ for host in HOSTS:
         cells = []
         for a in ARMS:
             r = res.get((host, a))
-            cells.append(f"{r[0][i]*1e12:8.0f}  " if r and not np.isnan(r[0][i]) else f"{'-':>10s}")
+            if r and not np.isnan(r[0][i]):
+                sd = r[2][i] * 1e12 if not np.isnan(r[2][i]) else float("nan")
+                cells.append(f"{r[0][i]*1e12:6.0f}±{sd:4.0f}" if sd == sd else f"{r[0][i]*1e12:6.0f}    ")
+            else:
+                cells.append(f"{'-':>11s}")
         print(f"  {t:>5.0f} | " + " | ".join(cells))
     nseg = {a: res[(host, a)][1] for a in ARMS if (host, a) in res}
-    print(f"  (segments averaged: {nseg})")
+    print(f"  (mean±per-segment-std ps; segments averaged: {nseg})")
 
 # Q1: hw/sw ratio per F9T host (time-of-day common-mode now)
 print("\n--- Q1 (hw/sw qErr ratio, <1 = hw better; interleaved, de-confounded) ---")
