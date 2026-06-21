@@ -7401,6 +7401,15 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         raise SystemExit(
             "--qerr-latest-chi and --router-qvir are mutually exclusive: "
             "the former replaces qVIR with the EKF's own chi² judgement.")
+    if _qerr_latest_chi and getattr(args, 'routed_qerr_arm', False):
+        # Both would yield comparative+latest (qerr-latest-chi wins via the OR
+        # below + the latest-feed branch), silently no-op'ing --routed-qerr-arm.
+        # Refuse rather than mislead (bravo #212 note 1; matches the v1/v2 style).
+        raise SystemExit(
+            "--qerr-latest-chi and --routed-qerr-arm are mutually exclusive: "
+            "latest-chi feeds the LATEST unmatched qErr through a comparative "
+            "gate; routed-qerr-arm feeds the MATCHED qErr through the absolute "
+            "gate.  Pick one.")
     servo = DOFreqEst(
         sigma_ticc_ns=sigma_ticc,
         sigma_do_phase_ns=sigma_do_phase_ns_eff,
@@ -11592,7 +11601,7 @@ Two-phase operation:
                             "latest qErr lose to raw (no poison).  servo_sim "
                             "go/no-go validated (proto_latest_qerr_chi.py).  "
                             "Default off; mutually exclusive with "
-                            "--router-qvir.")
+                            "--router-qvir and --routed-qerr-arm.")
     servo.add_argument("--servo-input", choices=("default", "tdcp"),
                        default="default",
                        help="Servo-input mode.  'default' = today's 4-arm "
