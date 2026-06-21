@@ -57,6 +57,12 @@ def load_capped(path, skip_before, cap_after=None):
     s = np.array(secs, dtype=np.int64)
     x = (s - s[0]).astype(np.float64)
     y = np.array([t - totals[0] for t in totals], dtype=np.float64)
+    # A single GLOBAL linear detrend over a 3h arm can leave slow thermal
+    # curvature in the residual, which inflates long-tau (>~500s) TDEV
+    # (bravo #207).  The fan-on cap on the default arm removes the worst
+    # case; the long-tau numbers on the other arms should be read as upper
+    # bounds.  The robust comparisons (Q1 mid-tau, Q2 short-tau crossover)
+    # are below the curvature scale and unaffected.
     slope, intc = np.polyfit(x, y, 1)
     return (y - (slope * x + intc)) * 1e-12
 
