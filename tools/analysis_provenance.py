@@ -29,7 +29,9 @@ It is NOT auto-derived from the git SHA: the SHA changes on every commit
 deliberately.  Examples of changes that REQUIRE a bump: the excursion
 metric definition, the detrend method, the clean-window selection, the
 CDF/TDEV/ADEV math, the pairing tolerance.  Examples that do NOT: a
-docstring fix, a new CLI flag that doesn't touch the math, a plot colour.
+docstring fix, a new CLI flag that doesn't touch the math, a plot colour,
+a change to how the provenance STRING itself is computed (e.g. the
+dirty-marker probe) — that's provenance plumbing, not analysis math.
 
 The git short-SHA (+ ``-dirty`` marker) rides ALONGSIDE the version for
 exactness — it pins the figure to a specific tree state.  The ``-dirty``
@@ -81,7 +83,14 @@ def _git_descriptor() -> str:
     sha = sha_out.strip()
     if not sha:
         return "nogit"
-    status = _git("status", "--porcelain")
+    # --untracked-files=no: count only TRACKED modifications (staged +
+    # unstaged) toward dirtiness.  Untracked files (venv/, *.egg-info/,
+    # state/, timelab/antennas.json) are ALWAYS present on lab hosts and
+    # have nothing to do with whether the analysis CODE is uncommitted —
+    # counting them made every figure stamp "-dirty" on every host (e.g.
+    # PiPuss stamped "609e505-dirty" with pristine tracked code), defeating
+    # the marker's purpose.
+    status = _git("status", "--porcelain", "--untracked-files=no")
     if status is None:
         # We have a SHA but couldn't read status — report the SHA without
         # claiming clean (can't prove clean, so be honest).

@@ -1,5 +1,6 @@
 """Unit tests for tools/analysis_provenance.py (PPS-comparison provenance)."""
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -72,6 +73,78 @@ def test_git_descriptor_status_unavailable_is_not_clean(monkeypatch):
         return None
     monkeypatch.setattr(ap, "_git", fake_git)
     assert ap._git_descriptor() == "abc1234-dirty"
+
+
+# --------------------------------------------------------------------------
+# Deterministic tracked-vs-untracked tests against a real temporary git repo.
+#
+# These drive _git_descriptor() through the REAL git invocation (no _git
+# monkeypatch) by repointing _REPO_ROOT at a freshly-initialised temp repo.
+# This genuinely exercises the `git status --untracked-files=no` logic and
+# the tracked-vs-untracked distinction that is the whole point of the fix.
+# --------------------------------------------------------------------------
+
+def _init_temp_repo(path: Path) -> None:
+    """git init a repo at *path* with a local identity and one commit."""
+    def g(*args):
+        subprocess.run(["git", "-C", str(path), *args],
+                       check=True, capture_output=True, text=True)
+    g("init")
+    g("config", "user.email", "test@example.com")
+    g("config", "user.name", "Provenance Test")
+    g("config", "commit.gpgsign", "false")
+    (path / "tracked.py").write_text("x = 1\n")
+    g("add", "tracked.py")
+    g("commit", "-m", "initial")
+
+
+def test_temp_repo_clean_has_no_dirty(tmp_path, monkeypatch):
+    """A clean committed repo → bare sha, no -dirty."""
+    _init_temp_repo(tmp_path)
+    monkeypatch.setattr(ap, "_REPO_ROOT", tmp_path)
+    desc = ap._git_descriptor()
+    assert desc != "nogit"
+    assert not desc.endswith("-dirty"), desc
+    assert re.fullmatch(r"[0-9a-f]+", desc), desc
+
+
+def test_temp_repo_untracked_file_is_not_dirty(tmp_path, monkeypatch):
+    """Adding an UNTRACKED file must NOT mark the tree dirty.
+
+    This is the bug being fixed: lab hosts always carry untracked files
+    (venv/, *.egg-info/, state/, timelab/antennas.json), and the old
+    `git status --porcelain` counted them, stamping every figure -dirty
+    even with pristine tracked analysis code."""
+    _init_temp_repo(tmp_path)
+    (tmp_path / "venv").mkdir()
+    (tmp_path / "venv" / "junk").write_text("ignore me\n")
+    (tmp_path / "antennas.json").write_text("{}\n")
+    monkeypatch.setattr(ap, "_REPO_ROOT", tmp_path)
+    desc = ap._git_descriptor()
+    assert not desc.endswith("-dirty"), (
+        f"untracked files falsely marked tree dirty: {desc!r}")
+
+
+def test_temp_repo_modified_tracked_file_is_dirty(tmp_path, monkeypatch):
+    """Modifying a TRACKED file → -dirty (the marker still fires for real
+    uncommitted analysis-code edits)."""
+    _init_temp_repo(tmp_path)
+    (tmp_path / "tracked.py").write_text("x = 2  # edited\n")
+    monkeypatch.setattr(ap, "_REPO_ROOT", tmp_path)
+    desc = ap._git_descriptor()
+    assert desc.endswith("-dirty"), (
+        f"modified tracked file should mark tree dirty: {desc!r}")
+
+
+def test_temp_repo_staged_tracked_change_is_dirty(tmp_path, monkeypatch):
+    """A STAGED tracked change is also dirty (staged + unstaged both count)."""
+    _init_temp_repo(tmp_path)
+    (tmp_path / "tracked.py").write_text("x = 3  # staged\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.py"],
+                   check=True, capture_output=True, text=True)
+    monkeypatch.setattr(ap, "_REPO_ROOT", tmp_path)
+    desc = ap._git_descriptor()
+    assert desc.endswith("-dirty"), desc
 
 
 def test_provenance_line_contains_tool_and_version():
