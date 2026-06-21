@@ -29,7 +29,7 @@ import numpy as np
 logging.disable(logging.CRITICAL)  # silence DOFreqEst per-epoch chatter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from peppar_fix.do_freq_est import DOFreqEst, _qerr, _CHI2_GATE_THRESHOLD  # noqa: E402
+from peppar_fix.do_freq_est import DOFreqEst, _qerr  # noqa: E402
 
 TICK = 8.0
 
@@ -122,15 +122,21 @@ def main():
         ('comparative', 'latest'),   # the fix: should beat the floor, not poison
         ('comparative', 'matched'),  # fix must not hurt the matched case
     ]
-    res = {}
+    # Seed sweep (bravo #204 note 1): a single seed leaves a gate-changing
+    # go/no-go resting on one draw.  Average x2 RMSE over several seeds and
+    # report the spread so the conclusions are seed-robust.
+    SEEDS = [1, 2, 3, 4, 5]
+    res = {}   # (router,qmode) -> mean rmse
     for router, qmode in rows:
-        rmse, mix, p22med, p22max = run(router, qmode)
-        res[(router, qmode)] = rmse
+        rmses = [run(router, qmode, seed=s)[0] for s in SEEDS]
+        res[(router, qmode)] = float(np.mean(rmses))
+        # show one representative seed's route mix + P22
+        _, mix, p22med, p22max = run(router, qmode, seed=SEEDS[0])
         mixs = " ".join(f"{k}={v}" for k, v in mix.items())
-        print(f"{router:>12s} {qmode:>8s} | {rmse*1e3:7.1f}ps | {mixs:>26s} | "
-              f"{p22med:7.2f} {p22max:7.2f}")
+        print(f"{router:>12s} {qmode:>8s} | {np.mean(rmses)*1e3:7.1f}±{np.std(rmses)*1e3:4.1f}ps | "
+              f"{mixs:>26s} | {p22med:7.2f} {p22max:7.2f}")
     floor = res[('comparative', 'none')]
-    print()
+    print(f"\n  (x2 RMSE = mean±std over seeds {SEEDS})")
     print(f"  NO-HARM FLOOR (no ext qErr)               : {floor*1e3:.1f} ps")
     print(f"  matched/absolute (today's behavior)       : {res[('absolute','matched')]*1e3:.1f} ps")
     print(f"  latest/ABSOLUTE  (Main: poisons?)         : {res[('absolute','latest')]*1e3:.1f} ps"
@@ -138,6 +144,12 @@ def main():
     print(f"  latest/COMPARATIVE (the fix)              : {res[('comparative','latest')]*1e3:.1f} ps"
           f"   ({res[('comparative','latest')]/floor:.2f}x the floor — {'HARM' if res[('comparative','latest')]>floor*1.05 else 'no harm'})")
     print(f"  matched/COMPARATIVE (fix doesn't hurt?)   : {res[('comparative','matched')]*1e3:.1f} ps")
+    # Honest tradeoff (bravo #204 note 2): comparative is not free in the
+    # always-matched case — it costs a little vs the absolute gate.
+    ma, mc = res[('absolute', 'matched')], res[('comparative', 'matched')]
+    print(f"\n  TRADEOFF: in the always-matched case, comparative costs "
+          f"{(mc-ma)/ma*100:.0f}% RMSE vs absolute ({mc*1e3:.0f} vs {ma*1e3:.0f} ps) "
+          f"— cheap insurance against the latest-qErr poison, not free.")
 
 
 if __name__ == "__main__":
