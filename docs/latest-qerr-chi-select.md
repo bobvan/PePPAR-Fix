@@ -1,6 +1,6 @@
 # latestQErrChiSelect — let the fusion filter judge qErr, drop the matching machinery
 
-**Status:** design / backlog (dayplan `latestQErrChiSelect`).
+**Status:** IMPLEMENTED behind `--qerr-latest-chi` (default off); lab A/B pending.  Dayplan `latestQErrChiSelect`.
 **Owner:** charlie. **Origin:** Bob, 2026-06-20.
 **Relationship:** simplifies the qErr path that `--routed-qerr-arm` / `--router-qvir`
 + `qVIR` currently guard; see [`qerr-correlation.md`](qerr-correlation.md).

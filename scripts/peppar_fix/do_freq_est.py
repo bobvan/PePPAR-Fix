@@ -95,7 +95,8 @@ class DOFreqEst:
                  max_step_ppb=None,
                  ocxo_trusted_gate=None,
                  routed_qerr=False,
-                 routed_qerr_v2=False):
+                 routed_qerr_v2=False,
+                 routed_qerr_comparative=False):
         self.max_ppb = max_ppb
         # routedQErrArm: per-edge chi² router for the TICC arm.  When
         # enabled, each TICC edge is routed (priority-ordered) to ONE
@@ -114,6 +115,16 @@ class DOFreqEst:
         # chi².  Mutually exclusive with v1 (engine raises if both
         # flags are set).  See PR #98 design.
         self._routed_qerr_v2 = routed_qerr_v2
+        # latestQErrChiSelect (docs/latest-qerr-chi-select.md): when set
+        # (with routed_qerr=True), _route_ticc_arm uses a COMPARATIVE gate
+        # — the ext candidate wins only if its chi² BEATS raw's, not merely
+        # clears the absolute _CHI2_GATE_THRESHOLD.  This is mandatory for
+        # the latest-unmatched qErr feed: an off-by-edge qErr is ~3.3 ns RMS
+        # → chi²≈17 at lock, which PASSES the absolute-100 gate and poisons
+        # z (servo_sim go/no-go: absolute+latest = 1.2× the no-qErr floor =
+        # HARM; comparative+latest = 0.75× = net benefit, no covariance
+        # collapse).  Pure argmin-chi2 (no margin) per the prototype.
+        self._routed_qerr_comparative = routed_qerr_comparative
         # L3 of the TDCP slip-protection stack: per-epoch actuator
         # rate limit.  None = disabled (today's behavior preserved).
         # When set, |adjfine_new - adjfine_prev| is clamped to this
@@ -496,11 +507,20 @@ class DOFreqEst:
                      uncorrected sub-tick qErr is ~uniform on
                      [-tick/2,+tick/2]).  Robust floor, always taken.
 
-        A mis-correlated external qErr is wrong by up to a half-tick
-        sawtooth → conspicuous chi² outlier vs the small external R →
-        falls through to internal/raw.  An F10T's uncorrelated qErr
-        always fails → routes to raw automatically (no per-receiver
-        flag needed).
+        ABSOLUTE gate (default): try ext, then int, accept the first whose
+        chi² ≤ _CHI2_GATE_THRESHOLD; raw is the always-accepted floor.  A
+        mis-correlated external qErr is wrong by up to a half-tick sawtooth →
+        conspicuous chi² outlier vs the small external R → falls through.
+        Safe when ext is *matched* (almost always correct).
+
+        COMPARATIVE gate (``routed_qerr_comparative``, latestQErrChiSelect):
+        pick the candidate with the SMALLEST chi² (a non-raw candidate must
+        BEAT raw, not merely clear the absolute threshold).  Mandatory for the
+        latest-unmatched qErr feed: an off-by-edge qErr (~3.3 ns RMS) lands at
+        chi²≈17 ≪ 100, so the absolute gate would ACCEPT it and poison z; the
+        comparative gate routes it to raw because raw's chi² is smaller.  Pure
+        argmin (no margin) — see docs/latest-qerr-chi-select.md and the
+        scripts/proto_latest_qerr_chi.py go/no-go.
         """
         H_x2 = np.array([[0.0, 0.0, -1.0, 0.0]])
 
@@ -514,6 +534,19 @@ class DOFreqEst:
         candidates.append((
             'raw', ticc_diff_ns, -x_pred[2], H_x2,
             R_base + (self.tick_ns ** 2) / 12.0))
+
+        if self._routed_qerr_comparative:
+            # Comparative: smallest chi² wins (argmin).  A non-raw candidate
+            # is selected only if it beats raw — otherwise raw is the floor.
+            best = None  # (chi2, tuple)
+            for cand in candidates:
+                name, z_eff, h_pred, H, R = cand
+                S = (H @ P_pred @ H.T).item() + R
+                chi2 = (z_eff - h_pred) ** 2 / S if S > 0 else 0.0
+                if best is None or chi2 < best[0]:
+                    best = (chi2, cand)
+            name, z_eff, h_pred, H, R = best[1]
+            return z_eff, h_pred, H, R, name
 
         for name, z_eff, h_pred, H, R in candidates:
             S = (H @ P_pred @ H.T).item() + R

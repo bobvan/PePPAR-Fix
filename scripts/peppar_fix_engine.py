@@ -7392,6 +7392,15 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         raise SystemExit(
             "--routed-qerr-arm (v1, chi²) and --router-qvir (v2, qVIR) "
             "are mutually exclusive: pick one.")
+    # latestQErrChiSelect (--qerr-latest-chi): comparative-gate router fed the
+    # LATEST unmatched qErr (no edge matching/queue/qVIR).  Built on the v1
+    # router (comparative chi² selection); mutually exclusive with the v2
+    # qVIR router.  See docs/latest-qerr-chi-select.md.
+    _qerr_latest_chi = getattr(args, 'qerr_latest_chi', False)
+    if _qerr_latest_chi and getattr(args, 'router_qvir', False):
+        raise SystemExit(
+            "--qerr-latest-chi and --router-qvir are mutually exclusive: "
+            "the former replaces qVIR with the EKF's own chi² judgement.")
     servo = DOFreqEst(
         sigma_ticc_ns=sigma_ticc,
         sigma_do_phase_ns=sigma_do_phase_ns_eff,
@@ -7404,8 +7413,10 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         base_freq=bootstrap_base_freq,
         max_step_ppb=_max_step if _max_step and _max_step > 0 else None,
         ocxo_trusted_gate=_ocxo_gate,
-        routed_qerr=getattr(args, 'routed_qerr_arm', False),
+        routed_qerr=(getattr(args, 'routed_qerr_arm', False)
+                     or _qerr_latest_chi),
         routed_qerr_v2=getattr(args, 'router_qvir', False),
+        routed_qerr_comparative=_qerr_latest_chi,
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
              "sigma_do=[%.4f ns, %.4f ppb], "
@@ -9015,8 +9026,17 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         # samples) ⇒ ticc_ext_correlated=False ⇒ raw (always safe).
         _ticc_ext_correlated = False
         _route_v2 = getattr(args, 'router_qvir', False)
-        _ticc_qerr_for_router = qerr_for_ticc_pps_ns if (
-            getattr(args, 'routed_qerr_arm', False) or _route_v2) else None
+        if getattr(args, 'qerr_latest_chi', False):
+            # latestQErrChiSelect: feed the LATEST qErr message (no edge
+            # matching, no queue, no qVIR) and let the comparative chi² gate
+            # in _route_ticc_arm decide.  The comparative gate makes this safe
+            # — a stale/off-by-edge latest qErr loses to raw on chi².
+            _latest_qerr_ns, _ = (qerr_store.get(max_age_s=2.0)
+                                  if qerr_store is not None else (None, None))
+            _ticc_qerr_for_router = _latest_qerr_ns
+        else:
+            _ticc_qerr_for_router = qerr_for_ticc_pps_ns if (
+                getattr(args, 'routed_qerr_arm', False) or _route_v2) else None
         if (_route_v2 and ticc_diff_ns is not None
                 and qerr_for_ticc_pps_ns is not None):
             qerr_alignment["ticc_var"].add(ticc_diff_ns)
@@ -11561,6 +11581,18 @@ Two-phase operation:
                             "Default off; mutually exclusive with "
                             "--routed-qerr-arm.  Validate in "
                             "closedLoopServoSim before enabling.")
+    servo.add_argument("--qerr-latest-chi", action="store_true",
+                       help="latestQErrChiSelect (docs/latest-qerr-chi-select."
+                            "md): feed the LATEST qErr message (no edge "
+                            "matching, no queue, no qVIR) to the TICC arm and "
+                            "let the EKF's COMPARATIVE chi² gate select ext vs "
+                            "raw per epoch — ext wins only if it BEATS raw's "
+                            "chi².  Drops the fragile correlation machinery; "
+                            "the comparative gate makes a stale/off-by-edge "
+                            "latest qErr lose to raw (no poison).  servo_sim "
+                            "go/no-go validated (proto_latest_qerr_chi.py).  "
+                            "Default off; mutually exclusive with "
+                            "--router-qvir.")
     servo.add_argument("--servo-input", choices=("default", "tdcp"),
                        default="default",
                        help="Servo-input mode.  'default' = today's 4-arm "
