@@ -408,7 +408,7 @@ def summary_table(res: dict, label_a: str = 'chA', label_b: str = 'chB'
     tdev = res.get('tdev_ns', {})
     names = {'chA': f'{label_a} (chA)', 'chB': f'{label_b} (chB)', 'Rb': 'Rb'}
     tau_to_idx = {float(t): i for i, t in enumerate(taus)}
-    header = (f'{"node":<18s}'
+    header = (f'{"node (TDEV, ns)":<18s}'
               + ''.join(f'{("τ=" + ("%g" % t) + "s"):>14s}'
                         for t in _REPORT_TAUS))
     lines = [header, '-' * len(header)]

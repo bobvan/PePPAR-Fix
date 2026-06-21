@@ -300,8 +300,8 @@ def main() -> int:
         hosts.append(_parse_host_input(spec))
 
     print(f'{"host":<14s} {"chA n":>8s} {"chB n":>8s} {"tdcp n":>8s} '
-          f'{"chA tdev(1s) ns":>16s} {"chB tdev(1s) ns":>16s} '
-          f'{"tdcp tdev(1s) ns":>17s}',
+          f'{"chA tdev(1s) (ns)":>18s} {"chB tdev(1s) (ns)":>18s} '
+          f'{"tdcp tdev(1s) (ns)":>19s}',
           file=sys.stderr)
     print('-' * 96, file=sys.stderr)
 
@@ -321,9 +321,9 @@ def main() -> int:
             'tdcp':        (adev_t, tdev_t),
         }
         print(f'{label:<14s} {len(chA):>8d} {len(chB):>8d} {len(tdcp_freq):>8d} '
-              f'{tdev_d.get(1.0, float("nan")):>16.3f} '
-              f'{tdev_g.get(1.0, float("nan")):>16.3f} '
-              f'{tdev_t.get(1.0, float("nan")):>17.3f}',
+              f'{tdev_d.get(1.0, float("nan")):>18.3f} '
+              f'{tdev_g.get(1.0, float("nan")):>18.3f} '
+              f'{tdev_t.get(1.0, float("nan")):>19.3f}',
               file=sys.stderr)
 
     if args.gnss_from is None or args.gnss_from == 'all':
@@ -419,7 +419,7 @@ def render_pair_stability(ticc_csv: Path, label_a: str, label_b: str,
     adev_a, tdev_a = adev_tdev_from_phase(chA)
     adev_b, tdev_b = adev_tdev_from_phase(chB)
 
-    print(f'{"clock":<24s} {"n":>8s} {"tdev(1s) ns":>14s}', file=sys.stderr)
+    print(f'{"clock":<24s} {"n":>8s} {"tdev(1s) (ns)":>14s}', file=sys.stderr)
     print('-' * 48, file=sys.stderr)
     print(f'{label_a:<24s} {len(chA):>8d} '
           f'{tdev_a.get(1.0, float("nan")):>14.3f}', file=sys.stderr)
