@@ -291,6 +291,12 @@ class SimConfig:
     initial_freq_ppb: float = 0.0      # bootstrap adjfine seed
     initial_dt_rx_ns: Optional[float] = 0.0  # None → 2-state mode
 
+    # softGateMidTau (I-092034): enable the soft TICC chi² gate (R-inflation,
+    # always-admit) instead of the binary hard reject.  Default off →
+    # DOFreqEst(soft_ticc_gate=False), the hard gate.  Used by the go/no-go
+    # proto (proto_soft_ticc_gate.py) to A/B mid-τ chA TDEV.
+    soft_ticc_gate: bool = False
+
     # EKF process/measurement tuning passthrough (DOFreqEst kwargs).
     sigma_do_phase_ns: float = 0.92
     sigma_do_freq_ppb: float = 0.01
@@ -435,7 +441,8 @@ class ClosedLoopSim:
             max_step_ppb=cfg.max_step_ppb,
             ocxo_trusted_gate=gate,
             routed_qerr=cfg.routed_qerr_enabled,
-            routed_qerr_v2=cfg.router_v2_enabled)
+            routed_qerr_v2=cfg.router_v2_enabled,
+            soft_ticc_gate=cfg.soft_ticc_gate)
         self.adjfine = cfg.initial_freq_ppb
         # Binary layer for the gross-fault A/B (#107 consumption).
         self.binary_layer = BinaryLayer(

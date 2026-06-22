@@ -7501,6 +7501,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                      or _qerr_latest_chi),
         routed_qerr_v2=getattr(args, 'router_qvir', False),
         routed_qerr_comparative=_qerr_latest_chi,
+        soft_ticc_gate=getattr(args, 'soft_ticc_gate', False),
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
              "sigma_do=[%.4f ns, %.4f ppb], "
@@ -11688,6 +11689,17 @@ Two-phase operation:
                        help="Escape hatch: disable the default-on "
                             "latestQErrChiSelect path and use the legacy matched "
                             "internal-qerr(x0) default instead.")
+    servo.add_argument("--soft-ticc-gate", dest="soft_ticc_gate",
+                       action="store_true", default=False,
+                       help="softGateMidTau (I-092034): replace the Arm-4 "
+                            "TICC chi² BINARY reject with a soft R-inflation "
+                            "gate (R·max(1, χ²/K²), always admit, never the "
+                            "open-loop blackout+snap the hard gate causes).  "
+                            "Targets the mid-τ (100–1000s) σ_servo_residual "
+                            "blowup — the only over-budget component per "
+                            "two-site-sync-budget.md §3.2.1.  Default OFF "
+                            "(byte-identical hard gate); validate in "
+                            "closedLoopServoSim + lab A/B before default-on.")
     servo.add_argument("--servo-input", choices=("default", "tdcp"),
                        default="default",
                        help="Servo-input mode.  'default' = today's 4-arm "

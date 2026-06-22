@@ -96,7 +96,8 @@ class DOFreqEst:
                  ocxo_trusted_gate=None,
                  routed_qerr=False,
                  routed_qerr_v2=False,
-                 routed_qerr_comparative=False):
+                 routed_qerr_comparative=False,
+                 soft_ticc_gate=False):
         self.max_ppb = max_ppb
         # routedQErrArm: per-edge chi² router for the TICC arm.  When
         # enabled, each TICC edge is routed (priority-ordered) to ONE
@@ -125,6 +126,11 @@ class DOFreqEst:
         # HARM; comparative+latest = 0.75× = net benefit, no covariance
         # collapse).  Pure argmin-chi2 (no margin) per the prototype.
         self._routed_qerr_comparative = routed_qerr_comparative
+        # softGateMidTau (I-092034): replace the Arm-4 chi² BINARY reject
+        # with a soft R-inflation gate (R·max(1, χ²/K²), always admit).
+        # Default off → byte-identical hard gate.  See the gate block in
+        # update() and docs ref two-site-sync-budget.md §3.2.1.
+        self._soft_ticc_gate = bool(soft_ticc_gate)
         # L3 of the TDCP slip-protection stack: per-epoch actuator
         # rate limit.  None = disabled (today's behavior preserved).
         # When set, |adjfine_new - adjfine_prev| is clamped to this
@@ -281,6 +287,13 @@ class DOFreqEst:
         }
         self.last_ocxo_gate_rejected: bool = False
         self.last_ocxo_gate_reason: str = ""
+        # softGateMidTau: the R-inflation factor the soft TICC gate applied
+        # last epoch (1.0 = no inflation / hard-gate mode / in-budget
+        # sample).  The applied Arm-4 pull is down-weighted vs the
+        # full-weight would_pull_ticc_* by S_base/S_eff (≤1; → 1/inflation
+        # only when R dominates S), so logging the factor keeps the actual
+        # weighting recoverable alongside the full-weight would_pull columns.
+        self.last_ticc_R_inflation: float = 1.0
         # Which TICC candidate the routed-qErr selector picked last
         # epoch ('ext'/'int'/'raw').  'int' when routing is disabled.
         self.last_ticc_route: str = 'int'
@@ -389,6 +402,7 @@ class DOFreqEst:
             self.last_arm_chi2[_k] = None
         self.last_ocxo_gate_rejected = False
         self.last_ocxo_gate_reason = ""
+        self.last_ticc_R_inflation = 1.0
         self.last_ticc_route = "int"
         # Clear the state-sanity guard: post-reset x is clean, so the
         # consecutive-violations counter starts fresh and the
@@ -878,7 +892,51 @@ class DOFreqEst:
 
             _chi2 = innov_ticc ** 2 / S if S > 0 else 0.0
             self.last_arm_chi2['ticc'] = _chi2
-            chi2_reject = _chi2 > _CHI2_GATE_THRESHOLD
+
+            # ── chi² gate: soft R-inflation (softGateMidTau) vs hard reject ──
+            # The values applied to the state below — S_apply / _K_apply_flat
+            # — default to the base S / K (hard-gate path, byte-identical).
+            # The soft gate replaces them with R-inflated effective values
+            # and never rejects on chi².
+            S_apply = S
+            _K_apply_flat = _K_ticc_flat
+            self.last_ticc_R_inflation = 1.0
+            if self._soft_ticc_gate:
+                # softGateMidTau (I-092034): the legacy gate is BINARY —
+                # χ²=innov²/S over _CHI2_GATE_THRESHOLD (10σ) skips the Arm-4
+                # update entirely, so during a transient the DO coasts
+                # open-loop through the blackout and the EKF SNAPS to the
+                # accumulated error when the gate finally reopens → a mid-τ
+                # (100–1000s) TDEV bulge (the only over-budget component per
+                # two-site-sync-budget.md §3.2.1).  The soft gate instead
+                # INFLATES R by max(1, χ²/K²) (K²=_CHI2_GATE_THRESHOLD) and
+                # ALWAYS admits: a sample at the knee is used at ~full weight;
+                # a 3× knee innovation is down-weighted ~9× but still pulls a
+                # little — no open-loop blackout, no snap (Huber / chi²-clamped
+                # soft gate).  χ²≤knee → factor 1.0 → identical to a normal
+                # accept, so only outliers differ from the hard path.  The
+                # OCXO physical gate (below) is independent and still rejects.
+                inflation = max(1.0, _chi2 / _CHI2_GATE_THRESHOLD)
+                if inflation > 1.0:
+                    self.last_ticc_R_inflation = inflation
+                    R_ticc_eff = R_ticc * inflation
+                    S_apply = (H_ticc @ P_pred @ H_ticc.T + R_ticc_eff).item()
+                    _K_apply_flat = ((P_pred @ H_ticc.T) / S_apply).flatten()
+                    # log.debug, not info (main #217 review nit 1): a
+                    # sustained mid-τ lockout episode produces many
+                    # consecutive over-knee admits — the very events we
+                    # study in the A/B — so info would flood run.log and
+                    # bury them.  last_ticc_R_inflation carries the same
+                    # signal into the arm-state CSV for analysis.
+                    log.debug(
+                        "[EKF] Arm 4 soft gate: χ²=%.0f > %.0f — R inflated "
+                        "×%.1f, admitted down-weighted (|innov|=%.1f ns, "
+                        "√S=%.1f ns)",
+                        _chi2, _CHI2_GATE_THRESHOLD, inflation,
+                        abs(innov_ticc), math.sqrt(S))
+                chi2_reject = False
+            else:
+                chi2_reject = _chi2 > _CHI2_GATE_THRESHOLD
             # soloObserverChiGate (2026-06-09): the chi² gate rejects an
             # outlier only when there's a REDUNDANT DO-phase observer to
             # fall back on.  When EXTINT (Arm 3) is absent this epoch the
@@ -892,6 +950,8 @@ class DOFreqEst:
             # it IS the truth about x[2].  A sustained real divergence is
             # still caught upstream by the outlier-ramp re-acquire, and the
             # OCXO physical gate below keeps its own sole-carrier override.
+            # (Moot under the soft gate, which never sets chi2_reject — it
+            # already admits the sole observer, just down-weighted.)
             ticc_sole_do_observer = extint_phase_ns is None
             if chi2_reject and ticc_sole_do_observer:
                 log.warning(
@@ -930,10 +990,13 @@ class DOFreqEst:
                 )
 
             if not (chi2_reject or ocxo_reject):
-                # K_ticc already computed above for pull attribution
-                x_pred = x_pred + _K_ticc_flat * innov_ticc
-                P_pred = P_pred - np.outer(_K_ticc_flat, _K_ticc_flat) * S
-                self.innov_monitor.observe(self._last_u, innov_ticc, S)
+                # _K_apply_flat / S_apply default to the base K / S (hard
+                # gate) and become the R-inflated effective values under the
+                # soft gate; the full-weight _K_ticc_flat is still recorded
+                # in last_arm_would_pull for pull attribution.
+                x_pred = x_pred + _K_apply_flat * innov_ticc
+                P_pred = P_pred - np.outer(_K_apply_flat, _K_apply_flat) * S_apply
+                self.innov_monitor.observe(self._last_u, innov_ticc, S_apply)
 
         self.x = x_pred
         self.P = P_pred
