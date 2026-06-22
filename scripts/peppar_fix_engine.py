@@ -6351,25 +6351,16 @@ def _reconcile_seed_freq(saved_base_freq, dac_actual_ppb,
     return saved_base_freq, None
 
 
-def _resolve_qerr_latest_chi(qlc_flag, *, router_qvir, routed_qerr_arm):
+def _resolve_qerr_latest_chi(qlc_flag):
     """latestQErrChiDefaultOn resolution — is the latest-chi qErr path active?
 
-    ``qlc_flag``: None = unspecified (CLI default), True = --qerr-latest-chi
-    explicit, False = --no-qerr-latest-chi.  latest-chi is the DEFAULT path; an
-    explicitly-chosen alternative router (--router-qvir / --routed-qerr-arm)
-    defers it.  An explicit --qerr-latest-chi alongside a router is a real
-    conflict.  Returns the resolved bool; raises SystemExit on conflict.
+    ``qlc_flag``: None = unspecified (CLI default → on), True = --qerr-latest-chi
+    explicit (on), False = --no-qerr-latest-chi (off → the legacy internal-
+    qerr(x0) path).  latest-chi is the DEFAULT and only routed qErr path now
+    that the matched v1/qVIR-v2 routers are retired (retireQerrMatchingCode
+    I-064807), so there is no longer an alternative router to defer to.
     """
-    other = bool(router_qvir) or bool(routed_qerr_arm)
-    if qlc_flag is True and other:
-        raise SystemExit(
-            "--qerr-latest-chi conflicts with --router-qvir / "
-            "--routed-qerr-arm: latest-chi feeds the LATEST unmatched qErr "
-            "through a comparative gate; the routers feed MATCHED qErr.  Pick "
-            "one (or use --no-qerr-latest-chi for the legacy matched default).")
-    if qlc_flag is None:
-        return not other   # default-on unless an alternative router was chosen
-    return bool(qlc_flag)
+    return True if qlc_flag is None else bool(qlc_flag)
 
 
 def _do_tadd_arm(args):
@@ -7494,40 +7485,21 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                         "TDEV(1s) for %s — gate disabled", do_uid_local)
     elif getattr(args, 'ocxo_trusted_gate', False):
         log.warning("OCXO gate requested but no DO UID resolved — gate disabled")
-    # Router v1 (--routed-qerr-arm, chi²) and v2 (--router-qvir, qVIR)
-    # are mutually exclusive — they're different routers with the same
-    # purpose.  Refuse both rather than silently picking one.
-    if (getattr(args, 'routed_qerr_arm', False)
-            and getattr(args, 'router_qvir', False)):
-        raise SystemExit(
-            "--routed-qerr-arm (v1, chi²) and --router-qvir (v2, qVIR) "
-            "are mutually exclusive: pick one.")
     # latestQErrChiSelect (--qerr-latest-chi): comparative-gate router fed the
-    # LATEST unmatched qErr (no edge matching/queue/qVIR).  Built on the v1
-    # router (comparative chi² selection); mutually exclusive with the v2
-    # qVIR router.  See docs/latest-qerr-chi-select.md.
-    # latestQErrChiDefaultOn: latest-chi is now the DEFAULT qErr path (cleared
-    # by servo_sim go/no-go #204, lab A/B parity #213, and the no-long-τ-drift
-    # default-on bake #215).  Tri-state arg: None = unspecified (→ default-on
-    # unless an alternative router is explicitly chosen), True = --qerr-latest-chi
-    # (explicit), False = --no-qerr-latest-chi (escape hatch → legacy matched
-    # internal-qerr default).  --router-qvir / --routed-qerr-arm select an
-    # alternative and implicitly defer the default; passing one of them AND an
-    # explicit --qerr-latest-chi is a real conflict → error.
+    # LATEST unmatched qErr (no edge matching/queue/qVIR).  This is the DEFAULT
+    # and only routed qErr path; the matched v1 (chi²) and qVIR-v2 routers were
+    # retired in retireQerrMatchingCode (I-064807).  Tri-state arg: None =
+    # unspecified (→ default-on), True = --qerr-latest-chi (explicit on), False
+    # = --no-qerr-latest-chi (escape hatch → legacy internal-qerr(x0) path).
     _qerr_latest_chi = _resolve_qerr_latest_chi(
-        getattr(args, 'qerr_latest_chi', None),
-        router_qvir=getattr(args, 'router_qvir', False),
-        routed_qerr_arm=getattr(args, 'routed_qerr_arm', False))
+        getattr(args, 'qerr_latest_chi', None))
     # Write the RESOLVED bool back so downstream reads (the _servo_epoch
     # latest-qErr feed) see the resolved value, not the tri-state arg.
     args.qerr_latest_chi = _qerr_latest_chi
     log.info("qErr path: %s",
              "latest-chi (comparative gate, latest unmatched qErr) [default]"
              if _qerr_latest_chi else
-             ("router-qvir (matched)" if getattr(args, 'router_qvir', False)
-              else "routed-qerr-arm (matched, absolute gate)"
-              if getattr(args, 'routed_qerr_arm', False)
-              else "internal qerr(x0) (legacy matched default; --no-qerr-latest-chi)"))
+             "internal qerr(x0) (--no-qerr-latest-chi)")
     servo = DOFreqEst(
         sigma_ticc_ns=sigma_ticc,
         sigma_do_phase_ns=sigma_do_phase_ns_eff,
@@ -7540,10 +7512,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         base_freq=bootstrap_base_freq,
         max_step_ppb=_max_step if _max_step and _max_step > 0 else None,
         ocxo_trusted_gate=_ocxo_gate,
-        routed_qerr=(getattr(args, 'routed_qerr_arm', False)
-                     or _qerr_latest_chi),
-        routed_qerr_v2=getattr(args, 'router_qvir', False),
-        routed_qerr_comparative=_qerr_latest_chi,
+        routed_qerr=_qerr_latest_chi,
         soft_ticc_gate=getattr(args, 'soft_ticc_gate', False),
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
@@ -7639,19 +7608,12 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                  _reset_budget.max_resets, _reset_budget.window_s)
 
     qerr_alignment = {
-        # Litmus 1: EXTTS PPS + qErr (matched to EXTTS epoch)
+        # Litmus 1: EXTTS PPS + qErr (matched to EXTTS epoch).  This
+        # EXTTS-side qVIR pair is independent of the (now-retired) TICC
+        # routers and stays.
         "pps_var": RunningVarianceWindow(),
         "pps_qerr_plus_var": RunningVarianceWindow(),
         "pps_qerr_minus_var": RunningVarianceWindow(),
-        # routedQErrArm v2 (--router-qvir): TICC-side qVIR for the
-        # router's ext-vs-raw decision.  Mirrors the EXTTS-side
-        # pair above but applied to the TICC arm.  Δvar(ticc_diff) /
-        # Δvar(ticc_diff + ext_qerr) — > 1.5 ⇒ ext correlated ⇒
-        # route 'ext'; otherwise 'raw'.  Per Main #98 review: this
-        # IS the single source of truth for "is qErr correlated
-        # right now" on the TICC arm.
-        "ticc_var": RunningVarianceWindow(),
-        "ticc_qerr_plus_var": RunningVarianceWindow(),
     }
 
     # PPS event queue
@@ -9165,46 +9127,19 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         _distance_for_gate = (_convergence.distance_to_lock
                               if _convergence is not None else None)
 
-        # routedQErrArm v2 (--router-qvir): TICC-side qVIR feeds the
-        # engine-side ext-vs-raw routing decision.  Per Main #98
-        # review: this IS the single source of truth — same machinery
-        # as the EXTTS-side qVIR pair, just applied to the TICC arm.
-        # Update both windows whenever both ticc_diff_ns AND
-        # qerr_for_ticc_pps_ns are available; the variance ratio
-        # gates the v2 router each epoch.  Bootstrap (window <8
-        # samples) ⇒ ticc_ext_correlated=False ⇒ raw (always safe).
-        _ticc_ext_correlated = False
-        _route_v2 = getattr(args, 'router_qvir', False)
+        # latestQErrChiSelect: feed the LATEST qErr message (no edge matching,
+        # no queue, no qVIR) and let the comparative chi² gate in
+        # _route_ticc_arm decide — a stale/off-by-edge latest qErr loses to raw
+        # on chi².  This is the only routed qErr path; the matched v1/qVIR-v2
+        # routers were retired in retireQerrMatchingCode (I-064807).  When
+        # --no-qerr-latest-chi is set, qerr_latest_chi resolves False → no
+        # router candidate (None) → the EKF's internal qerr(x0) model.
         if getattr(args, 'qerr_latest_chi', False):
-            # latestQErrChiSelect: feed the LATEST qErr message (no edge
-            # matching, no queue, no qVIR) and let the comparative chi² gate
-            # in _route_ticc_arm decide.  The comparative gate makes this safe
-            # — a stale/off-by-edge latest qErr loses to raw on chi².
             _latest_qerr_ns, _ = (qerr_store.get(max_age_s=2.0)
                                   if qerr_store is not None else (None, None))
             _ticc_qerr_for_router = _latest_qerr_ns
         else:
-            _ticc_qerr_for_router = qerr_for_ticc_pps_ns if (
-                getattr(args, 'routed_qerr_arm', False) or _route_v2) else None
-        if (_route_v2 and ticc_diff_ns is not None
-                and qerr_for_ticc_pps_ns is not None):
-            qerr_alignment["ticc_var"].add(ticc_diff_ns)
-            qerr_alignment["ticc_qerr_plus_var"].add(
-                ticc_diff_ns + qerr_for_ticc_pps_ns)
-            _ticc_var = qerr_alignment["ticc_var"].diff_variance()
-            _ticc_plus_var = qerr_alignment[
-                "ticc_qerr_plus_var"].diff_variance()
-            if (_ticc_var is not None and _ticc_plus_var is not None
-                    and _ticc_plus_var > 0.0
-                    and qerr_alignment["ticc_qerr_plus_var"].count() >= 8):
-                _ticc_qvir = _ticc_var / _ticc_plus_var
-                _ticc_ext_correlated = _ticc_qvir > 1.5
-                if n_epochs % 60 == 0:
-                    log.info("  [ROUTED_QERR v2] TICC qVIR = %.2f "
-                             "(threshold 1.5 → ext_correlated=%s, "
-                             "window n=%d)",
-                             _ticc_qvir, _ticc_ext_correlated,
-                             qerr_alignment["ticc_qerr_plus_var"].count())
+            _ticc_qerr_for_router = None
 
         adjfine_ppb = -servo.update(
             dt=dt_actual,
@@ -9220,7 +9155,6 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             pseudo_phase_sigma_ns=_pseudo_phase_sigma_ns,
             ticc_qerr_ns=_ticc_qerr_for_router,
             distance_to_lock=_distance_for_gate,
-            ticc_ext_correlated=_ticc_ext_correlated,
         )
 
         # ekfStateSanityNoRecovery: route sustained state-sanity
@@ -9388,11 +9322,11 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                 hr.epochs, hr.corr_u_innov, hr.norm_bias, hr.nis,
                 hr.status, hr.consec_bad,
             )
-        # Periodic cumulative route-selection report for the
-        # routed-qErr router (#79 follow-up: surface what the router is
+        # Periodic cumulative route-selection report for the comparative
+        # latest-chi router (#79 follow-up: surface what the router is
         # doing on hardware; without this we only had an in-memory
         # last_ticc_route per epoch).
-        if (n_epochs % 60 == 0 and getattr(args, 'routed_qerr_arm', False)
+        if (n_epochs % 60 == 0 and getattr(args, 'qerr_latest_chi', False)
                 and hasattr(servo, 'n_route_ext')):
             _ne = servo.n_route_ext
             _ni = servo.n_route_int
@@ -11707,32 +11641,11 @@ Two-phase operation:
     servo.add_argument("--ocxo-trusted-min-age", type=float, default=60.0,
                        help="OCXO gate disabled for the first N seconds of "
                             "filter life (bootstrap protection).  Default 60.")
-    servo.add_argument("--routed-qerr-arm", action="store_true",
-                       help="Route each TICC edge (per-edge chi²) to "
-                            "external-qErr-corrected, internal-qerr(x[0]), "
-                            "or raw — whichever is consistent.  A mis-"
-                            "correlated external qErr is a tick-scale chi² "
-                            "outlier → falls through to raw, so chi² is the "
-                            "correlation-quality detector (no qVIR gate).  "
-                            "Needs the honest small Q (from DO char) to "
-                            "discriminate tick mismatches.  Default off.  "
-                            "Mutually exclusive with --router-qvir (v2).")
-    servo.add_argument("--router-qvir", action="store_true", default=False,
-                       help="routedQErrArm v2 (docs/routed-qerr-router-v2-"
-                            "qvir.md, PR #98): two-candidate router "
-                            "(ext vs raw, both H=[0,0,-1,0]), routed by "
-                            "qVIR > 1.5 on the TICC arm instead of v1's "
-                            "chi².  Drops v1's 'internal' candidate (the "
-                            "rx-TCXO leakage path).  qVIR uses the engine's "
-                            "RunningVarianceWindow machinery applied to "
-                            "the TICC stream (Δvar(raw)/Δvar(raw+qerr)); "
-                            "bootstrap (window <8 samples) routes to raw.  "
-                            "Default off; mutually exclusive with "
-                            "--routed-qerr-arm.  Validate in "
-                            "closedLoopServoSim before enabling.")
-    # latestQErrChiDefaultOn: tri-state, DEFAULT-ON.  Unspecified → on (unless
-    # an alternative router is chosen); --qerr-latest-chi forces on;
-    # --no-qerr-latest-chi is the escape hatch to the legacy matched default.
+    # latestQErrChiDefaultOn: tri-state, DEFAULT-ON.  Unspecified → on;
+    # --qerr-latest-chi forces on; --no-qerr-latest-chi is the escape hatch to
+    # the legacy internal-qerr(x0) path.  The matched v1 (--routed-qerr-arm)
+    # and qVIR-v2 (--router-qvir) routers were removed in retireQerrMatchingCode
+    # (I-064807); comparative latest-chi is the only routed qErr path now.
     servo.add_argument("--qerr-latest-chi", dest="qerr_latest_chi",
                        action="store_true", default=None,
                        help="latestQErrChiSelect (docs/latest-qerr-chi-select."
@@ -11745,9 +11658,7 @@ Two-phase operation:
                             "latest qErr lose to raw (no poison).  DEFAULT-ON "
                             "(cleared by A/B parity #213 + no-drift bake #215); "
                             "this flag forces it on.  Use --no-qerr-latest-chi "
-                            "to fall back to the legacy matched default.  "
-                            "Conflicts with --router-qvir / --routed-qerr-arm "
-                            "(which select an alternative).")
+                            "to fall back to the internal-qerr(x0) path.")
     servo.add_argument("--no-qerr-latest-chi", dest="qerr_latest_chi",
                        action="store_false",
                        help="Escape hatch: disable the default-on "
