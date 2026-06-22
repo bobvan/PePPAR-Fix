@@ -922,7 +922,13 @@ class DOFreqEst:
                     R_ticc_eff = R_ticc * inflation
                     S_apply = (H_ticc @ P_pred @ H_ticc.T + R_ticc_eff).item()
                     _K_apply_flat = ((P_pred @ H_ticc.T) / S_apply).flatten()
-                    log.info(
+                    # log.debug, not info (main #217 review nit 1): a
+                    # sustained mid-τ lockout episode produces many
+                    # consecutive over-knee admits — the very events we
+                    # study in the A/B — so info would flood run.log and
+                    # bury them.  last_ticc_R_inflation carries the same
+                    # signal into the arm-state CSV for analysis.
+                    log.debug(
                         "[EKF] Arm 4 soft gate: χ²=%.0f > %.0f — R inflated "
                         "×%.1f, admitted down-weighted (|innov|=%.1f ns, "
                         "√S=%.1f ns)",
