@@ -69,6 +69,9 @@ def main():
     ap.add_argument("--out-dir", default=".")
     ap.add_argument("--csv", default=None)
     ap.add_argument("--tokens", default=None, help="comma list to override choke-ring tokens")
+    ap.add_argument("--out-name", default="chokering_pcv", help="output basename (no ext)")
+    ap.add_argument("--title", default="Choke-ring antenna PCV (relative to PCO)",
+                    help="plot title prefix")
     args = ap.parse_args()
 
     toks = tuple(t.strip().upper() for t in args.tokens.split(",")) if args.tokens else TOKENS
@@ -104,7 +107,7 @@ def main():
               f"p-p avg {np.nanmean(a[:,3]):.2f} ({np.nanmin(a[:,3]):.2f}..{np.nanmax(a[:,3]):.2f})")
 
     # CSV
-    csv_path = args.csv or os.path.join(args.out_dir, "chokering_pcv.csv")
+    csv_path = args.csv or os.path.join(args.out_dir, args.out_name + ".csv")
     os.makedirs(args.out_dir, exist_ok=True)
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
@@ -138,11 +141,11 @@ def main():
     a1.set_ylabel("NOAZI PCV relative to PCO  [mm]")
     handles = [plt.Line2D([], [], color=cmap[f], lw=3, label=f) for f in fams]
     a1.legend(handles=handles, loc="lower left", fontsize=11)
-    fig.suptitle(f"Choke-ring antenna PCV (relative to PCO) — IGS {os.path.basename(args.atx)}\n"
-                 f"{len(seen)} models · L1 p-p avg {np.nanmean(A[:,1]):.0f} mm, "
+    fig.suptitle(f"{args.title} — IGS {os.path.basename(args.atx)}\n"
+                 f"{len(seen)} model(s) · L1 p-p avg {np.nanmean(A[:,1]):.0f} mm, "
                  f"L2 p-p avg {np.nanmean(A[:,3]):.0f} mm", fontsize=18, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
-    out = os.path.join(args.out_dir, "chokering_pcv")
+    out = os.path.join(args.out_dir, args.out_name)
     fig.savefig(out + ".pdf"); fig.savefig(out + ".png", dpi=200)
     plt.close(fig)
     print(f"wrote {out}.pdf/.png  ({len(seen)} models plotted)")
