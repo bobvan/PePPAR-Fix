@@ -6308,6 +6308,27 @@ def _reconcile_seed_freq(saved_base_freq, dac_actual_ppb,
     return saved_base_freq, None
 
 
+def _resolve_qerr_latest_chi(qlc_flag, *, router_qvir, routed_qerr_arm):
+    """latestQErrChiDefaultOn resolution — is the latest-chi qErr path active?
+
+    ``qlc_flag``: None = unspecified (CLI default), True = --qerr-latest-chi
+    explicit, False = --no-qerr-latest-chi.  latest-chi is the DEFAULT path; an
+    explicitly-chosen alternative router (--router-qvir / --routed-qerr-arm)
+    defers it.  An explicit --qerr-latest-chi alongside a router is a real
+    conflict.  Returns the resolved bool; raises SystemExit on conflict.
+    """
+    other = bool(router_qvir) or bool(routed_qerr_arm)
+    if qlc_flag is True and other:
+        raise SystemExit(
+            "--qerr-latest-chi conflicts with --router-qvir / "
+            "--routed-qerr-arm: latest-chi feeds the LATEST unmatched qErr "
+            "through a comparative gate; the routers feed MATCHED qErr.  Pick "
+            "one (or use --no-qerr-latest-chi for the legacy matched default).")
+    if qlc_flag is None:
+        return not other   # default-on unless an alternative router was chosen
+    return bool(qlc_flag)
+
+
 def _do_tadd_arm(args):
     """ARM the TADD divider if configured.  Extracted for reuse."""
     tadd_gpio = getattr(args, 'tadd_gpio', None)
@@ -7442,20 +7463,28 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
     # LATEST unmatched qErr (no edge matching/queue/qVIR).  Built on the v1
     # router (comparative chi² selection); mutually exclusive with the v2
     # qVIR router.  See docs/latest-qerr-chi-select.md.
-    _qerr_latest_chi = getattr(args, 'qerr_latest_chi', False)
-    if _qerr_latest_chi and getattr(args, 'router_qvir', False):
-        raise SystemExit(
-            "--qerr-latest-chi and --router-qvir are mutually exclusive: "
-            "the former replaces qVIR with the EKF's own chi² judgement.")
-    if _qerr_latest_chi and getattr(args, 'routed_qerr_arm', False):
-        # Both would yield comparative+latest (qerr-latest-chi wins via the OR
-        # below + the latest-feed branch), silently no-op'ing --routed-qerr-arm.
-        # Refuse rather than mislead (bravo #212 note 1; matches the v1/v2 style).
-        raise SystemExit(
-            "--qerr-latest-chi and --routed-qerr-arm are mutually exclusive: "
-            "latest-chi feeds the LATEST unmatched qErr through a comparative "
-            "gate; routed-qerr-arm feeds the MATCHED qErr through the absolute "
-            "gate.  Pick one.")
+    # latestQErrChiDefaultOn: latest-chi is now the DEFAULT qErr path (cleared
+    # by servo_sim go/no-go #204, lab A/B parity #213, and the no-long-τ-drift
+    # default-on bake #215).  Tri-state arg: None = unspecified (→ default-on
+    # unless an alternative router is explicitly chosen), True = --qerr-latest-chi
+    # (explicit), False = --no-qerr-latest-chi (escape hatch → legacy matched
+    # internal-qerr default).  --router-qvir / --routed-qerr-arm select an
+    # alternative and implicitly defer the default; passing one of them AND an
+    # explicit --qerr-latest-chi is a real conflict → error.
+    _qerr_latest_chi = _resolve_qerr_latest_chi(
+        getattr(args, 'qerr_latest_chi', None),
+        router_qvir=getattr(args, 'router_qvir', False),
+        routed_qerr_arm=getattr(args, 'routed_qerr_arm', False))
+    # Write the RESOLVED bool back so downstream reads (the _servo_epoch
+    # latest-qErr feed) see the resolved value, not the tri-state arg.
+    args.qerr_latest_chi = _qerr_latest_chi
+    log.info("qErr path: %s",
+             "latest-chi (comparative gate, latest unmatched qErr) [default]"
+             if _qerr_latest_chi else
+             ("router-qvir (matched)" if getattr(args, 'router_qvir', False)
+              else "routed-qerr-arm (matched, absolute gate)"
+              if getattr(args, 'routed_qerr_arm', False)
+              else "internal qerr(x0) (legacy matched default; --no-qerr-latest-chi)"))
     servo = DOFreqEst(
         sigma_ticc_ns=sigma_ticc,
         sigma_do_phase_ns=sigma_do_phase_ns_eff,
@@ -11636,7 +11665,11 @@ Two-phase operation:
                             "Default off; mutually exclusive with "
                             "--routed-qerr-arm.  Validate in "
                             "closedLoopServoSim before enabling.")
-    servo.add_argument("--qerr-latest-chi", action="store_true",
+    # latestQErrChiDefaultOn: tri-state, DEFAULT-ON.  Unspecified → on (unless
+    # an alternative router is chosen); --qerr-latest-chi forces on;
+    # --no-qerr-latest-chi is the escape hatch to the legacy matched default.
+    servo.add_argument("--qerr-latest-chi", dest="qerr_latest_chi",
+                       action="store_true", default=None,
                        help="latestQErrChiSelect (docs/latest-qerr-chi-select."
                             "md): feed the LATEST qErr message (no edge "
                             "matching, no queue, no qVIR) to the TICC arm and "
@@ -11644,10 +11677,17 @@ Two-phase operation:
                             "raw per epoch — ext wins only if it BEATS raw's "
                             "chi².  Drops the fragile correlation machinery; "
                             "the comparative gate makes a stale/off-by-edge "
-                            "latest qErr lose to raw (no poison).  servo_sim "
-                            "go/no-go validated (proto_latest_qerr_chi.py).  "
-                            "Default off; mutually exclusive with "
-                            "--router-qvir and --routed-qerr-arm.")
+                            "latest qErr lose to raw (no poison).  DEFAULT-ON "
+                            "(cleared by A/B parity #213 + no-drift bake #215); "
+                            "this flag forces it on.  Use --no-qerr-latest-chi "
+                            "to fall back to the legacy matched default.  "
+                            "Conflicts with --router-qvir / --routed-qerr-arm "
+                            "(which select an alternative).")
+    servo.add_argument("--no-qerr-latest-chi", dest="qerr_latest_chi",
+                       action="store_false",
+                       help="Escape hatch: disable the default-on "
+                            "latestQErrChiSelect path and use the legacy matched "
+                            "internal-qerr(x0) default instead.")
     servo.add_argument("--servo-input", choices=("default", "tdcp"),
                        default="default",
                        help="Servo-input mode.  'default' = today's 4-arm "
