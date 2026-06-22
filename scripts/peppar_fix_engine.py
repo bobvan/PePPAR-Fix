@@ -6270,6 +6270,44 @@ def _bootstrap_compute_base_freq(args, pps_freq_ppb, pps_freq_unc,
     return base_freq, tcxo_freq_corr_ppb
 
 
+# pifaceWarmStartSeedDrift: the largest sane bootstrap glide between the saved
+# crystal-freq seed and the DAC's actual output, in ppb.  A warm-start lands
+# near the operating point, so the legit difference is small (a few–tens of
+# ppb); anything beyond this means the saved seed is stale/inconsistent with the
+# physical DAC and must not be trusted.
+_SEED_GLIDE_SANITY_PPB = 100.0
+
+
+def _reconcile_seed_freq(saved_base_freq, dac_actual_ppb,
+                         sanity_ppb=_SEED_GLIDE_SANITY_PPB):
+    """Reconcile the EKF crystal-freq seed with the DAC's actual output.
+
+    Both ``saved_base_freq`` (from runtime state) and ``dac_actual_ppb``
+    (``actuator.read_frequency_ppb()`` after seeding) are estimates of the DO
+    operating point and should differ only by the small bootstrap glide.  A
+    large disagreement means the saved seed is stale/inconsistent with the
+    physical DAC (PiFace 2026-06-21: saved 546 ppb vs DAC-actual 1.2 ppb → the
+    EKF would seed x[3]=-546, expecting +546 ppb of correction the DAC isn't
+    applying → startup divergence to tens of µs).  When that happens, trust the
+    DAC's physical reality and seed from ``dac_actual_ppb`` instead.
+
+    Returns ``(base_freq, reason)`` where reason is None if the saved seed was
+    kept, else a human string describing the override.
+    """
+    if saved_base_freq is None:
+        return dac_actual_ppb, None
+    if dac_actual_ppb is None:
+        return saved_base_freq, None
+    glide = dac_actual_ppb - saved_base_freq
+    if abs(glide) > sanity_ppb:
+        return (dac_actual_ppb,
+                f"saved crystal freq {saved_base_freq:.1f} ppb disagrees with "
+                f"DAC actual {dac_actual_ppb:.1f} ppb by {glide:.1f} ppb "
+                f"(>{sanity_ppb:.0f}) — stale/inconsistent seed "
+                f"(pifaceWarmStartSeedDrift); seeding from DAC-actual")
+    return saved_base_freq, None
+
+
 def _do_tadd_arm(args):
     """ARM the TADD divider if configured.  Extracted for reuse."""
     tadd_gpio = getattr(args, 'tadd_gpio', None)
@@ -7183,6 +7221,14 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                  "(current_adj=%.1f, glide=%.1f)",
                  bootstrap_base_freq, current_adj,
                  current_adj - bootstrap_base_freq)
+        # pifaceWarmStartSeedDrift: reject a saved crystal-freq seed that
+        # disagrees with the DAC's actual output beyond a sane glide — seed the
+        # EKF from the DAC's physical reality so x[3] and the DAC can't start
+        # hundreds of ppb apart (which causes the PiFace startup divergence).
+        bootstrap_base_freq, _reconcile_reason = _reconcile_seed_freq(
+            bootstrap_base_freq, current_adj)
+        if _reconcile_reason:
+            log.warning("DOFreqEst: %s", _reconcile_reason)
 
     # Q inputs come from the per-section .toml characterization, resolved
     # through do_char_resolve.  ONE resolve serves the σ_DO derivation here,
