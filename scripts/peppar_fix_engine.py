@@ -7345,6 +7345,19 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             f"{_engine_char.steering_provenance!r} (not measured) on a DAC "
             f"actuator — refusing to discipline an uncalibrated DAC.  Run "
             f"scripts/do_steering_char.py to measure its EFC slope first.")
+    # midTauTrackingResidual STEP C (I-102153): explicit override of the DO-freq
+    # process-noise Q[3,3] (=sigma_do_freq_ppb²) for the per-host Q-stiffness
+    # A/B.  Takes precedence over BOTH the default AND the do-char value so the
+    # A/B can vary Q without editing the host's .toml.  EXPERIMENT-ONLY — the
+    # provenance is logged loudly so an overridden run is never mistaken for a
+    # measured one.  None (default) = use the do-char / default value unchanged.
+    _sdf_override = getattr(args, 'sigma_do_freq_override', None)
+    if _sdf_override is not None:
+        log.warning("[STEP-C] sigma_do_freq OVERRIDE: %.5f → %.5f ppb/√s "
+                    "(was %s) — EXPERIMENT knob, not a measured value",
+                    sigma_do_freq_ppb_eff, _sdf_override, _q_freq_source)
+        sigma_do_freq_ppb_eff = float(_sdf_override)
+        _q_freq_source = f"STEP-C-override(was {_q_freq_source})"
     log.info("DOFreqEst Q: sigma_do_phase=%.4f ns/√s (%s), "
              "sigma_do_freq=%.4f ppb/√s (%s)",
              sigma_do_phase_ns_eff, _q_phase_source,
@@ -11395,7 +11408,19 @@ Two-phase operation:
     servo.add_argument("--kalman-sigma-freq", type=float, default=0.01,
                        help="DO frequency random walk (ppb/epoch). Lower = "
                             "more stable frequency estimate, less wander. "
-                            "Default 0.01 from ADEV characterization.")
+                            "Default 0.01 from ADEV characterization.  NOTE: "
+                            "for a do-char-configured host this is OVERRIDDEN "
+                            "by the .toml sigma_do_freq; use "
+                            "--sigma-do-freq-override to force a value.")
+    servo.add_argument("--sigma-do-freq-override", type=float, default=None,
+                       help="midTauTrackingResidual STEP C (I-102153): force "
+                            "the DO-freq process-noise sigma (ppb/√s, "
+                            "Q[3,3]=σ²), taking precedence over BOTH the "
+                            "default AND the do-char .toml value.  For the "
+                            "per-host Q-stiffness A/B (e.g. clkPoC3 "
+                            "0.0006→0.0003 to coast more through mid-τ).  "
+                            "EXPERIMENT knob — logged loudly as non-measured; "
+                            "do not use in production.")
     servo.add_argument("--kalman-sigma-tcxo-freq", type=float, default=0.1,
                        help="rx TCXO frequency random walk (ppb/epoch).  "
                             "Default 0.1 — empirically better than the 0.5 "
