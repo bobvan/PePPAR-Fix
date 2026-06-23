@@ -61,6 +61,15 @@ key — the hardware front-end isn't there.
 
 ## Signal capability matrix
 
+> Visualized on the GNSS frequency axis (à la PocketSDR's signal-band
+> chart) by `tools/plot_receiver_signal_coverage.py` →
+> `receiver_signal_coverage.{pdf,png}`: one lane per receiver, a shaded
+> block over each RF band group it tracks (solid = tracked, amber hatch =
+> 2-band "L2 *or* L5, pick one", faint = unconfirmed). Makes the coverage
+> *differences* legible at a glance — X20P spans 4 bands incl. E6/HAS,
+> F9P is L1+L2 (empty L5 slot), the timing F9T-20B/F10T lean L1+L5, and
+> the TIM 2.20 / LEA-11B variants are L1 + (L2 **or** L5).
+
 Tested by sending CFG-VALSET (RAM layer) for each key individually.
 ACK = accepted, NAK = rejected by firmware.
 
