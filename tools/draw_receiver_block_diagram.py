@@ -112,9 +112,17 @@ def main():
     arrow(ax, (14.95, 3.05), (14.95, 2.35), color="#38761d", lw=2.8)  # DO -> sub-nano PPS
     ax.text(14.95, 2.1, "Sub-nano PPS", ha="center", va="center", fontsize=13,
             color="#38761d", weight="bold")
-    # flat-line glyph (clean, sub-ns) to the left of the label
-    ax.plot([12.35, 13.55], [2.1, 2.1], color="#38761d", lw=2.8, zorder=5)
-    ax.text(12.95, 1.78, "≪ 1 ns", ha="center", va="center", fontsize=10.5, color="#38761d")
+    # near-flat glyph (clean, sub-ns) to the left of the label — tiny irregular
+    # bumps so it's honest (a disciplined PPS isn't a perfect line), but small
+    # relative to the ~8 ns raw sawtooth above (sawtooth p-p = 2*_amp = 0.34).
+    _gx0, _gx1, _gyc = 12.35, 13.55, 2.1
+    _gbump = [0.0, 0.012, -0.008, 0.015, 0.004, -0.013, 0.007,
+              0.011, -0.006, 0.013, -0.004, 0.0]          # p-p 0.028 ≈ 0.7 ns
+    _gn = len(_gbump)
+    _gxs = [_gx0 + (_gx1 - _gx0) * _k / (_gn - 1) for _k in range(_gn)]
+    _gys = [_gyc + _b for _b in _gbump]
+    ax.plot(_gxs, _gys, color="#38761d", lw=2.8, zorder=5, solid_joinstyle="round")
+    ax.text(12.95, 1.78, "< 1 ns", ha="center", va="center", fontsize=10.5, color="#38761d")
 
     # raw PPS out the bottom of the receiver (the timing receiver's own PPS pin)
     arrow(ax, (4.7, 2.85), (4.7, 1.95), color="#666666", lw=2.6)
