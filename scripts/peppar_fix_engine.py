@@ -827,6 +827,11 @@ class TiccPairMeasurement:
     recv_mono: float
     confidence: float
     ref_qerr_ns: float = None  # qerr matched to the ref (gnss_pps) edge
+    # gnssPpsQErrLog: raw ref (gnss_pps / chB) edge, surfaced so the de-
+    # sawtoothed F9T solution (chB-vs-Rb + qErr) can be logged.  chB-vs-Rb =
+    # ref_sec*1e12 + ref_ps (the TICC timebase is Rb-locked).
+    ref_ps: int = None
+    ref_recv_mono: float = None
 
 
 class TiccPairTracker:
@@ -905,6 +910,8 @@ class TiccPairTracker:
                     getattr(ref_event, "correlation_confidence", 1.0) or 1.0,
                 ),
                 ref_qerr_ns=self._ref_qerr.pop(ref_event.ref_sec, None),
+                ref_ps=ref_event.ref_ps,
+                ref_recv_mono=ref_event.recv_mono,
             )
 
     def latest(self, now_mono: float, max_age_s: float):
@@ -4628,6 +4635,42 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             except OSError as e:
                 log.error("Failed to open arm_state_log %s: %s",
                           args.arm_state_log, e)
+        # --gnss-pps-qerr-log (Main's fair-F9T-SPP-vs-PPP ask + Bob's
+        # second-opinion bonus): per chB(GNSS-PPS-vs-Rb) edge, log the raw
+        # chB timestamp + TWO qErr columns —
+        #   qerr_matched : qErr mono-matched to THIS chB edge
+        #                  (match_pps_mono, the CLOCK_MONOTONIC expected-offset
+        #                  match — the FIX for the integer-ref_sec aliasing).
+        #                  chB-vs-Rb + qerr_matched = de-sawtoothed F9T solution.
+        #   qerr_latest  : the most-recent unmatched qErr (qerr_store.get) =
+        #                  exactly what the latest-chi filter feeds.  Bob's
+        #                  SECOND OPINION: matched≈latest for ~all samples; a
+        #                  divergence is a direct off-by-edge alarm independent
+        #                  of the comparative gate's routing.
+        if getattr(args, 'gnss_pps_qerr_log', None):
+            try:
+                _needs_header = (not os.path.exists(args.gnss_pps_qerr_log)
+                                 or os.path.getsize(args.gnss_pps_qerr_log) == 0)
+                _gpq_f = open(args.gnss_pps_qerr_log, 'a', newline='')
+                _gpq_csv = csv.writer(_gpq_f)
+                if _needs_header:
+                    _gpq_csv.writerow([
+                        'host_timestamp', 'gps_second',
+                        'chb_ref_sec', 'chb_ref_ps',   # chB raw vs Rb timebase
+                        'chb_recv_mono',
+                        'qerr_matched_ns', 'qerr_matched_offset_s',
+                        'qerr_latest_ns',
+                        # offline: chB_vs_Rb = detrend(chb_ref_sec*1e12+chb_ref_ps);
+                        # corrected = chB_vs_Rb + qerr_matched; cross-check
+                        # |qerr_matched - qerr_latest| should be ~0.
+                    ])
+                    _gpq_f.flush()
+                servo_ctx['gnss_pps_qerr_log_writer'] = _gpq_csv
+                servo_ctx['gnss_pps_qerr_log_file'] = _gpq_f
+                log.info("gnss-pps-qErr CSV log: %s", args.gnss_pps_qerr_log)
+            except OSError as e:
+                log.error("Failed to open gnss_pps_qerr_log %s: %s",
+                          args.gnss_pps_qerr_log, e)
         # --per-sv-resid-log: per-epoch per-SV post-fit residuals.
         # One row per (epoch, SV) that contributed observations.  Lets
         # downstream analysis ask "is dt_rx noise filter-side or
@@ -8550,6 +8593,27 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
             # time in the ticc_reader thread — deterministic, no race
             # with latest().  See docs/stream-timescale-correlation.md.
             qerr_for_ticc_pps_ns = ticc_measurement.ref_qerr_ns
+            # gnssPpsQErrLog: per chB(GNSS-PPS-vs-Rb) edge, emit the raw chB
+            # timestamp + the CORRECT mono-matched qErr (the fix for ref_sec
+            # aliasing) AND the latest unmatched qErr (Bob's second opinion =
+            # the latest-chi filter feed).  matched≈latest unless the edge
+            # match drifts → a direct off-by-edge alarm.
+            _gpq_w = ctx.get('gnss_pps_qerr_log_writer')
+            if _gpq_w is not None and ticc_measurement.ref_ps is not None:
+                _qm, _qm_off = qerr_store.match_pps_mono(
+                    ticc_measurement.ref_recv_mono, expected_offset_s=0.95)
+                _ql, _ = qerr_store.get(max_age_s=2.0)
+                _gpq_w.writerow([
+                    datetime.now(tz=timezone.utc).isoformat(), '',
+                    ticc_measurement.ref_sec, ticc_measurement.ref_ps,
+                    f"{ticc_measurement.ref_recv_mono:.9f}",
+                    f"{_qm:.4f}" if _qm is not None else '',
+                    f"{_qm_off:.4f}" if _qm_off is not None else '',
+                    f"{_ql:.4f}" if _ql is not None else '',
+                ])
+                _gpq_f = ctx.get('gnss_pps_qerr_log_file')
+                if _gpq_f is not None:
+                    _gpq_f.flush()
     if qerr_for_extts_pps_ns is None and n_epochs % 10 == 0:
         log.info("  [%s] qErr match miss (mono)", n_epochs)
     elif qerr_for_extts_pps_ns is not None and n_epochs % 10 == 0:
@@ -11924,6 +11988,18 @@ Two-phase operation:
     ticc.add_argument("--qerr-log-stride", type=int, default=1,
                       help="Decimation stride for --qerr-log.  1 = every "
                            "TIM-TP message (~1 Hz, default).  0 coerced to 1.")
+    ticc.add_argument("--gnss-pps-qerr-log", default=None,
+                      help="Fair F9T-SPP-vs-PPP comparison log (Main's ask + "
+                           "Bob's second-opinion bonus).  Per chB(GNSS-PPS-vs-"
+                           "Rb) edge: raw chB timestamp + TWO qErr columns — "
+                           "qerr_matched (mono-matched to THIS chB edge via "
+                           "match_pps_mono expected_offset 0.95s — the FIX for "
+                           "integer-ref_sec aliasing; chB-vs-Rb + qerr_matched "
+                           "= the de-sawtoothed F9T solution) and qerr_latest "
+                           "(the most-recent unmatched qErr = the latest-chi "
+                           "filter feed).  matched≈latest for ~all samples; a "
+                           "divergence is a direct off-by-edge alarm.  Needs a "
+                           "TIM-firmware F9T (qErr non-zero) + TICC chB.")
     ticc.add_argument("--extint-log", default=None,
                       help="Optional raw TIM-TM2 CSV log path for the "
                            "gnss-phase-experiment.  Each row captures "
