@@ -257,25 +257,47 @@ otcBob1 2026-06-23** (these addresses respond; OUTPUT_TDC_0 is configured).
 | OUTPUT_TDC_3 | 0xCD18 | 8 | unused (all 0) |
 | INPUT_TDC | 0xCD20 | 8 | input-TDC config (all 0 live) |
 
-**OUTPUT_TDC_CTRL_3** (Renesas clockgen prog. manual p290, 2023) — one byte
-selecting the two operands the Output TDC compares:
-- `TARGET_INDEX[7:4]`, `SOURCE_INDEX[3:0]`; each: `0x0–0x7`=DPLL0–7,
-  `0x8`=GPIO6, `0x9`=GPIO1, `0xA`=GPIO2, `0xB`=GPIO7.
-- A DPLL operand is measured via its **Master Sync** (9-FOD-cycle fixed delay
-  to the output). **Raw CLK inputs are NOT selectable** — to compare against
-  the F9T PPS (an input), present it as a DPLL Master Sync or wire it to a
-  GPIO. CTRL_4 = "configure output TDC" (bitfields not yet in hand).
-- ⚠️ CTRL_3 **offset within the 8-byte module not yet confirmed** — assumed
-  base+3 (0xCD03), but the live OUTPUT_TDC_0 has its non-zero bytes at
-  offsets 0,4,5,6, so the CTRL_0..7 layout needs the manual's adjacent pages
-  before trusting a write. **Still needed from Timebeat: CTRL_0/1/2/4 +
-  OUTPUT_TDC_CFG bitfields + the measurement-readout register & format.**
+**Full register definitions** — from the *8A3xxxx Family Programming Guide
+v49* (©2023-04-06; pp.285-291, §OUTPUT_TDC), publicly downloadable from
+renesas.com (no login). Archived: `gt:~/gt/datasheets/renesas-8a3xxxx-family-
+programming-guide-v49.pdf`. Companion: ClockMatrix TDC Manual R31UZ0005EU.
 
-**Status-module TDC readout** (live: `TDC_CFG_STATUS`@0xC0E8=0x02,
-`TDC0_STATUS`@0xC0E9=0x82, measurements all 0) — see "TDC measurement
-registers" under Status registers above; relationship to the OUTPUT_TDC_n
-modules (which TDC0..3_MEASUREMENT corresponds to which OUTPUT_TDC_n, or
-whether these are the per-DPLL Input TDCs) is not yet pinned.
+OUTPUT_TDC_n module register index (offset from module base, e.g. 0xCD00):
+
+| Off | Register | Fields |
+|-----|----------|--------|
+| 000h | OUTPUT_TDC_CTRL_0 | `SAMPLES[15:0]` — # samples to average (0 = 4096); one sample/100µs |
+| 002h | OUTPUT_TDC_CTRL_1 | `TARGET_PHASE_OFFSET[15:0]` signed ps — **alignment mode only** |
+| 004h | OUTPUT_TDC_CTRL_2 | `ALIGN_TARGET_MASK[7:0]` — **alignment mode only** (bit i = DPLLi) |
+| **005h** | OUTPUT_TDC_CTRL_3 | `TARGET_INDEX[7:4]` / `SOURCE_INDEX[3:0]`: 0–7=DPLL0–7, 8=GPIO6, 9=GPIO1, A=GPIO2, B=GPIO7 |
+| **006h** | OUTPUT_TDC_CTRL_4 | **TRIGGER byte**: `GO[0]`, `MODE[1]` (0=measure/1=align), `TYPE[2]` (0=single/1=continuous), `ALIGN_RESET[3]`, `DISABLE_MEASUREMENT_FILTER[7]` |
+
+A DPLL operand is measured via its **Master Sync** (fixed 9-FOD-cycle delay to
+the output). **Raw CLK inputs are NOT selectable** — to compare against the F9T
+PPS (a CLK input), present it as a DPLL Master Sync (a DPLL referencing it) or
+wire it to GPIO1/2.
+
+Global config `OUTPUT_TDC_CFG` (0xCCD0): GBL_0=000h `FAST_LOCK_ENABLE_DELAY`,
+GBL_1=002h `FAST_LOCK_DISABLE_DELAY`, **GBL_2=004h (0xCCD4)** = `ENABLE[0]`,
+`REF_SEL[1]` (0=XTAL,1=XO_DPLL); writing GBL_2 activates the module.
+
+Measurement readout `STATUS.OUTPUT_TDCn_MEASUREMENT` (n=0:0xC0F0, 1:0xC100,
+2:0xC108, 3:0xC110): **`PHASE[47:0]` = signed 48-bit integer in PICOSECONDS**
+(= sum/of/samples, one per 100µs). **Positive = target edge leads source.**
+Status: `OUTPUT_TDC_CFG_STATUS`@0xC0E8, `OUTPUT_TDCn_STATUS`@0xC0E9..EC.
+(Per-DPLL **Input TDC**/PFD phase is separate: `DPLLn_PHASE_STATUS`@0xC118+,
+signed 36-bit × 50 ps — what `clockmatrix_phase.py` reads.)
+
+**Measurement procedure (spare Output TDC):** subsystem already enabled by
+Timebeat (CFG GBL_2 = 0x03) → don't touch CFG; pick a spare module; write
+CTRL_0 (samples), CTRL_3 (target/source), then CTRL_4 with `MODE=0, GO=1`
+(writing CTRL_4 triggers); poll `OUTPUT_TDCn_STATUS`/read MEASUREMENT.
+
+**⚠️ Live: OUTPUT_TDC_0 is IN USE by Timebeat** — `0A 00 00 00 06 03 07 00`
+decodes to SAMPLES=10, ALIGN_TARGET_MASK=0x06 (DPLL1+DPLL2), CTRL_3 SOURCE=
+DPLL3, CTRL_4=0x07 (`GO+MODE=align+TYPE=continuous`) → continuously aligning
+DPLL1/DPLL2 outputs to DPLL3. **Use OUTPUT_TDC_1/2/3 (read all-zero = free)
+for measurement; do not disturb OUTPUT_TDC_0.**
 
 ### GPIO config bases (for "wire F9T PPS → GPIO" option)
 
