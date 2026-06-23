@@ -1,6 +1,17 @@
 # ClockMatrix Input TDC — TICC-free phase reference on Timebeat hardware
 
 **Status**: design / proposal (2026-06-17). Review before any hardware poking.
+
+> ⚠️ **2026-06-23 OTC/Mini correction.** This doc says "F9T PPS = CLK5"
+> throughout — that is the **Mini (ptBoat)** wiring. On the **OTC (otcBob1)**
+> the **F9T PPS is CLK2** (verified by live recon + a Timebeat data point;
+> CLK5 reads no-signal on the OTC). The two boards differ — do not
+> cross-apply CLK/DPLL assignments. Also: the OTC ClockMatrix is behind a
+> `pca954x` mux (0x58 on i2c-15 = mux ch0), and the "OUTPUT_1 25 MHz
+> CTRL_0=0x03=DPLL_3" claim below does NOT reproduce on the OTC (live read
+> gave OUTPUT1 CTRL_0=0x14; output→DPLL source-select decode is unconfirmed),
+> so **which DPLL drives the i226 25 MHz on the OTC is not yet positively
+> identified.** See `timebeat-otc-register-map.md` (updated 2026-06-23).
 **Prize (Bob, 2026-06-17)**: run the PePPAR-Fix servo on Timebeat OTC
 (Renesas 8A34002 ClockMatrix) with **no external dependencies** — specifically
 **no TICC**. A jumper wire on the board is acceptable; persuading Timebeat to

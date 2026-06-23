@@ -1,7 +1,17 @@
 # Renesas 8A34002 ClockMatrix Register Map
 
-**Date**: 2026-04-04
+**Date**: 2026-04-04 (updated 2026-06-23)
 **Status**: Confirmed via live I2C reads on ptBoat and otcBob1
+
+> ⚠️ **OTC vs Mini — DPLL and CLK-input assignments DIFFER between the two
+> hosts. Do NOT cross-apply.** `otcBob1` is an **Open Time Card (OTC)**;
+> `ptBoat` is an **OTC Mini PT**. They are different boards with different
+> wiring. The clearest known difference (verified 2026-06-23 + Timebeat
+> confirmation): **F9T PPS is on CLK2 on the OTC (otcBob1)** but **CLK5 on
+> the Mini (ptBoat)**. Earlier revisions of this doc listed a single
+> "confirmed" mapping for both — that conflated the two. Every host-specific
+> fact below is now labelled OTC or Mini; treat any unlabelled legacy claim
+> as suspect until re-verified on the specific board.
 
 ## Chip and register addressing
 
@@ -16,10 +26,22 @@ docs that assumed page-register addressing:
 
 ## I2C access method
 
+> **OTC (otcBob1) is behind a `pca954x` I2C mux** (verified 2026-06-23).
+> The mux sits at `1-0070` on the PCIe i2c-1; its 8 downstream channels are
+> the kernel virtual buses **i2c-15..i2c-22 = mux channels 0..7**. The
+> ClockMatrix (0x58) is on **channel 0 = i2c-15**. The kernel mux framework
+> auto-selects the channel when you open i2c-15, so no manual mux write is
+> needed — but the chip is NOT directly on i2c-1. (`smbus2.SMBus(15)` works.)
+> Access works with **timebeat stopped** — DPLL0/DPLL3 `MODE` read `0x00`
+> (PLL mode) which can look like a dead bus; validate against a register
+> known to be non-zero (e.g. DPLL1/DPLL2 `MODE = 0x20` synthesizer, or the
+> input monitors at 0xC044), not against MODE. Mini (ptBoat) historically
+> used bus 16; re-verify (mux topology may differ).
+
 ```python
 import smbus2
 
-bus = smbus2.SMBus(bus_num)  # 15 for otcBob1, 16 for ptBoat
+bus = smbus2.SMBus(bus_num)  # OTC otcBob1: 15 (= pca954x mux ch0); Mini ptBoat: 16
 addr = 0x58
 
 # Read: write 2-byte register address, then read
@@ -220,6 +242,48 @@ Value of -8192 at 1000ppb = no signal / saturated.
 | 6 | 0xCA80 | 8 |
 | 7 | 0xCA90 | 8 |
 
+## TDC subsystems — Output TDC & Input TDC
+
+Module base addresses from the mainline Linux `idt8a340_reg.h` (v5.15;
+removed in later kernels) — a primary source — and **verified live on
+otcBob1 2026-06-23** (these addresses respond; OUTPUT_TDC_0 is configured).
+
+| Module | Address | Size | Notes |
+|--------|---------|------|-------|
+| OUTPUT_TDC_CFG | 0xCCD0 | 8 | global Output-TDC config; live byte[4]=0x03 |
+| OUTPUT_TDC_0 | 0xCD00 | 8 | **configured live** (`0A 00 00 00 06 03 07 00`) |
+| OUTPUT_TDC_1 | 0xCD08 | 8 | unused (all 0) |
+| OUTPUT_TDC_2 | 0xCD10 | 8 | unused (all 0) |
+| OUTPUT_TDC_3 | 0xCD18 | 8 | unused (all 0) |
+| INPUT_TDC | 0xCD20 | 8 | input-TDC config (all 0 live) |
+
+**OUTPUT_TDC_CTRL_3** (Renesas clockgen prog. manual p290, 2023) — one byte
+selecting the two operands the Output TDC compares:
+- `TARGET_INDEX[7:4]`, `SOURCE_INDEX[3:0]`; each: `0x0–0x7`=DPLL0–7,
+  `0x8`=GPIO6, `0x9`=GPIO1, `0xA`=GPIO2, `0xB`=GPIO7.
+- A DPLL operand is measured via its **Master Sync** (9-FOD-cycle fixed delay
+  to the output). **Raw CLK inputs are NOT selectable** — to compare against
+  the F9T PPS (an input), present it as a DPLL Master Sync or wire it to a
+  GPIO. CTRL_4 = "configure output TDC" (bitfields not yet in hand).
+- ⚠️ CTRL_3 **offset within the 8-byte module not yet confirmed** — assumed
+  base+3 (0xCD03), but the live OUTPUT_TDC_0 has its non-zero bytes at
+  offsets 0,4,5,6, so the CTRL_0..7 layout needs the manual's adjacent pages
+  before trusting a write. **Still needed from Timebeat: CTRL_0/1/2/4 +
+  OUTPUT_TDC_CFG bitfields + the measurement-readout register & format.**
+
+**Status-module TDC readout** (live: `TDC_CFG_STATUS`@0xC0E8=0x02,
+`TDC0_STATUS`@0xC0E9=0x82, measurements all 0) — see "TDC measurement
+registers" under Status registers above; relationship to the OUTPUT_TDC_n
+modules (which TDC0..3_MEASUREMENT corresponds to which OUTPUT_TDC_n, or
+whether these are the per-DPLL Input TDCs) is not yet pinned.
+
+### GPIO config bases (for "wire F9T PPS → GPIO" option)
+
+`GPIO_USER_CONTROL`=0xC160; per-GPIO config blocks: GPIO_0=0xC8C2,
+**GPIO_1=0xC8D4, GPIO_2=0xC8E6**, GPIO_3=0xC900 … GPIO_7=0xC948 (18 bytes
+each). GPIO1/GPIO2 are externally exposed on the OTC and are valid Output-TDC
+operands (0x9 / 0xA) — the path for a raw PPS edge into the Output TDC.
+
 ## Other registers
 
 | Register | Address | Size |
@@ -230,26 +294,40 @@ Value of -8192 at 1000ppb = no signal / saturated.
 | OTP | 0xCF70 | ? |
 | BYTE | 0xCF80 | ? |
 
-## Clock input mapping (confirmed)
+## Clock input mapping — **OTC and Mini DIFFER**
 
-| Input | otcBob1 Signal | ptBoat Signal | Evidence |
-|-------|---------------|---------------|----------|
-| CLK2 | OCXO | OCXO | Only input with real freq data (-106 ppb on ptBoat, 0 ppb on otcBob1) |
-| CLK5 | F9T PPS | F9T PPS | DPLL_0/3 priority, active on both hosts |
-| CLK0 | ? (active on otcBob1) | inactive | |
-| CLK1 | ? (active on otcBob1) | inactive | |
-| CLK3 | OCXO-derived? (active on otcBob1) | inactive | DPLL_1/2 priority 0 |
+⚠️ Prior revisions listed one mapping "confirmed" for both hosts; that was a
+conflation. The two boards are wired differently.
+
+### OTC (otcBob1) — verified 2026-06-23 (live recon + Timebeat data point)
+
+| Input | OTC Signal | Evidence |
+|-------|-----------|----------|
+| **CLK2** | **F9T PPS** | Timebeat confirmation + live: CLK2 active (freq≈0), DPLL0/DPLL3 ref=CLK2, config `pps_clk=2` |
+| CLK5 | **dead** (no signal) | live: `-8192` = no signal/saturated on OTC (this is the *Mini's* F9T PPS input, not the OTC's) |
+| CLK0, CLK8, CLK10, CLK11 | active (roles TBD) | present in input monitors, freq≈0 |
+| CLK1, CLK3, CLK13 | present but unqualified | input-monitor nonzero, freq `-8192` |
+| OCXO | **input TBD on OTC** | NOT confirmed to be CLK2 (that was the old wrong claim); needs identification |
+
+### Mini (ptBoat) — prior recon
+
+| Input | Mini Signal | Evidence |
+|-------|------------|----------|
+| CLK5 | F9T PPS | DPLL3 locked to CLK5, PFD ~25.3 ns (ptBoat recon) |
+| CLK2 | OCXO | only input with real freq data (−106 ppb) |
+| others | inactive | only CLK2,5 active on the Mini |
 
 ## Host comparison
 
 | Aspect | otcBob1 (OTC SBC) | ptBoat (OTC Mini PT) |
 |--------|-------------------|----------------------|
-| I2C bus | 15 | 16 |
+| I2C bus | 15 (= pca954x mux **ch0**) | 16 |
+| F9T PPS input | **CLK2** (CLK5 dead) | **CLK5** (CLK2 = OCXO) |
 | Active inputs | 9 (CLK0,1,2,3,5,8,10,11,13) | 2 (CLK2,5) |
-| DPLL_0 | PLL/manual, holdover, ref=CLK2 | PLL, freerun |
-| DPLL_1 | PLL, freerun | PLL, freerun |
-| DPLL_2 | PLL, freerun | PLL, freerun |
-| DPLL_3 | PLL/manual, holdover, ref=CLK2 | PLL, freerun |
+| DPLL_0 | PLL, holdover, ref=CLK2 (2026-06-23) | PLL, freerun |
+| DPLL_1 | **synthesizer, freerun** (2026-06-23) | PLL, freerun |
+| DPLL_2 | **synthesizer, freerun** (2026-06-23) | PLL, freerun |
+| DPLL_3 | PLL, holdover, ref=CLK2; FCW actuator (steering disabled — feeds i226) | PLL, freerun |
 | Timebeat DCO | Active (freq_rho on DPLL_3) | Inactive (clkgen commented out) |
 | DPLL_3 PHASE_OFFSET | Live value (Timebeat steering) | Zero |
 | DPLL_0 PHASE_STATUS | Non-zero (measuring) | Zero |
