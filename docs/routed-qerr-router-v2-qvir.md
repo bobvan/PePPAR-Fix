@@ -1,6 +1,14 @@
 # Routed-qErr router v2 — qVIR-routed two-candidate
 
-**Status:** design. Successor to the merged v1 router (PR #79). Open
+> **RETIRED 2026-06-22 (retireQerrMatchingCode, I-064807).** The qVIR-gated
+> v2 router and the matched v1 router were removed from the runtime once the
+> comparative-gate latest-qErr path (latestQErrChiSelect) became the default
+> and only routed qErr path. qVIR survives only as an offline diagnostic
+> (`scripts/tdev_qerrab.py`, `scripts/proto_latest_qerr_chi.py`). This
+> document is kept for historical/design context only — it no longer
+> describes live code. See [`latest-qerr-chi-select.md`](latest-qerr-chi-select.md).
+
+**Status:** RETIRED (was: design). Successor to the merged v1 router (PR #79). Open
 question: drop the `internal` candidate? Raised by Charlie (#79 review,
 2026-05-28) and Main (#79 review, 2026-05-29 18:47); validated by my
 own routedQErrArm coupling finding. Validate any change in

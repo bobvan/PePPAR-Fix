@@ -1,10 +1,11 @@
 """Tests for the routedQErrArm per-edge TICC selector.
 
 Each TICC edge routes to one of {external-qErr, internal-qerr(x[0]),
-raw} based on chi².  External fires when well-correlated; a
-mis-correlated (tick-scale) external qErr falls through to raw; an
-F10T's uncorrelated qErr always routes to raw.  See dayplan
-routedQErrArm.
+raw} by the COMPARATIVE chi² gate (smallest chi² wins; the legacy
+absolute-gate and qVIR-v2 routers were retired in retireQerrMatchingCode
+I-064807).  External fires when well-correlated; a mis-correlated
+(tick-scale) external qErr falls through to int/raw; an F10T's
+uncorrelated qErr routes to raw.  See dayplan routedQErrArm.
 """
 import numpy as np
 import unittest
@@ -15,10 +16,10 @@ from peppar_fix.do_freq_est import DOFreqEst, _qerr
 def _f(routed=True, **kw):
     # sigma_do_phase=0.05 ns = the char-derived steady-state Q the
     # router is designed to operate in.  With the 0.92 ns default, Q
-    # re-inflates P[2,2] each predict to σ≈0.93 ns, where even a
-    # full-tick (8 ns) mismatch is only ~8.6σ (χ²≈74 < 100) and would
-    # be wrongly accepted — the router's tick-discrimination depends on
-    # the honest small Q (see qFromCharPerActuator coupling).
+    # re-inflates P[2,2] each predict to σ≈0.93 ns, where a wrong ext
+    # candidate's small R lets it beat raw — the router's tick-
+    # discrimination depends on the honest small Q (see
+    # qFromCharPerActuator coupling).
     defaults = dict(
         sigma_ticc_ns=0.060,
         sigma_do_phase_ns=0.05,

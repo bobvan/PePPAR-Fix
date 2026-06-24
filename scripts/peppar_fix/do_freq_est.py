@@ -95,37 +95,22 @@ class DOFreqEst:
                  max_step_ppb=None,
                  ocxo_trusted_gate=None,
                  routed_qerr=False,
-                 routed_qerr_v2=False,
-                 routed_qerr_comparative=False,
                  soft_ticc_gate=False):
         self.max_ppb = max_ppb
-        # routedQErrArm: per-edge chi² router for the TICC arm.  When
-        # enabled, each TICC edge is routed (priority-ordered) to ONE
-        # of three candidates — external-qErr-corrected, internal-
-        # qerr(x[0])-corrected, or raw — based on which is consistent.
-        # A mis-correlated external qErr is wrong by ~a tick = a
-        # conspicuous chi² outlier, so chi² IS the correlation-quality
-        # detector (no separate qVIR gate).  Default off preserves the
-        # single internal-qerr path.  See dayplan routedQErrArm.
+        # routedQErrArm (latestQErrChiSelect, docs/latest-qerr-chi-select.md):
+        # per-edge COMPARATIVE chi² router for the TICC arm.  When enabled,
+        # each TICC edge is routed to ONE of three candidates — external-qErr-
+        # corrected, internal-qerr(x[0])-corrected, or raw — by smallest chi²
+        # (a non-raw candidate wins only if it BEATS raw, not merely clears an
+        # absolute threshold).  The comparative gate is what makes the
+        # latest-unmatched qErr feed safe: an off-by-edge qErr is ~3.3 ns RMS
+        # → chi²≈17 at lock, which would PASS an absolute-100 gate and poison
+        # z, but loses to raw under the comparative gate.  Default off
+        # preserves the single internal-qerr path (the --no-qerr-latest-chi
+        # escape hatch).  The legacy absolute-gate v1 router and the qVIR-
+        # gated v2 router were retired in retireQerrMatchingCode (I-064807);
+        # qVIR survives only as an offline diagnostic.
         self._routed_qerr = routed_qerr
-        # routedQErrArm v2 (docs/routed-qerr-router-v2-qvir.md): drops
-        # the v1 'internal' candidate (H=[-1,0,-1,0], the rx-TCXO
-        # leakage path).  Two candidates only — 'ext' and 'raw', both
-        # H=[0,0,-1,0] — routed by the engine-side qVIR-vs-threshold
-        # decision (passed as `ticc_ext_correlated`) instead of v1's
-        # chi².  Mutually exclusive with v1 (engine raises if both
-        # flags are set).  See PR #98 design.
-        self._routed_qerr_v2 = routed_qerr_v2
-        # latestQErrChiSelect (docs/latest-qerr-chi-select.md): when set
-        # (with routed_qerr=True), _route_ticc_arm uses a COMPARATIVE gate
-        # — the ext candidate wins only if its chi² BEATS raw's, not merely
-        # clears the absolute _CHI2_GATE_THRESHOLD.  This is mandatory for
-        # the latest-unmatched qErr feed: an off-by-edge qErr is ~3.3 ns RMS
-        # → chi²≈17 at lock, which PASSES the absolute-100 gate and poisons
-        # z (servo_sim go/no-go: absolute+latest = 1.2× the no-qErr floor =
-        # HARM; comparative+latest = 0.75× = net benefit, no covariance
-        # collapse).  Pure argmin-chi2 (no margin) per the prototype.
-        self._routed_qerr_comparative = routed_qerr_comparative
         # softGateMidTau (I-092034): replace the Arm-4 chi² BINARY reject
         # with a soft R-inflation gate (R·max(1, χ²/K²), always admit).
         # Default off → byte-identical hard gate.  See the gate block in
@@ -521,20 +506,17 @@ class DOFreqEst:
                      uncorrected sub-tick qErr is ~uniform on
                      [-tick/2,+tick/2]).  Robust floor, always taken.
 
-        ABSOLUTE gate (default): try ext, then int, accept the first whose
-        chi² ≤ _CHI2_GATE_THRESHOLD; raw is the always-accepted floor.  A
-        mis-correlated external qErr is wrong by up to a half-tick sawtooth →
-        conspicuous chi² outlier vs the small external R → falls through.
-        Safe when ext is *matched* (almost always correct).
+        COMPARATIVE gate (latestQErrChiSelect): pick the candidate with the
+        SMALLEST chi² (a non-raw candidate must BEAT raw, not merely clear an
+        absolute threshold).  Mandatory for the latest-unmatched qErr feed: an
+        off-by-edge qErr (~3.3 ns RMS) lands at chi²≈17 ≪ 100, so an absolute
+        gate would ACCEPT it and poison z; the comparative gate routes it to
+        raw because raw's chi² is smaller.  Pure argmin (no margin) — see
+        docs/latest-qerr-chi-select.md and scripts/proto_latest_qerr_chi.py.
 
-        COMPARATIVE gate (``routed_qerr_comparative``, latestQErrChiSelect):
-        pick the candidate with the SMALLEST chi² (a non-raw candidate must
-        BEAT raw, not merely clear the absolute threshold).  Mandatory for the
-        latest-unmatched qErr feed: an off-by-edge qErr (~3.3 ns RMS) lands at
-        chi²≈17 ≪ 100, so the absolute gate would ACCEPT it and poison z; the
-        comparative gate routes it to raw because raw's chi² is smaller.  Pure
-        argmin (no margin) — see docs/latest-qerr-chi-select.md and the
-        scripts/proto_latest_qerr_chi.py go/no-go.
+        (The legacy absolute-gate path and the qVIR-gated v2 router were
+        removed in retireQerrMatchingCode I-064807; comparative is now the
+        only routing mode.)
         """
         H_x2 = np.array([[0.0, 0.0, -1.0, 0.0]])
 
@@ -549,71 +531,17 @@ class DOFreqEst:
             'raw', ticc_diff_ns, -x_pred[2], H_x2,
             R_base + (self.tick_ns ** 2) / 12.0))
 
-        if self._routed_qerr_comparative:
-            # Comparative: smallest chi² wins (argmin).  A non-raw candidate
-            # is selected only if it beats raw — otherwise raw is the floor.
-            best = None  # (chi2, tuple)
-            for cand in candidates:
-                name, z_eff, h_pred, H, R = cand
-                S = (H @ P_pred @ H.T).item() + R
-                chi2 = (z_eff - h_pred) ** 2 / S if S > 0 else 0.0
-                if best is None or chi2 < best[0]:
-                    best = (chi2, cand)
-            name, z_eff, h_pred, H, R = best[1]
-            return z_eff, h_pred, H, R, name
-
-        for name, z_eff, h_pred, H, R in candidates:
+        # Comparative: smallest chi² wins (argmin).  A non-raw candidate
+        # is selected only if it beats raw — otherwise raw is the floor.
+        best = None  # (chi2, tuple)
+        for cand in candidates:
+            name, z_eff, h_pred, H, R = cand
             S = (H @ P_pred @ H.T).item() + R
-            innov = z_eff - h_pred
-            chi2 = innov ** 2 / S if S > 0 else 0.0
-            if name == 'raw' or chi2 <= _CHI2_GATE_THRESHOLD:
-                return z_eff, h_pred, H, R, name
-        # Unreachable (raw always accepted) but keep the contract total.
-        name, z_eff, h_pred, H, R = candidates[-1]
+            chi2 = (z_eff - h_pred) ** 2 / S if S > 0 else 0.0
+            if best is None or chi2 < best[0]:
+                best = (chi2, cand)
+        name, z_eff, h_pred, H, R = best[1]
         return z_eff, h_pred, H, R, name
-
-    def _route_ticc_arm_v2(self, x_pred, ticc_diff_ns, ticc_qerr_ns,
-                           ticc_ext_correlated, R_base):
-        """Two-candidate qVIR-routed TICC selector — routedQErrArm v2
-        (docs/routed-qerr-router-v2-qvir.md, PR #98).
-
-        Returns ``(z_eff, h_pred, H, R, name)`` for the chosen
-        candidate.  Drops v1's 'internal' candidate entirely (its
-        H=[-1,0,-1,0] is the rx-TCXO leakage path the router was
-        designed to bypass).  Both candidates use H=[0,0,-1,0] — no
-        x[0] coupling — so neither bleeds rx-TCXO noise into z_ticc.
-
-          external — z = ticc_diff + ext_qerr, h = -x[2],
-                     R = R_base.  Chosen when the caller (engine) says
-                     the qVIR window says qErr is correlated right now
-                     (qVIR > 1.5 litmus, per Main #98 review use
-                     servo_ctx['qvir'] / ticc qVIR window — single
-                     source of truth, decided engine-side).
-          raw      — z = ticc_diff, h = -x[2],
-                     R = R_base + tick²/12 (sawtooth variance; the
-                     uncorrected sub-tick qErr is ~uniform on
-                     [-tick/2, +tick/2]).  Robust floor.
-
-        Bootstrap (qVIR window not yet full → ticc_ext_correlated
-        False) defaults to raw — the always-safe candidate.  Per Main
-        #98 review the bootstrap window-not-full latency is acceptable
-        (the actuator is in initial-acquisition during that window
-        anyway); confirm no bootstrap-convergence-time regression
-        vs v1 in the sim A/B.
-
-        No chi² inside the router (the v1 filter-state coupling we
-        explicitly removed).  No 'internal' candidate to fall through
-        to — the legacy non-routed code path (default, no flag) still
-        runs the v1 internal model and decommissions in lockstep with
-        v1 once v2 becomes default (PR #98 long-term migration plan).
-        """
-        H_x2 = np.array([[0.0, 0.0, -1.0, 0.0]])
-        h_pred = -x_pred[2]
-        if ticc_ext_correlated and ticc_qerr_ns is not None:
-            return (ticc_diff_ns + ticc_qerr_ns, h_pred, H_x2, R_base,
-                    'ext')
-        return (ticc_diff_ns, h_pred, H_x2,
-                R_base + (self.tick_ns ** 2) / 12.0, 'raw')
 
     def update(self, *,
                dt=1.0,
@@ -624,8 +552,7 @@ class DOFreqEst:
                ticc_diff_ns=None, ticc_sigma_ns=None,
                pseudo_phase_ns=None, pseudo_phase_sigma_ns=None,
                ticc_qerr_ns=None,
-               distance_to_lock=None,
-               ticc_ext_correlated=False):
+               distance_to_lock=None):
         """Process one epoch with up to six conditional measurement arms.
 
         Per docs/dofreq-est-measurement-ladder.md and
@@ -831,20 +758,7 @@ class DOFreqEst:
             tick_third = self.tick_ns / 3.0
             R_lin = ((self.tick_ns / 2.0) ** 2 *
                      min(1.0, (sigma_x0 / tick_third) ** 2))
-            if self._routed_qerr_v2:
-                # v2: two-candidate, qVIR-routed (engine-side decision
-                # via ticc_ext_correlated).  No 'internal' candidate
-                # by design.
-                z_eff, h_pred, H_ticc, R_scalar, _routed = \
-                    self._route_ticc_arm_v2(
-                        x_pred, ticc_diff_ns, ticc_qerr_ns,
-                        ticc_ext_correlated, R_base)
-                self.last_ticc_route = _routed
-                if _routed == 'ext':
-                    self.n_route_ext += 1
-                else:  # 'raw' (no 'int' in v2)
-                    self.n_route_raw += 1
-            elif self._routed_qerr:
+            if self._routed_qerr:
                 z_eff, h_pred, H_ticc, R_scalar, _routed = \
                     self._route_ticc_arm(x_pred, P_pred, ticc_diff_ns,
                                          ticc_qerr_ns, R_base, R_lin)

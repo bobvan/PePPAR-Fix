@@ -89,7 +89,9 @@ class RouteCounterIncrementTest(unittest.TestCase):
         self.assertEqual(f.n_route_raw, 0)
 
     def test_counters_accumulate_over_epochs(self):
-        # Clean-ext sequence: every epoch routes to 'ext'.
+        # Clean-ext sequence: counters accumulate one per epoch.  Both 'ext'
+        # and 'int' are perfect fits here (χ²≈0), so the comparative (argmin)
+        # gate may pick either — but it never falls to 'raw' on clean data.
         f = _f()
         for _ in range(5):
             f.x = np.array([2.5, 0.0, -10.0, 0.0])  # reset to sub-tick=2.5
@@ -97,7 +99,8 @@ class RouteCounterIncrementTest(unittest.TestCase):
                      ticc_sigma_ns=0.060)
         total = f.n_route_ext + f.n_route_int + f.n_route_raw
         self.assertEqual(total, 5)
-        self.assertEqual(f.n_route_ext, 5)
+        self.assertEqual(f.n_route_raw, 0)
+        self.assertEqual(f.n_route_ext + f.n_route_int, 5)
 
     def test_no_increment_when_no_ticc_update(self):
         # An epoch without ticc_diff_ns doesn't go through the router.

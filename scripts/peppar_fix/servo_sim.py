@@ -236,31 +236,15 @@ class SimConfig:
 
     # routedQErrArm (bravo PR #79).  When True, the sim emits an
     # external-qErr stream alongside TICC (modelling the F9T's TIM-TP
-    # sub-tick report) and DOFreqEst's per-edge chi² router picks
-    # 'ext'/'int'/'raw' per epoch.  ext_qerr_noise_ns models the
+    # sub-tick report) and DOFreqEst's per-edge COMPARATIVE chi² router
+    # picks 'ext'/'int'/'raw' per epoch.  ext_qerr_noise_ns models the
     # receiver-specific quality of that report: ~0.1 ns for F9T (clean
     # → 'ext' wins), ~3 ns for F10T (noisy → router falls back to
     # 'raw').  Default off preserves the single internal-qerr path.
+    # (The matched qVIR-v2 router this once also exercised was retired in
+    # retireQerrMatchingCode I-064807; routed_qerr is now comparative-only.)
     routed_qerr_enabled: bool = False
     ext_qerr_noise_ns: float = 0.1
-
-    # routedQErrArm v2 (bravo PR #110): two-candidate qVIR-routed router
-    # (drop 'internal').  Sets DOFreqEst(routed_qerr_v2=True) and passes
-    # ticc_ext_correlated per epoch.  ticc_ext_correlated_override allows
-    # the test to force the routing decision; when None the sim auto-
-    # derives correlated = (ext_qerr_noise_ns < 1.0 ns) — a proxy for
-    # qVIR > 1.5 (F9T-clean ~0.1 ns → True; F10T-noisy ~3 ns → False;
-    # pathological ~8 ns → False).  The engine computes qVIR from a
-    # running-variance pair; the proxy preserves the route-distribution
-    # contrast without rebuilding the variance machinery in the sim.
-    # Host-realistic noise values sit well above or below the 1.0 ns
-    # proxy boundary (F9T 0.1, F10T 3.0, pathological 8.0) so the
-    # auto-derived correlated flag matches each regime decisively; use
-    # ticc_ext_correlated_override for finer pinning between regimes.
-    # Mutually exclusive with routed_qerr_enabled (v1) — enforced in
-    # __post_init__.
-    router_v2_enabled: bool = False
-    ticc_ext_correlated_override: Optional[bool] = None
 
     # Actuator (PHC adjfine / DAC) quantization step in ppb.  The servo
     # commands a continuous adjfine; the hardware applies the nearest
@@ -320,12 +304,6 @@ class SimConfig:
 
     # Label for logs/plots.
     label: str = "sim"
-
-    def __post_init__(self):
-        if self.routed_qerr_enabled and self.router_v2_enabled:
-            raise ValueError(
-                "routed_qerr_enabled (v1) and router_v2_enabled are mutually "
-                "exclusive; the engine routes via a single DOFreqEst flag")
 
 
 @dataclass
@@ -441,7 +419,6 @@ class ClosedLoopSim:
             max_step_ppb=cfg.max_step_ppb,
             ocxo_trusted_gate=gate,
             routed_qerr=cfg.routed_qerr_enabled,
-            routed_qerr_v2=cfg.router_v2_enabled,
             soft_ticc_gate=cfg.soft_ticc_gate)
         self.adjfine = cfg.initial_freq_ppb
         # Binary layer for the gross-fault A/B (#107 consumption).
@@ -562,21 +539,11 @@ class ClosedLoopSim:
             m["ticc_sigma_ns"] = c.sigma_ticc_ns
             # External qErr stream — the F9T/F10T's TIM-TP report of
             # its own sub-tick at this edge.  qerr() of the actual edge
-            # plus receiver-specific reporting noise.  Both v1
-            # (routed_qerr_enabled) and v2 (router_v2_enabled) consume it.
-            if c.routed_qerr_enabled or c.router_v2_enabled:
+            # plus receiver-specific reporting noise.  Consumed by the
+            # comparative router (routed_qerr_enabled).
+            if c.routed_qerr_enabled:
                 m["ticc_qerr_ns"] = (_qerr(edge, c.tick_ns)
                                      + rng.normal(0.0, c.ext_qerr_noise_ns))
-            # v2 also needs the qVIR-decided ticc_ext_correlated flag.
-            # The engine derives it from a running-variance window; the
-            # sim proxies with the override (if set) or a noise-magnitude
-            # heuristic (ext_noise < 1 ns ≈ correlated, else not).
-            if c.router_v2_enabled:
-                if c.ticc_ext_correlated_override is not None:
-                    m["ticc_ext_correlated"] = bool(
-                        c.ticc_ext_correlated_override)
-                else:
-                    m["ticc_ext_correlated"] = (c.ext_qerr_noise_ns < 1.0)
         return m
 
     def run(self) -> SimResult:
