@@ -177,27 +177,27 @@ def main():
 
     BXR = IXC + IW / 2                                    # box right edge = 5.0
     # broadcast + precise corr -> precise-satellite merge node
-    mnode = (6.15, 2.85)
-    box(ax, mnode[0], mnode[1], 1.5, 1.05,
+    mnode = (6.22, 2.85)
+    box(ax, mnode[0], mnode[1], 1.84, 1.1,
         "Precise satellite\norbit · clock · biases\n(broadcast + SSR)", C_MERGE,
-        fs=10, weight="bold", lw=2.0)
-    feed(ax, (BXR, 3.30), (mnode[0] - 0.75, 3.10), C_BC)
-    feed(ax, (BXR, 2.40), (mnode[0] - 0.75, 2.55), C_SSR)
-    ax.text(5.22, 2.85, "+", ha="center", va="center", fontsize=22,
+        fs=9.5, weight="bold", lw=2.0)
+    feed(ax, (BXR, 3.30), (mnode[0] - 0.92, 3.10), C_BC)
+    feed(ax, (BXR, 2.40), (mnode[0] - 0.92, 2.55), C_SSR)
+    ax.text(5.18, 2.85, "+", ha="center", va="center", fontsize=22,
             weight="bold", color="#6c3483", zorder=6)
 
-    bus_xp = 7.05
+    bus_xp = 7.28
     ax.plot([bus_xp, bus_xp], [1.25, 4.20], color="#888", lw=2.2, zorder=1)
     feed(ax, (BXR, 4.20), (bus_xp, 4.20), C_OBS)
-    feed(ax, (mnode[0] + 0.75, 2.85), (bus_xp, 2.85), C_MERGE)
+    feed(ax, (mnode[0] + 0.92, 2.85), (bus_xp, 2.85), C_MERGE)
     feed(ax, (BXR, 1.25), (bus_xp, 1.25), C_ADV)
-    box(ax, 8.95, 2.60, 3.2, 1.65,
+    box(ax, 9.10, 2.60, 3.2, 1.65,
         "Sequential PPP filter  (Kalman)\nposition · clock · ZTD ·\n"
         "ambiguities  (float → fixed)", C_EST, fs=11.5, weight="bold", lw=2.2)
-    arrow(ax, (bus_xp, 2.60), (7.35, 2.60))
-    box(ax, 12.50, 2.60, 2.8, 1.25, "Precise clock & time\n≈ cm · sub-ns",
+    arrow(ax, (bus_xp, 2.60), (7.50, 2.60))
+    box(ax, 12.60, 2.60, 2.8, 1.25, "Precise clock & time\n≈ cm · sub-ns",
         C_OUT_PPP, fs=13.5, weight="bold", lw=2.4)
-    arrow(ax, (10.55, 2.60), (11.1, 2.60))
+    arrow(ax, (10.70, 2.60), (11.20, 2.60))
 
     # convergence-time feedback loop (output -> input through a clock)
     ax.plot([9.85, 9.85], [1.78, 1.15], color=C_LOOP, lw=2.2, zorder=4)
