@@ -24,6 +24,103 @@ engineering (`timebeat-otc-register-map.md`, `timebeat-integration-paths.md`,
 `timebeat-status-2026-04-06.md`, memory `project_8a34012_register_map`).
 
 
+## Loopback wire plan — THE VALIDATED PATH (2026-06-24)
+
+Exhaustive on-chip testing on the OTC's DO (DPLL3, otcBob1, 2026-06-23/24)
+settles it: **a single DPLL channel cannot be software-steered AND yield a
+usable phase error at the same time.** One jumper wire is required. Below: why,
+the exact recipe, the servo architecture, and bring-up.
+
+### Why the wire is required — the no-wire single-DPLL space is exhausted
+
+The chip enforces a **measure-vs-steer separation**. `PHASE_STATUS` (the PFD,
+input-vs-own-output) is a live, usable error **only** in an actively-measuring
+PLL state — exactly when the *hardware* loop owns the frequency. Every way to
+open the loop for software steering kills the phase reading (all measured on
+DPLL3, `PLL_MODE`=PLL except the FCW row):
+
+| channel state | PHASE_STATUS | software-steerable? |
+|---|---|---|
+| PLL / auto (locked) | live, clean ~50 ps sawtooth | **no** — hardware owns freq |
+| `write_freq` (FCW) mode | fixed **−409 µs** artifact | yes (FCW) but no usable phase |
+| PLL / `force_freerun` (state=010) | **zeroed** (constant 0) | no |
+| PLL / `force_holdover` + manual val (state=011) | **frozen** at entry value | no (manual value inert) |
+| PLL / auto + BW≈0 (1 µHz) | live sawtooth | FCW register **inert** in auto |
+
+Extra: in auto on the OTC, the hardware loop reads **holdover** lock-status with
+`FILTER_STATUS=0` (even with `FILTER_STATUS_UPDATE_EN=1`, `SELECT=delta_freq`) —
+i.e. **Timebeat disciplines DPLL3 in software**, so there is no hardware
+"auto-FCW" to read either. Net: no single-channel, no-wire way to do
+"open loop + steer + read phase." This is exactly what the field works around
+with **external** phase (OCP Time Card loops 1 PPS OUT → NIC 1 PPS IN; `ts2phc`
+timestamps it; the Renesas-blessed pattern is DCO mode + external servo).
+
+### The wire
+
+**One jumper: the disciplined `PPS OUT` → a spare `CLK` input.** Then the
+**Input TDC** (a DPLL's PFD in *phase-measurement* mode) compares the two
+same-frequency 1 PPS signals — **GPS (F9T) vs the real physical output** —
+giving the servo error directly, on-chip, no TICC. This is the on-chip analog
+of the OCP Time Card's "1 PPS OUT → NIC 1 PPS IN."
+
+- **OTC (otcBob1):** F9T PPS is already **CLK2** (needs no wire). Wire
+  **PPS OUT → a spare CLK input** — **CLK5 reads dead/free** on the OTC (prime
+  candidate), or any unused CLKn.
+- **Mini (ptBoat):** F9T PPS is **CLK5**; spare-CLK + connector exposure are
+  unverified — recon the Mini before wiring (do NOT assume OTC values).
+
+### Register recipe (OTC; DPLL3-class addresses)
+
+**Measurement channel** — a **spare** DPLL (not the 25 MHz synth DPLL; not the
+DO if it's the one being steered):
+- `MODE` (DPLL+0x37): `PLL_MODE=5` (phase_measurement) → byte **0x28**.
+- `PHASE_MEASUREMENT_CFG` (DPLL+0x36): `PFD_REF_CLK_SEL = CLK2` (F9T),
+  `PFD_FB_CLK_SEL = CLK_loopback` (PPS OUT). Confirm byte layout by read-back.
+- Read `PHASE_STATUS` (DPLL3 = **0xC130**), signed 36-bit × **50 ps** = the
+  GPS-vs-real-output error.
+- High-precision (**0.39 ps**, optional): enable via
+  `DPLL_FILTER_STATUS_UPDATE_CFG` (DPLL+0x06: `UPDATE_EN[2]=1`) + set the
+  `tdc_clk` divider (0xCD20–0xCD24) so it is **not** an integer multiple of 1 Hz,
+  then read `FILTER_STATUS` (DPLL3 = **0xC098**) as signed 48-bit × 50/128 ps.
+
+**Steering channel** — the DO (**DPLL3**) in `write_freq` mode (the TICC-proven
+FCW actuator):
+- `MODE` `write_freq` (`pll_mode=2` → **0x10**); FCW via `DPLL_FREQ` (DPLL3 =
+  **0xC850**), 42-bit signed FFO × 2⁻⁵³ (≈ ppb × 2⁵³/1e9).
+
+**Servo:** read the measurement channel's `PHASE_STATUS` (GPS − real output) →
+write the DO channel's FCW. Two channels — one measures, one steers — **no
+external TICC**.
+
+### Calibration (Bob's constant-offset point)
+The wire path (PPS OUT pad → jumper → CLK input buffer) adds a **fixed** delay.
+Calibrate it once against an external reference (a TICC, one time) and subtract;
+it does not drift with discipline.
+
+### Resolution reality
+The F9T PPS / real-output edges carry ~ns of their own noise — far above the
+50 ps Phase-Status floor (let alone 0.39 ps). So the win is **removing the
+external box**, not better resolution. 50 ps Phase Status is plenty for
+GPS-vs-PPS; high-precision Filter Status is available but unnecessary here.
+
+### Bring-up
+- **P0 (done):** register map + no-wire dead-ends + STATE_MODE map → confirms
+  the wire is necessary.
+- **P1:** add the jumper (PPS OUT → spare CLK IN); configure the measurement
+  DPLL (phase_meas, REF=CLK2 / FB=loopback); read `PHASE_STATUS` =
+  GPS-vs-output; close the FCW loop from it onto DPLL3. **No TICC in the loop.**
+- **P2:** high-precision Filter Status; cross-check vs an external TICC once;
+  then run TICC-free.
+- **P3:** productize as a ClockMatrix phase-observer arm in the engine (sibling
+  to TICC/EXTINT/TDCP); request the jumper on future Timebeat boards.
+
+**Safety:** experiment on **DPLL3 = the DO** — validated safe to mode-swing
+(it is NOT the i226 25 MHz, which is a *separate* synth DPLL sharing only global
+settings; mode-swinging + FCW-railing DPLL3 did not drop the host). Don't touch
+global/CFG registers or the 25 MHz synth DPLL.
+
+---
+
 ## 2026-06-21 — Timebeat pushback + P0 result (tie-breaker)
 
 Timebeat pushed back on two points: (1) "I can't write FCW while reading a
