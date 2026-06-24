@@ -285,8 +285,22 @@ Measurement readout `STATUS.OUTPUT_TDCn_MEASUREMENT` (n=0:0xC0F0, 1:0xC100,
 2:0xC108, 3:0xC110): **`PHASE[47:0]` = signed 48-bit integer in PICOSECONDS**
 (= sum/of/samples, one per 100µs). **Positive = target edge leads source.**
 Status: `OUTPUT_TDC_CFG_STATUS`@0xC0E8, `OUTPUT_TDCn_STATUS`@0xC0E9..EC.
-(Per-DPLL **Input TDC**/PFD phase is separate: `DPLLn_PHASE_STATUS`@0xC118+,
-signed 36-bit × 50 ps — what `clockmatrix_phase.py` reads.)
+
+**RESOLUTION — Output TDC ≠ 50 ps measurement; Input TDC IS** (measured
+2026-06-23, otcBob1). The "50 ps" associated with the **Output** TDC is its
+*fixed alignment threshold* (TDC Manual R31UZ0005EU §2.9: "TDC mechanism only
+adjusts … when it drifts by more than 50ps. The 50ps threshold is fixed"), NOT
+a measurement step. The Output TDC is an **alignment** engine; its measurement
+mode is **~2 ns single-sample** (one ref-clock period — live DPLL3-vs-DPLL0 read
+only 0/2000/4000 ps), improvable only by **`SAMPLES` averaging** (slow: ~N s at a
+1 Hz Master Sync). The high-resolution **measurement** instrument is the
+**Input TDC** (a DPLL's PFD): `DPLLn_PHASE_STATUS`@0xC118+ reads on a **50 ps
+grid** (signed 36-bit × 50 ps — verified: every PFD sample a multiple of 50 ps,
+tracing the ~8 ns F9T sawtooth), and `DPLLn_FILTER_STATUS`@0xC080+ gives the
+high-precision path (× 50/128 = **0.39 ps**; needs the `tdc_clk` divider set so
+it's not an integer multiple of the input). 625 MHz default TDC clock.
+**For 50 ps / sub-ps F9T-vs-output: use the Input TDC with PPS OUT looped to a
+spare CLK input — NOT two GPIOs into the Output TDC.**
 
 **Measurement procedure (spare Output TDC):** subsystem already enabled by
 Timebeat (CFG GBL_2 = 0x03) → don't touch CFG; pick a spare module; write

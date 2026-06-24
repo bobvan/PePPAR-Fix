@@ -93,7 +93,7 @@ phase_meas, retest and drop the jumper.**
 |---|---|---|
 | What it is | any DPLL channel's **PFD** | dedicated unit (×4) |
 | Measures between | two **input clocks `CLKn`**, same frequency | two **DPLL outputs**, or a DPLL output vs **GPIO1/2/6/7** |
-| Resolution | 50 ps (phase_status); **0.39 ps** (filter_status, high-precision) | 50 ps |
+| Resolution | 50 ps (phase_status); **0.39 ps** (filter_status, high-precision) | **~2 ns single-sample** (avg'able via SAMPLES, slow). "50 ps" = its *alignment threshold*, NOT measurement res — verified 2026-06-23 |
 | Right for us | **GPS PPS (CLK5) vs disciplined-output PPS** | output-to-output skew |
 
 We were fighting the **Output** TDC. The correct tool for a PPS-on-an-input is
