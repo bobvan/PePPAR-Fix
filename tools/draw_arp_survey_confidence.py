@@ -99,6 +99,8 @@ def main():
     ap.add_argument("--antennas-json", default=DEFAULT_JSON)
     ap.add_argument("--out-dir", default=".")
     ap.add_argument("--out-name", default="arp_survey_confidence")
+    ap.add_argument("--scale-mm", type=float, default=None,
+                    help="force panel half-range (mm) so multiple slides share one scale")
     args = ap.parse_args()
 
     with open(args.antennas_json) as f:
@@ -106,7 +108,12 @@ def main():
     e = db[args.uid]
     lat, lon, alt = e["lat"], e["lon"], e["alt_m"]
     sig = e["across_day_sigma_mm"]
-    sNS, sEW, sV = sig["lat"], sig["lon"], sig["alt"]      # mm
+    # N/S, E/W, vertical 1σ (mm).  Prefer explicit local lat/lon; otherwise fall
+    # back to the published ECEF X/Y spreads (the same N/S←X, E/W←Y mapping the
+    # antennas.json uses for ufo1).  alt is always the local vertical.
+    sNS = sig.get("lat", sig.get("X"))
+    sEW = sig.get("lon", sig.get("Y"))
+    sV = sig["alt"]
 
     # mm -> deg for the cardinal-point LLA labels
     dlat = (sNS / 1000.0) / M_PER_DEG_LAT
@@ -126,7 +133,7 @@ def main():
 
     plt.rcParams.update({"font.size": 12})
     fig, (axL, axR) = plt.subplots(1, 2, figsize=(16, 9))
-    L = max(sNS, sEW, sV) + 3.2                            # shared half-range, mm
+    L = args.scale_mm or (max(sNS, sEW, sV) + 3.2)         # shared half-range, mm
     _panel(axL, L); _panel(axR, L)
 
     # ════ LEFT: plan view ═══════════════════════════════════════════════════
@@ -201,24 +208,40 @@ def main():
 
     frame = e.get("frame", "").replace("@", " @ ")
     method = e.get("method", "")
-    ant = e.get("antenna", "")
+    ant = e.get("antenna", "").split("(")[0].split("—")[0].strip().replace(" NONE", "")
     cc = e.get("cross_check", {})
-    pride = next((v.get("horiz_mm") for k, v in cc.items() if "PRIDE" in k), None)
-    f9p = next((v.get("horiz_mm") for k, v in cc.items() if "F9P" in k), None)
+    caveat = e.get("antenna_calibration_caveat")
+
+    def _xc(token, keys):
+        for k, v in cc.items():
+            if token in k and isinstance(v, dict):
+                for kk in keys:
+                    if kk in v:
+                        return v[kk]
+        return None
+    pride = _xc("PRIDE", ["horiz_mm", "itrf_3d_mm_diff_C", "itrf_3d_mm_diff_B"])
+    f9p = _xc("F9P", ["horiz_mm", "horiz_3d_mm_diff"])
     xchk = []
     if pride is not None:
-        xchk.append(f"PRIDE PPP-AR {pride:g} mm horiz")
+        xchk.append(f"PRIDE PPP-AR {pride:g} mm")
     if f9p is not None:
-        xchk.append(f"F9P CORS-RTK {f9p:g} mm horiz")
+        xchk.append(f"F9P CORS-RTK {f9p:g} mm")
+    cal_note = "" if caveat else " (NGS-calibrated PCO/PCV)"
+    n_runs = len(e.get("source_runs", [])) or 6
     prov = (f"{frame}  ·  {method}  ·  Leica GRX1200 GG Pro reference + "
-            f"{ant} (NGS-calibrated PCO/PCV)\n"
-            f"1σ = across-day spread of 6 × 24 h OPUS-Static solutions  "
+            f"{ant} antenna{cal_note}\n"
+            f"1σ = across-day spread of {n_runs} × 24 h OPUS-Static solutions  "
             f"(N/S {sNS:.2f} mm, E/W {sEW:.2f} mm, vertical {sV:.2f} mm)"
             + ("   ·   cross-checks: " + ", ".join(xchk) if xchk else ""))
-    fig.text(0.5, 0.045, prov, ha="center", va="center", fontsize=11,
-             color="#333")
+    fig.text(0.5, 0.062, prov, ha="center", va="center", fontsize=11, color="#333")
+    if caveat:
+        fig.text(0.5, 0.018,
+                 "Note: un-calibrated antenna (OPUS applied SFESPK6618H NONE antex) — "
+                 "across-day precision shown here; a constant ΔPCO accuracy bias is "
+                 "absorbed into the ARP.",
+                 ha="center", va="center", fontsize=9.5, color="#777", style="italic")
 
-    fig.tight_layout(rect=[0, 0.085, 1, 0.89])
+    fig.tight_layout(rect=[0, 0.135, 1, 0.89])
     os.makedirs(args.out_dir, exist_ok=True)
     out = os.path.join(args.out_dir, args.out_name)
     fig.savefig(out + ".pdf"); fig.savefig(out + ".png", dpi=200)
