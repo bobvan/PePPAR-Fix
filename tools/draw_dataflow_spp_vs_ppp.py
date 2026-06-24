@@ -109,7 +109,7 @@ def main():
     ax.set_xlim(0, 16); ax.set_ylim(0, 9); ax.axis("off")
 
     # ── title + colour legend ───────────────────────────────────────────────
-    ax.text(8.0, 8.72, "Two data flows, one antenna — SPP vs PPP",
+    ax.text(8.0, 8.72, "Two data flows — SPP vs PPP",
             ha="center", va="center", fontsize=25, weight="bold")
     legend = [(C_OBS, "observations (shared)"),
               (C_BC, "broadcast nav (shared)"),
