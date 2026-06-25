@@ -35,8 +35,20 @@ docs that assumed page-register addressing:
 > Access works with **timebeat stopped** — DPLL0/DPLL3 `MODE` read `0x00`
 > (PLL mode) which can look like a dead bus; validate against a register
 > known to be non-zero (e.g. DPLL1/DPLL2 `MODE = 0x20` synthesizer, or the
-> input monitors at 0xC044), not against MODE. Mini (ptBoat) historically
-> used bus 16; re-verify (mux topology may differ).
+> input monitors at 0xC044), not against MODE.
+>
+> **⭐ OTC-vs-Mini runtime probe (confirmed 2026-06-25):** both boards are CM5
+> with the *identical* pca954x mux at `1-0070` and the same i2c-15..22 virtual
+> buses — BUT the ClockMatrix is wired to a **different mux channel**:
+> **OTC (otcBob1) = i2c-15 (mux ch0)**, **Mini (ptBoat) = i2c-16 (mux ch1)**
+> (both at addr 0x58). This is a PCB-wiring difference (hardware-rooted, stable),
+> so the cleanest runtime board-type probe is: **0x58 answers on i2c-15 ⇒ OTC,
+> on i2c-16 ⇒ Mini.** (No HAT EEPROM / device-tree field distinguishes them.)
+> Secondary chip-config confirmations: DPLL3 (the DO on both) references
+> **CLK2 on OTC vs CLK5 on Mini** (= the F9T PPS input); active-input count is
+> 9 (OTC) vs 2 (Mini: CLK2=OCXO, CLK5=F9T). Combo setup is identical on both
+> (all DPLLs COMBO_SLAVE_CFG_0=0x28, SRC_ID=8 SW-combo) so the combo servo
+> ports to the Mini (DPLL3, ref CLK5).
 
 ```python
 import smbus2
@@ -357,7 +369,7 @@ conflation. The two boards are wired differently.
 
 | Aspect | otcBob1 (OTC SBC) | ptBoat (OTC Mini PT) |
 |--------|-------------------|----------------------|
-| I2C bus | 15 (= pca954x mux **ch0**) | 16 |
+| I2C bus | 15 (= pca954x mux **ch0**) | **16 (= pca954x mux ch1)** — confirmed 2026-06-25; the clean OTC/Mini probe |
 | F9T PPS input | **CLK2** (CLK5 dead) | **CLK5** (CLK2 = OCXO) |
 | Active inputs | 9 (CLK0,1,2,3,5,8,10,11,13) | 2 (CLK2,5) |
 | DPLL_0 | PLL, holdover, ref=CLK2 (2026-06-23) | PLL, freerun |
