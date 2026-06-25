@@ -38,8 +38,12 @@ ok "git working tree ($(git branch --show-current 2>/dev/null) @ $(git rev-parse
 # Timebeat hosts they also waste scarce space (otcBob1: peppar-fix-old 97M +
 # peppar_venv 28M found 2026-06-25).
 for stray in "$HOME"/peppar* "$HOME"/PePPAR* "$HOME/git/PePPAR-Fix"; do
-  [ -e "$stray" ] && [ "$stray" != "$REPO" ] && \
+  [ -d "$stray" ] && [ "$stray" != "$REPO" ] || continue
+  # Only flag actual repo/venv COPIES — a .git, a scripts/peppar_fix tree, or a
+  # venv (pyvenv.cfg).  Skips legit data dirs (e.g. peppar-survey-data/raw).
+  if [ -d "$stray/.git" ] || [ -d "$stray/scripts/peppar_fix" ] || [ -f "$stray/pyvenv.cfg" ]; then
     warn "stray copy at $stray ($(du -sh "$stray" 2>/dev/null | cut -f1)) — remove it; the repo lives ONLY at ~/peppar-fix (CLAUDE.md 2026-04-08)"
+  fi
 done
 
 # 2. venv + engine deps via pyproject (canonical; smbus2 for ClockMatrix/I2C)
