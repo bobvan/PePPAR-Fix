@@ -162,3 +162,7 @@ class TiccEvent:
     parse_age_s: Optional[float] = None
     correlation_confidence: Optional[float] = None
     estimator_residual_s: Optional[float] = None
+    # The raw TICC line (no newline) — for the pos_replay raw-capture tap so
+    # replay re-feeds the exact wire text through the same parser.  Default
+    # None keeps existing constructions unchanged.
+    raw_line: Optional[str] = None

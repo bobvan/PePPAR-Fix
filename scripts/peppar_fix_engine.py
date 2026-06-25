@@ -4258,7 +4258,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                      ar_position=None, ar_pos_lock=None,
                      extint_store=None,
                      pos_sigma_m=None, pos_source=None,
-                     survey_refresh_queue=None, arp_box=None):
+                     survey_refresh_queue=None, arp_box=None, raw_bundle=None):
     """Run FixedPosFilter for clock estimation with optional servo.
 
     This is the steady-state phase: position is known, we estimate clock
@@ -4585,7 +4585,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
         servo_result = None
         for pps_attempt in range(1, pps_max_retries + 1):
             servo_result = _setup_servo(args, known_ecef, qerr_store,
-                                        extint_store=extint_store, ptp=ptp)
+                                        extint_store=extint_store, ptp=ptp,
+                                        raw_bundle=raw_bundle)
             if not isinstance(servo_result, int) or servo_result != 3:
                 break
             if pps_attempt < pps_max_retries:
@@ -7096,7 +7097,8 @@ def _load_timestamper_bias(args, key):
         return None
 
 
-def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
+def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
+                 raw_bundle=None):
     """Set up servo (PHC-based or TICC-only).
 
     Returns context dict on success, or an int exit code on failure:
@@ -7867,6 +7869,10 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
         qerr_ticc_tracker = QErrTimescaleTracker()
 
         def ticc_reader():
+            # raw_bundle is captured from _setup_servo's scope; nonlocal lets
+            # the on-error disable (raw_bundle = None) rebind it instead of
+            # creating a closure-local that would UnboundLocalError on read.
+            nonlocal raw_bundle
             # When TICC-driven, the reference channel (chB) also generates
             # PpsEvent objects for the correlation gate — replacing EXTTS.
             # We derive the GPS second from host monotonic time + the
@@ -7904,6 +7910,18 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
                                     event.channel,
                                 ])
                                 ticc_log_f.flush()
+                            # pos_replay raw-capture tap: the raw TICC line +
+                            # its canonical recv_mono (the same stamp the
+                            # engine correlates with).  record_line re-adds
+                            # the newline; replay re-parses via iter_events.
+                            if raw_bundle is not None and event.raw_line:
+                                try:
+                                    raw_bundle.record_line(
+                                        "ticc", event.raw_line, event.recv_mono)
+                                except (OSError, ValueError):
+                                    log.warning("--raw-capture-dir TICC record "
+                                                "failed; disabling")
+                                    raw_bundle = None
                             # Ingest first so _armed is set after boot
                             # discard period completes.
                             was_armed = ticc_tracker._armed
@@ -10715,6 +10733,7 @@ def run(args):
             pos_source=pos_source,
             survey_refresh_queue=_survey_refresh_queue,
             arp_box=_arp_box,
+            raw_bundle=_raw_bundle,
         )
         # run_steady_state returns an int exit code on error
         # (e.g. 5 for catastrophic-reject cascade) or a gate_stats
@@ -12198,8 +12217,8 @@ Two-phase operation:
                            "input stream's RAW payloads + CLOCK_MONOTONIC "
                            "recv_mono into per-stream .cap files + a "
                            "manifest.toml, for deterministic replay.  "
-                           "Taps UBX (RAWX/SFRBX/NAV-*/TIM-TP), RTCM SSR, and "
-                           "broadcast eph; TICC tap to follow.  Write to "
+                           "Taps UBX (RAWX/SFRBX/NAV-*/TIM-TP), RTCM SSR, "
+                           "broadcast eph, and TICC chA/chB lines.  Write to "
                            "gt/RAIDZ (not lab eMMC/SD) for long captures.")
     ticc.add_argument("--r-calibration", default=None,
                       help="Path to a per-host R-calibration TOML "
