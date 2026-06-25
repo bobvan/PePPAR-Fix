@@ -184,6 +184,18 @@ def _periodic_ztd_tie(filt, args, lat_deg, alt_m, n_epochs, log):
         log.warning("[ZTD_TIE] epoch=%d Saastamoinen failed (%s); skipping tie",
                     n_epochs, exc)
         return
+    # [METAR] periodic surface-weather + Saastamoinen ZHD/ZTD line.  Rides
+    # the ZTD-tie cadence (every --ztd-tie-interval-s, finer than METAR's
+    # ~hourly update), giving a pos_replay reference capture the ZHD anchor
+    # for its ZTD-truth comparison (docs/pos-replay-capture-manifest.md §4–5;
+    # the engine logs surface pressure only at [INIT_ZTD] otherwise).
+    log.info(
+        "[METAR] epoch=%d %s age=%.0fmin T=%.1fC dewp=%.1fC altim=%.1fhPa "
+        "Pstn=%.1fhPa e=%.1fhPa ZHD=%.4fm ZWD=%.4fm ZTD=%.4fm",
+        n_epochs, rec.get('station', station), age_s / 60.0,
+        diag['temp_C'], diag['dewp_C'], diag['altim_hPa'],
+        diag['P_station_hPa'], diag['e_hPa'],
+        diag['zhd_m'], diag['zwd_m'], diag['ztd_m'])
     # ZTD state index differs between FixedPosFilter (IDX_ZTD
     # class attribute) and PPPFilter (PPP_IDX_ZTD module constant).
     # Use the same getattr fallback the engine uses elsewhere.
@@ -3147,6 +3159,31 @@ class AntPosEstThread(threading.Thread):
                     )
 
             self._n_epochs += 1
+
+            # [PPP_STATE] per-epoch position-filter estimate + σ for a
+            # pos_replay reference capture (Group B,
+            # docs/pos-replay-capture-manifest.md §3): the position-estimating
+            # PPPFilter's ECEF position, 3D position σ, and residual ZTD + σ —
+            # the error/own-σ inputs the divergence monitor scores.  The main
+            # servo loop's --filter-state-log only sees the clock filter; this
+            # is the position half it can't reach.  Opt-in (--ppp-state-log):
+            # an unconditional per-epoch INFO line would be ~86k lines/day at
+            # 1 Hz on every run, against this loop's own throttling
+            # convention — every-epoch detail is for captures only.
+            if getattr(self._args, 'ppp_state_log', False):
+                try:
+                    _pp = filt.x[:3]
+                    _ps = position_sigma_3d(filt.P)
+                    _pz = float(filt.x[PPP_IDX_ZTD])
+                    _pzs = math.sqrt(max(0.0,
+                        float(filt.P[PPP_IDX_ZTD, PPP_IDX_ZTD])))
+                    log.info(
+                        "[PPP_STATE] epoch=%d n=%d ecef=%.4f,%.4f,%.4f "
+                        "sigma_pos=%.4fm ztd=%+.4fm sigma_ztd=%.4fm",
+                        self._n_epochs, n_used, float(_pp[0]), float(_pp[1]),
+                        float(_pp[2]), float(_ps), _pz, _pzs)
+                except (IndexError, ValueError, TypeError):
+                    pass
 
             # Phase-residual admission gate ingest — feed this epoch's
             # post-fit phase residuals into WlPhaseAdmissionGate so it
@@ -12092,6 +12129,16 @@ Two-phase operation:
     ticc.add_argument("--filter-state-log-stride", type=int, default=1,
                       help="Decimation stride for --filter-state-log.  "
                            "1 = every epoch (default).  0 coerced to 1.")
+    ticc.add_argument("--ppp-state-log", action="store_true",
+                      help="Emit a per-epoch [PPP_STATE] line from the "
+                           "position filter (AntPosEst/PPPFilter): ECEF "
+                           "position, 3D position σ, and residual ZTD + σ "
+                           "— the position half --filter-state-log (clock "
+                           "filter) can't reach.  Opt-in: the position σ is "
+                           "the error/own-σ input a pos_replay reference "
+                           "capture scores (docs/pos-replay-capture-manifest.md "
+                           "§3).  Off by default — every-epoch detail is for "
+                           "captures, not ordinary runs.")
     ticc.add_argument("--r-calibration", default=None,
                       help="Path to a per-host R-calibration TOML "
                            "(produced by scripts/peppar_fix/fit_r_"
