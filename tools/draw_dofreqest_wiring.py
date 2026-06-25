@@ -1,29 +1,30 @@
 #!/usr/bin/env python3
-"""draw_dofreqest_wiring.py — DOFreqEst state/arm wiring schematic (16:9).
+"""draw_dofreqest_wiring.py — fusion-filter / two-oscillator slide (16:9).
 
-A clearer alternative to dofreqest_viz.svg / dofreqest-state-arm-map.svg.
+A presentation-first alternative to dofreqest_viz.svg / dofreqest-state-arm-
+map.svg: large fonts, few words, no code-level indices.
 
 Two big state boxes — the rx TCXO and the DO — each bisected by a dotted line
-into a PHASE half and a FREQUENCY half (the four EKF states x0..x3).  Both are
-enclosed by the DOFreqEst filter (4-state EKF + LQR).  Around them sit the
-physical signal chain (antenna → GNSS receiver → DO → TICC / ClockMatrix) and
-the PPP engine, wired in by the SEVEN measurement arms; the LQR control output
-is the actuation that steers the DO (the servo loop), not an arm:
+into a PHASE half and a FREQUENCY half.  Both are enclosed by the four-state
+EKF + LQR.  Around them sit the physical signal chain (antenna → GNSS receiver
+→ DO → TICC / ClockMatrix) and the PPP engine, wired in by the SEVEN measurement
+arms; the LQR control output is the actuation that steers the DO (the servo
+loop), not an arm:
 
-  x0 φ_rx (rx phase)   ← Arm 1 PPP dt_rx
-  x1 f_rx (rx freq)    ← Arm 2 qErr, Arm 5 TDCP
-  x2 φ_do (DO phase)   ← Arm 3 EXTINT, Arm 4 TICC (couples x0), Arm 6 holdover,
-                          Arm 7 cm_phase (ClockMatrix PFD — Timebeat OTC only)
-  x3 f_do (DO freq)    ← no arm — hidden, recovered through the predict step
-  LQR reads x2,x3 → adjfine / DAC / ClockMatrix combo bus → steers the DO
+  rx TCXO phase   ← PPP dt_rx
+  rx TCXO freq    ← qErr, TDCP
+  DO phase        ← EXTINT, TICC (couples rx phase), holdover,
+                     ClockMatrix on-chip phase (Timebeat OTC only)
+  DO freq         ← no arm — recovered through the predict step
+  LQR → steer the DO (adjfine / DAC / ClockMatrix combo bus) — the servo loop
 
-Arm 7 (cm_phase, added for Timebeat OTC — otcBob1 / ptBoat) reads the DO-vs-F9T
-phase straight off the ClockMatrix DPLL's on-chip phase-frequency detector
-(~50 ps) over I²C — same observation state as EXTINT (x2), but with no TICC and
-no EXTINT wire, and the same chip steers the DO via the combo bus.
+The ClockMatrix arm (cm_phase, added for Timebeat OTC — otcBob1 / ptBoat) reads
+the DO-vs-F9T phase straight off the ClockMatrix DPLL's on-chip phase-frequency
+detector (~50 ps) over I²C — same observation state as EXTINT, but with no TICC
+and no EXTINT wire, and the same chip steers the DO via the combo bus.
 
-Predict each epoch folds frequency into phase: φ += f·dt (rx) and
-φ_do −= (f_do+adjfine)·dt (DO), which is how the hidden x3 becomes observable.
+Predict each epoch folds frequency into phase (φ ← φ + f·dt), which is how the
+unobserved DO frequency state becomes recoverable.
 
 16:9, vector PDF + PNG.
 """
@@ -84,18 +85,18 @@ def draw_antenna(ax, cx, cy, s=1.0):
                          color="#2e86c1", lw=1.6, zorder=3))
 
 
-def statebox(ax, x0, y0, x1, y1, title, fc, left, right):
+def statebox(ax, x0, y0, x1, y1, title, fc, left, right, title_fs=17, inner_fs=15):
     """A state box bisected into phase (left) / frequency (right) halves."""
-    box(ax, x0, y0, x1, y1, "", fc, lw=2.2)
+    box(ax, x0, y0, x1, y1, "", fc, lw=2.6)
     xm = (x0 + x1) / 2
     ax.plot([xm, xm], [y0 + 0.06, y1 - 0.06], color="#555", lw=1.4,
             ls=(0, (3, 3)), zorder=4)
-    ax.text(xm, y1 + 0.16, title, ha="center", va="bottom", fontsize=11.5,
+    ax.text(xm, y1 + 0.16, title, ha="center", va="bottom", fontsize=title_fs,
             weight="bold", zorder=5)
     ax.text((x0 + xm) / 2, (y0 + y1) / 2, left, ha="center", va="center",
-            fontsize=10, zorder=5)
+            fontsize=inner_fs, zorder=5)
     ax.text((xm + x1) / 2, (y0 + y1) / 2, right, ha="center", va="center",
-            fontsize=10, zorder=5)
+            fontsize=inner_fs, zorder=5)
     return xm
 
 
@@ -104,121 +105,91 @@ def main():
     fig, ax = plt.subplots(figsize=(16, 9))
     ax.set_xlim(0, 16); ax.set_ylim(0, 9); ax.axis("off")
 
-    ax.text(8.0, 8.68, "DOFreqEst — two oscillators, four states, seven measurement arms",
-            ha="center", va="center", fontsize=21, weight="bold")
+    ax.text(8.0, 8.66,
+            "Fusion Filter Tracking Two Coupled Oscillators and Servo",
+            ha="center", va="center", fontsize=26, weight="bold")
 
     # ── filter enclosure ────────────────────────────────────────────────────
-    box(ax, 5.0, 0.7, 15.6, 7.95, "", C_FILT, lw=2.6, ec="#34495e")
-    ax.text(5.2, 7.7, "DOFreqEst  ·  4-state EKF + LQR", ha="left", va="center",
-            fontsize=13, weight="bold", color="#34495e")
+    box(ax, 5.0, 0.7, 15.6, 7.95, "", C_FILT, lw=2.8, ec="#34495e")
+    ax.text(5.25, 7.62, "Four-State Extended Kalman Filter + LQR", ha="left",
+            va="center", fontsize=18, weight="bold", color="#34495e")
 
-    # ── two state boxes ─────────────────────────────────────────────────────
-    rxm = statebox(ax, 6.6, 5.0, 11.2, 6.7, "rx TCXO  (estimated state)", "#d6eaf8",
-                   "x0\nφ_rx\nphase\n(ns)", "x1\nf_rx\nfrequency\n(ppb)")
-    dom = statebox(ax, 6.6, 2.2, 11.2, 3.9, "DO  (estimated state)", "#d5f0e0",
-                   "x2\nφ_do\nphase\n(ns)", "x3\nf_do\nfrequency\n(ppb)*")
+    # ── two state boxes (the oscillators) ───────────────────────────────────
+    rxm = statebox(ax, 6.6, 5.0, 11.2, 6.7, "rx TCXO", "#d6eaf8",
+                   "φ_rx\nphase", "f_rx\nfrequency")
+    dom = statebox(ax, 6.6, 2.2, 11.2, 3.9, "DO", "#d5f0e0",
+                   "φ_do\nphase", "f_do\nfrequency")
 
     # predict: frequency folds into phase each epoch (curved arrow R→L inside)
-    for (y0, y1, txt, col) in ((5.0, 6.7, "φ_rx += f_rx·dt", C_RX),
-                               (2.2, 3.9, "φ_do −= (f_do+adjfine)·dt", C_DO)):
+    for (y0, y1) in ((5.0, 6.7), (2.2, 3.9)):
         ax.add_patch(FancyArrowPatch((9.6, y1 - 0.18), (8.2, y1 - 0.18),
                      connectionstyle="arc3,rad=-0.5", arrowstyle="-|>",
-                     mutation_scale=14, lw=1.6, color="#7f8c8d", zorder=6))
-    ax.text(8.9, 4.62, "predict: φ += f·dt", ha="center", fontsize=8.5,
+                     mutation_scale=15, lw=1.8, color="#7f8c8d", zorder=6))
+    ax.text(8.9, 4.6, "predict:  φ ← φ + f·dt", ha="center", fontsize=11,
             color="#7f8c8d", style="italic", zorder=7)
-    ax.text(8.9, 1.92, "predict folds f_do (+adjfine) into φ_do", ha="center",
-            fontsize=8.5, color="#7f8c8d", style="italic", zorder=7)
 
-    # TICC coupling between φ_rx (x0) and φ_do (x2)
+    # coupling between φ_rx and φ_do
     ax.add_patch(FancyArrowPatch((7.7, 5.0), (7.7, 3.9),
                  connectionstyle="arc3,rad=0.0", arrowstyle="<|-|>",
-                 mutation_scale=14, lw=1.8, color=C_COUP, ls=(0, (4, 2)), zorder=6))
-    label(ax, 7.7, 4.45, "couples\nφ_rx ↔ φ_do", C_COUP, fs=8)
+                 mutation_scale=16, lw=2.0, color=C_COUP, ls=(0, (4, 2)), zorder=6))
+    label(ax, 7.7, 4.45, "φ_rx ↔ φ_do", C_COUP, fs=10.5)
 
-    # ── LQR control + actuation ─────────────────────────────────────────────
-    box(ax, 12.0, 2.45, 14.9, 3.65,
-        "LQR control\nreads x2, x3\n→ actuator", "#fdebd0", fs=10,
-        weight="bold", lw=1.8, ec=C_CTRL)
-    arrow(ax, (11.2, 3.05), (12.0, 3.05), color=C_CTRL, lw=2.4)
-    label(ax, 11.6, 3.32, "control", C_CTRL, fs=8.5)
+    # ── LQR control + actuation (emphasised) ────────────────────────────────
+    box(ax, 12.1, 2.4, 15.1, 3.7, "LQR control", "#fdebd0", fs=17,
+        weight="bold", lw=2.4, ec=C_CTRL)
+    arrow(ax, (11.2, 3.05), (12.1, 3.05), color=C_CTRL, lw=2.6)
+    label(ax, 11.65, 3.32, "state", C_CTRL, fs=11)
 
-    # ── physical hardware (left column) ─────────────────────────────────────
-    draw_antenna(ax, 0.95, 7.55, s=1.0)
-    box(ax, 0.55, 6.25, 4.55, 7.05,
-        "GNSS receiver (F9T)\nraw obs · gnss_pps · qErr · EXTINT-in", C_HW, fs=9.5,
+    # ── physical hardware (left column, emphasised) ─────────────────────────
+    draw_antenna(ax, 0.95, 7.6, s=1.0)
+    box(ax, 0.55, 6.25, 4.55, 7.05, "GNSS receiver  (F9T)\nraw obs · qErr", C_HW,
+        fs=13, weight="bold")
+    box(ax, 0.55, 5.25, 4.55, 5.95, "PPP engine\ndt_rx · TDCP", C_PPP, fs=13,
         weight="bold")
-    box(ax, 0.55, 5.25, 4.55, 5.95,
-        "PPP engine\ndt_rx (rx phase) · TDCP (rx freq)", C_PPP, fs=9.5, weight="bold")
-    box(ax, 0.55, 4.30, 4.55, 4.95, "TICC\nchA do_pps − chB gnss_pps", C_HW, fs=9.5,
+    box(ax, 0.55, 4.30, 4.55, 4.95, "TICC\ndo_pps − gnss_pps", C_HW, fs=13,
         weight="bold")
-    box(ax, 0.55, 2.95, 4.55, 3.65,
-        "ClockMatrix DPLL  (Timebeat OTC)\non-chip PFD: do_pps vs gnss_pps (~50 ps)\n"
-        "· also the combo-bus actuator", "#d0ece7", fs=8.3, ec=C_CM, lw=1.7,
-        ls=(0, (5, 2)), weight="bold")
-    box(ax, 0.55, 1.55, 4.55, 2.25, "Disciplined Oscillator (DO)\n→ do_pps    ← steer",
-        "#d5f0e0", fs=9.5, weight="bold")
+    box(ax, 0.55, 2.95, 4.55, 3.65, "ClockMatrix DPLL\n(Timebeat OTC)", "#d0ece7",
+        fs=12.5, ec=C_CM, lw=2.0, ls=(0, (5, 2)), weight="bold")
+    box(ax, 0.55, 1.55, 4.55, 2.25, "Disciplined Oscillator\n→ do_pps    ← steer",
+        "#d5f0e0", fs=13, weight="bold")
 
-    arrow(ax, (0.95, 7.35), (0.95, 7.07), color="#333", lw=1.8)          # antenna->rx
-    arrow(ax, (1.4, 6.25), (1.4, 5.97), color="#555", lw=1.6)            # raw obs->PPP
-    label(ax, 2.05, 6.10, "raw obs", "#555", fs=8)
-    # do_pps: DO -> ClockMatrix -> TICC (both phase-comparators see do_pps)
-    arrow(ax, (1.3, 2.25), (1.3, 2.93), color="#555", lw=1.6)
-    arrow(ax, (1.3, 3.65), (1.3, 4.28), color="#555", lw=1.6)
-    label(ax, 1.3, 2.62, "do_pps", "#555", fs=8)
-    # gnss_pps -> ClockMatrix ref + TICC chB, down the far-left margin
-    elbow(ax, [(0.85, 6.25), (0.40, 6.0), (0.40, 3.3), (0.55, 3.3)], "#555", lw=1.4)
-    arrow(ax, (0.40, 4.62), (0.55, 4.62), color="#555", lw=1.4)
-    ax.text(0.27, 4.95, "gnss_pps", rotation=90, ha="center", va="center",
-            fontsize=7.5, color="#555", zorder=6)
+    arrow(ax, (0.95, 7.4), (0.95, 7.07), color="#333", lw=2.0)          # antenna->rx
+    arrow(ax, (1.5, 6.25), (1.5, 5.97), color="#555", lw=1.8)           # raw obs->PPP
+    label(ax, 2.2, 6.11, "raw obs", "#555", fs=9)
 
-    # ── the seven measurement arms ──────────────────────────────────────────
-    # rx-TCXO arms (1, 2, 5) enter the rx box's LEFT edge; labels name the state.
-    arrow(ax, (4.55, 6.55), (6.6, 6.4), color=C_RX, lw=2.0)             # Arm2 qErr -> x1
-    label(ax, 5.6, 6.62, "Arm 2  qErr → x1", C_RX)
-    arrow(ax, (4.55, 5.6), (6.6, 5.95), color=C_RX, lw=2.0)            # Arm1 PPP -> x0
-    label(ax, 5.55, 5.82, "Arm 1  PPP dt_rx → x0", C_RX)
-    arrow(ax, (4.55, 5.4), (6.6, 5.3), color=C_RX, lw=2.0)             # Arm5 TDCP -> x1
-    label(ax, 5.55, 5.12, "Arm 5  TDCP → x1", C_RX)
+    # EXTINT: the DO's do_pps is wired up into the F9T's EXTINT input
+    elbow(ax, [(0.55, 2.0), (0.28, 2.0), (0.28, 6.62), (0.55, 6.62)], "#444", lw=2.2)
+    ax.text(0.46, 4.2, "EXTINT", rotation=90, ha="center", va="center",
+            fontsize=12, color="#444", weight="bold", zorder=8,
+            bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.95))
 
-    # DO arms (3, 4, 6, 7) enter the DO box's LEFT edge / bottom.
-    arrow(ax, (4.55, 4.6), (6.6, 3.6), color=C_DO, lw=2.0)             # Arm4 TICC -> x2
-    label(ax, 5.6, 3.98, "Arm 4  TICC → x2", C_DO)
-    # Arm 7 cm_phase — ClockMatrix PFD -> x2 (dashed: host-dependent, Timebeat OTC)
-    arrow(ax, (4.55, 3.3), (6.6, 3.22), color=C_DO, lw=2.0, ls=(0, (5, 2)))
-    label(ax, 5.62, 3.02, "Arm 7  cm_phase → x2", C_DO)
-    # Arm3 EXTINT: the receiver timestamps do_pps -> reaches down to the DO state
-    elbow(ax, [(4.55, 6.4), (4.78, 6.4), (4.78, 2.9), (6.6, 2.9)], C_DO, lw=2.0)
-    label(ax, 4.74, 4.5, "Arm 3\nEXTINT\n→ x2", C_DO)
-    # Arm 6: holdover pseudo-obs -> x2 (synthetic, only during HOLDOVER)
-    box(ax, 5.5, 0.95, 7.6, 1.65, "holdover integrator\n(TDCP-synth φ_do)",
-        "#fdf2e9", fs=8, ec=C_DO, lw=1.4)
-    elbow(ax, [(6.55, 1.65), (6.55, 2.2)], C_DO, lw=1.8, ls=(0, (4, 2)))
-    label(ax, 6.55, 1.9, "Arm 6  pseudo → x2", C_DO, fs=8)
+    # ── the seven measurement arms (no Arm numbers, no state indices) ────────
+    # rx-TCXO arms enter the rx box's LEFT edge.
+    arrow(ax, (4.55, 6.55), (6.6, 6.4), color=C_RX, lw=2.2)             # qErr
+    label(ax, 5.55, 6.62, "qErr", C_RX, fs=12)
+    arrow(ax, (4.55, 5.6), (6.6, 5.95), color=C_RX, lw=2.2)            # PPP dt_rx
+    label(ax, 5.55, 5.84, "PPP  dt_rx", C_RX, fs=12)
+    arrow(ax, (4.55, 5.4), (6.6, 5.3), color=C_RX, lw=2.2)             # TDCP
+    label(ax, 5.6, 5.12, "TDCP", C_RX, fs=12)
 
-    # actuation feedback: LQR -> DO hardware (servo loop)
-    elbow(ax, [(14.9, 2.45), (14.9, 0.45), (2.55, 0.45), (2.55, 1.55)],
-          C_CTRL, lw=2.0)
-    label(ax, 8.5, 0.45,
-          "adjfine / DAC / ClockMatrix combo bus  →  steer the DO  (servo loop)",
-          C_CTRL, fs=9)
+    # DO arms enter the DO box's LEFT edge / bottom.
+    arrow(ax, (4.55, 4.6), (6.6, 3.6), color=C_DO, lw=2.2)             # TICC
+    label(ax, 5.6, 4.02, "TICC", C_DO, fs=12)
+    # ClockMatrix on-chip phase -> DO (dashed: host-dependent, Timebeat OTC)
+    arrow(ax, (4.55, 3.3), (6.6, 3.22), color=C_DO, lw=2.2, ls=(0, (5, 2)))
+    label(ax, 5.7, 3.0, "ClockMatrix", C_DO, fs=12)
+    # EXTINT: the receiver's timestamp of do_pps -> reaches down to the DO state
+    elbow(ax, [(4.55, 6.4), (4.85, 6.4), (4.85, 2.9), (6.6, 2.9)], C_DO, lw=2.2)
+    label(ax, 4.85, 4.55, "EXTINT", C_DO, fs=12)
+    # holdover pseudo-obs -> DO (synthetic, only during HOLDOVER)
+    box(ax, 5.5, 0.95, 7.7, 1.65, "holdover", "#fdf2e9", fs=12, ec=C_DO, lw=1.6,
+        weight="bold")
+    elbow(ax, [(6.6, 1.65), (6.6, 2.2)], C_DO, lw=2.0, ls=(0, (4, 2)))
 
-    # ── Arm 7 callout (upper-right) ─────────────────────────────────────────
-    ax.text(13.45, 6.85,
-            "Arm 7 · cm_phase   (Timebeat OTC — otcBob1 / ptBoat)\n"
-            "DO-vs-F9T phase straight off the ClockMatrix DPLL's\n"
-            "on-chip PFD (~50 ps), read over I²C.  Same H as EXTINT\n"
-            "(observes x2) — but needs no TICC and no EXTINT wire,\n"
-            "and the SAME chip steers the DO via the combo bus.",
-            ha="center", va="center", fontsize=9, color="#0b5345",
-            bbox=dict(boxstyle="round,pad=0.4", fc="#e8f6f3", ec=C_CM, lw=1.4))
-
-    # ── hidden-state note ───────────────────────────────────────────────────
-    ax.text(11.4, 3.0, "*", fontsize=14, color="#c0392b", weight="bold", zorder=6)
-    ax.text(15.45, 4.95,
-            "* x3 (f_do) has NO arm.\n  It is the state we ACTUATE\n  on, yet never measure"
-            " directly —\n  recovered only through the\n  predict step folding it into x2.",
-            ha="right", va="center", fontsize=9, color="#c0392b",
-            bbox=dict(boxstyle="round,pad=0.35", fc="#fdf2f0", ec="#c0392b", lw=1.2))
+    # actuation feedback: LQR -> DO hardware (servo loop, emphasised)
+    elbow(ax, [(14.9, 2.4), (14.9, 0.42), (2.55, 0.42), (2.55, 1.55)],
+          C_CTRL, lw=2.8)
+    label(ax, 9.0, 0.42, "steer the DO   ·   servo loop", C_CTRL, fs=15)
 
     fig.tight_layout()
     os.makedirs(out_dir, exist_ok=True)
