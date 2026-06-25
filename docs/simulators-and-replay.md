@@ -46,6 +46,12 @@ codebase:
 | **`pos_sim`** | synthetic simulator | position (`FixedPosFilter` / `PPPFilter`) | **new (§3)** |
 | **`pos_replay`** | replay harness | position (and the whole pipeline) | **new (§4)** |
 
+The taxonomy is a **2×2** (simulator/replay × time/position).  The fourth
+cell — a *`servo_replay`* (the time filter replayed against recorded TICC
++ external truth) — we've already done ad-hoc (the combo-servo TICC#4
+cross-check, the de-sawtooth chB-vs-Rb), so the vocabulary generalizes
+cleanly; formalizing that cell is out of scope here.
+
 `servo_sim` and `pos_sim` are **siblings** — same paradigm, different
 filter.  `pos_replay` is an **evolution of the existing published-data
 regression harness** ([regression-harness-plan.md](regression-harness-plan.md),
@@ -126,7 +132,13 @@ filter consumes.
   up each geometry with a clean ISB and see whether it's an
   observability/rank issue independent of any one day's data.
 
-**What it can't do.**  It is only as real as the forward model.  Its
+**What it can't do.**  It is only as real as the forward model.  Because
+it emits `z = h(truth)` with the **same** forward model the filter
+inverts, it validates the *estimator given the model* (Q, priors,
+observability, null-routing) but can **never** catch a forward-*model*
+bug: a bug in `h()` is shared by emitter and filter, so it's invisible
+here — only `pos_replay`'s real observations catch model bugs.
+Concretely: its
 "truth ZTD" is whatever you injected, so it can validate that the filter
 *handles the tropo model correctly* but **cannot catch a wrong tropo
 model** (mapping function, a-priori) — for that you need a real sky and
@@ -190,6 +202,11 @@ filter's **trajectory against the truth corridor over time**:
   could be a transient still settling); far-and-diverging is the kill
   signal.  The goal is to conclude "no point continuing" at 30 min
   instead of burning the whole replay.
+
+*(Computing the error/own-σ track requires the replay to **log the
+filter's per-epoch reported σ** — the P-matrix diagonal for position and
+ZTD — alongside its state, so add that to the replay's output
+requirements.)*
 
 **Why this is the rig's killer feature.**  The (pos,ZTD,clk) null drift
 produces **no internal innovation signature** — the observations stay
@@ -308,5 +325,6 @@ exists and shows the filter routing misfit into ZTD *in a vacuum*;
   comparison.
 - `pos_sim` "closed-loop" semantics: the position estimator has no
   actuator, so the only feedback is truth-evolves / filter-tracks.
-  Decide whether to also model a slowly-moving truth (kinematic) or hold
-  a static ARP and move only ZTD/clk (the null axes).
+  **Decided** (main review): the first cut **holds a static ARP and
+  moves only (ZTD, clk)** — that directly excites the null, which is the
+  whole point; add kinematic truth later.
