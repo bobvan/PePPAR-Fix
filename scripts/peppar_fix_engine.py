@@ -218,6 +218,36 @@ def _periodic_ztd_tie(filt, args, lat_deg, alt_m, n_epochs, log):
     )
 
 
+def make_raw_capture_bundle(args, systems, log):
+    """Create a pos_replay RawCaptureBundle from --raw-capture-dir + write its
+    manifest, or return None when the flag is unset.
+
+    Extracted from main() so it's unit-testable.  ARP/antenna conventions
+    come from the offline truth (antennas.json), so the live manifest only
+    pins the operational knobs the engine knows (ztd station, known-pos,
+    systems).  Manifest-write failure is non-fatal (logged); capture still
+    records.  See docs/pos-replay-capture-manifest.md §6.
+    """
+    if not getattr(args, 'raw_capture_dir', None):
+        return None
+    import socket
+    from peppar_fix.raw_capture import RawCaptureBundle
+    bundle = RawCaptureBundle(args.raw_capture_dir)
+    try:
+        bundle.write_manifest(
+            host=socket.gethostname(),
+            started_iso=datetime.now(tz=timezone.utc).isoformat(),
+            conventions={
+                "ztd_station": getattr(args, 'init_ztd_station', '') or '',
+                "known_pos": getattr(args, 'known_pos', '') or '',
+                "systems": list(systems) if systems else [],
+            },
+            notes="pos_replay reference capture (UBX stream)")
+    except OSError as exc:
+        log.warning("raw-capture manifest write failed: %s", exc)
+    return bundle
+
+
 def _open_slip_csv(path):
     """Open the slip CSV file (header written once); return the csv.writer."""
     global _SLIP_CSV_FILE, _SLIP_CSV_WRITER
@@ -10155,6 +10185,16 @@ def run(args):
         ubx_log_file = open(args.ubx_out, 'ab')
         log.info(f"Raw UBX capture → {args.ubx_out}")
         serial_kwargs['ubx_log_file'] = ubx_log_file
+    # pos_replay raw-capture bundle (--raw-capture-dir): records each input
+    # stream's raw payloads + recv_mono for deterministic replay
+    # (docs/pos-replay-capture-manifest.md).  UBX is tapped here (via
+    # serial_kwargs); the SSR/eph/TICC taps are the next increment.
+    _raw_bundle = make_raw_capture_bundle(args, systems, log)
+    if _raw_bundle is not None:
+        import atexit
+        atexit.register(_raw_bundle.close)
+        log.info("raw-capture bundle → %s (UBX stream)", args.raw_capture_dir)
+        serial_kwargs['raw_bundle'] = _raw_bundle
     t_serial = threading.Thread(
         target=serial_reader,
         args=(args.serial, args.baud, obs_queue, stop_event, beph, systems, ssr),
@@ -12139,6 +12179,15 @@ Two-phase operation:
                            "capture scores (docs/pos-replay-capture-manifest.md "
                            "§3).  Off by default — every-epoch detail is for "
                            "captures, not ordinary runs.")
+    ticc.add_argument("--raw-capture-dir", default=None,
+                      help="Write a pos_replay reference-capture bundle to "
+                           "DIR (docs/pos-replay-capture-manifest.md): each "
+                           "input stream's RAW payloads + CLOCK_MONOTONIC "
+                           "recv_mono into per-stream .cap files + a "
+                           "manifest.toml, for deterministic replay.  "
+                           "Currently taps the UBX stream (RAWX/SFRBX/NAV-*/"
+                           "TIM-TP); SSR/eph/TICC taps to follow.  Write to "
+                           "gt/RAIDZ (not lab eMMC/SD) for long captures.")
     ticc.add_argument("--r-calibration", default=None,
                       help="Path to a per-host R-calibration TOML "
                            "(produced by scripts/peppar_fix/fit_r_"

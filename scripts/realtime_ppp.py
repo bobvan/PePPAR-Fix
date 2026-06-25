@@ -1136,7 +1136,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                    raw_callback=None, nav2_store=None, rinex_writer=None,
                    extint_store=None, nav_sig_store=None,
                    nav_clock_store=None, nav_time_gps_store=None,
-                   nav_pvt_store=None, ubx_log_file=None):
+                   nav_pvt_store=None, ubx_log_file=None, raw_bundle=None):
     """Read UBX messages from a GNSS device.
 
     Puts (timestamp, observations_list) tuples onto obs_queue for each
@@ -1258,6 +1258,17 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                 except (OSError, ValueError):
                     log.warning("--ubx-out write failed; disabling capture")
                     ubx_log_file = None
+            # pos_replay raw-capture tap: record the raw UBX frame + its
+            # CLOCK_MONOTONIC arrival stamp.  This recv_mono defines the
+            # captured timeline a deterministic replay reproduces (manifest
+            # §2; the now_mono/recv_mono gates of #224 are driven from it).
+            if raw_bundle is not None and raw:
+                try:
+                    raw_bundle.record("ubx", raw, time.monotonic())
+                except (OSError, ValueError):
+                    log.warning("--raw-capture-dir UBX record failed; "
+                                "disabling raw capture")
+                    raw_bundle = None
             if not raw:
                 continue
             delay_injector.maybe_inject_delay(source_name)

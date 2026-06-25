@@ -69,5 +69,34 @@ class TestMetarLine(unittest.TestCase):
         self.assertIsNone(filt.tied)
 
 
+class TestRawCaptureBundleSetup(unittest.TestCase):
+    """make_raw_capture_bundle: None when --raw-capture-dir unset; otherwise a
+    bundle with a manifest pinning the operational conventions (§6)."""
+
+    def test_returns_none_when_flag_unset(self):
+        args = types.SimpleNamespace(raw_capture_dir=None)
+        self.assertIsNone(eng.make_raw_capture_bundle(
+            args, ["gps"], logging.getLogger("t")))
+
+    def test_creates_bundle_and_manifest(self):
+        import tempfile
+        import tomllib
+        with tempfile.TemporaryDirectory() as d:
+            args = types.SimpleNamespace(
+                raw_capture_dir=d, init_ztd_station="KORD",
+                known_pos="-2730000,-4440000,3975000")
+            bundle = eng.make_raw_capture_bundle(
+                args, ["gps", "gal"], logging.getLogger("t"))
+            self.assertIsNotNone(bundle)
+            bundle.close()
+            with open(os.path.join(d, "manifest.toml"), "rb") as f:
+                m = tomllib.load(f)
+            self.assertEqual(m["conventions"]["ztd_station"], "KORD")
+            self.assertEqual(m["conventions"]["systems"], ["gps", "gal"])
+            self.assertEqual(m["conventions"]["known_pos"],
+                             "-2730000,-4440000,3975000")
+            self.assertNotEqual(m["software"]["git_rev"], "unknown")
+
+
 if __name__ == "__main__":
     unittest.main()
