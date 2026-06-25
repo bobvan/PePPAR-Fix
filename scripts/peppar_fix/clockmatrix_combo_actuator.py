@@ -152,26 +152,31 @@ class ClockMatrixComboActuator(FrequencyActuator):
         self._combo_reg = ctrl_base + _DPLL_CTRL_COMBO_SW_OFFSET
 
         # Saved originals for teardown (hand-back to hardware DPLL).
+        self._orig_mode: int | None = None
         self._orig_bw: list | None = None
         self._orig_slave0: int | None = None
         self._orig_combo: bytes | None = None
         self._current_ppb = 0.0
 
     def setup(self) -> None:
-        """Configure the combo path: BW→0, subscribe to the SW-combo source.
+        """Configure the combo path: force PLL/auto, BW→0, subscribe to SW-combo.
 
-        Leaves MODE untouched (the DPLL must already be in PLL/auto so
-        ``PHASE_STATUS`` is live — that is timebeat's running state).  Saves
-        BW / SLAVE0 / COMBO_SW for teardown.  Writes combo = 0 so we start
-        from no software contribution.
+        The combo bus only sums into the DCO while the DPLL is in PLL/auto (so
+        ``PHASE_STATUS`` is the live DO-vs-F9T error).  We FORCE pll_mode→PLL
+        because the engine bootstrap may have left DPLL3 in write_freq mode
+        (the FCW path) — in which case ``PHASE_STATUS`` reads the fixed
+        write_freq artifact (~−409 µs) and the servo trips the outlier gate
+        (observed otcBob1 2026-06-25).  Saves MODE / BW / SLAVE0 / COMBO_SW for
+        teardown.  Writes combo = 0 so we start from no software contribution.
         """
-        mode = self._i2c.read(self._mode_reg, 1)[0]
-        pll_mode = (mode >> _PLL_MODE_SHIFT) & 0x07
+        self._orig_mode = self._i2c.read(self._mode_reg, 1)[0]
+        pll_mode = (self._orig_mode >> _PLL_MODE_SHIFT) & 0x07
         if pll_mode != _PLL_MODE_PLL:
-            log.warning(
-                "ClockMatrix combo DPLL_%d: MODE=0x%02X pll_mode=%d (not PLL) "
-                "— PHASE_STATUS may not be live; combo servo needs PLL/auto",
-                self._dpll_id, mode, pll_mode)
+            pll_auto = self._orig_mode & ~_PLL_MODE_MASK  # pll_mode bits → 0
+            self._i2c.write(self._mode_reg, [pll_auto])
+            log.info("ClockMatrix combo DPLL_%d: forced MODE 0x%02X→0x%02X "
+                     "(pll_mode %d→0, write_freq→PLL/auto) so PHASE_STATUS is live",
+                     self._dpll_id, self._orig_mode, pll_auto, pll_mode)
 
         self._orig_bw = self._i2c.read(self._bw_reg, 2)
         self._orig_slave0 = self._i2c.read(self._slave0_reg, 1)[0]
@@ -191,15 +196,24 @@ class ClockMatrixComboActuator(FrequencyActuator):
                  "combo=0, gain=%.4f)", self._dpll_id, slave0, self._combo_gain)
 
     def teardown(self) -> None:
-        """Restore saved registers — hand the DO back to the hardware DPLL."""
+        """Restore saved registers — hand the DO back to the hardware DPLL.
+
+        Hands DPLL3 back in **PLL/auto** (pll_mode→PLL), NOT whatever pre-combo
+        mode was saved: the engine bootstrap may have left it in write_freq, and
+        timebeat does NOT auto-recover a write_freq DPLL on restart (observed
+        otcBob1 2026-06-25 — the host stayed mis-disciplined).  PLL/auto + the
+        restored BW lets the hardware DPLL re-lock to F9T PPS.
+        """
         if self._orig_combo is not None:
             self._i2c.write(self._combo_reg, list(self._orig_combo))
         if self._orig_slave0 is not None:
             self._i2c.write(self._slave0_reg, [self._orig_slave0])
         if self._orig_bw is not None:
             self._i2c.write(self._bw_reg, list(self._orig_bw))
-        log.info("ClockMatrix combo DPLL_%d: restored — DO back on hardware DPLL",
-                 self._dpll_id)
+        if self._orig_mode is not None:
+            self._i2c.write(self._mode_reg, [self._orig_mode & ~_PLL_MODE_MASK])
+        log.info("ClockMatrix combo DPLL_%d: restored (PLL/auto) — DO back on "
+                 "hardware DPLL", self._dpll_id)
         self._current_ppb = 0.0
 
     def adjust_frequency_ppb(self, ppb: float) -> float:

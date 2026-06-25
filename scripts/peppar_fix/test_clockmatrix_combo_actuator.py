@@ -116,11 +116,24 @@ class ComboActuatorSetupTeardownTest(unittest.TestCase):
         self.assertEqual(i2c.read(_SLAVE0, 1)[0], 0x28)
         # Combo value zeroed at arm time.
         self.assertEqual(int.from_bytes(i2c.read(_COMBO, 6), 'little'), 0)
-        # MODE never written (must stay PLL/auto for live phase).
+        # MODE not rewritten when already PLL/auto (initial 0x00).
         self.assertNotIn(_MODE, [addr for addr, _ in i2c.writes])
 
-    def test_teardown_restores_exact_saved_bytes(self):
+    def test_setup_forces_pll_auto_when_write_freq(self):
+        # The bootstrap may leave DPLL3 in write_freq (pll_mode=2); setup() must
+        # FORCE PLL/auto so PHASE_STATUS is live (not the −409 µs artifact).
+        init = _timebeat_initial()
+        init[_MODE] = (2 << 3)  # pll_mode=2 (write_freq) = 0x10
+        i2c = _FakeI2C(init)
+        act = ClockMatrixComboActuator(i2c, dpll_id=3)
+        act.setup()
+        mode = i2c.read(_MODE, 1)[0]
+        self.assertEqual((mode >> 3) & 0x07, 0,
+                         "setup must force pll_mode→PLL (0) when starting write_freq")
+
+    def test_teardown_restores_exact_saved_bytes_and_pll_auto(self):
         initial = _timebeat_initial()
+        initial[_MODE] = (2 << 3)  # start in write_freq (bootstrap's doing)
         i2c = _FakeI2C(initial)
         act = ClockMatrixComboActuator(i2c, dpll_id=3)
         act.setup()
@@ -132,16 +145,9 @@ class ComboActuatorSetupTeardownTest(unittest.TestCase):
         self.assertEqual(i2c.read(_SLAVE0, 1)[0], initial[_SLAVE0])
         self.assertEqual(i2c.read(_COMBO, 6),
                          bytes(initial[_COMBO + i] for i in range(6)))
-
-    def test_setup_warns_when_not_pll_auto(self):
-        init = _timebeat_initial()
-        init[_MODE] = (5 << 3)  # pll_mode=5 (write_freq), not PLL
-        i2c = _FakeI2C(init)
-        act = ClockMatrixComboActuator(i2c, dpll_id=3)
-        with self.assertLogs("peppar_fix.clockmatrix_combo_actuator",
-                             level="WARNING") as cm:
-            act.setup()
-        self.assertTrue(any("not PLL" in m for m in cm.output))
+        # MODE handed back in PLL/auto (NOT the saved write_freq) — timebeat
+        # does not auto-recover a write_freq DPLL.
+        self.assertEqual((i2c.read(_MODE, 1)[0] >> 3) & 0x07, 0)
 
 
 class ComboActuatorSteeringTest(unittest.TestCase):
