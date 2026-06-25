@@ -798,6 +798,31 @@ class PPPFilter:
         sin_elev = np.dot(e, up)
         return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
 
+    def geometric_range(self, receiver_pos, sat_pos):
+        """Sagnac-corrected geometric range + line-of-sight geometry.
+
+        Returns ``(rho, e_los, elev_deg, sat_rot)``.  This is the geometry
+        half of the measurement model — the single source of truth shared
+        by ``update()`` (which inverts it) and the ``pos_sim`` emitter
+        (which runs it forward from a known truth).  One copy is what lets
+        the simulator drive the *real* filter faithfully; see
+        docs/simulators-and-replay.md.
+        """
+        dx = sat_pos - receiver_pos
+        rho = np.linalg.norm(dx)
+        tau = rho / C
+        rot = OMEGA_E * tau
+        sat_rot = np.array([
+            sat_pos[0] * math.cos(rot) + sat_pos[1] * math.sin(rot),
+            -sat_pos[0] * math.sin(rot) + sat_pos[1] * math.cos(rot),
+            sat_pos[2]
+        ])
+        dx = sat_rot - receiver_pos
+        rho = np.linalg.norm(dx)
+        elev = self.compute_elevation(receiver_pos, sat_rot)
+        e_los = dx / rho
+        return rho, e_los, elev, sat_rot
+
     def compute_azimuth(self, receiver_pos, sat_pos):
         """Azimuth of the satellite from the receiver, degrees clockwise
         from geodetic north.  0 = north, 90 = east, 180 = south.
@@ -942,19 +967,8 @@ class PPPFilter:
                 reject_counts['clock_bad'] += 1
                 continue
 
-            dx = sat_pos - receiver_pos
-            rho = np.linalg.norm(dx)
-            tau = rho / C
-            rot = OMEGA_E * tau
-            sat_rot = np.array([
-                sat_pos[0] * math.cos(rot) + sat_pos[1] * math.sin(rot),
-                -sat_pos[0] * math.sin(rot) + sat_pos[1] * math.cos(rot),
-                sat_pos[2]
-            ])
-            dx = sat_rot - receiver_pos
-            rho = np.linalg.norm(dx)
-
-            elev = self.compute_elevation(receiver_pos, sat_rot)
+            rho, e_los, elev, sat_rot = self.geometric_range(
+                receiver_pos, sat_pos)
             if elev < ELEV_MASK:
                 reject_counts['below_mask'] += 1
                 continue
@@ -981,7 +995,6 @@ class PPPFilter:
 
             tropo = self.tropo_delay(elev)
             m_wet = self.wet_mapping(elev)
-            e_los = dx / rho
 
             # Clock + ISB — read from x_eval (the iterate), not self.x
             isb_idx = self.isb_index(obs['sys'])
