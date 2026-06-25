@@ -61,6 +61,26 @@ fi
 # 3. runtime dirs
 mkdir -p data state/dos state/receivers state/positions && ok "data/ + state/ dirs"
 
+# 3.5 udev rules — non-root device access (dialout group + stable PTP symlinks).
+# Without these /dev/ptp* is root-only (0600) and the engine can't open it as a
+# normal user — the i226 igc PHC needs MODE=0664 GROUP=dialout (bob is in
+# dialout).  Caught provisioning ptBoat 2026-06-25; the rules are also what
+# give /dev/ptp_i226 / /dev/ticc* their stable names.
+RULES=timelab/99-timelab.rules
+DEST=/etc/udev/rules.d/99-timelab.rules
+if [ -f "$RULES" ]; then
+  if sudo cmp -s "$RULES" "$DEST" 2>/dev/null; then
+    ok "udev rules current"
+  elif sudo cp "$RULES" "$DEST" 2>/dev/null && sudo udevadm control --reload-rules 2>/dev/null \
+       && sudo udevadm trigger 2>/dev/null; then
+    ok "deployed 99-timelab.rules + reloaded udev"
+  else
+    warn "udev rule deploy failed (passwordless sudo?) — /dev/ptp* may stay root-only"
+  fi
+else
+  warn "timelab/99-timelab.rules missing from repo — can't grant non-root device access"
+fi
+
 # 4. preflight checks (warnings only)
 echo "--- preflight ---"
 venv/bin/python -c "import numpy,scipy,pyubx2,pyrtcm,serial,pyproj,smbus2" 2>/dev/null \
@@ -72,7 +92,11 @@ if [ -f "$CFG" ]; then
   SER=$(grep -E '^\s*serial' "$CFG" | head -1 | sed -E 's/.*=\s*"?([^"]+)"?.*/\1/')
   [ -n "${SER:-}" ] && { [ -e "$SER" ] && ok "serial $SER present" || warn "serial $SER MISSING"; }
   PTP=$(grep -E '^\s*ptp_dev' "$CFG" | head -1 | sed -E 's/.*=\s*"?([^"]+)"?.*/\1/')
-  [ -n "${PTP:-}" ] && { [ -e "$PTP" ] && ok "PTP $PTP present" || warn "PTP $PTP MISSING"; }
+  if [ -n "${PTP:-}" ]; then
+    if [ ! -e "$PTP" ]; then warn "PTP $PTP MISSING"
+    elif [ -r "$PTP" ] && [ -w "$PTP" ]; then ok "PTP $PTP present + user-accessible (rw)"
+    else warn "PTP $PTP present but NOT user-accessible (root-only) — 99-timelab.rules + dialout needed"; fi
+  fi
 else
   warn "no host config $CFG — create one (see config/otcbob1.toml) so the wrapper auto-discovers it"
 fi
