@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pos_sim — synthetic closed-loop simulator for the POSITION filter.
+"""pos_sim — synthetic simulator for the POSITION filter.
 
 Sibling of ``servo_sim`` (the time/servo filter): a constructed ground
 truth — a static ARP, a residual ZTD, a receiver clock, and per-SV float
@@ -258,6 +258,10 @@ def run(sky, truth, *, n_epochs=600, dt=1.0, seed=0,
 
         err_vec = np.asarray(filt.x[:3], float) - truth.arp_ecef
         pos_err = float(np.linalg.norm(err_vec))
+        # Scalar monitor σ: RMS of the three ECEF position-axis 1-σ.  Ignores
+        # off-diagonal covariance — a full position-covariance norm (or a
+        # Mahalanobis distance err·P⁻¹·err) is a later refinement; this is
+        # enough for the corridor's K·σ test.
         pos_sigma = float(math.sqrt(max(0.0, np.mean(np.diag(filt.P)[:3]))))
         ztd_err = float(filt.x[IDX_ZTD] - truth.ztd(t_s))
         ztd_sigma = float(math.sqrt(max(0.0, filt.P[IDX_ZTD, IDX_ZTD])))
