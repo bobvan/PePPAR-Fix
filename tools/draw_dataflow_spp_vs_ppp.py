@@ -152,8 +152,8 @@ def main():
     draw_antenna(ax, 1.30, 5.55, s=1.0)
     draw_cloud(ax, 1.40, 3.55, "Internet\nNTRIP")
     draw_cloud(ax, 1.40, 2.30, "Internet\nHAS · IDD")
-    draw_thermo(ax, 1.18, 1.05, s=1.0)
-    ax.text(1.45, 1.05, "local weather\n(METAR)", ha="left", va="center",
+    draw_thermo(ax, 1.32, 1.12, s=1.0)
+    ax.text(1.32, 1.66, "local weather (METAR)", ha="center", va="center",
             fontsize=9, weight="bold", color="#922b21")
 
     BXL, IXC, IW = 2.30, 3.65, 2.70      # box left edge / centre / width
@@ -228,7 +228,7 @@ def main():
         thin_arrow(ax, (1.78, 5.40), (BXL - 0.02, y))
     thin_arrow(ax, (1.85, 3.20), (BXL - 0.02, 2.55))            # NTRIP -> precise (solid)
     thin_arrow(ax, (1.85, 2.15), (BXL - 0.02, 2.40), C_HAS, ls=DASH)   # HAS IDD -> precise
-    thin_arrow(ax, (2.02, 1.05), (BXL - 0.02, 1.22))            # METAR -> advanced models
+    thin_arrow(ax, (1.62, 1.12), (BXL - 0.02, 1.18))            # METAR -> advanced models
     # HAS via E6-B: from the antenna, dashed, down the left margin into the box
     ax.plot([1.30, 0.60, 0.60], [5.05, 5.05, 2.92], color=C_HAS, lw=2.0,
             ls=DASH, zorder=2)
