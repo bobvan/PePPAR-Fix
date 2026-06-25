@@ -184,6 +184,18 @@ def _periodic_ztd_tie(filt, args, lat_deg, alt_m, n_epochs, log):
         log.warning("[ZTD_TIE] epoch=%d Saastamoinen failed (%s); skipping tie",
                     n_epochs, exc)
         return
+    # [METAR] periodic surface-weather + Saastamoinen ZHD/ZTD line.  Rides
+    # the ZTD-tie cadence (every --ztd-tie-interval-s, finer than METAR's
+    # ~hourly update), giving a pos_replay reference capture the ZHD anchor
+    # for its ZTD-truth comparison (docs/pos-replay-capture-manifest.md §4–5;
+    # the engine logs surface pressure only at [INIT_ZTD] otherwise).
+    log.info(
+        "[METAR] epoch=%d %s age=%.0fmin T=%.1fC dewp=%.1fC altim=%.1fhPa "
+        "Pstn=%.1fhPa e=%.1fhPa ZHD=%.4fm ZWD=%.4fm ZTD=%.4fm",
+        n_epochs, rec.get('station', station), age_s / 60.0,
+        diag['temp_C'], diag['dewp_C'], diag['altim_hPa'],
+        diag['P_station_hPa'], diag['e_hPa'],
+        diag['zhd_m'], diag['zwd_m'], diag['ztd_m'])
     # ZTD state index differs between FixedPosFilter (IDX_ZTD
     # class attribute) and PPPFilter (PPP_IDX_ZTD module constant).
     # Use the same getattr fallback the engine uses elsewhere.
@@ -3147,6 +3159,27 @@ class AntPosEstThread(threading.Thread):
                     )
 
             self._n_epochs += 1
+
+            # [PPP_STATE] per-epoch position-filter estimate + σ for a
+            # pos_replay reference capture (Group B,
+            # docs/pos-replay-capture-manifest.md §3): the position-estimating
+            # PPPFilter's ECEF position, 3D position σ, and residual ZTD + σ —
+            # the error/own-σ inputs the divergence monitor scores.  The main
+            # servo loop's --filter-state-log only sees the clock filter; this
+            # is the position half it can't reach.
+            try:
+                _pp = filt.x[:3]
+                _ps = position_sigma_3d(filt.P)
+                _pz = float(filt.x[PPP_IDX_ZTD])
+                _pzs = math.sqrt(max(0.0,
+                    float(filt.P[PPP_IDX_ZTD, PPP_IDX_ZTD])))
+                log.info(
+                    "[PPP_STATE] epoch=%d n=%d ecef=%.4f,%.4f,%.4f "
+                    "sigma_pos=%.4fm ztd=%+.4fm sigma_ztd=%.4fm",
+                    self._n_epochs, n_used, float(_pp[0]), float(_pp[1]),
+                    float(_pp[2]), float(_ps), _pz, _pzs)
+            except (IndexError, ValueError, TypeError):
+                pass
 
             # Phase-residual admission gate ingest — feed this epoch's
             # post-fit phase residuals into WlPhaseAdmissionGate so it
