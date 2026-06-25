@@ -60,7 +60,7 @@ payloads plus that monotonic stamp.
 | RTCM SSR (orbit/clock/code-bias/phase-bias) | NTRIP caster | **raw RTCM3 bytes** | ~varies | `recv_mono` per frame |
 | Broadcast ephemeris (RTCM 1019/1042/1046 or UBX SFRBX) | NTRIP `BCEP` mount / receiver | **raw bytes** | sparse | `recv_mono` |
 | TICC chA/chB lines (DO-PPS, GNSS-PPS) | TICC serial | raw lines | 1 Hz | `recv_mono` per line |
-| EXTTS / qErr (if present) | PHC / TIM-TP | decoded ok (already correlated) | 1 Hz | `recv_mono` |
+| EXTTS / qErr (if present) | PHC / TIM-TP | **raw TIM-TP / EXTTS + `recv_mono`** (not the already-correlated form) | 1 Hz | `recv_mono` per message |
 
 Notes:
 - The **obs↔PPS correlation** is timing-sensitive; capturing each
@@ -69,6 +69,12 @@ Notes:
   single re-ordered log.
 - RAWX is the seed of the **truth pipeline** (§4) as well as the filter
   input — one capture serves both.
+- **Everything is captured raw, including qErr/EXTTS.**  Capturing the
+  *already-correlated* qErr↔edge form would bake in the live match
+  decision and prevent `pos_replay` from re-deriving or ablating it —
+  contradicting the capture-raw principle.  Capture raw TIM-TP +
+  `recv_mono`; the replay re-runs `match_pps_mono` (the gnss-pps-qErr
+  work already made this match replayable from raw + `recv_mono`).
 
 
 ## 3. Group B — engine outputs (for scoring)
@@ -138,10 +144,21 @@ pin these in `manifest.toml` and the compare tool:
 
 ## 6. Determinism, product-matching, and the bundle
 
-- **Deterministic replay.**  Replay the raw streams single-threaded, in
-  `recv_mono` order, with no wall-clock/RNG/threaded-numpy nondeterminism,
-  so a fixed capture + fixed code → bit-identical output (the property
-  that makes it a regression).
+- **Deterministic replay = a virtual `recv_mono` clock.**  Replay the raw
+  streams single-threaded, in `recv_mono` order, with no
+  wall-clock/RNG/threaded-numpy nondeterminism, so a fixed capture + fixed
+  code → bit-identical output (the property that makes it a regression).
+  The deepest risk: the live engine is multi-threaded and some
+  gate/age/timeout decision may evaluate against **live
+  `time.monotonic()`** (`age = now − recv_mono > max_age`) rather than the
+  captured stamp.  Replay is bit-identical only if **every** such decision
+  is a pure function of the captured `recv_mono` — a *virtual clock*
+  driven by the replayed stream, with no hidden wall-clock read at
+  decision time.  This is **build milestone 0** (§8): audit the obs↔PPS
+  correlation gate, `match_pps_mono`, and all freshness/`max_age` checks
+  for wall-clock dependence *before* building replay; any that read
+  wall-clock must be driven from the virtual clock (or that decision point
+  captured).  Otherwise it isn't a regression.
 - **Product-matched replay.**  Support swapping the correction source:
   replay with the real-time SSR as captured **or** with final products
   (the truth used).  Final-products → if it converges, the gap was
@@ -174,6 +191,14 @@ Each is one bundle; `pos_replay` iterates the library.
 
 ## 8. What to build (scope, smallest → largest)
 
+0. **Determinism / gate-purity audit** *(milestone 0 — before replay).*
+   Audit the obs↔PPS correlation gate, `match_pps_mono`, and every
+   freshness/`max_age` check for **live `time.monotonic()` reads at
+   decision time** (§6).  Deliver a finding: which decisions are pure
+   functions of `recv_mono` vs which read wall-clock, and the plan to
+   drive the latter from a virtual clock.  Read-only; gates whether
+   deterministic replay (step 5) is even achievable.  *Small but
+   load-bearing.*
 1. **Periodic pressure log** — extend `_seed_ztd_from_metar` to log
    station pressure hourly through the run.  *Small.*
 2. **Engine-output completeness** — make `--filter-state-log` (in
@@ -200,9 +225,14 @@ real bundle), then 4+5 (truth + replay).  Per the parent doc, this is the
 ## Open decisions
 
 - **Raw vs decoded tap** — recommendation: capture raw + `recv_mono`,
-  derive the decoded filter-input record.  Confirm the raw UBX/RTCM
-  volume over 24 h is acceptable (estimate: tens of MB/h → ~hundreds of
-  MB/day; fine).
+  derive the decoded filter-input record.
+- **Volume + storage** — UBX is tens of MB/h, but multi-GNSS RTCM SSR
+  (orbit/clock/code+phase bias) alone can be a few KB/s → hundreds of
+  MB/day, so a 24 h all-streams bundle may be **~GB-class**.  Measure
+  against a real 1 h capture before committing to 24 h.  Write the bundle
+  to **gt (RAIDZ)**, *not* the lab host's eMMC/SD — per the lab-storage
+  rule, eMMC/SD fail without warning, and a 24 h capture is exactly the
+  kind of artifact that must not live only on a lab card.
 - **Which host** — a lab host with clean sky and a surveyed ARP
   (sub-cm truth already in `antennas.json`), running the position filter
   (not `--no-antposest`).
