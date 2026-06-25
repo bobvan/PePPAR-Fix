@@ -4,7 +4,7 @@
 Renders DOFreqEst (scripts/peppar_fix/do_freq_est.py) as a state×arm
 incidence diagram:
   - 4 state nodes (rows), color-coded measured vs hidden
-  - 6 measurement arms entering from the left at the state(s) they observe
+  - 7 measurement arms entering from the left at the state(s) they observe
   - the predict-step dynamics coupling (f→φ integrators) as internal arrows
   - the actuator feedback (adjfine → φ_do, derived from the hidden f_do)
 
@@ -50,11 +50,12 @@ arms = [
     ("A2 qErr",   "σ≈0.3 ppb", ["x1"], ""),
     ("A5 TDCP",   "σ≈0.026 ppb", ["x1"], ""),
     ("A3 EXTINT", "σ≈5–10 ns", ["x2"], ""),
+    ("A7 cm_phase", "σ≈50 ps", ["x2"], "on-chip / TICC-free"),
     ("A6 pseudo", "σ grows",   ["x2"], "holdover"),
     ("A4 TICC",   "σ≈60 ps",   ["x0", "x2"], "nonlinear / coupled"),
 ]
 # stack arms vertically on the left
-ARM_TOP, ARM_GAP = 80, 70
+ARM_TOP, ARM_GAP = 80, 64
 arm_y = {a[0]: ARM_TOP + i * ARM_GAP for i, a in enumerate(arms)}
 
 

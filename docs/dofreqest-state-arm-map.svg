@@ -13,21 +13,24 @@
 <rect x="40" y="62" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
 <text x="115.0" y="78" text-anchor="middle" font-size="12" font-weight="bold">A1 PPP</text>
 <text x="115.0" y="92" text-anchor="middle" font-size="9" fill="#555">σ≈0.1 ns</text>
-<rect x="40" y="132" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
-<text x="115.0" y="148" text-anchor="middle" font-size="12" font-weight="bold">A2 qErr</text>
-<text x="115.0" y="162" text-anchor="middle" font-size="9" fill="#555">σ≈0.3 ppb</text>
-<rect x="40" y="202" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
-<text x="115.0" y="218" text-anchor="middle" font-size="12" font-weight="bold">A5 TDCP</text>
-<text x="115.0" y="232" text-anchor="middle" font-size="9" fill="#555">σ≈0.026 ppb</text>
-<rect x="40" y="272" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
-<text x="115.0" y="288" text-anchor="middle" font-size="12" font-weight="bold">A3 EXTINT</text>
-<text x="115.0" y="302" text-anchor="middle" font-size="9" fill="#555">σ≈5–10 ns</text>
-<rect x="40" y="342" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
-<text x="115.0" y="358" text-anchor="middle" font-size="12" font-weight="bold">A6 pseudo</text>
-<text x="115.0" y="372" text-anchor="middle" font-size="9" fill="#555">σ grows · holdover</text>
-<rect x="40" y="412" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
-<text x="115.0" y="428" text-anchor="middle" font-size="12" font-weight="bold">A4 TICC</text>
-<text x="115.0" y="442" text-anchor="middle" font-size="9" fill="#555">σ≈60 ps · nonlinear / coupled</text>
+<rect x="40" y="126" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<text x="115.0" y="142" text-anchor="middle" font-size="12" font-weight="bold">A2 qErr</text>
+<text x="115.0" y="156" text-anchor="middle" font-size="9" fill="#555">σ≈0.3 ppb</text>
+<rect x="40" y="190" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<text x="115.0" y="206" text-anchor="middle" font-size="12" font-weight="bold">A5 TDCP</text>
+<text x="115.0" y="220" text-anchor="middle" font-size="9" fill="#555">σ≈0.026 ppb</text>
+<rect x="40" y="254" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<text x="115.0" y="270" text-anchor="middle" font-size="12" font-weight="bold">A3 EXTINT</text>
+<text x="115.0" y="284" text-anchor="middle" font-size="9" fill="#555">σ≈5–10 ns</text>
+<rect x="40" y="318" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<text x="115.0" y="334" text-anchor="middle" font-size="12" font-weight="bold">A7 cm_phase</text>
+<text x="115.0" y="348" text-anchor="middle" font-size="9" fill="#555">σ≈50 ps · on-chip / TICC-free</text>
+<rect x="40" y="382" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<text x="115.0" y="398" text-anchor="middle" font-size="12" font-weight="bold">A6 pseudo</text>
+<text x="115.0" y="412" text-anchor="middle" font-size="9" fill="#555">σ grows · holdover</text>
+<rect x="40" y="446" width="150" height="36" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+<text x="115.0" y="462" text-anchor="middle" font-size="12" font-weight="bold">A4 TICC</text>
+<text x="115.0" y="476" text-anchor="middle" font-size="9" fill="#555">σ≈60 ps · nonlinear / coupled</text>
 <rect x="470" y="78.0" width="230" height="64" rx="7" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2.5"/>
 <text x="484" y="102" font-size="16" font-weight="bold" fill="#2e7d32">x0  φ_rx</text>
 <text x="484" y="122" font-size="11" fill="#444">rx-TCXO phase (ns)</text>
@@ -45,12 +48,13 @@
 <text x="484" y="462" font-size="11" fill="#444">DO freq (ppb)</text>
 <text x="690" y="434.0" text-anchor="end" font-size="10" font-style="italic" fill="#c62828">HIDDEN — no arm</text>
 <path d="M190,80 C330.0,80 330.0,110 468,110" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
-<path d="M190,150 C330.0,150 330.0,210 468,210" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
-<path d="M190,220 C330.0,220 330.0,210 468,210" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
-<path d="M190,290 C330.0,290 330.0,350 468,350" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
-<path d="M190,360 C330.0,360 330.0,350 468,350" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
-<path d="M190,430 C330.0,430 330.0,120 468,120" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
-<path d="M190,430 C330.0,430 330.0,340 468,340" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M190,144 C330.0,144 330.0,210 468,210" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M190,208 C330.0,208 330.0,210 468,210" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M190,272 C330.0,272 330.0,350 468,350" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M190,336 C330.0,336 330.0,350 468,350" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M190,400 C330.0,400 330.0,350 468,350" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M190,464 C330.0,464 330.0,120 468,120" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
+<path d="M190,464 C330.0,464 330.0,340 468,340" fill="none" stroke="#1565c0" stroke-width="1.6" marker-end="url(#armhead)" opacity="0.85"/>
 <path d="M700,210 C728,210 728,110 700,110" fill="none" stroke="#6a1b9a" stroke-width="2" marker-end="url(#dynhead)"/>
 <text x="736" y="164.0" font-size="10" fill="#6a1b9a">∫ f_rx·dt</text>
 <path d="M700,450 C728,450 728,350 700,350" fill="none" stroke="#6a1b9a" stroke-width="2" marker-end="url(#dynhead)"/>
