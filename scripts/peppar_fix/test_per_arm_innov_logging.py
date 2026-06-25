@@ -21,7 +21,7 @@ import numpy as np
 from peppar_fix.do_freq_est import DOFreqEst
 
 
-_ARMS = ('ppp', 'qerr', 'tdcp', 'extint', 'pseudo', 'ticc')
+_ARMS = ('ppp', 'qerr', 'tdcp', 'extint', 'pseudo', 'ticc', 'cm_phase')
 
 
 def _baseline():
@@ -41,7 +41,7 @@ def _baseline():
 
 
 def test_dicts_initialized_with_all_arm_keys():
-    """Both dicts have all six expected keys, all None at construction."""
+    """Both dicts have all seven expected keys, all None at construction."""
     f = _baseline()
     assert set(f.last_arm_innov.keys()) == set(_ARMS)
     assert set(f.last_arm_S.keys()) == set(_ARMS)

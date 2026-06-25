@@ -7,9 +7,14 @@ implementations of ``FrequencyActuator``:
     ``dac_actuator.py``.  Used by PiFace + clkPoC3.
   - ``PhcAdjfineActuator`` (Linux PHC ``clock_adjtime``) — see
     ``phc_actuator.py``.  Used by TimeHat + MadHat (i226 NIC TCXO).
-  - ``ClockmatrixActuator`` (Renesas 8A34002 I²C DPLL FCW) — see
+  - ``ClockMatrixActuator`` (Renesas 8A34002 I²C DPLL FCW, ``write_freq``
+    path — steers but kills the live phase reading) — see
     ``clockmatrix_actuator.py``.  Used by Timebeat OTC hosts
     (otcBob1, ptBoat).
+  - ``ClockMatrixComboActuator`` (Renesas 8A34002 combo bus — sums a software
+    FFO into the DCO bypassing the loop filter, so ``PHASE_STATUS`` stays live
+    and one DPLL can steer AND measure with no wire/TICC) — see
+    ``clockmatrix_combo_actuator.py``.  The no-wire discipline path for OTC/Mini.
 
 Future: White Rabbit, other timing chips.  Adding a new DO architecture
 means implementing this interface; servo, characterization

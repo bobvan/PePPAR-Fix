@@ -154,7 +154,7 @@ read back confirmed. No Timing Commander or EEPROM reprogramming needed.
 | 0x14 | PHASE_OFFSET_CFG | 6 | Phase offset (Timebeat writes here) |
 | 0x1A | FINE_PHASE_ADV_CFG | 2 | Fine phase advance |
 | 0x1C | FOD_FREQ | 6 | Fractional output divider frequency |
-| 0x28 | COMBO_SW_VALUE_CNFG | 4 | |
+| 0x28 | COMBO_SW_VALUE_CNFG | 6 | Signed 48-bit FFO × 2⁻⁵³ (combo-bus SW steer). Was mistakenly listed as size 4; the validated PoC + firmware use a 6-byte/48-bit field. |
 
 ## DPLL phase write registers
 

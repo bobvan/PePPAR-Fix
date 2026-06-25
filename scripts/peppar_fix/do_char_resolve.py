@@ -56,13 +56,16 @@ class EngineCharacterization:
         return self.provenance.get("steering", "absent")
 
 
-# Actuators whose steering gain is a PER-UNIT quantity that must be MEASURED
-# (the DAC's EFC slope, ppb/code, varies per oscillator → do_steering_char).
+# Actuators whose steering gain is a PER-UNIT quantity that must be MEASURED:
+#   - DAC: the VCOCXO's EFC slope (ppb/code) varies per oscillator
+#     → do_steering_char, recorded as [steering].slope_ppb_per_code.
+#   - ClockMatrix_combo: the combo-bus realized/naive ratio (~0.7×) is per-chip
+#     → clockmatrix_combo_gain_char, recorded as [steering].combo_gain.
 # PHC_adjfine and ClockMatrix_FCW are deliberately absent: their gain is an
-# exact, fixed hardware constant (the PTP-clock / ClockMatrix register→freq
-# mapping), so there is nothing to characterize and no [steering] measurement
-# to demand — the refuse gate must not fire on them.
-STEERING_MEASURED_REQUIRED = ("DAC",)
+# exact, fixed hardware constant (the PTP-clock / ClockMatrix write_freq
+# register→freq mapping), so there is nothing to characterize and no [steering]
+# measurement to demand — the refuse gate must not fire on them.
+STEERING_MEASURED_REQUIRED = ("DAC", "ClockMatrix_combo")
 
 
 def _resolve_from_toml(do_uid: str, dos_dir: Optional[str]
@@ -165,8 +168,11 @@ def resolve_dac_actuator_params(
     if do_uid is None:
         return None
     c = do_schema.load_do_characterization(do_uid, dos_dir=dos_dir)
-    if c.identity.get("actuator_type") not in STEERING_MEASURED_REQUIRED:
-        return None  # intrinsic-gain actuator — nothing to source from steering
+    if c.identity.get("actuator_type") != "DAC":
+        # Only the DAC sources its kwargs from the EFC slope.  A combo DO is
+        # also in STEERING_MEASURED_REQUIRED but uses combo_gain
+        # (resolve_combo_actuator_params), not slope_ppb_per_code.
+        return None
     if c.provenance.get("steering") != "measured":
         raise do_schema.SchemaError(
             f"DO {do_uid!r}: [steering] provenance is "
@@ -209,21 +215,77 @@ def resolve_dac_actuator_params(
     return params
 
 
+def resolve_combo_actuator_params(
+        do_uid: Optional[str], *, dos_dir: Optional[str] = None
+        ) -> Optional[dict]:
+    """Source ClockMatrixComboActuator parameters from the MEASURED [steering].
+
+    The combo bus's realized/naive frequency ratio (~0.7×) is a PER-CHIP
+    quantity (it depends on the DCO combo-injection scaling), so — like the
+    DAC's EFC slope — a guessed/default value is unsafe.  This makes the
+    measured [steering].combo_gain the single source of truth for the combo
+    actuator's gain.
+
+    Returns ``{"combo_gain": float}`` when the DO is a ClockMatrix_combo
+    actuator with measured steering.  Returns None when the actuator is not a
+    combo type or do_uid is None.  Returns None (defers, does NOT raise) when
+    the DO is UNREGISTERED/unreadable — the actuator type is unknown, so this is
+    not the place to refuse; the engine's own resolve_engine_characterization
+    raises the unregistered-DO error consistently downstream.  Raises
+    SchemaError only when a REGISTERED combo DO's steering was never measured —
+    the engine must STOP, not actuate the combo on a default gain (mirrors
+    should_refuse_for_steering at construction time).
+    """
+    if do_uid is None:
+        return None
+    try:
+        c = do_schema.load_do_characterization(do_uid, dos_dir=dos_dir)
+    except do_schema.SchemaError:
+        # Unregistered / unreadable DO — can't know it's a combo actuator, so
+        # defer (return None) rather than refuse.  Existing FCW/PHC ClockMatrix
+        # hosts that predate the per-DO schema keep working; a genuinely
+        # unregistered DO still fails later at resolve_engine_characterization.
+        return None
+    if c.identity.get("actuator_type") != "ClockMatrix_combo":
+        return None
+    if c.provenance.get("steering") != "measured":
+        raise do_schema.SchemaError(
+            f"DO {do_uid!r}: [steering] provenance is "
+            f"{c.provenance.get('steering', 'absent')!r}, not 'measured' — "
+            f"refusing to discipline a ClockMatrix combo path on a non-measured "
+            f"gain.  Run scripts/clockmatrix_combo_gain_char.py first.  There is "
+            f"no default combo_gain: the realized/naive ratio is per-chip, so a "
+            f"guessed gain is unsafe.")
+    cg = c.steering.get("combo_gain")
+    if cg is None or cg == 0:
+        raise do_schema.SchemaError(
+            f"DO {do_uid!r}: [steering] is measured but combo_gain is "
+            f"{cg!r} — re-run scripts/clockmatrix_combo_gain_char.py.")
+    return {"combo_gain": float(cg)}
+
+
 def format_provenance_log(do_uid: str, ec: EngineCharacterization) -> list[str]:
     """Operator-facing provenance lines for engine startup.
 
     Class-default and MISSING sections get a loud trailing call to action
     (per docs §"Class defaults" — a default is not a measurement).
     """
+    # The steering tool depends on the actuator: a combo DO is characterized
+    # by clockmatrix_combo_gain_char.py, every other measurable one by
+    # do_steering_char.py.
+    steering_tool = ("clockmatrix_combo_gain_char.py"
+                     if ec.actuator_type == "ClockMatrix_combo"
+                     else "do_steering_char.py")
     lines = [f"DO {do_uid} characterization source = {ec.schema}"]
     for section, src in sorted(ec.provenance.items()):
         nudge = ""
         if "class-default" in src:
             tool = {"freerun_noise": "do_freerun_char.py",
                     "actuation_noise": "do_actuator_char.py",
-                    "steering": "do_steering_char.py"}.get(section, "do_*_char.py")
+                    "steering": steering_tool}.get(section, "do_*_char.py")
             nudge = f"   ← RUN {tool} FOR A REAL MEASUREMENT"
         elif src == "MISSING":
-            nudge = "   ← REQUIRED (run do_steering_char.py) — engine will refuse to actuate"
+            nudge = (f"   ← REQUIRED (run {steering_tool}) — engine will "
+                     f"refuse to actuate")
         lines.append(f"  [{section}] {src}{nudge}")
     return lines

@@ -78,7 +78,14 @@ ALLOWED_CLASSES = ("OCXO", "TCXO", "Rb", "PHC")
 
 
 # Allowed actuator types.  Maps to FrequencyActuator implementations.
-ALLOWED_ACTUATOR_TYPES = ("DAC", "PHC_adjfine", "ClockMatrix_FCW")
+#
+# ClockMatrix_FCW (write_freq) gain is an exact register→freq constant — no
+# per-unit measurement.  ClockMatrix_combo (the combo-bus loop-filter-bypass
+# path) is DIFFERENT: the realized/naive frequency ratio (~0.7×) is per-chip,
+# so it MUST be measured (clockmatrix_combo_gain_char.py) and recorded in
+# [steering].combo_gain — same rule as the DAC's per-unit EFC slope.
+ALLOWED_ACTUATOR_TYPES = ("DAC", "PHC_adjfine", "ClockMatrix_FCW",
+                          "ClockMatrix_combo")
 
 
 # Class defaults per docs §"Class defaults".  Numbers are argued in PR
@@ -290,18 +297,32 @@ def validate_characterization(data: dict) -> list[str]:
                 f"[actuation_noise].sigma_q_ns must be > 0, got {sq!r}"
             )
 
-    # [steering] validation — slope must be non-zero (sign-meaningful)
+    # [steering] validation — the measured per-unit gain must be non-zero.
+    # Which field carries it is actuator-aware: ClockMatrix_combo records a
+    # dimensionless combo_gain (realized/naive), every other measurable
+    # actuator records slope_ppb_per_code.
     st = data.get("steering")
     if isinstance(st, dict) and st.get("source") == "measured":
-        errors.extend(_check_measured_required(
-            "steering", st, _REQUIRED_MEASURED_KEYS["steering"]))
-        slope = st.get("slope_ppb_per_code")
-        if slope is not None and slope == 0:
-            errors.append(
-                "[steering].slope_ppb_per_code must be non-zero "
-                "(measured slope of zero is a calibration failure, "
-                "not a valid DO)"
-            )
+        actuator_type = ident.get("actuator_type") if isinstance(ident, dict) else None
+        if actuator_type == "ClockMatrix_combo":
+            errors.extend(_check_measured_required("steering", st, ("combo_gain",)))
+            cg = st.get("combo_gain")
+            if cg is not None and (not isinstance(cg, (int, float)) or cg == 0):
+                errors.append(
+                    "[steering].combo_gain must be a non-zero number "
+                    "(realized/naive frequency ratio; zero is a calibration "
+                    "failure, not a valid combo path)"
+                )
+        else:
+            errors.extend(_check_measured_required(
+                "steering", st, _REQUIRED_MEASURED_KEYS["steering"]))
+            slope = st.get("slope_ppb_per_code")
+            if slope is not None and slope == 0:
+                errors.append(
+                    "[steering].slope_ppb_per_code must be non-zero "
+                    "(measured slope of zero is a calibration failure, "
+                    "not a valid DO)"
+                )
         # dac_gain (optional, back-compat): the DAC output-stage gain mode
         # the slope was MEASURED at.  A slope is only valid at the same gain
         # mode it was characterized under (1× vs 2× changes the volts/code,

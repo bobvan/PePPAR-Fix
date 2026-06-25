@@ -41,8 +41,12 @@ def _stub_smbus_factory(bus_num):
     _BUSES.append(bus)
     return bus
 
-if "smbus2" not in sys.modules:
-    sys.modules["smbus2"] = types.SimpleNamespace(SMBus=_stub_smbus_factory)
+# Force the stub unconditionally.  A plain `if "smbus2" not in sys.modules`
+# guard is defeated whenever another test in the same session imports the
+# venv's real smbus2 first (e.g. via clockmatrix.py) — DacActuator's deferred
+# `import smbus2` would then get the real module and try to open /dev/i2c-1.
+# This test must never touch hardware, so always install the mock.
+sys.modules["smbus2"] = types.SimpleNamespace(SMBus=_stub_smbus_factory)
 
 from peppar_fix.dac_actuator import DacActuator  # noqa: E402
 

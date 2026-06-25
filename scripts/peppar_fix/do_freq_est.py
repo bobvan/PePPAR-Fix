@@ -241,13 +241,16 @@ class DOFreqEst:
         #   extint  — Arm 3, F9T TIM-TM2 → x[2]
         #   pseudo  — Arm 6, holdover-integrated synthetic x[2]
         #   ticc    — Arm 4, TICC chA-chB (nonlinear coupling)
+        #   cm_phase — Arm 7, ClockMatrix DPLL PHASE_STATUS → x[2]
         self.last_arm_innov: dict[str, float | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
             'extint': None, 'pseudo': None, 'ticc': None,
+            'cm_phase': None,
         }
         self.last_arm_S: dict[str, float | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
             'extint': None, 'pseudo': None, 'ticc': None,
+            'cm_phase': None,
         }
         # Per-arm pull attribution (pullAttributionLog).  Captures K
         # (Kalman gain vector) and would_pull (K · innov — state delta
@@ -261,14 +264,17 @@ class DOFreqEst:
         self.last_arm_K: dict[str, list[float] | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
             'extint': None, 'pseudo': None, 'ticc': None,
+            'cm_phase': None,
         }
         self.last_arm_would_pull: dict[str, list[float] | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
             'extint': None, 'pseudo': None, 'ticc': None,
+            'cm_phase': None,
         }
         self.last_arm_chi2: dict[str, float | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
             'extint': None, 'pseudo': None, 'ticc': None,
+            'cm_phase': None,
         }
         self.last_ocxo_gate_rejected: bool = False
         self.last_ocxo_gate_reason: str = ""
@@ -551,9 +557,10 @@ class DOFreqEst:
                extint_phase_ns=None, extint_sigma_ns=None,
                ticc_diff_ns=None, ticc_sigma_ns=None,
                pseudo_phase_ns=None, pseudo_phase_sigma_ns=None,
+               cm_phase_ns=None, cm_phase_sigma_ns=None,
                ticc_qerr_ns=None,
                distance_to_lock=None):
-        """Process one epoch with up to six conditional measurement arms.
+        """Process one epoch with up to seven conditional measurement arms.
 
         Per docs/dofreq-est-measurement-ladder.md and
         docs/tdcp-servo-integration.md.  All arms are keyword-only.
@@ -571,6 +578,8 @@ class DOFreqEst:
         Arm pseudo (6) observes  x[2] = DO phase, synthetic from TDCP-
                                  integrated phase during holdover
         Arm TICC   (4) observes  -x[2] - qerr(x[0])  (nonlinear coupling)
+        Arm cm_phase(7) observes x[2] = DO phase, on-chip ClockMatrix
+                                 DPLL PHASE_STATUS (DO PPS vs F9T PPS)
 
         Args:
             dt: seconds since last correction.
@@ -601,6 +610,13 @@ class DOFreqEst:
                 own state estimate of x[0], not from a separately-
                 matched qErr stream.  Sigma defaults to the
                 constructor's R_ticc if not provided.
+            cm_phase_ns, cm_phase_sigma_ns:
+                Arm 7 — on-chip ClockMatrix DPLL PHASE_STATUS = the
+                DO PPS vs F9T PPS phase error read from the DPLL's PFD
+                (50 ps resolution, σ ~0.05 ns).  Same observation state
+                as Arm 3 (x[2], DO phase, linear H), but measured on the
+                same chip that carries the DO — no TICC, no EXTINT wire.
+                The TICC-free DO-phase observer for Timebeat OTC hosts.
 
         Returns:
             Frequency in ppb to apply via adjfine.
@@ -622,7 +638,14 @@ class DOFreqEst:
         # whichever arrives first.  If neither arrives, leave x[2] at
         # its constructor default and let the LQR develop it.
         if self._need_phc_seed:
-            if extint_phase_ns is not None:
+            if cm_phase_ns is not None:
+                # On-chip ClockMatrix PHASE_STATUS — the cleanest linear x[2]
+                # observer (~50 ps) and, on OTC hosts, usually the only one.
+                self.x[2] = cm_phase_ns
+                self.P[2, 2] = max(cm_phase_sigma_ns ** 2 if cm_phase_sigma_ns
+                                   else 100.0, 100.0)
+                self._need_phc_seed = False
+            elif extint_phase_ns is not None:
                 self.x[2] = extint_phase_ns
                 self.P[2, 2] = max(extint_sigma_ns ** 2 if extint_sigma_ns
                                    else 100.0, 100.0)
@@ -708,6 +731,22 @@ class DOFreqEst:
                 H=np.array([[0.0, 0.0, 1.0, 0.0]]),
                 R=extint_sigma_ns ** 2,
                 arm_name='extint',
+            )
+
+        # ── Arm 7: ClockMatrix PHASE_STATUS (linear, observes x[2]) ──
+        # On-chip DPLL PFD = DO PPS vs F9T PPS, read over I2C (50 ps res).
+        # Same H as Arm 3 (EXTINT) — an independent x[2] observer that needs
+        # no TICC and no EXTINT wire (the TICC-free arm for OTC hosts).  An
+        # actuator on the SAME DPLL (ClockMatrixComboActuator) is fine: the
+        # PFD measures DO-vs-reference, the combo bus injects frequency, and
+        # the EKF closes the loop just as it does for a DAC + EXTINT pair.
+        if cm_phase_ns is not None and cm_phase_sigma_ns is not None:
+            x_pred, P_pred = self._kalman_linear_update(
+                x_pred, P_pred,
+                z=cm_phase_ns,
+                H=np.array([[0.0, 0.0, 1.0, 0.0]]),
+                R=cm_phase_sigma_ns ** 2,
+                arm_name='cm_phase',
             )
 
         # ── Arm 6: holdover pseudo-obs (linear, observes x[2]) ──
@@ -866,7 +905,8 @@ class DOFreqEst:
             # OCXO physical gate below keeps its own sole-carrier override.
             # (Moot under the soft gate, which never sets chi2_reject — it
             # already admits the sole observer, just down-weighted.)
-            ticc_sole_do_observer = extint_phase_ns is None
+            ticc_sole_do_observer = (extint_phase_ns is None
+                                     and cm_phase_ns is None)
             if chi2_reject and ticc_sole_do_observer:
                 log.warning(
                     "[EKF] Arm 4 chi² (χ²=%.0f, |innov|=%.1f ns, √S=%.1f ns) "

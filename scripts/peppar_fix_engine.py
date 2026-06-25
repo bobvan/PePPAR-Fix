@@ -6168,6 +6168,32 @@ def _resolve_do_uid(args):
     return None
 
 
+def _build_clockmatrix_actuator(cm_i2c, cm_dpll, combo_params):
+    """Select the ClockMatrix actuator from the DO's measured characterization.
+
+    ``combo_params`` is ``do_char_resolve.resolve_combo_actuator_params(do_uid)``:
+      * ``{'combo_gain': g}`` → ``ClockMatrixComboActuator`` (the one-DPLL
+        no-wire combo-bus servo — steers DPLL3 via the combo bus while its
+        PFD/PHASE_STATUS stays live, so the same DPLL both steers and observes).
+      * ``None`` → ``ClockMatrixActuator`` (write_freq/FCW — the two-DPLL path:
+        steers one DPLL, a separate DPLL measures phase).
+
+    Returns ``(actuator, actuator_type, one_dpll)``.  ``one_dpll=True`` (combo)
+    tells the caller the phase observer must read the SAME DPLL the actuator
+    steers and must NOT reconfigure it (the actuator already owns its config).
+
+    Refusal for a combo DO whose gain was never measured happens upstream in
+    resolve_combo_actuator_params (it raises) — Bob's no-default-gain rule.
+    """
+    if combo_params is not None:
+        from peppar_fix.clockmatrix_combo_actuator import ClockMatrixComboActuator
+        return (ClockMatrixComboActuator(cm_i2c, dpll_id=cm_dpll,
+                                         combo_gain=combo_params['combo_gain']),
+                "clockmatrix_combo", True)
+    from peppar_fix.clockmatrix_actuator import ClockMatrixActuator
+    return (ClockMatrixActuator(cm_i2c, dpll_id=cm_dpll), "clockmatrix", False)
+
+
 # ── DO bootstrap (absorbed from phc_bootstrap.py) ─────────────────── #
 
 
@@ -7095,17 +7121,32 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             log.error("DAC actuator init failed: %s", e)
             actuator = None
     elif getattr(args, 'clockmatrix_bus', None) is not None:
+        # Combo-vs-FCW selection is driven by the DO's measured characterization.
+        # Resolve OUTSIDE the try so an unmeasured combo DO STOPS the engine
+        # (resolve_combo_actuator_params raises) rather than silently falling
+        # back to PHC — Bob's no-default-actuator-gain rule.
+        from peppar_fix.do_char_resolve import resolve_combo_actuator_params
+        _combo_params = resolve_combo_actuator_params(_resolve_do_uid(args))
         try:
             from peppar_fix.clockmatrix import ClockMatrixI2C
-            from peppar_fix.clockmatrix_actuator import ClockMatrixActuator
             cm_i2c = ClockMatrixI2C(
                 bus_num=args.clockmatrix_bus,
                 addr=int(getattr(args, 'clockmatrix_addr', '0x58'), 0))
             cm_dpll = getattr(args, 'clockmatrix_dpll_actuator', 3)
-            actuator = ClockMatrixActuator(cm_i2c, dpll_id=cm_dpll)
-            actuator_type = "clockmatrix"
-            log.info("Using ClockMatrix actuator: bus=%d dpll=%d",
-                     args.clockmatrix_bus, cm_dpll)
+            actuator, actuator_type, cm_one_dpll = _build_clockmatrix_actuator(
+                cm_i2c, cm_dpll, _combo_params)
+            if cm_one_dpll:
+                # One-DPLL combo servo: the on-chip phase observer reads the
+                # SAME DPLL the combo steers (no separate measurement DPLL, no
+                # wire).  Override any profile clockmatrix_dpll_phase.
+                args.clockmatrix_dpll_phase = cm_dpll
+                log.info("Using ClockMatrix COMBO actuator: bus=%d dpll=%d "
+                         "combo_gain=%.4f (one-DPLL no-wire; phase on DPLL%d)",
+                         args.clockmatrix_bus, cm_dpll,
+                         _combo_params['combo_gain'], cm_dpll)
+            else:
+                log.info("Using ClockMatrix actuator (FCW): bus=%d dpll=%d",
+                         args.clockmatrix_bus, cm_dpll)
         except Exception as e:
             log.error("ClockMatrix actuator init failed: %s", e)
             actuator = None
@@ -7154,9 +7195,19 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None):
             cm_pps_clk = getattr(args, 'clockmatrix_pps_clk', 2)
             cm_phase_source = ClockMatrixPhaseSource(
                 cm_i2c, dpll_id=cm_phase_dpll, pps_clk=cm_pps_clk)
-            cm_phase_source.setup()
-            log.info("Using ClockMatrix TDC phase source: DPLL_%d, CLK%d",
-                     cm_phase_dpll, cm_pps_clk)
+            if actuator_type == "clockmatrix_combo":
+                # One-DPLL combo: the actuator already configured this DPLL
+                # (PLL/auto + BW≈0 + combo subscribe).  Do NOT call setup() —
+                # it would reconfigure the ref/PLL-mode and fight the combo
+                # config.  Just read PHASE_STATUS (read-only, like
+                # clockmatrix_combo_gain_char).  teardown() is then a no-op
+                # (no saved originals), leaving hand-back to the actuator.
+                log.info("ClockMatrix combo: reading PHASE_STATUS on DPLL_%d "
+                         "(read-only, no reconfigure)", cm_phase_dpll)
+            else:
+                cm_phase_source.setup()
+                log.info("Using ClockMatrix TDC phase source: DPLL_%d, CLK%d",
+                         cm_phase_dpll, cm_pps_clk)
         except Exception as e:
             log.error("ClockMatrix phase source failed: %s — using EXTTS", e)
             cm_phase_source = None
@@ -8229,14 +8280,26 @@ def _match_pps_event_from_history(ctx, obs_event, target_sec,
 
 
 def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
-    """ClockMatrix-only servo epoch: TDC phase → PI → FCW.
+    """ClockMatrix servo epoch: on-chip PHASE_STATUS → DOFreqEst (Arm 7) → actuator.
 
-    Reads phase error from the ClockMatrix TDC (DPLL PFD measuring
-    PPS vs clock tree) and steers frequency via FCW. No EXTTS, no PHC,
-    no PPS correlation — everything is I2C.
+    The DO-phase observer for Timebeat OTC/Mini hosts is the ClockMatrix DPLL
+    PFD (``PHASE_STATUS`` = DO PPS vs F9T PPS), read over I2C — no EXTTS, no
+    PHC, no TICC.  It feeds DOFreqEst's ``cm_phase`` arm (Arm 7, observes x[2])
+    alongside the PPP carrier arm (``dt_rx`` → x[0]); the EKF fuses them and the
+    combo/FCW actuator applies the correction.  This replaces the legacy
+    standalone PI loop (which predated DOFreqEst and was incompatible with it —
+    positional ``update`` + ``kp/ki/integral`` the EKF doesn't have) so OTC
+    hosts get the SAME estimator (OCXO physical gate, coast-cap, PPP fusion,
+    state-sanity reset budget) as DAC / PHC-adjfine hosts.
+
+    The moonshot design lives here: the PPP carrier-phase solution is the
+    low-noise driver, the on-chip PHASE_STATUS is the PPS-edge observer, and the
+    OCXO is the short-τ floor — exactly the arms the EKF needs to beat the
+    hardware DPLL.  ``--no-cm-phase`` drops Arm 7 (PPP-only) for the A/B that
+    asks whether the on-chip observer helps.
     """
     cm_phase = ctx['cm_phase_source']
-    servo = ctx['servo']
+    servo = ctx['servo']            # DOFreqEst (same object as DAC/PHC hosts)
     scheduler = ctx['scheduler']
     log_w = ctx.get('log_w')
 
@@ -8246,18 +8309,12 @@ def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
             log.info("  [%d] No ClockMatrix phase reading", n_epochs)
         return "no_phase"
 
-    # The TDC PFD measures PPS vs DPLL output.
-    # Positive = output behind PPS = need to speed up.
-    # Use TDC as the sole error source with 50 ps confidence.
-    cm_tdc_confidence_ns = 0.050
-
+    # Gross-excursion gate with a bounded reset budget before exit-5
+    # (exitFiveToServoReset site C, unchanged from the PI path).
     TRACK_OUTLIER_NS = args.track_outlier_ns
     if TRACK_OUTLIER_NS is not None and abs(phase_ns) > TRACK_OUTLIER_NS:
         ctx['consecutive_outliers'] = ctx.get('consecutive_outliers', 0) + 1
         if ctx['consecutive_outliers'] >= 30:
-            # exitFiveToServoReset site C (ClockMatrix outlier cascade):
-            # try in-process reset before exit-5.  Within budget →
-            # reset the EKF, clear the counter, keep coasting.
             if _request_servo_reset(ctx, 'cm_outlier') == "reset":
                 ctx['consecutive_outliers'] = 0
                 return "outlier"
@@ -8266,51 +8323,57 @@ def _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
             ctx['phc_diverged'] = True
             return "outlier"
         return "outlier"
-    else:
-        ctx['consecutive_outliers'] = 0
+    ctx['consecutive_outliers'] = 0
 
-    scheduler.accumulate(phase_ns, cm_tdc_confidence_ns, 'CM_TDC')
+    # The EKF needs wall-clock dt, not the PI path's sample count.  Track the
+    # last-correction monotonic stamp in ctx; clamp to a sane band.
+    now_mono = time.monotonic()
+    last_mono = ctx.get('_cm_last_mono')
+    dt_actual = (now_mono - last_mono) if last_mono is not None else 1.0
+    dt_actual = max(1e-3, min(dt_actual, 60.0))
+    ctx['_cm_last_mono'] = now_mono
 
-    if scheduler.should_correct():
-        avg_error, avg_confidence, n_samples = scheduler.flush()
+    # Arm 7 gating (--no-cm-phase → PPP-only A/B).  σ = 50 ps TDC resolution.
+    cm_phase_ns = phase_ns if getattr(args, 'cm_phase_arm', True) else None
+    cm_phase_sigma_ns = 0.050 if cm_phase_ns is not None else None
 
-        BASE_KP = args.track_kp
-        BASE_KI = args.track_ki
-        GAIN_REF_SIGMA = args.gain_ref_sigma
-        GAIN_MIN_SCALE = args.gain_min_scale
-        GAIN_MAX_SCALE = args.gain_max_scale
-        gain_scale = max(GAIN_MIN_SCALE, min(GAIN_MAX_SCALE,
-                         GAIN_REF_SIGMA / avg_confidence))
-        servo.kp = BASE_KP * gain_scale
-        servo.ki = BASE_KI * gain_scale
+    # DOFreqEst fusion → DO frequency-error estimate.  Apply its NEGATIVE as the
+    # pull (same sign contract as adjfine: speed up a slow DO).  The combo/FCW
+    # actuator's adjust_frequency_ppb(+ppb) speeds up the DO, matching adjfine.
+    freq_ppb = -servo.update(
+        dt=dt_actual,
+        dt_rx_ns=dt_rx_ns, dt_rx_sigma_ns=dt_rx_sigma,
+        cm_phase_ns=cm_phase_ns, cm_phase_sigma_ns=cm_phase_sigma_ns,
+    )
 
-        # ClockMatrix FCW: positive error → positive freq (opposite of adjfine)
-        freq_ppb = servo.update(avg_error, dt=float(n_samples))
+    # State-sanity reset budget (mirror the standard epoch): a sustained EKF
+    # runaway resets in-process within budget, else exit-5 for wrapper relaunch.
+    if servo.is_state_corrupted():
+        if _request_servo_reset(ctx, 'state_sanity') == "reset":
+            freq_ppb = -servo.freq
+        else:
+            log.error("  state-sanity sustained beyond reset budget — "
+                      "exiting for wrapper re-bootstrap (exit code 5).")
+            ctx['phc_diverged'] = True
 
-        max_ppb = args.track_max_ppb or 244_000.0
-        if abs(freq_ppb) > max_ppb:
-            freq_ppb = math.copysign(max_ppb, freq_ppb)
-        if abs(freq_ppb) >= max_ppb * 0.95:
-            servo.integral = freq_ppb / servo.ki if servo.ki != 0 else 0
-            log.warning('  Anti-windup: freq=%+.0fppb at rail', freq_ppb)
+    # Clamp to the actuator authority.
+    max_ppb = args.track_max_ppb or 244_000.0
+    if abs(freq_ppb) > max_ppb:
+        freq_ppb = math.copysign(max_ppb, freq_ppb)
 
-        if not args.freerun:
-            ctx['actuator'].adjust_frequency_ppb(freq_ppb)
-        ctx['adjfine_ppb'] = freq_ppb
-        ctx['gain_scale'] = gain_scale
+    if not args.freerun:
+        ctx['actuator'].adjust_frequency_ppb(freq_ppb)
+    ctx['adjfine_ppb'] = freq_ppb
 
-        # Output-side actuation history → physical-drift estimator
-        # inside compute_adaptive_interval().  Long-window slope of
-        # adjfine = |open-loop DO drift rate|; combined with input-
-        # side σ_obs to choose τ.  See schedulerCombinedDriftEstimator.
-        scheduler.record_actuation(time.monotonic(), freq_ppb)
-        scheduler.compute_adaptive_interval()
+    # Output-side actuation history → adaptive-interval (Goldilocks) drift
+    # estimator, same as the standard path.
+    scheduler.record_actuation(now_mono, freq_ppb)
+    scheduler.compute_adaptive_interval()
 
-        if n_epochs % 10 == 0:
-            log.info("  [%d] CM_TDC: err=%+.1fns (avg %d) freq=%+.1fppb "
-                     "gain=%.2fx interval=%d",
-                     n_epochs, avg_error, n_samples, freq_ppb,
-                     gain_scale, scheduler.interval)
+    if n_epochs % 10 == 0:
+        log.info("  [%d] CM_TDC: phase=%+.1fns dt=%.1fs freq=%+.1fppb "
+                 "cm_arm=%s interval=%d", n_epochs, phase_ns, dt_actual,
+                 freq_ppb, cm_phase_ns is not None, scheduler.interval)
 
     if log_w is not None:
         log_w.writerow({
@@ -11632,6 +11695,15 @@ Two-phase operation:
                             "useful for ablation runs comparing PPP-only "
                             "to PPP+EXTINT performance.  See "
                             "docs/dofreq-est-measurement-ladder.md.")
+    servo.add_argument("--no-cm-phase", dest="cm_phase_arm",
+                       action="store_false", default=True,
+                       help="Disable DOFreqEst Arm 7 (ClockMatrix PHASE_STATUS "
+                            "→ x[2]).  On Timebeat OTC/Mini hosts the on-chip "
+                            "DPLL PFD is the TICC-free DO-phase observer; "
+                            "dropping it leaves the EKF on PPP carrier alone "
+                            "for the moonshot A/B (does the on-chip observer "
+                            "help vs PPP-only?).  No effect on non-ClockMatrix "
+                            "hosts.")
     servo.add_argument("--extint-late-reject-ns", type=float, default=50.0,
                        help="EXTINT ringing late-edge rejection threshold "
                             "(ns).  The F9P EXTINT input network can ring and "

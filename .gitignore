@@ -3,8 +3,12 @@ data/
 
 # Host-local state (receiver identity, position, DO characterization).
 # Runtime JSON is host-specific; README.md files are checked in so
-# lab hosts get directory descriptions on pull.
+# lab hosts get directory descriptions on pull.  DO characterization
+# migrated from per-host <uid>.json to the per-section <uid>.toml schema
+# (do_schema) — those are equally host-local and must be ignored too,
+# else do_*_char tools leave untracked files that risk accidental commit.
 state/**/*.json
+state/**/*.toml
 state/**/*.tmp
 
 # Credentials — any ntrip*.conf variant (ntrip-cnes.conf,
