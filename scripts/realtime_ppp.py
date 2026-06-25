@@ -336,13 +336,20 @@ class QErrStore:
         with self._lock:
             self._fifo.clear()
 
-    def get(self, max_age_s=2.0):
-        """Return (qerr_ns, tow_ms) or (None, None) if stale/unavailable."""
+    def get(self, max_age_s=2.0, now_mono=None):
+        """Return (qerr_ns, tow_ms) or (None, None) if stale/unavailable.
+
+        ``now_mono`` overrides the wall-clock reference for the freshness
+        check (None = live ``time.monotonic()``).  Passing the virtual
+        replay clock makes the decision a pure function of captured
+        ``recv_mono`` — see docs/pos-replay-capture-manifest.md §6.
+        """
+        now = time.monotonic() if now_mono is None else now_mono
         with self._lock:
             if not self._samples:
                 return None, None
             latest = self._samples[-1]
-            if time.monotonic() - latest["host_time"] > max_age_s:
+            if now - latest["host_time"] > max_age_s:
                 return None, None
             return latest["qerr_ns"], latest["tow_ms"]
 
@@ -373,13 +380,17 @@ class QErrStore:
                 if s["host_time"] > host_time_floor
             ]
 
-    def snapshot(self, max_age_s=2.0):
-        """Return latest qErr sample metadata or Nones if stale/unavailable."""
+    def snapshot(self, max_age_s=2.0, now_mono=None):
+        """Return latest qErr sample metadata or Nones if stale/unavailable.
+
+        ``now_mono`` overrides the freshness reference (None = live).
+        """
+        now = time.monotonic() if now_mono is None else now_mono
         with self._lock:
             if not self._samples:
                 return None, None, None
             latest = self._samples[-1]
-            age_s = time.monotonic() - latest["host_time"]
+            age_s = now - latest["host_time"]
             if age_s > max_age_s:
                 return None, None, None
             return latest["qerr_ns"], latest["tow_ms"], age_s
@@ -412,7 +423,8 @@ class QErrStore:
             _, sample, offset_s = best
             return sample["qerr_ns"], offset_s
 
-    def match_gps_time(self, gps_time, max_age_s=30.0, max_tow_delta_ms=1000):
+    def match_gps_time(self, gps_time, max_age_s=30.0, max_tow_delta_ms=1000,
+                       now_mono=None):
         """Return qErr matched to the GNSS epoch second.
 
         TIM-TP describes the timing of the *next* timepulse, so its towMS
@@ -421,12 +433,13 @@ class QErrStore:
         the true integer second — round() recovers the correct second.
 
         Returns `(qerr_ns, tow_ms, age_s, tow_delta_ms)` or Nones when no
-        sufficiently fresh, close TIM-TP sample is available.
+        sufficiently fresh, close TIM-TP sample is available.  ``now_mono``
+        overrides the freshness reference (None = live).
         """
         target_tow_ms = self._normalize_tow_ms(
             int(round(self.gps_tow_ms(gps_time) / 1000.0)) * 1000
         )
-        now = time.monotonic()
+        now = time.monotonic() if now_mono is None else now_mono
         with self._lock:
             best = None
             for sample in reversed(self._samples):
@@ -547,16 +560,18 @@ class Nav2PositionStore:
         with self._lock:
             return self._update_count > 0
 
-    def get_opinion(self, max_age_s=30.0):
+    def get_opinion(self, max_age_s=30.0, now_mono=None):
         """Return a position opinion dict, or None if stale/unavailable.
 
         The opinion contains all confidence-relevant fields for the
         position confidence framework (see docs/position-confidence.md).
+        ``now_mono`` overrides the freshness reference (None = live).
         """
+        now = time.monotonic() if now_mono is None else now_mono
         with self._lock:
             if self._host_mono is None:
                 return None
-            age = time.monotonic() - self._host_mono
+            age = now - self._host_mono
             if age > max_age_s:
                 return None
             if self._fix_type not in (2, 3) or self._lat is None:
@@ -603,12 +618,12 @@ class Nav2PositionStore:
             'n_updates': n,
         }
 
-    def get_ecef(self, max_age_s=30.0):
+    def get_ecef(self, max_age_s=30.0, now_mono=None):
         """Return (ecef_xyz, h_acc_m, age_s) or (None, None, None) if stale.
 
         Legacy interface — prefer get_opinion() for new code.
         """
-        opinion = self.get_opinion(max_age_s=max_age_s)
+        opinion = self.get_opinion(max_age_s=max_age_s, now_mono=now_mono)
         if opinion is None:
             return None, None, None
         return opinion['ecef'], opinion['h_acc_m'], opinion['age_s']
@@ -836,7 +851,7 @@ class Nav2SignalStore:
         with self._lock:
             return dict(self._by_key)
 
-    def get_signal(self, sv, sig_id, max_age_s=5.0):
+    def get_signal(self, sv, sig_id, max_age_s=5.0, now_mono=None):
         """Return dict signal status, or None if missing or stale.
 
         Per the slipDetectUnified-main Phase A.5 monitor contract
@@ -861,11 +876,12 @@ class Nav2SignalStore:
             None if the (sv, sig_id) pair was never seen or its
             status is older than max_age_s.
         """
+        now = time.monotonic() if now_mono is None else now_mono
         with self._lock:
             st = self._by_key.get((sv, sig_id))
         if st is None:
             return None
-        age_s = time.monotonic() - st.host_mono
+        age_s = now - st.host_mono
         if age_s > max_age_s:
             return None
         return {
@@ -881,15 +897,16 @@ class Nav2SignalStore:
             'ageS':        age_s,
         }
 
-    def iter_signals(self, max_age_s=5.0):
+    def iter_signals(self, max_age_s=5.0, now_mono=None):
         """Yield (sv, sig_id) tuples for currently-fresh signals.
 
         Per the Phase A.5 monitor contract — gives the consumer a
         deterministic iteration order over signals the receiver is
         actively reporting on.  Stale entries are filtered out by
-        the same max_age_s window as get_signal().
+        the same max_age_s window as get_signal().  ``now_mono``
+        overrides the freshness reference (None = live).
         """
-        now = time.monotonic()
+        now = time.monotonic() if now_mono is None else now_mono
         with self._lock:
             items = [(key, st.host_mono) for key, st in self._by_key.items()]
         for (sv, sig_id), host_mono in sorted(items):
@@ -945,7 +962,8 @@ class NavClockStore:
             self._host_mono = time.monotonic()
             self._update_count += 1
 
-    def get(self):
+    def get(self, now_mono=None):
+        now = time.monotonic() if now_mono is None else now_mono
         with self._lock:
             if self._host_mono is None:
                 return None
@@ -956,7 +974,7 @@ class NavClockStore:
                 'f_acc_ps_per_s': self._f_acc_ps_per_s,
                 'itow_ms': self._itow_ms,
                 'host_mono': self._host_mono,
-                'age_s': time.monotonic() - self._host_mono,
+                'age_s': now - self._host_mono,
                 'n_updates': self._update_count,
             }
 
@@ -996,7 +1014,8 @@ class NavTimeGpsStore:
             self._host_mono = time.monotonic()
             self._update_count += 1
 
-    def get(self):
+    def get(self, now_mono=None):
+        now = time.monotonic() if now_mono is None else now_mono
         with self._lock:
             if self._host_mono is None:
                 return None
@@ -1010,7 +1029,7 @@ class NavTimeGpsStore:
                 'valid_week': self._valid_week,
                 'valid_leap_s': self._valid_leap_s,
                 'host_mono': self._host_mono,
-                'age_s': time.monotonic() - self._host_mono,
+                'age_s': now - self._host_mono,
                 'n_updates': self._update_count,
             }
 
