@@ -9,6 +9,7 @@ bit-identical deterministic replay.  Default (None) = live, byte-identical.
 import os
 import sys
 import time
+import types
 import unittest
 
 _SCRIPTS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,6 +17,41 @@ if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
 from realtime_ppp import QErrStore, NavClockStore, NavTimeGpsStore  # noqa: E402
+
+
+class TestEndToEndPurity(unittest.TestCase):
+    """The decisive property: with the ingest stamp from a captured
+    ``recv_mono`` AND the read from a virtual ``now_mono``, the freshness
+    age is a pure function of captured time — no live clock anywhere.  This
+    is what makes the getter deterministic *end-to-end* under replay."""
+
+    def test_qerr_age_is_purely_captured_time(self):
+        s = QErrStore()
+        s.update(qerr_ps=1000.0, tow_ms=12345, recv_mono=5000.0)  # captured stamp
+        # snapshot age is exactly now_mono - recv_mono, regardless of wall clock
+        _q, _tow, age = s.snapshot(max_age_s=10.0, now_mono=5003.5)
+        self.assertAlmostEqual(age, 3.5, places=9)
+        self.assertIsNotNone(s.get(max_age_s=2.0, now_mono=5001.0)[0])
+        self.assertIsNone(s.get(max_age_s=2.0, now_mono=5005.0)[0])
+
+    def test_match_pps_mono_pure_end_to_end(self):
+        """match_pps_mono was already pure in pps_recv_mono; with the ingest
+        stamp also captured, the qErr↔PPS match is deterministic end-to-end."""
+        s = QErrStore()
+        s.update(qerr_ps=2000.0, tow_ms=1000, recv_mono=8000.0)
+        # PPS edge ~0.9 s after the TIM-TP (the expected offset) → matches
+        qerr_ns, offset = s.match_pps_mono(pps_recv_mono=8000.9)
+        self.assertIsNotNone(qerr_ns)
+        self.assertAlmostEqual(offset, 0.9, places=6)
+        # an edge far from the expected offset → no match
+        self.assertEqual(s.match_pps_mono(pps_recv_mono=8005.0)[0], None)
+
+    def test_navclock_ingest_and_read_pure(self):
+        s = NavClockStore()
+        msg = types.SimpleNamespace(clkB=1.0, clkD=2.0, tAcc=3.0, fAcc=4.0,
+                                    iTOW=5)
+        s.update(msg, recv_mono=100.0)
+        self.assertAlmostEqual(s.get(now_mono=106.0)["age_s"], 6.0, places=9)
 
 
 class TestQErrStoreNowMono(unittest.TestCase):
