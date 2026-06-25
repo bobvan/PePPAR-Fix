@@ -12,3 +12,6 @@ eph_mount = "BCEP00BKG0"
 # or the --known-pos CLI flag on first run).  See timelab/antennas.json
 # for authoritative lab ARP references.
 systems = "gps,gal"
+# DO uid for the registered ClockMatrix_combo DO (state/dos/<do_label>.toml,
+# host-local; combo_gain measured 2026-06-25).  Used by the combo actuator path.
+do_label = "otc-otcbob1-combo"

@@ -130,15 +130,17 @@ timescale = "tai"
 pps_pin = 0
 extts_channel = 0
 perout_channel = 0
-# ClockMatrix FCW steering via I2C — DISABLED: FCW controls DPLL_3
-# output (PPS) but NOT the 25 MHz PHY clock to i226.  PHC frequency
-# must use adjfine.  Re-enable once we identify which DPLL/FOD
-# drives the 25 MHz.
-#clockmatrix_bus = 15
-#clockmatrix_addr = "0x58"
-#clockmatrix_dpll_actuator = 3
-#clockmatrix_dpll_phase = 2
-#clockmatrix_pps_clk = 2
+# ClockMatrix COMBO-bus discipline (VALIDATED 2026-06-25: the combo servo beats
+# the hardware DPLL at mid-τ — P4 graded A/B).  DPLL3 = the OCXO DO; the combo
+# steers it via the combo bus AND reads on-chip PHASE_STATUS (no TICC, no wire).
+# F9T-PPS on CLK2 (OTC).  The engine builds ClockMatrixComboActuator from the
+# DO's measured combo_gain (state/dos/<do_label>.toml, host-local) and points
+# the phase observer at the actuator DPLL automatically.  Requires timebeat
+# stopped (MANUAL by design) + the DO registered ClockMatrix_combo.
+clockmatrix_bus = 15
+clockmatrix_addr = "0x58"
+clockmatrix_dpll_actuator = 3
+clockmatrix_pps_clk = 2
 # Servo tuning — OCXO has lower noise, can use tighter gains
 track_kp = 0.03
 track_ki = 0.001
