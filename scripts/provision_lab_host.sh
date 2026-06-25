@@ -9,9 +9,12 @@
 #
 # What it does (provision):
 #   - verifies ~/peppar-fix is the SINGLE authoritative git checkout
-#   - creates the venv at ./venv and installs the engine via pyproject
-#     (`pip install -e '.[timebeat]'` — canonical, pulls numpy/scipy/pyubx2/
-#     pyserial/pyrtcm/pyproj + smbus2; never --break-system-packages)
+#   - creates the venv at ./venv and installs the ENGINE-ONLY stack via
+#     pyproject (`pip install -e '.[timebeat]'` — numpy/scipy/pyubx2/pyserial/
+#     pyrtcm/pyproj + smbus2; never --break-system-packages).  Deliberately
+#     LEAN: NO analysis libs (matplotlib/allantools/pandas live in the
+#     `[analysis]` extra).  These disk-constrained Timebeat hosts do NO on-host
+#     crunching — pull captures to gt and analyze there.
 #   - creates data/ + state/ runtime dirs
 # What it checks (preflight, non-fatal warnings):
 #   - engine imports, serial/PTP devices, ntrip.conf, host config
@@ -29,16 +32,21 @@ echo "=== PePPAR-Fix host provisioning: $HOST ($REPO) ==="
 # 1. single authoritative git checkout (guard the 2026-04-08 multi-copy mess)
 [ -d .git ] || die "not a git working tree — \$HOME/peppar-fix must be the checkout"
 ok "git working tree ($(git branch --show-current 2>/dev/null) @ $(git rev-parse --short HEAD 2>/dev/null))"
-for stray in "$HOME/git/PePPAR-Fix" "$HOME/PePPAR-Fix"; do
+# Stray-copy guard — catch ANY ~/peppar* / ~/PePPAR* / ~/git/PePPAR-Fix that
+# isn't the authoritative checkout.  The 2026-04-08 incident was non-git copies
+# at ~/peppar-fix / ~/git/PePPAR-Fix / ~/PePPAR-Fix; on disk-constrained
+# Timebeat hosts they also waste scarce space (otcBob1: peppar-fix-old 97M +
+# peppar_venv 28M found 2026-06-25).
+for stray in "$HOME"/peppar* "$HOME"/PePPAR* "$HOME/git/PePPAR-Fix"; do
   [ -e "$stray" ] && [ "$stray" != "$REPO" ] && \
-    warn "stray copy at $stray — the repo must live ONLY at ~/peppar-fix (see CLAUDE.md, 2026-04-08 incident)"
+    warn "stray copy at $stray ($(du -sh "$stray" 2>/dev/null | cut -f1)) — remove it; the repo lives ONLY at ~/peppar-fix (CLAUDE.md 2026-04-08)"
 done
 
 # 2. venv + engine deps via pyproject (canonical; smbus2 for ClockMatrix/I2C)
 if [ ! -x venv/bin/python ]; then
   echo "  creating venv ..."; python3 -m venv venv || die "venv creation failed"
 fi
-echo "  installing engine (pip install -e '.[timebeat]') ..."
+echo "  installing engine-only stack (pip install -e '.[timebeat]'; no analysis libs) ..."
 venv/bin/pip install --quiet --upgrade pip >/dev/null 2>&1
 if venv/bin/pip install --quiet -e '.[timebeat]' >/tmp/provision_pip.log 2>&1; then
   ok "engine installed in ./venv"
@@ -67,6 +75,16 @@ fi
 
 [ -f ntrip.conf ] && ok "ntrip.conf present" || \
   warn "ntrip.conf MISSING — scp TimeHat:~/peppar-fix/ntrip.conf . (the one legitimate scp; credentials not in repo)"
+
+# disk pressure — Timebeat hosts have small disks (otcBob1 = 7 G).  Keep logs +
+# captures lean; pull captures to gt and don't leave stray copies.
+AVAIL=$(df -P / | awk 'NR==2{print $4}')
+USEPCT=$(df -P / | awk 'NR==2{print $5}')
+if [ "${AVAIL:-0}" -lt 307200 ]; then   # < 300 MB
+  warn "low disk: / is $USEPCT used, $((AVAIL/1024)) MB free — clean captures (pull to gt) / strays"
+else
+  ok "disk / $USEPCT used, $((AVAIL/1024)) MB free"
+fi
 
 echo "=== $HOST: provisioned ($WARN warning(s)) ==="
 exit 0
