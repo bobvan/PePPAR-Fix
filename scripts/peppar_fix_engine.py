@@ -240,7 +240,8 @@ def make_raw_capture_bundle(args, systems, log):
             conventions={
                 "ztd_station": getattr(args, 'init_ztd_station', '') or '',
                 "known_pos": getattr(args, 'known_pos', '') or '',
-                "systems": list(systems) if systems else [],
+                # sorted → deterministic manifest regardless of set/list input
+                "systems": sorted(systems) if systems else [],
             },
             notes="pos_replay reference capture (UBX stream)")
     except OSError as exc:

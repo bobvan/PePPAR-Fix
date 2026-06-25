@@ -92,7 +92,8 @@ class TestRawCaptureBundleSetup(unittest.TestCase):
             with open(os.path.join(d, "manifest.toml"), "rb") as f:
                 m = tomllib.load(f)
             self.assertEqual(m["conventions"]["ztd_station"], "KORD")
-            self.assertEqual(m["conventions"]["systems"], ["gps", "gal"])
+            # sorted → deterministic regardless of input order (set or list)
+            self.assertEqual(m["conventions"]["systems"], ["gal", "gps"])
             self.assertEqual(m["conventions"]["known_pos"],
                              "-2730000,-4440000,3975000")
             self.assertNotEqual(m["software"]["git_rev"], "unknown")
