@@ -1955,7 +1955,8 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
 
 def ntrip_reader(stream, beph, ssr, stop_event, label="NTRIP",
                  bias_only=False, skip_biases=False,
-                 skip_code_biases=False, skip_phase_biases=False):
+                 skip_code_biases=False, skip_phase_biases=False,
+                 raw_bundle=None, raw_stream=None):
     """Read RTCM3 messages from an NtripStream.
 
     Routes broadcast ephemeris messages to BroadcastEphemeris and SSR
@@ -1997,6 +1998,18 @@ def ntrip_reader(stream, beph, ssr, stop_event, label="NTRIP",
             if mute_controller.should_drop(source_name):
                 mute_controller.note_drop(source_name)
                 continue
+
+            # pos_replay raw-capture tap: record the raw RTCM frame with the
+            # CANONICAL recv_mono the engine correlated it with (meta, set in
+            # messages_with_metadata) — no clock re-read, no re-serialization
+            # (manifest §2; honors the one-stamp-per-frame discipline).
+            if raw_bundle is not None and raw_stream and meta.get("raw"):
+                try:
+                    raw_bundle.record(raw_stream, meta["raw"], meta["recv_mono"])
+                except (OSError, ValueError):
+                    log.warning("--raw-capture-dir %s record failed; "
+                                "disabling raw capture", raw_stream)
+                    raw_bundle = None
 
             identity = str(getattr(msg, 'identity', ''))
             event = RtcmEvent(

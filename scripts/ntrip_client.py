@@ -429,6 +429,10 @@ class NtripStream:
                     "parse_age_s": 0.0,
                     "correlation_confidence": confidence,
                     "estimator_residual_s": estimator_residual_s,
+                    # raw RTCM3 frame bytes + the canonical recv_mono above —
+                    # for the pos_replay raw-capture tap (manifest §2).  The
+                    # exact frame the engine correlated, not a re-serialization.
+                    "raw": frame,
                 }
             except Exception as e:
                 log.debug(f"Failed to parse message type {msg_type}: {e}")

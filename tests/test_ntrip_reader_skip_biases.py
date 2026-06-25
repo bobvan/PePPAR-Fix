@@ -151,3 +151,36 @@ def test_bias_only_with_skip_phase_routes_only_code():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ── pos_replay raw-capture tap ──────────────────────────────────────── #
+
+
+def test_ntrip_reader_taps_raw_frames_with_canonical_recv_mono(tmp_path):
+    """The SSR/eph tap records each raw RTCM frame with the canonical
+    meta["recv_mono"] (no clock re-read, no re-serialization)."""
+    import os
+    from peppar_fix.raw_capture import RawCaptureBundle, read_stream
+
+    bundle = RawCaptureBundle(str(tmp_path))
+    stream = MagicMock()
+    stream.messages_with_metadata.return_value = [
+        (_make_msg("1057"), {**_fake_meta(), "recv_mono": 10.0, "raw": b"\xd3aaa"}),
+        (_make_msg("1058"), {**_fake_meta(), "recv_mono": 11.5, "raw": b"\xd3bbb"}),
+    ]
+    ntrip_reader(stream, MagicMock(), MagicMock(), threading.Event(),
+                 label="SSR", raw_bundle=bundle, raw_stream="ssr")
+    bundle.close()
+    recs = list(read_stream(os.path.join(str(tmp_path), "raw", "ssr.cap")))
+    assert recs == [(10.0, b"\xd3aaa"), (11.5, b"\xd3bbb")]
+
+
+def test_ntrip_reader_no_capture_when_meta_lacks_raw(tmp_path):
+    """A stream whose meta has no 'raw' key (pre-tap) is a safe no-op."""
+    import os
+    from peppar_fix.raw_capture import RawCaptureBundle
+
+    bundle = RawCaptureBundle(str(tmp_path))
+    _run_reader(["1057"], raw_bundle=bundle, raw_stream="ssr")  # _fake_meta has no raw
+    bundle.close()
+    assert not os.path.exists(os.path.join(str(tmp_path), "raw", "ssr.cap"))

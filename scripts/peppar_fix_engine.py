@@ -240,7 +240,8 @@ def make_raw_capture_bundle(args, systems, log):
             conventions={
                 "ztd_station": getattr(args, 'init_ztd_station', '') or '',
                 "known_pos": getattr(args, 'known_pos', '') or '',
-                "systems": list(systems) if systems else [],
+                # sorted → deterministic manifest regardless of set/list input
+                "systems": sorted(systems) if systems else [],
             },
             notes="pos_replay reference capture (UBX stream)")
     except OSError as exc:
@@ -1210,8 +1211,12 @@ def load_ntrip_config(args):
 
 # ── Shared infrastructure setup ──────────────────────────────────────── #
 
-def start_ntrip_threads(args, beph, ssr, stop_event):
-    """Start NTRIP threads for ephemeris and SSR corrections."""
+def start_ntrip_threads(args, beph, ssr, stop_event, raw_bundle=None):
+    """Start NTRIP threads for ephemeris and SSR corrections.
+
+    ``raw_bundle`` (pos_replay --raw-capture-dir): each NTRIP thread taps its
+    raw RTCM frames into a distinct capture stream — eph / ssr / ssr_bias.
+    """
     threads = []
     use_tls = args.ntrip_tls or args.ntrip_port == 443
 
@@ -1225,6 +1230,7 @@ def start_ntrip_threads(args, beph, ssr, stop_event):
         t = threading.Thread(
             target=ntrip_reader,
             args=(eph_stream, beph, ssr, stop_event, "EPH"),
+            kwargs={'raw_bundle': raw_bundle, 'raw_stream': 'eph'},
             daemon=True,
         )
         t.start()
@@ -1256,6 +1262,7 @@ def start_ntrip_threads(args, beph, ssr, stop_event):
                 'skip_biases':       getattr(args, 'no_primary_biases', False),
                 'skip_code_biases':  getattr(args, 'no_ssr_code_bias', False),
                 'skip_phase_biases': getattr(args, 'no_ssr_phase_bias', False),
+                'raw_bundle': raw_bundle, 'raw_stream': 'ssr',
             },
             daemon=True,
         )
@@ -1309,6 +1316,7 @@ def start_ntrip_threads(args, beph, ssr, stop_event):
                 'bias_only':         True,
                 'skip_code_biases':  getattr(args, 'no_ssr_code_bias', False),
                 'skip_phase_biases': getattr(args, 'no_ssr_phase_bias', False),
+                'raw_bundle': raw_bundle, 'raw_stream': 'ssr_bias',
             },
             daemon=True,
         )
@@ -9991,8 +9999,18 @@ def run(args):
     if not args.ntrip_caster and not args.eph_mount:
         log.warning("No NTRIP source — using broadcast ephemeris from receiver only")
 
-    # Start NTRIP threads
-    start_ntrip_threads(args, beph, ssr, stop_event)
+    # pos_replay raw-capture bundle (--raw-capture-dir) — created here, before
+    # the NTRIP + serial readers start, so it taps all input streams.  systems
+    # parsed inline for the manifest (the canonical `systems` is set below).
+    _raw_bundle = make_raw_capture_bundle(
+        args, (set(args.systems.split(',')) if args.systems else None), log)
+    if _raw_bundle is not None:
+        import atexit
+        atexit.register(_raw_bundle.close)
+        log.info("raw-capture bundle → %s", args.raw_capture_dir)
+
+    # Start NTRIP threads (tapped into the raw-capture bundle when set)
+    start_ntrip_threads(args, beph, ssr, stop_event, raw_bundle=_raw_bundle)
 
     # Parse systems filter (needed before warmup)
     systems = set(args.systems.split(',')) if args.systems else None
@@ -10185,15 +10203,10 @@ def run(args):
         ubx_log_file = open(args.ubx_out, 'ab')
         log.info(f"Raw UBX capture → {args.ubx_out}")
         serial_kwargs['ubx_log_file'] = ubx_log_file
-    # pos_replay raw-capture bundle (--raw-capture-dir): records each input
-    # stream's raw payloads + recv_mono for deterministic replay
-    # (docs/pos-replay-capture-manifest.md).  UBX is tapped here (via
-    # serial_kwargs); the SSR/eph/TICC taps are the next increment.
-    _raw_bundle = make_raw_capture_bundle(args, systems, log)
+    # pos_replay raw-capture: feed the UBX stream into the bundle created
+    # above (before the NTRIP threads).  SSR/eph already tapped via
+    # start_ntrip_threads; TICC is the next increment.
     if _raw_bundle is not None:
-        import atexit
-        atexit.register(_raw_bundle.close)
-        log.info("raw-capture bundle → %s (UBX stream)", args.raw_capture_dir)
         serial_kwargs['raw_bundle'] = _raw_bundle
     t_serial = threading.Thread(
         target=serial_reader,
@@ -12185,8 +12198,8 @@ Two-phase operation:
                            "input stream's RAW payloads + CLOCK_MONOTONIC "
                            "recv_mono into per-stream .cap files + a "
                            "manifest.toml, for deterministic replay.  "
-                           "Currently taps the UBX stream (RAWX/SFRBX/NAV-*/"
-                           "TIM-TP); SSR/eph/TICC taps to follow.  Write to "
+                           "Taps UBX (RAWX/SFRBX/NAV-*/TIM-TP), RTCM SSR, and "
+                           "broadcast eph; TICC tap to follow.  Write to "
                            "gt/RAIDZ (not lab eMMC/SD) for long captures.")
     ticc.add_argument("--r-calibration", default=None,
                       help="Path to a per-host R-calibration TOML "
