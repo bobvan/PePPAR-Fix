@@ -168,8 +168,47 @@ to build the truth:
 - **Surveyed ARP** (`timelab/antennas.json`, OPUS multi-day, σ≈12 mm) —
   the one genuinely sub-cm position truth we already hold.
 
+**Success metric — a truth-relative divergence corridor, not a hit-test.**
+`pos_replay` is **not** graded on landing inside the accepted CI.  Many
+honest runs won't — real-time corrections and a real-time-only ZTD
+legitimately miss a batch-smoothed answer.  What we grade is the
+filter's **trajectory against the truth corridor over time**:
+
+- Each epoch, compute the deviation from the accepted solution (position
+  E/N/U and ZTD), normalized to σ — reported **two** ways:
+  - **error / truth-CI** — is the filter outside the externally accepted
+    answer?
+  - **error / the filter's own reported σ** — is the filter *dishonest*
+    (claiming a tight σ while far from truth)?  This is the
+    `false-confidence (σ ≪ error)` failure the position acceptance bar
+    names, and it is the signature of misfit hiding in the (pos,ZTD,clk)
+    null.
+- The **verdict is about the trajectory, not one epoch**: declare a run
+  **doomed and abort early** when the deviation exceeds K·σ (e.g. 3σ)
+  **and** its trend is still *growing* over a sustained window
+  (e.g. 30 min) — far *and moving farther*.  Far alone isn't enough (it
+  could be a transient still settling); far-and-diverging is the kill
+  signal.  The goal is to conclude "no point continuing" at 30 min
+  instead of burning the whole replay.
+
+**Why this is the rig's killer feature.**  The (pos,ZTD,clk) null drift
+produces **no internal innovation signature** — the observations stay
+satisfied while the whole null combination slides — so the live engine's
+own watchdogs (`state_sanity`, ResetBudget, exit-5) *cannot see it*; they
+key on innovations, not on truth.  Only an **external** truth exposes a
+confident-but-wrong trajectory.  `pos_replay`'s truth-relative divergence
+corridor is precisely the instrument that makes the invisible drift
+visible, and the early-abort rule makes watching it cheap.
+
+*(The same divergence monitor is the shared scoring layer for `pos_sim`
+too — there truth is exact, so there's no CI term, just error/σ and its
+trend.)*
+
 **What it's for.**
 
+- **Watch the filter diverge from truth, and fail fast** — the primary
+  use (see the metric above): see the trajectory leave the ±K·σ corridor
+  and keep going, and stop, rather than asserting it must land in the CI.
 - **Localize the real-world gap.**  When our real-time output disagrees
   with truth, *product-matched replay* separates "our filter" from "our
   real-time corrections": feed final products → if it converges, it was
