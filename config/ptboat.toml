@@ -1,0 +1,14 @@
+[peppar]
+serial = "/dev/ttyAMA0"
+baud = 115200
+ubx_port = "UART"
+receiver = "f9t"
+ptp_profile = "ptBoat"
+ptp_dev = "/dev/ptp0"
+ntrip_conf = "ntrip.conf"
+eph_mount = "BCEP00BKG0"
+# known_pos is NOT committed.  Position is loaded from
+# state/receivers/<uid>.json at runtime (Phase 1 bootstrap or --known-pos).
+# ptBoat's antenna is on a separate mount ~50 cm west of UFO1 and is
+# UN-SURVEYED as of 2026-06-25 — Phase 1 PPP estimates it for now.
+systems = "gps,gal"
