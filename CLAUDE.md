@@ -535,11 +535,23 @@ work it'll be on a different host.
 | TimeHat | `/home/bob/peppar-fix/venv` | `source ../venv/bin/activate` |
 | PiPuss | `/home/bob/pygpsclient` | `source ~/pygpsclient/bin/activate` |
 | ~~Onocoy~~ | mothballed 2026-04-08 | – |
-| otcBob1 | (system python3) | May need `pip install smbus2` for I2C |
+| otcBob1 | `/home/bob/peppar-fix/venv` | `source ../venv/bin/activate` |
+| ptBoat | `/home/bob/peppar-fix/venv` | `source ../venv/bin/activate` |
 
-Scripts live in `/home/bob/peppar-fix/scripts/` on TimeHat. Other hosts
-may not have the full peppar-fix repo — deploy scripts via `scp` as
-needed.
+**Provisioning a host — `scripts/provision_lab_host.sh`** (2026-06-25): the
+idempotent setup.  `cd ~/peppar-fix && bash scripts/provision_lab_host.sh`
+creates the venv and installs the **engine-only** stack
+(`pip install -e '.[timebeat]'` → numpy/scipy/pyubx2/pyserial/pyrtcm/pyproj +
+smbus2; **no** analysis libs — matplotlib/allantools/pandas live in the
+`[analysis]` extra), creates data/ + state/ dirs, and runs a preflight
+(imports, serial/PTP, ntrip.conf, **stray-copy guard**, **disk-pressure
+warning**).  The Timebeat hosts have small disks (otcBob1 = 7 GB, 4.6 GB of it
+`/usr`) — **do NO on-host analysis; pull captures to gt and crunch there**, and
+keep no stray repo copies (found + removed 97 M + 28 M + 771 M of strays
+provisioning OTC/Mini 2026-06-25).
+
+Scripts live in `/home/bob/peppar-fix/scripts/` on every provisioned host (the
+repo IS `~/peppar-fix`).
 
 ### Running unit tests — always from the dev-box venv
 
