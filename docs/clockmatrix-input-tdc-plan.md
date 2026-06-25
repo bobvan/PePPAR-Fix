@@ -24,12 +24,62 @@ engineering (`timebeat-otc-register-map.md`, `timebeat-integration-paths.md`,
 `timebeat-status-2026-04-06.md`, memory `project_8a34012_register_map`).
 
 
-## Loopback wire plan — THE VALIDATED PATH (2026-06-24)
+## ⭐ COMBO-BUS SOFTWARE SERVO — the NO-WIRE path (REPRODUCED 2026-06-25)
 
-Exhaustive on-chip testing on the OTC's DO (DPLL3, otcBob1, 2026-06-23/24)
-settles it: **a single DPLL channel cannot be software-steered AND yield a
-usable phase error at the same time.** One jumper wire is required. Below: why,
-the exact recipe, the servo architecture, and bring-up.
+**This supersedes the "loopback wire is required" conclusion below.** Timebeat
+(Phuong) found, and we reproduced on otcBob1 DPLL3, a way to run a full
+closed-loop software servo on a **single DPLL channel, no wire, no TICC** — by
+steering through the **combo bus**, which sums into the DCO *bypassing the loop
+filter*. The earlier dead-ends (write_freq / holdover / freerun) all failed
+because they fought the loop-filter path; the combo bus is a *separate* DCO
+injection that coexists with PLL/auto's live phase reading.
+
+**The recipe (DPLL3 / OTC addresses):**
+1. **PLL / auto** (`MODE`=0x00) — keeps `PHASE_STATUS` (0xC130) live = the
+   F9T(CLK2)-vs-DCO error.
+2. **Loop BW = 0** (`DPLL_BW` 0xC6C0 → 1 µHz, `[0x01,0x00]`) — the hardware
+   loop filter contributes nothing (no GNSS-derived steering leaks in).
+3. **Subscribe to the SW combo source**: `DPLL_COMBO_SLAVE_CFG_0` (DPLL+0x32 =
+   0xC4B2) = **0x28** = `PRI_COMBO_SRC_EN=1, PRI_COMBO_SRC_ID=8`. **SRC_ID 8 is
+   the SW-combo bus** (0–7 are real DPLLs; 8 = software value). *(This was
+   already Timebeat's running value on DPLL3.)*
+4. **Steer** by writing `DPLL_COMBO_SW_VALUE_CNFG` (DPLL_CTRL+0x28 = 0xC6E4),
+   signed 48-bit FFO × 2⁻⁵³ (≈ ppb × 2⁵³/1e9) — it's *added to the DCO via the
+   combo bus*.
+5. Software servo: read `PHASE_STATUS` → PI → write `COMBO_SW_VALUE`.
+
+**Reproduced result (otcBob1 DPLL3, 2026-06-25):** open-loop, +200 ppb combo →
+phase ramped −137 k ps/s; −300 ppb → +262 k ps/s (steering confirmed, sign
+`+COMBO_SW → −ramp`, gain ~0.7× naive — calibratable). Closed PI loop: phase
+**bounded and converging** (−14 ns → −5 ns, settled std 3 ns = the F9T
+sawtooth), vs ±137 k ps/s open-loop = **LOCKED**. Data:
+`gt:~/gt/datasheets/cm_comboloop_otcbob1_20260625.csv`; scripts `cm_combo2.py`,
+`cm_comboloop.py`.
+
+**Caveats:** (a) this disciplines the DO's *internal* DCO vs F9T — the physical
+`PPS OUT` edge still differs by a constant output-divider/pad delay (the
+loopback wire's remaining role is *verifying/characterizing the real output
+edge*, no longer *enabling* the servo). (b) `FILTER_STATUS` delta_freq stays 0
+(filter-status path idle in this state) — use the phase ramp, not delta_freq,
+to confirm steering. (c) Quick-PI numbers above; residual offset still
+converging, gain ~0.7× — both are tuning/calibration, not blockers.
+**Safety:** all on DPLL3 (the DO; NOT the i226 25 MHz, a separate synth DPLL),
+save/restore, host up throughout.
+
+---
+
+## Loopback wire plan — superseded as "required" by the combo-bus path above (2026-06-24)
+
+> **Superseded 2026-06-25:** the combo-bus servo above achieves on-chip
+> software discipline with **no wire**. The wire below is no longer *required*;
+> it remains useful only to measure the **physical PPS OUT edge** (the combo
+> servo sees the internal DCO). Keeping the analysis for that narrower purpose.
+
+Exhaustive on-chip testing on the OTC's DO (DPLL3, otcBob1, 2026-06-23/24) had
+suggested a single DPLL channel cannot be software-steered AND yield a usable
+phase error at the same time — **true for the loop-filter steering paths
+(write_freq/holdover/freerun), but the combo bus is the exception that makes it
+work (see above).** Below: the wire recipe, useful for physical-output checks.
 
 ### Why the wire is required — the no-wire single-DPLL space is exhausted
 
