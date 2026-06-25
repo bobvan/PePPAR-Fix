@@ -123,8 +123,16 @@ class Truth:
 
 
 def emit(filt, sky, truth, t_s, t_dt, rng, sigma_code_m=0.3, sigma_carrier_m=0.005,
-         cno=45.0):
-    """Emit one epoch of synthetic obs via the filter's OWN forward model."""
+         cno=45.0, bias_fn=None):
+    """Emit one epoch of synthetic obs via the filter's OWN forward model.
+
+    ``bias_fn(sv, sys, elev_deg) -> metres`` injects an UNMODELED per-SV range
+    error (orbit/clock/correction error or multipath) that the filter does
+    NOT know about — i.e. a deliberate forward-MODEL error.  This breaks the
+    shared-h() faithfulness on purpose, to study how the estimator routes an
+    observation-side error (the realm pos_replay carries for real).  Default
+    None = faithful (no injected error).
+    """
     obs = []
     clk = truth.clk(t_s)
     ztd = truth.ztd(t_s)
@@ -139,6 +147,8 @@ def emit(filt, sky, truth, t_s, t_dt, rng, sigma_code_m=0.3, sigma_carrier_m=0.0
         isb = truth.isb_m.get(sysname, 0.0) if sysname != "gps" else 0.0
         # The exact observable the filter inverts (h(truth)):
         rho_pred = rho + clk + isb - sat_clk * C + tropo + ztd * m_wet
+        if bias_fn is not None:
+            rho_pred += bias_fn(sv, sysname, elev)   # unmodeled obs-side error
         amb = truth.amb_m.setdefault(sv, rng.uniform(-1e6, 1e6))
         obs.append({
             "sv": sv,
@@ -197,7 +207,8 @@ class DivergenceMonitor:
 def run(sky, truth, *, n_epochs=600, dt=1.0, seed=0,
         seed_pos_offset_enu=(0.0, 0.0, 0.0), seed_pos_sigma_m=5.0,
         seed_ztd_offset_m=0.0, ztd_sigma_m=0.2, clock_model="random_walk",
-        monitor=None, sigma_code_m=0.3, sigma_carrier_m=0.005):
+        monitor=None, sigma_code_m=0.3, sigma_carrier_m=0.005, systems=None,
+        bias_fn=None):
     """Drive the real PPPFilter (position estimator) against the synthetic truth.
 
     Seeds the filter at truth + an optional ENU position offset / ZTD
@@ -210,7 +221,12 @@ def run(sky, truth, *, n_epochs=600, dt=1.0, seed=0,
     seed_pos = truth.arp_ecef + de * east + dn * north + du * up
 
     filt = PPPFilter(clock_model=clock_model)
-    systems = sorted({sky.sys_of[s] for s in sky.svs})
+    # systems: which constellations the filter EXPECTS — drives ISB pinning
+    # (a present non-reference system's ISB is pinned to 0 only if its
+    # reference is absent).  Default: derive from the sky (the engine's
+    # behavior).  Override to study the rank effect of (un)pinning.
+    if systems is None:
+        systems = sorted({sky.sys_of[s] for s in sky.svs})
     filt.initialize(seed_pos, truth.clk0_m, 0.0, 0.0, systems=systems,
                     pos_sigma_m=seed_pos_sigma_m, ztd_sigma_m=ztd_sigma_m,
                     init_ztd_m=truth.ztd0_m + seed_ztd_offset_m)
@@ -228,7 +244,8 @@ def run(sky, truth, *, n_epochs=600, dt=1.0, seed=0,
         if i > 0:
             filt.predict(dt)
         obs = emit(filt, sky, truth, t_s, t_dt, rng,
-                   sigma_code_m=sigma_code_m, sigma_carrier_m=sigma_carrier_m)
+                   sigma_code_m=sigma_code_m, sigma_carrier_m=sigma_carrier_m,
+                   bias_fn=bias_fn)
         # caller manages the per-SV float ambiguity lifecycle (as the engine does)
         seen = {o["sv"] for o in obs}
         for o in obs:
@@ -267,6 +284,39 @@ def strong_sky(arp):
         (20, 15), (70, 55), (140, 25), (200, 70),
         (250, 18), (300, 45), (340, 35), (110, 80)])]
     return SyntheticSky(arp, sats)
+
+
+# Single-constellation (Galileo): observable, but high-elevation-heavy so the
+# up/ZTD/clock axes are poorly separated.
+_GAL_SATS = [(40, 78), (120, 72), (210, 80), (300, 75), (150, 40), (20, 30)]
+# Low-elevation GPS "anchors" — the cross-elevation lines of sight that break
+# the up/ZTD degeneracy when the second constellation is added.
+_GPS_ANCHORS = [(60, 18), (160, 22), (250, 15), (330, 30)]
+
+
+def gal_only_sky(arp):
+    """Galileo only — 6 SVs, high-elevation-heavy (up/ZTD weakly separated)."""
+    return SyntheticSky(arp, [(f"E{i+1:02d}", "gal", az, el)
+                              for i, (az, el) in enumerate(_GAL_SATS)])
+
+
+def gps_gal_sky(arp):
+    """GPS + Galileo — the Galileo set plus low-elevation GPS anchors."""
+    sats = [(f"E{i+1:02d}", "gal", az, el) for i, (az, el) in enumerate(_GAL_SATS)]
+    sats += [(f"G{i+1:02d}", "gps", az, el)
+             for i, (az, el) in enumerate(_GPS_ANCHORS)]
+    return SyntheticSky(arp, sats)
+
+
+def gps_elev_bias(amplitude_m=0.8):
+    """An unmodeled, elevation-dependent GPS-only range error (stands in for a
+    bad GPS orbit/clock correction, L5 datum offset, or multipath) — the kind
+    of obs-side error pos_replay carries for real.  GAL is untouched."""
+    def _bias(sv, sysname, elev_deg):
+        if sysname != "gps":
+            return 0.0
+        return amplitude_m / math.sin(math.radians(max(elev_deg, 5.0)))
+    return _bias
 
 
 def moderate_sky(arp):
@@ -317,6 +367,37 @@ def main():
     print("          GROWS past 3σ → monitor fires: 'no point continuing'")
     print("weak    → unobservable, but σ stays honestly large → no fire")
     print("(The monitor needs confident AND wrong AND diverging — not just far.)")
+    constellation_demo(arp)
+
+
+def constellation_demo(arp):
+    """The GPS-vs-Galileo question: does adding GPS help or hurt, and why?
+
+    Answer (clean obs): more constellations only HELP — adding GPS's
+    low-elevation anchors breaks the up/ZTD degeneracy a high-elevation-heavy
+    Galileo-only sky suffers from.  So "Galileo converges but GPS+GAL doesn't"
+    cannot come from rank/geometry; it needs a GPS-side OBSERVATION error.
+    Inject one and GPS+GAL degrades — the asymmetry is observation-side, which
+    is exactly what pos_sim (shared h()) can't carry and pos_replay can.
+    """
+    print("\n\npos_sim — single-constellation (GPS vs Galileo) rank story\n")
+    truth_kw = dict(ztd0_m=0.05, ztd_rate_m_s=1e-3)
+    rows = [
+        ("Galileo only", gal_only_sky(arp), None),
+        ("GPS+GAL (clean)", gps_gal_sky(arp), None),
+        ("GPS+GAL (GPS biased)", gps_gal_sky(arp), gps_elev_bias()),
+    ]
+    print(f"{'config':>22s} | {'n':>2s} | {'pos_err':>8s} | {'σ_pos':>6s}")
+    print("-" * 48)
+    for label, sky, bias in rows:
+        truth = Truth(arp_ecef=arp, **truth_kw)
+        rec = run(sky, truth, n_epochs=400, seed=1, ztd_sigma_m=0.05, bias_fn=bias)
+        print(f"{label:>22s} | {len(sky.svs):>2d} | "
+              f"{rec['pos_err_m'][-1]:7.3f} | {rec['pos_sigma_m'][-1]:6.3f}")
+    print("\nGalileo only → high-el-heavy, up/ZTD weakly separated → biased")
+    print("GPS+GAL clean→ low-elev GPS anchors break the degeneracy → RESCUED")
+    print("GPS+GAL biased→ an unmodeled GPS obs-error degrades it → 'adds GPS")
+    print("               hurts' is OBSERVATION-side, not rank → pos_replay's job")
 
 
 if __name__ == "__main__":

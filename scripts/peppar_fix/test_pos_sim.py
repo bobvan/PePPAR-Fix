@@ -116,5 +116,35 @@ class TestGeometryHelpers(unittest.TestCase):
         self.assertLess(elev_low, elev)
 
 
+class TestConstellationRank(unittest.TestCase):
+    """The GPS-vs-Galileo story: with clean obs, adding a constellation only
+    HELPS (rank/geometry); making GPS+GAL *worse* than Galileo-only requires a
+    GPS-side observation error, not a filter-rank effect."""
+
+    def _err(self, sky, bias=None):
+        truth = ps.Truth(arp_ecef=ARP, ztd0_m=0.05, ztd_rate_m_s=1e-3)
+        rec = ps.run(sky, truth, n_epochs=400, seed=1, ztd_sigma_m=0.05,
+                     bias_fn=bias)
+        return rec["pos_err_m"][-1]
+
+    def test_adding_gps_rescues_galileo_only(self):
+        gal = self._err(ps.gal_only_sky(ARP))
+        dual = self._err(ps.gps_gal_sky(ARP))
+        # clean dual must be clearly better than single (rank/geometry helps)
+        self.assertLess(dual, gal)
+        self.assertLess(dual, 0.5 * gal)
+
+    def test_asymmetry_needs_an_obs_side_error(self):
+        dual_clean = self._err(ps.gps_gal_sky(ARP))
+        dual_biased = self._err(ps.gps_gal_sky(ARP), bias=ps.gps_elev_bias())
+        # only an unmodeled GPS obs-error makes "adding GPS" hurt
+        self.assertGreater(dual_biased, dual_clean + 0.05)
+
+    def test_gps_bias_leaves_galileo_untouched(self):
+        bias = ps.gps_elev_bias()
+        self.assertEqual(bias("E01", "gal", 80.0), 0.0)
+        self.assertNotEqual(bias("G01", "gps", 20.0), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
