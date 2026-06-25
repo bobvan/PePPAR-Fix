@@ -107,5 +107,68 @@ class TestRobustness(unittest.TestCase):
             self.assertEqual(list(rc.read_stream(cap)), [])
 
 
+class TestProvenance(unittest.TestCase):
+    def test_git_rev_resolves_from_code_checkout_not_bundle(self):
+        """The fix: git_rev must come from the module's checkout, not the
+        bundle dir (gt/RAIDZ, a non-repo) which would yield 'unknown'."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with rc.RawCaptureBundle(d) as b:
+                b.record("ubx", b"x", 1.0)
+                path = b.write_manifest(host="h", started_iso="t")
+            with open(path, "rb") as f:
+                m = tomllib.load(f)
+            self.assertNotEqual(m["software"]["git_rev"], "unknown")
+
+    def test_explicit_git_rev_override_wins(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with rc.RawCaptureBundle(d) as b:
+                b.record("ubx", b"x", 1.0)
+                path = b.write_manifest(host="h", started_iso="t",
+                                        software={"git_rev": "cafef00d"})
+            with open(path, "rb") as f:
+                m = tomllib.load(f)
+            self.assertEqual(m["software"]["git_rev"], "cafef00d")
+
+    def test_notes_with_control_chars_round_trip(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with rc.RawCaptureBundle(d) as b:
+                b.record("ubx", b"x", 1.0)
+                path = b.write_manifest(host="h", started_iso="t",
+                                        notes="line1\nline2\ttab")
+            with open(path, "rb") as f:
+                m = tomllib.load(f)        # must parse despite the newline/tab
+            self.assertEqual(m["capture"]["notes"], "line1\nline2\ttab")
+
+
+class TestThreadSafety(unittest.TestCase):
+    def test_concurrent_record_no_lost_writes(self):
+        import tempfile
+        import threading
+        N_THREADS, N_EACH = 8, 500
+        with tempfile.TemporaryDirectory() as d:
+            b = rc.RawCaptureBundle(d)
+
+            def worker(tid):
+                for i in range(N_EACH):
+                    b.record("ubx", bytes([tid]) * 4, recv_mono=float(i))
+
+            threads = [threading.Thread(target=worker, args=(t,))
+                       for t in range(N_THREADS)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            b.close()
+            total = N_THREADS * N_EACH
+            self.assertEqual(b.counts["ubx"], total)         # no lost increments
+            recs = list(rc.read_stream(os.path.join(d, "raw", "ubx.cap")))
+            self.assertEqual(len(recs), total)               # every record intact
+            # each payload is exactly 4 bytes (no interleaved/torn writes)
+            self.assertTrue(all(len(pl) == 4 for _rm, pl in recs))
+
+
 if __name__ == "__main__":
     unittest.main()

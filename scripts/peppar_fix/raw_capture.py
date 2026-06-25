@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import struct
 import subprocess
+import threading
 from typing import Iterator, Tuple
 
 _REC_HDR = struct.Struct("<dI")          # recv_mono (float64), length (uint32)
@@ -44,6 +45,12 @@ class RawCaptureBundle:
 
     Streams are appended to lazily (a ``.cap`` opens on first record).  Use as
     a context manager, or call :meth:`close` explicitly.
+
+    Thread-safe: the live ``--raw-capture-dir`` tap feeds one bundle from the
+    independent reader threads (UBX, TICC, NTRIP/SSR, eph), so ``record()``
+    holds a short lock around the file-handle dict + the two writes + the
+    count (a tiny critical section — never across ``flush()``/disk I/O, per
+    the no-long-GIL-holds rule).
     """
 
     def __init__(self, bundle_dir: str):
@@ -54,6 +61,7 @@ class RawCaptureBundle:
             os.makedirs(os.path.join(bundle_dir, sub), exist_ok=True)
         self._files: dict[str, "object"] = {}
         self._counts: dict[str, int] = {}
+        self._lock = threading.Lock()
 
     def _fh(self, stream: str):
         fh = self._files.get(stream)
@@ -66,10 +74,12 @@ class RawCaptureBundle:
 
     def record(self, stream: str, payload: bytes, recv_mono: float) -> None:
         """Append one raw message (``payload``) stamped with ``recv_mono``."""
-        fh = self._fh(stream)
-        fh.write(_REC_HDR.pack(float(recv_mono), len(payload)))
-        fh.write(payload)
-        self._counts[stream] = self._counts.get(stream, 0) + 1
+        hdr = _REC_HDR.pack(float(recv_mono), len(payload))
+        with self._lock:
+            fh = self._fh(stream)
+            fh.write(hdr)
+            fh.write(payload)
+            self._counts[stream] = self._counts.get(stream, 0) + 1
 
     def record_line(self, stream: str, line, recv_mono: float) -> None:
         """Append a text line (TICC) — stored as bytes with a trailing \\n."""
@@ -91,7 +101,12 @@ class RawCaptureBundle:
         round-trips through ``tomllib``.  Returns the manifest path.
         """
         soft = dict(software or {})
-        soft.setdefault("git_rev", _git_rev(self.dir))
+        # Resolve the git rev from the CODE checkout (this module's location),
+        # NOT the bundle dir — bundles are archived to gt/RAIDZ, which isn't a
+        # git checkout, so cwd=bundle would silently record "unknown" and
+        # defeat the provenance field.  An explicit software={"git_rev": ...}
+        # from the engine tap still wins via setdefault.
+        soft.setdefault("git_rev", _git_rev())
         sections = {
             "capture": {
                 "host": host,
@@ -185,24 +200,37 @@ def merged_records(bundle_dir: str) -> Iterator[Tuple[float, str, bytes]]:
 
 # ── helpers ─────────────────────────────────────────────────────────── #
 
+def _toml_str(s: str) -> str:
+    """A valid TOML basic string — escape backslash/quote + control chars."""
+    out = (s.replace("\\", "\\\\").replace('"', '\\"')
+           .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
+    return '"' + out + '"'
+
+
 def _toml(v) -> str:
     """Minimal TOML value formatter for the shapes the manifest uses."""
     if isinstance(v, bool):
         return "true" if v else "false"
-    if isinstance(v, (int, float)):
+    if isinstance(v, float):
+        # TOML has no inf/nan basic value — fall back to a quoted string.
+        return repr(v) if (v == v and abs(v) != float("inf")) else _toml_str(str(v))
+    if isinstance(v, int):
         return repr(v)
     if isinstance(v, str):
-        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        return _toml_str(v)
     if isinstance(v, dict):
         return "{ " + ", ".join(f"{k} = {_toml(x)}" for k, x in v.items()) + " }"
     if isinstance(v, (list, tuple)):
         return "[" + ", ".join(_toml(x) for x in v) + "]"
-    return '"' + str(v).replace('"', '\\"') + '"'
+    return _toml_str(str(v))
 
 
-def _git_rev(cwd: str) -> str:
+def _git_rev(cwd: str | None = None) -> str:
+    # Default to the module's checkout (where the code lives), not the caller's
+    # cwd / the bundle dir — see write_manifest's note.
+    cwd = cwd or os.path.dirname(os.path.abspath(__file__))
     try:
-        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd or ".",
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd,
                              capture_output=True, text=True, timeout=5)
         return out.stdout.strip() if out.returncode == 0 else "unknown"
     except (OSError, subprocess.SubprocessError):
