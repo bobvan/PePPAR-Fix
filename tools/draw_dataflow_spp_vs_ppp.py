@@ -85,15 +85,28 @@ def draw_antenna(ax, cx, cy, s=1.0):
             fontsize=11, weight="bold")
 
 
-def draw_cloud(ax, cx, cy, label, s=0.72, fc="#eaf2fb"):
+def draw_cloud(ax, cx, cy, label, s=0.6, fc="#eaf2fb"):
     for dx, dy, r in [(-0.42, 0.02, 0.34), (-0.02, 0.14, 0.42),
                       (0.42, 0.04, 0.32), (0.0, -0.12, 0.5)]:
         ax.add_patch(Circle((cx + dx * s, cy + dy * s), r * s, fc=fc, ec="none",
                             zorder=3))
     ax.add_patch(Ellipse((cx, cy - 0.2 * s), 1.7 * s, 0.5 * s, fc=fc, ec="none",
                          zorder=3))
-    ax.text(cx, cy + 0.0 * s, label, ha="center", va="center", fontsize=10,
+    ax.text(cx, cy + 0.0 * s, label, ha="center", va="center", fontsize=8.5,
             zorder=5, weight="bold")
+
+
+def draw_thermo(ax, cx, cy, s=1.0):
+    ax.add_patch(Circle((cx, cy - 0.22 * s), 0.13 * s, fc="#c0392b",
+                        ec="#922b21", lw=1.5, zorder=4))
+    ax.add_patch(FancyBboxPatch((cx - 0.055 * s, cy - 0.16 * s), 0.11 * s, 0.42 * s,
+                                boxstyle="round,pad=0,rounding_size=0.05",
+                                fc="white", ec="#922b21", lw=1.6, zorder=4))
+    ax.plot([cx, cx], [cy - 0.22 * s, cy + 0.14 * s], color="#c0392b",
+            lw=2.6, zorder=5)
+    for ty in (0.0, 0.09):
+        ax.plot([cx + 0.06 * s, cx + 0.1 * s], [cy + ty * s, cy + ty * s],
+                color="#922b21", lw=1.0, zorder=5)
 
 
 def draw_clock(ax, cx, cy, r=0.22):
@@ -137,8 +150,11 @@ def main():
 
     # ── sources ─────────────────────────────────────────────────────────────
     draw_antenna(ax, 1.30, 5.55, s=1.0)
-    draw_cloud(ax, 1.35, 3.20, "Internet\nNTRIP")
-    draw_cloud(ax, 1.35, 1.45, "Internet\nHAS · IDD")
+    draw_cloud(ax, 1.40, 3.55, "Internet\nNTRIP")
+    draw_cloud(ax, 1.40, 2.30, "Internet\nHAS · IDD")
+    draw_thermo(ax, 1.18, 1.05, s=1.0)
+    ax.text(1.45, 1.05, "local weather\n(METAR)", ha="left", va="center",
+            fontsize=9, weight="bold", color="#922b21")
 
     BXL, IXC, IW = 2.30, 3.65, 2.70      # box left edge / centre / width
 
@@ -210,14 +226,15 @@ def main():
     # ── source -> box arrows ────────────────────────────────────────────────
     for y in (7.50, 6.55, 4.20, 3.30):       # antenna -> obs + broadcast eph
         thin_arrow(ax, (1.78, 5.40), (BXL - 0.02, y))
-    thin_arrow(ax, (1.85, 3.05), (BXL - 0.02, 2.52))            # NTRIP -> precise (solid)
-    thin_arrow(ax, (1.85, 1.60), (BXL - 0.02, 2.30), C_HAS, ls=DASH)   # HAS IDD -> precise
+    thin_arrow(ax, (1.85, 3.20), (BXL - 0.02, 2.55))            # NTRIP -> precise (solid)
+    thin_arrow(ax, (1.85, 2.15), (BXL - 0.02, 2.40), C_HAS, ls=DASH)   # HAS IDD -> precise
+    thin_arrow(ax, (2.02, 1.05), (BXL - 0.02, 1.22))            # METAR -> advanced models
     # HAS via E6-B: from the antenna, dashed, down the left margin into the box
-    ax.plot([1.30, 0.66, 0.66], [5.05, 5.05, 2.6], color=C_HAS, lw=2.0,
+    ax.plot([1.30, 0.60, 0.60], [5.05, 5.05, 2.92], color=C_HAS, lw=2.0,
             ls=DASH, zorder=2)
-    thin_arrow(ax, (0.66, 2.60), (BXL - 0.02, 2.46), C_HAS, ls=DASH)
-    ax.text(0.5, 3.7, "HAS · E6-B", rotation=90, ha="center", va="center",
-            fontsize=9.5, color=C_HAS, weight="bold")
+    thin_arrow(ax, (0.60, 2.92), (BXL - 0.02, 2.74), C_HAS, ls=DASH)
+    ax.text(0.46, 3.95, "HAS · E6-B", rotation=90, ha="center", va="center",
+            fontsize=9, color=C_HAS, weight="bold")
 
     # ── footnotes ───────────────────────────────────────────────────────────
     ax.text(8.2, 0.40,
