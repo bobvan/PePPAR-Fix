@@ -533,6 +533,7 @@ class Ticc:
                     min(1.0, base_confidence * estimator_sample["confidence"]),
                 ),
                 estimator_residual_s=estimator_sample["residual_s"],
+                raw_line=line,            # raw wire text for the raw-capture tap
             )
 
     def _observe_chb_event(self, recv_mono: float) -> None:
