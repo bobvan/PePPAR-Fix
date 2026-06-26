@@ -1,0 +1,28 @@
+# gt-nfs.service — sshfs mount of gt:~/gt-nfs at ~/gt-nfs on a lab host.
+#
+# The archival / data path for the disk-constrained Timebeat hosts (otcBob1 =
+# 7 GB): pull captures + logs to gt's RAIDZ-3 over the ssh access the hosts
+# already have — no scp, no NFS-in-LXC.  COMFORT layer, NOT a dependency of the
+# overnight servo (keep the engine's hot-path logs local + bounded; mount is
+# `soft`/reconnect so a network blip degrades gracefully).
+#
+# Prereqs (per host, one-time): bob has an ssh key authorized on gt
+# (~/.ssh/id_ed25519 → gt:~/.ssh/authorized_keys) and gt's host key in
+# known_hosts.  Install: sudo cp deploy/gt-nfs.service /etc/systemd/system/ &&
+# sudo systemctl enable --now gt-nfs.service
+[Unit]
+Description=sshfs mount of gt:~/gt-nfs at ~/gt-nfs (archival/data path)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bob
+ExecStartPre=/bin/mkdir -p /home/bob/gt-nfs
+ExecStart=/usr/bin/sshfs -f -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,StrictHostKeyChecking=accept-new,idmap=user gt:gt-nfs /home/bob/gt-nfs
+ExecStop=/bin/fusermount -u /home/bob/gt-nfs
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
