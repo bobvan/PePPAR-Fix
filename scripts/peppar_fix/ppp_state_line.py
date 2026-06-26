@@ -3,12 +3,15 @@
 The engine emits this per-epoch line (position-filter ECEF + σ, residual ZTD +
 σ, GPS-time key); ``pos_replay_compare`` parses it; and pos_replay **stage 2b**
 will re-emit it when it regenerates the engine output from a replayed bundle.
-Three consumers of one format → make the format a single shared function so the
-emitter and the parser can't drift (the lesson of the duplicated ZTD apriori in
-#235: a load-bearing constant — here a wire format — needs one definition).
 
-``format_ppp_state_line`` is the producer; ``pos_replay_compare._PPP_RE`` is the
-matching consumer.  ``test_ppp_state_line`` pins the round-trip.
+``format_ppp_state_line`` is the single **producer**, structurally shared by the
+engine emitter and the stage-2b re-emitter (so *those two* can't diverge).  The
+**consumer**, ``pos_replay_compare._PPP_RE``, is a separate representation — a
+regex can't be derived from a printf — so producer↔consumer consistency is NOT
+structural; it rests on ``test_ppp_state_line`` (an exact-string anchor + a
+field-wise round-trip through the parser) staying comprehensive.  That test is
+therefore load-bearing: **a field added here must grow the test** or the
+guarantee lapses silently (Charlie #238).
 """
 from __future__ import annotations
 
