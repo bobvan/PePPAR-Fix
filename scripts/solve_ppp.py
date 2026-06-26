@@ -132,6 +132,12 @@ from solve_dualfreq import (
     ALPHA_L1_L2, ALPHA_L2, ALPHA_E1, ALPHA_E5B, ALPHA_B1I_B2I, ALPHA_B2I,
 )
 from ppp_corrections import OSBParser, CLKFile
+# Single source of the fixed hydrostatic-apriori zenith delay the IDX_ZTD
+# residual rides on.  pos_replay's total-ZTD assembly reconstructs the filter's
+# total as ENGINE_ZTD_APRIORI_M + residual, so the apriori the engine APPLIES
+# (below) and the one the compare ASSUMES must be the same constant — route
+# both through this one definition (Charlie #235 finding 1).
+from peppar_fix.saastamoinen import ENGINE_ZTD_APRIORI_M
 
 # IF wavelengths for carrier phase
 WL_L1 = C / F_L1
@@ -871,12 +877,12 @@ class PPPFilter:
         if elevation_deg < 5.0:
             elevation_deg = 5.0
         if PPPFilter._GMF_PROVIDER is not None:
-            # 2.3 m a-priori dry zenith delay × hydrostatic mapping.
-            # The wet residual rides on the ZTD state and is mapped
+            # ENGINE_ZTD_APRIORI_M a-priori dry zenith delay × hydrostatic
+            # mapping.  The wet residual rides on the ZTD state and is mapped
             # separately via wet_mapping().
-            return 2.3 * PPPFilter._GMF_PROVIDER.m_hydrostatic(
+            return ENGINE_ZTD_APRIORI_M * PPPFilter._GMF_PROVIDER.m_hydrostatic(
                 math.radians(elevation_deg))
-        return 2.3 / math.sin(math.radians(elevation_deg))
+        return ENGINE_ZTD_APRIORI_M / math.sin(math.radians(elevation_deg))
 
     @staticmethod
     def wet_mapping(elevation_deg):
@@ -1558,7 +1564,7 @@ class FixedPosFilter:
             return None
 
         sin_elev = math.sin(math.radians(max(5, elev)))
-        tropo = 2.3 / sin_elev
+        tropo = ENGINE_ZTD_APRIORI_M / sin_elev
         m_wet = 1.0 / sin_elev  # wet mapping function
         return {
             'rho': rho,

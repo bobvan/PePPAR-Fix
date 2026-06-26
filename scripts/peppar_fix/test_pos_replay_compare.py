@@ -192,6 +192,19 @@ class TestTotalZtdAssembly(unittest.TestCase):
         rows = prc.parse_ppp_state([_ppp_line(1, _TRUTH, 0.1, ztd=0.05)])
         self.assertEqual(prc.ztd_total_series_from_ppp(rows), [])
 
+    def test_engine_applies_the_same_apriori_the_compare_assumes(self):
+        # Finding 1: the engine's tropo apriori (solve_ppp) and the constant
+        # the compare assembles from MUST be one value.  At zenith the engine
+        # tropo IS the apriori (mapping=1) — assert they match so a future
+        # retune in one place can't silently mis-assemble every total.
+        import sys
+        sys.path.insert(0, _SCRIPTS)
+        from solve_ppp import PPPFilter
+        from peppar_fix.saastamoinen import ENGINE_ZTD_APRIORI_M
+        f = PPPFilter.__new__(PPPFilter)
+        self.assertAlmostEqual(f.tropo_delay(90.0), ENGINE_ZTD_APRIORI_M,
+                               places=9)
+
 
 class TestAbsoluteBias(unittest.TestCase):
     def _pt(self, t, ztd, sig=0.01):

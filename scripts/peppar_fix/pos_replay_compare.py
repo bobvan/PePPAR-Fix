@@ -426,8 +426,12 @@ def _print_metar_crosscheck(rows, metar_rows, truth_raw, args):
     if not truth:
         return
     import statistics
-    by_t = {round(p.t_s): p.ztd_m for p in truth}
-    diffs = [w.ztd_m - by_t[round(w.t_s)] for w in wx if round(w.t_s) in by_t]
+    # interpolate_ztd stores t_s as the EXACT wx time it was interpolated at, so
+    # key on the exact float — no round-to-second (which would silently drop a
+    # point whose sub-second t_s straddles an integer boundary).  Out-of-span wx
+    # points simply aren't in `by_t`.
+    by_t = {p.t_s: p.ztd_m for p in truth}
+    diffs = [w.ztd_m - by_t[w.t_s] for w in wx if w.t_s in by_t]
     if diffs:
         print(f"ZTD [METAR] cross-check: weather-model total − NRCan median "
               f"{statistics.median(diffs) * 1e3:+.1f} mm over {len(diffs)} pts "
