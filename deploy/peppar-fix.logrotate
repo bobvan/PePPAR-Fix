@@ -1,0 +1,9 @@
+/home/bob/peppar-fix/data/peppar-fix.log {
+    size 20M
+    rotate 4
+    compress
+    copytruncate
+    missingok
+    notifempty
+    su bob bob
+}

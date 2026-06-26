@@ -1,90 +1,27 @@
-# peppar-fix.service — GNSS-disciplined PTP clock appliance
-#
-# Runs the peppar-fix wrapper with layered ptp4l clock-class supervision.
-# See docs/ptp4l-supervision.md for the full design.
-#
-# Install:
-#   sudo cp deploy/peppar-fix.service /etc/systemd/system/
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now peppar-fix.service
-#
-# Prerequisites:
-#   - ptp4l running with free_running=1 and uds_address=/var/run/ptp4l
-#   - pmc binary in PATH (from linuxptp package)
-#   - GNSS receiver accessible at PEPPAR_SERIAL device path
-#   - PHC accessible at PEPPAR_PTP_DEV device path
-#
-# Customize the Environment lines or use an EnvironmentFile for
-# site-specific configuration.
-
+# peppar-fix.service — disciplines the ClockMatrix OCXO (combo servo).
+# THE BOOT DEFAULT on a validated OTC/Mini host (Bob 2026-06-25): peppar-fix is
+# the default timing service; timebeat is the operator's EXPLICIT choice
+# (`systemctl start timebeat` stops this via Conflicts=).  Self-healing:
+# Restart=on-failure + the wrapper's own exit-5 relaunch loop; any harder
+# failure → reboot → this starts again → re-disciplines (power cycle recovers
+# any ClockMatrix state — Bob accepts that risk).  Logs LOCAL + bounded
+# (logrotate → gt-nfs); the sshfs mount is never in the hot path.
 [Unit]
-Description=PePPAR Fix — GNSS-disciplined precision clock
-Documentation=https://github.com/your-org/peppar-fix
-After=network-online.target ptp4l.service
+Description=PePPAR-Fix — discipline the ClockMatrix OCXO (combo servo)
+Conflicts=timebeat.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=peppar
-Group=peppar
-
-# ── Site configuration ──────────────────────────────────────────────── #
-# Override these with a drop-in or EnvironmentFile.
-
-Environment=PEPPAR_SERIAL=/dev/gnss-top
-Environment=PEPPAR_BAUD=921600
-Environment=PEPPAR_NTRIP_CONF=/etc/peppar-fix/ntrip.conf
-Environment=PEPPAR_EPH_MOUNT=BCEP00BKG0
-Environment=PEPPAR_PTP_DEV=/dev/ptp0
-Environment=PEPPAR_SYSTEMS=gps,gal
-Environment=PEPPAR_PMC_UDS=/var/run/ptp4l
-Environment=PEPPAR_PMC_DOMAIN=0
-
-# EnvironmentFile=-/etc/peppar-fix/peppar-fix.env
-
-# ── Main process ────────────────────────────────────────────────────── #
-
-ExecStart=/usr/local/bin/peppar-fix \
-    --pmc ${PEPPAR_PMC_UDS}
-
-# ── Failsafe: degrade clockClass on ANY stop ────────────────────────── #
-# systemd runs ExecStopPost even after SIGKILL or OOM-kill.  This is
-# the last-resort guarantee that ptp4l stops announcing clockClass 6
-# when peppar-fix is not running.
-
-ExecStopPost=/bin/sh -c '\
-    pmc -u -i /tmp/peppar-pmc-stop.$$ -s ${PEPPAR_PMC_UDS} -d ${PEPPAR_PMC_DOMAIN} -b 0 \
-    "SET GRANDMASTER_SETTINGS_NP \
-        clockClass 248 \
-        clockAccuracy 0xfe \
-        offsetScaledLogVariance 0xffff \
-        currentUtcOffset 37 \
-        leap61 0 \
-        leap59 0 \
-        currentUtcOffsetValid 0 \
-        ptpTimescale 1 \
-        timeTraceable 0 \
-        frequencyTraceable 0 \
-        timeSource 0xa0" \
-    || true'
-
-# ── Process management ──────────────────────────────────────────────── #
-
+User=bob
+WorkingDirectory=/home/bob/peppar-fix
+ExecStartPre=/bin/sleep 3
+ExecStart=/bin/bash /home/bob/peppar-fix/scripts/peppar-fix
+StandardOutput=append:/home/bob/peppar-fix/data/peppar-fix.log
+StandardError=append:/home/bob/peppar-fix/data/peppar-fix.log
 Restart=on-failure
-RestartSec=10
-WatchdogSec=300
-
-# Required capabilities (no full root needed if user has these)
-AmbientCapabilities=CAP_SYS_TIME CAP_NET_RAW
-CapabilityBoundingSet=CAP_SYS_TIME CAP_NET_RAW
-
-# Hardening
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/var/run /tmp
-ReadWritePaths=/etc/peppar-fix
-NoNewPrivileges=yes
-PrivateTmp=yes
+RestartSec=15
 
 [Install]
 WantedBy=multi-user.target

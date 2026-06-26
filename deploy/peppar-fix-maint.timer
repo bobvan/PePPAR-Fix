@@ -1,0 +1,8 @@
+[Unit]
+Description=Run PePPAR-Fix log maintenance every 15 min
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+[Install]
+WantedBy=timers.target

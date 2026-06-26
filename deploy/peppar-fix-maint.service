@@ -1,0 +1,6 @@
+[Unit]
+Description=PePPAR-Fix log maintenance (rotate + ship to gt-nfs)
+[Service]
+Type=oneshot
+User=bob
+ExecStart=/home/bob/peppar-fix/deploy/peppar-fix-maint.sh
