@@ -240,10 +240,20 @@ Each is one bundle; `pos_replay` iterates the library.
 4. **Truth-ingest + ZTD-compare tooling** — RAWX→RINEX→{PRIDE,OPUS,NRCan},
    parse outputs, build the truth series, and the §5 convention-matched
    ZTD comparison.  *Medium (the ZTD convention is the subtle part).*
-5. **Deterministic replay + product-swap** — extend
-   `scripts/regression/run_regression.py` to consume a bundle, replay the
-   raw multi-stream capture deterministically, and swap products.  Score
-   with the `pos_sim` divergence monitor.  *Largest.*
+5. **Deterministic replay + product-swap** — *the largest, split in two:*
+   - **5a — replay driver core** *(done: `pos_replay_driver.py`).*  Re-feed
+     a bundle through the engine's own stores in `recv_mono` order under a
+     **virtual clock** (`now_mono` = captured `recv_mono`, never wall-clock),
+     proving milestone-0's bit-identical reproduction.  Drives the
+     virtual-clock-pure stores (qErr / NAV-CLOCK / NAV-TIMEGPS / TIM-TM2 /
+     NAV-PVT); SSR / eph / RAWX are surfaced in the trace but applied in 5b.
+   - **5b — filter epoch step + `[PPP_STATE]`/`[METAR]` regeneration +
+     product-swap.**  Factor the engine's per-epoch filter step out of the
+     threaded `run_steady_state` into a reusable, thread-free callable; drive
+     it from 5a's re-feed to regenerate the engine outputs, score with the
+     `pos_sim` divergence monitor, and swap real-time SSR ↔ final products.
+     Carries Charlie's #230 obs↔PPS RAWX canonical-stamp once-over.  *The
+     remaining largest piece.*
 
 Sequence 1→2 first (cheap, unblock a first capture), then 3 (capture a
 real bundle), then 4+5 (truth + replay).  Per the parent doc, this is the
