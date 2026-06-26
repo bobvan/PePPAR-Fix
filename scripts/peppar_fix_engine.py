@@ -3221,7 +3221,10 @@ class AntPosEstThread(threading.Thread):
                         gps_time.isoformat(), self._n_epochs, n_used,
                         float(_pp[0]), float(_pp[1]),
                         float(_pp[2]), float(_ps), _pz, _pzs)
-                except (IndexError, ValueError, TypeError):
+                except (IndexError, ValueError, TypeError, AttributeError):
+                    # AttributeError covers gps_time.isoformat() — a None
+                    # gps_time must never crash the filter thread (the whole
+                    # point of this guard is "logging can't take down _run_inner").
                     pass
 
             # Phase-residual admission gate ingest — feed this epoch's

@@ -159,7 +159,7 @@ def compare_ztd(our, truth, *, k_sigma: float = 3.0, window: int = 120,
     import statistics
     from peppar_fix.pos_sim import DivergenceMonitor
 
-    _empty = {"n_aligned": 0, "offset_m": None,
+    _empty = {"n_aligned": 0, "inconclusive": True, "offset_m": None,
               "verdict": {"fired": False, "fired_epoch": None}}
     if not our or not truth:
         return _empty
@@ -182,13 +182,22 @@ def compare_ztd(our, truth, *, k_sigma: float = 3.0, window: int = 120,
     offset = statistics.median(residuals)
     mon = DivergenceMonitor(k_sigma=k_sigma, window=window)
     detrended = []
-    for i, ((op, _tp), res) in enumerate(zip(pairs, residuals)):
+    for (op, _tp), res in zip(pairs, residuals):
         d = abs(res - offset)
         detrended.append(d)
-        mon.update(i, d, max(op.sigma_ztd_m, 1e-6))
+        # Report the aligned GPS-time (int unix seconds), not the pair index,
+        # so verdict.fired_epoch is an honest, greppable timestamp — detection
+        # is index-relative, so this is reporting-only (mirrors compare_position
+        # passing the real engine epoch).
+        mon.update(int(op.t_s), d, max(op.sigma_ztd_m, 1e-6))
     return {
         "n_aligned": len(pairs),
         "window": window,
+        # < window aligned pairs can never fill the monitor's window, so the
+        # verdict is necessarily "no fire" — surfaced as inconclusive rather
+        # than an implicit pass (the exact false-confidence this tool exists to
+        # catch).
+        "inconclusive": len(pairs) < window,
         "offset_m": offset,
         "detrended_m": detrended,
         "final_detrended_m": detrended[-1],

@@ -128,6 +128,38 @@ class TestZtdCompare(unittest.TestCase):
         res = prc.compare_ztd(our, truth, align_tol_s=60.0)
         self.assertEqual(res["n_aligned"], 0)
 
+    def test_short_series_is_inconclusive(self):
+        # fewer aligned pairs than the window can never fire → inconclusive,
+        # not a falsely reassuring "stayed in corridor".
+        truth = [self._pt(i, 0.10) for i in range(30)]
+        our = [self._pt(i, 0.10) for i in range(30)]
+        res = prc.compare_ztd(our, truth, window=120)
+        self.assertEqual(res["n_aligned"], 30)
+        self.assertTrue(res["inconclusive"])
+        self.assertFalse(res["verdict"]["fired"])
+
+    def test_long_series_is_not_inconclusive(self):
+        truth = [self._pt(i, 0.10) for i in range(200)]
+        our = [self._pt(i, 0.10) for i in range(200)]
+        res = prc.compare_ztd(our, truth, window=120)
+        self.assertFalse(res["inconclusive"])
+
+    def test_empty_is_inconclusive(self):
+        res = prc.compare_ztd([], [])
+        self.assertTrue(res["inconclusive"])
+        self.assertEqual(res["n_aligned"], 0)
+
+    def test_fired_epoch_is_gps_time_not_pair_index(self):
+        # the fired epoch should be the aligned GPS-time (unix seconds), a
+        # large timestamp — not a small pair index.
+        base = 1_750_000_000
+        truth = [self._pt(base + i, 0.10) for i in range(300)]
+        our = [self._pt(base + i, 0.10 + 0.20 + 0.002 * i, sig=0.01)
+               for i in range(300)]
+        res = prc.compare_ztd(our, truth)
+        self.assertTrue(res["verdict"]["fired"])
+        self.assertGreater(res["verdict"]["fired_epoch"], base)
+
     def test_series_from_ppp_uses_gps_keyed_rows_only(self):
         rows = prc.parse_ppp_state([
             _ppp_line(1, _TRUTH, 0.1, ztd=0.07,
