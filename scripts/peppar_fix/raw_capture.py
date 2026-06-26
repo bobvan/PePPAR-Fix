@@ -63,6 +63,8 @@ class RawCaptureBundle:
         self._files: dict[str, "object"] = {}
         self._counts: dict[str, int] = {}
         self._lock = threading.Lock()
+        self._flush_stop: "threading.Event | None" = None
+        self._flusher: "threading.Thread | None" = None
 
     def _fh(self, stream: str):
         fh = self._files.get(stream)
@@ -129,13 +131,45 @@ class RawCaptureBundle:
         return path
 
     def flush(self) -> None:
-        for fh in self._files.values():
-            fh.flush()
+        """Flush all stream buffers to the OS.  Lock-safe: snapshots the file
+        handles under the lock, then flushes OUTSIDE it — never holds the lock
+        across disk I/O (the no-long-GIL-holds rule)."""
+        with self._lock:
+            handles = list(self._files.values())
+        for fh in handles:
+            try:
+                fh.flush()
+            except (OSError, ValueError):
+                pass
+
+    def start_flusher(self, interval_s: float = 5.0) -> None:
+        """Flush periodically from a daemon thread, so a SIGKILL / power loss
+        on a long capture loses at most ~``interval_s`` of the unflushed tail
+        (``read_stream`` is truncation-safe).  ``interval_s <= 0`` disables;
+        idempotent (a second call is a no-op)."""
+        if not interval_s or interval_s <= 0 or self._flush_stop is not None:
+            return
+        self._flush_stop = threading.Event()
+
+        def _loop():
+            while not self._flush_stop.wait(interval_s):
+                self.flush()
+
+        self._flusher = threading.Thread(target=_loop, daemon=True,
+                                         name="raw-capture-flush")
+        self._flusher.start()
 
     def close(self) -> None:
-        for fh in self._files.values():
-            fh.close()
-        self._files.clear()
+        if self._flush_stop is not None:
+            self._flush_stop.set()         # stop the periodic flusher ...
+            if self._flusher is not None:
+                self._flusher.join(timeout=2.0)   # ... and wait it out, so it
+                # can't touch a handle we're about to close (deterministic).
+        self.flush()                       # flush() takes the lock itself
+        with self._lock:
+            for fh in self._files.values():
+                fh.close()
+            self._files.clear()
 
     def __enter__(self) -> "RawCaptureBundle":
         return self
@@ -147,7 +181,14 @@ class RawCaptureBundle:
 def read_stream(cap_path: str) -> Iterator[Tuple[float, bytes]]:
     """Yield ``(recv_mono, payload)`` per record from a ``.cap`` file, in
     order.  A truncated trailing record (e.g. a killed capture) ends the
-    iteration cleanly rather than raising."""
+    iteration cleanly rather than raising.
+
+    For **quiescent/closed** bundles (the replay use case).  A short trailing
+    record is treated as a clean end — so a *live tailer* reading a still-being-
+    written bundle would stop early the instant it hit a mid-flush boundary
+    (header flushed, payload pending) and miss everything after; a tailer must
+    retry on a short payload instead of stopping.  Replay reads after close,
+    so this is correct there."""
     with open(cap_path, "rb") as f:
         while True:
             hdr = f.read(_REC_HDR.size)

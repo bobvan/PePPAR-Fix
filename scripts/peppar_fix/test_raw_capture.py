@@ -172,3 +172,69 @@ class TestThreadSafety(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPeriodicFlush(unittest.TestCase):
+    def test_flush_makes_data_readable_without_close(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            b = rc.RawCaptureBundle(d)
+            b.record("ubx", b"frame", 1.0)
+            b.flush()                       # without close, flush → on disk
+            recs = list(rc.read_stream(os.path.join(d, "raw", "ubx.cap")))
+            self.assertEqual(recs, [(1.0, b"frame")])
+            b.close()
+
+    def test_periodic_flusher_flushes_in_background(self):
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            b = rc.RawCaptureBundle(d)
+            b.start_flusher(interval_s=0.02)
+            b.record("ubx", b"bg", 1.0)
+            time.sleep(0.12)                # let the flusher run a cycle
+            recs = list(rc.read_stream(os.path.join(d, "raw", "ubx.cap")))
+            self.assertEqual(recs, [(1.0, b"bg")])
+            b.close()
+
+    def test_close_stops_flusher(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            b = rc.RawCaptureBundle(d)
+            b.start_flusher(interval_s=0.02)
+            flusher = b._flusher
+            b.close()
+            flusher.join(timeout=1.0)
+            self.assertFalse(flusher.is_alive())
+
+    def test_start_flusher_idempotent(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            b = rc.RawCaptureBundle(d)
+            b.start_flusher(interval_s=0.05)
+            first = b._flusher
+            b.start_flusher(interval_s=0.05)    # no-op
+            self.assertIs(b._flusher, first)
+            b.close()
+
+    def test_flush_safe_during_concurrent_records(self):
+        import tempfile
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            b = rc.RawCaptureBundle(d)
+            stop = threading.Event()
+
+            def writer():
+                i = 0
+                while not stop.is_set():
+                    b.record("ubx", b"xxxx", float(i)); i += 1
+
+            t = threading.Thread(target=writer)
+            t.start()
+            for _ in range(200):
+                b.flush()                   # concurrent flush + record: no crash
+            stop.set(); t.join()
+            b.close()
+            recs = list(rc.read_stream(os.path.join(d, "raw", "ubx.cap")))
+            self.assertEqual(len(recs), b.counts["ubx"])
+            self.assertTrue(all(len(pl) == 4 for _rm, pl in recs))
