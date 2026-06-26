@@ -47,6 +47,7 @@ import numpy as np
 from solve_pseudorange import C, ecef_to_lla, lla_to_ecef
 from solve_ppp import PPPFilter, FixedPosFilter, ls_init, N_BASE, SIGMA_P_IF, IDX_ZTD as PPP_IDX_ZTD
 from peppar_fix.obs_routing import obs_for_position
+from peppar_fix.ppp_state_line import format_ppp_state_line
 from solid_tide import solid_tide_displacement, sun_pos_ecef
 import peer_publisher
 from antex import ANTEXParser, compute_pcv_correction
@@ -3224,12 +3225,12 @@ class AntPosEstThread(threading.Thread):
                     _pz = float(filt.x[PPP_IDX_ZTD])
                     _pzs = math.sqrt(max(0.0,
                         float(filt.P[PPP_IDX_ZTD, PPP_IDX_ZTD])))
-                    log.info(
-                        "[PPP_STATE] gps=%s epoch=%d n=%d ecef=%.4f,%.4f,%.4f "
-                        "sigma_pos=%.4fm ztd=%+.4fm sigma_ztd=%.4fm",
-                        gps_time.isoformat(), self._n_epochs, n_used,
-                        float(_pp[0]), float(_pp[1]),
-                        float(_pp[2]), float(_ps), _pz, _pzs)
+                    # Shared formatter (pos_replay stage 2b re-emits the same
+                    # line from a replayed bundle; one format definition keeps
+                    # emitter + parser in step).  '%s' to log.info so the line
+                    # passes through verbatim (it has its own % conversions).
+                    log.info("%s", format_ppp_state_line(
+                        gps_time, self._n_epochs, n_used, _pp, _ps, _pz, _pzs))
                 except (IndexError, ValueError, TypeError, AttributeError):
                     # AttributeError covers gps_time.isoformat() — a None
                     # gps_time must never crash the filter thread (the whole

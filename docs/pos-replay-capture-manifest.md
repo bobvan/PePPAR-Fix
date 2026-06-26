@@ -260,7 +260,12 @@ Each is one bundle; `pos_replay` iterates the library.
      score with the `pos_sim` divergence monitor, and swap real-time SSR ↔ final
      products.  Carries Charlie's #230 obs↔PPS RAWX canonical-stamp once-over,
      the #236-F2 `late_edge_filter` config, and the #236-F4 TICC recv-estimator
-     reconstruction.  *The remaining largest piece.*
+     reconstruction.  *The remaining largest piece — sequenced into safe,
+     separately-reviewable extractions in
+     [`pos-replay-stage2b-plan.md`](pos-replay-stage2b-plan.md).  The shared
+     `[PPP_STATE]` output seam (`peppar_fix/ppp_state_line.py`) is done; the two
+     hot-path extractions (RAWX→obs, then the EKF epoch step) follow as their
+     own behavior-preserving PRs.*
 
 Sequence 1→2 first (cheap, unblock a first capture), then 3 (capture a
 real bundle), then 4+5 (truth + replay).  Per the parent doc, this is the
