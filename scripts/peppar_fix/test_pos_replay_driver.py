@@ -93,7 +93,9 @@ class TestReplayDispatch(unittest.TestCase):
             self.assertIn("NAV-CLOCK", idents)
             self.assertIn("ticc:chA", idents)
             self.assertIn("ticc:chB", idents)
-            self.assertIn("ssr", idents)            # surfaced, deferred to stage 2
+            # the dummy (invalid) SSR frame routes through RTCMReader and tags
+            # gracefully — stage 2a applies SSR/eph (no longer deferred)
+            self.assertIn("rtcm?", idents)
 
     def test_ticc_events_accumulated(self):
         with tempfile.TemporaryDirectory() as d:
@@ -138,14 +140,63 @@ class TestReplayDispatch(unittest.TestCase):
             self.assertEqual(r.counts["ticc"], 2)
             self.assertEqual(r.counts["ssr"], 1)
 
-    def test_deferred_stream_not_applied(self):
-        # ssr is counted + traced but touches no store (stage 2 applies it)
+    def test_ssr_store_exists_and_frame_routed_gracefully(self):
+        # stage 2a: SSR is applied via the shared router; an invalid frame is
+        # tagged "rtcm?" without raising, and the store set carries ssr/beph.
         with tempfile.TemporaryDirectory() as d:
             _make_bundle(d)
             r = drv.ReplayDriver(d); r.run()
             self.assertEqual(r.counts["ssr"], 1)
-            # no SSR store exists in the stage-1 store set
-            self.assertNotIn("ssr", r.stores)
+            self.assertIn("ssr", r.stores)
+            self.assertIn("beph", r.stores)
+
+
+class TestRtcmApplication(unittest.TestCase):
+    def test_eph_frame_routes_to_beph(self):
+        # real RTCM bytes are impractical to synthesize, so mock the parser and
+        # confirm the driver wires a parsed eph identity through the SHARED
+        # router into the beph store (1019 = GPS broadcast eph).
+        import types
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.record("eph", b"\xd3rawframe", recv_mono=200.0)
+            b.close()
+            fake_msg = types.SimpleNamespace(identity="1019")
+            captured = {}
+
+            def _fake_route(identity, msg_view, beph, ssr, label, **kw):
+                captured["identity"] = identity
+                captured["label"] = label
+                captured["bias_only"] = kw.get("bias_only")
+                return "eph", 5
+
+            with mock.patch("pyrtcm.RTCMReader.parse", return_value=fake_msg), \
+                 mock.patch("realtime_ppp.route_rtcm_message", _fake_route):
+                r = drv.ReplayDriver(d); r.run()
+            self.assertEqual(captured["identity"], "1019")
+            self.assertEqual(captured["label"], "eph")
+            self.assertFalse(captured["bias_only"])
+            self.assertIn("eph:1019", [i for _t, _s, i in r.trace])
+
+    def test_ssr_bias_routes_bias_only(self):
+        import types
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.record("ssr_bias", b"\xd3rawframe", recv_mono=200.0)
+            b.close()
+            fake_msg = types.SimpleNamespace(identity="1265")
+            captured = {}
+
+            def _fake_route(identity, msg_view, beph, ssr, label, **kw):
+                captured["bias_only"] = kw.get("bias_only")
+                return "bias_gapfill", None
+
+            with mock.patch("pyrtcm.RTCMReader.parse", return_value=fake_msg), \
+                 mock.patch("realtime_ppp.route_rtcm_message", _fake_route):
+                r = drv.ReplayDriver(d); r.run()
+            self.assertTrue(captured["bias_only"])   # secondary mount = bias-only
 
 
 class TestEmptyBundle(unittest.TestCase):

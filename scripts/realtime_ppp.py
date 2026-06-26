@@ -1959,6 +1959,44 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
 
 # ── NTRIP correction reader ────────────────────────────────────────────────── #
 
+def route_rtcm_message(identity, msg_view, beph, ssr, label, *,
+                       bias_only=False, skip_biases=False,
+                       skip_code_biases=False, skip_phase_biases=False):
+    """Route ONE decoded RTCM message to BroadcastEphemeris / SSRState.
+
+    The single source of RTCM-routing truth, shared by the live ``ntrip_reader``
+    and ``pos_replay`` — so the replay can't silently drift from the live engine
+    (the lesson of Charlie's #236 qErr-invalid finding: reimplemented dispatch
+    diverges).  Pure except for the ``beph``/``ssr`` update side effects.
+
+    Returns ``(tag, detail)``: ``tag`` ∈ {``skip_code_bias``, ``skip_phase_bias``,
+    ``skip_bias``, ``bias_gapfill``, ``skip_non_bias``, ``eph``, ``ssr``,
+    ``ignored``}; ``detail`` is the update return (prn for eph, result for
+    ssr/bias) or None.  The caller owns logging/counting from the tag.
+    """
+    if skip_code_biases and identity in CODE_BIAS_MSG_TYPES:
+        return "skip_code_bias", None
+    if skip_phase_biases and identity in PHASE_BIAS_MSG_TYPES:
+        return "skip_phase_bias", None
+    if skip_biases and identity in BIAS_MSG_TYPES:
+        return "skip_bias", None
+    if bias_only:
+        # Dual-mount fusion: secondary mount supplies ONLY biases, gap-fill
+        # signals only (cross-AC datum mixing on shared signals breaks AR).
+        if identity in BIAS_MSG_TYPES:
+            result = ssr.update_from_rtcm(msg_view, src_mount=label,
+                                          gap_fill_only=True)
+            return "bias_gapfill", result
+        return "skip_non_bias", None
+    if identity in EPH_MSG_TYPES:
+        prn = beph.update_from_rtcm(msg_view)
+        return "eph", prn
+    if identity in SSR_MSG_TYPES or identity.startswith('4076_'):
+        result = ssr.update_from_rtcm(msg_view, src_mount=label)
+        return "ssr", result
+    return "ignored", None
+
+
 def ntrip_reader(stream, beph, ssr, stop_event, label="NTRIP",
                  bias_only=False, skip_biases=False,
                  skip_code_biases=False, skip_phase_biases=False,
@@ -2036,49 +2074,30 @@ def ntrip_reader(stream, beph, ssr, stop_event, label="NTRIP",
             if n_total <= 3 or identity not in msg_counts or msg_counts[identity] <= 1:
                 log.debug(f"[{label}] msg #{n_total}: identity={identity}")
 
-            # Diagnostic skip filters apply uniformly: drop matching bias
-            # messages before any other routing happens.
-            if skip_code_biases and identity in CODE_BIAS_MSG_TYPES:
+            # Route via the shared router (the single source of routing truth,
+            # also used by pos_replay so live and replay can't drift).  The
+            # router owns the skip/bias_only/eph/ssr decisions incl. src_mount
+            # labelling and gap-fill-only secondary-mount biases; the caller
+            # owns logging + counting from the returned tag.
+            tag, detail = route_rtcm_message(
+                identity, msg_view, beph, ssr, label,
+                bias_only=bias_only, skip_biases=skip_biases,
+                skip_code_biases=skip_code_biases,
+                skip_phase_biases=skip_phase_biases)
+            if tag in ("skip_code_bias", "skip_phase_bias", "skip_bias"):
                 continue
-            if skip_phase_biases and identity in PHASE_BIAS_MSG_TYPES:
-                continue
-            if skip_biases and identity in BIAS_MSG_TYPES:
-                continue
-
-            # Route to appropriate handler.  In bias_only mode, reject
-            # everything except the bias message subset — the primary
-            # mount owns orbit/clock/ephemeris.  AND filter the
-            # secondary-mount bias writes to gap-fill signals only:
-            # cross-AC datum mixing on shared (SV, signal) breaks AR
-            # because LAMBDA expects integer ambiguities in a single
-            # datum but the persistent AC datum offset is non-integer.
-            # See docs/ac-datum-mixing.md and ssr_corrections.GAP_FILL_SIGNALS.
-            if bias_only:
-                if identity in BIAS_MSG_TYPES:
-                    result = ssr.update_from_rtcm(
-                        msg_view, src_mount=label, gap_fill_only=True)
-                    if n_total <= 5:
-                        log.info(f"[{label}] bias routed (gap-fill only): "
-                                 f"{identity} → {result}")
-                else:
-                    n_skipped_non_phase_bias += 1
-            elif identity in EPH_MSG_TYPES:
-                prn = beph.update_from_rtcm(msg_view)
-                if prn and beph.n_satellites % 10 == 0:
-                    log.debug(f"[{label}] {beph.summary()}")
-            elif identity in SSR_MSG_TYPES or identity.startswith('4076_'):
-                # I-122350-main P1 follow-up: pass label as src_mount on
-                # the primary-mount path too.  Without this, every bias
-                # delivered by the primary mount tags src=? in
-                # [CB_APPLIED] / [PB_APPLIED] (only the bias_only
-                # secondary-mount path was plumbing src_mount, which
-                # makes the dual-mount diagnostic asymmetric — CNES
-                # biases unlabelled, WHU biases labelled).  Also
-                # confirmed against TimeHat day0502-cnes-baseline log
-                # (184/184 entries with src=?).
-                result = ssr.update_from_rtcm(msg_view, src_mount=label)
+            if tag == "skip_non_bias":
+                n_skipped_non_phase_bias += 1
+            elif tag == "bias_gapfill":
                 if n_total <= 5:
-                    log.info(f"[{label}] SSR routed: {identity} → {result}")
+                    log.info(f"[{label}] bias routed (gap-fill only): "
+                             f"{identity} → {detail}")
+            elif tag == "eph":
+                if detail and beph.n_satellites % 10 == 0:
+                    log.debug(f"[{label}] {beph.summary()}")
+            elif tag == "ssr":
+                if n_total <= 5:
+                    log.info(f"[{label}] SSR routed: {identity} → {detail}")
 
             if n_total % 100 == 0:
                 suffix = (f" | skipped {n_skipped_non_phase_bias} non-bias"

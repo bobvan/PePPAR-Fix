@@ -30,15 +30,25 @@ It parses each stream with the engine's own decoders (``pyubx2.UBXReader``,
 The UBX ``identity → store`` dispatch mirrors ``realtime_ppp.serial_reader``;
 keep the two in step (fidelity depends on it).
 
-**Scope boundary (stage 1 vs stage 2).**  This drives the *virtual-clock-pure*
-stores — the qErr / NAV-CLOCK / NAV-TIMEGPS / TIM-TM2 / NAV-PVT chain whose
-freshness logic was made ``now_mono``-pure in the milestone-0 refactor (#224–
-#230).  SSR / eph / RAWX records are surfaced in the trace (counted, in order)
-but **not yet applied**: regenerating ``[PPP_STATE]`` / ``[METAR]`` needs the
-filter epoch step, which lives inside the engine's threaded ``run_steady_state``
-and must be factored into a reusable, thread-free callable first.  That is
-**stage 2** (and carries Charlie's #230 obs↔PPS RAWX canonical-stamp once-over).
-Stage 1 proves the foundation stage 2 stands on.
+**Scope (stages so far).**
+
+- **Stage 1** — the *virtual-clock-pure* UBX/TICC stores (qErr / NAV-CLOCK /
+  NAV-TIMEGPS / TIM-TM2 / NAV-PVT) whose freshness logic was made
+  ``now_mono``-pure in the milestone-0 refactor (#224–#230).
+- **Stage 2a** — the **corrections**: SSR / eph RTCM frames are now *applied*
+  (not just surfaced) into ``SSRState`` / ``BroadcastEphemeris`` via
+  ``realtime_ppp.route_rtcm_message`` — the SAME router the live
+  ``ntrip_reader`` calls, so replay routing can't drift from live.  ``ssr_bias``
+  routes bias-only (secondary mount).  This is the correction state the filter
+  step needs, and the seam where **product-swap** plugs in (point the SSR
+  stream at final products instead of the captured real-time SSR).
+
+**Still ahead — stage 2b.**  Regenerating ``[PPP_STATE]`` / ``[METAR]`` needs
+the per-epoch filter step (RAWX → obs → ``filt.update`` → emit), which lives
+inside the threaded ``run_steady_state`` and must be factored into a reusable,
+thread-free callable.  That carries Charlie's #230 obs↔PPS RAWX canonical-stamp
+once-over, the #236-F2 ``late_edge_filter`` config, and the #236-F4 TICC
+recv-estimator reconstruction.
 """
 from __future__ import annotations
 
@@ -52,9 +62,6 @@ if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
 from peppar_fix.raw_capture import merged_records  # noqa: E402
-
-# Streams surfaced in the trace but applied only in stage 2 (the filter step).
-_DEFERRED_STREAMS = ("ssr", "ssr_bias", "eph")
 
 
 class VirtualClock:
@@ -75,16 +82,25 @@ class VirtualClock:
 
 
 def default_replay_stores() -> dict:
-    """Build the engine's virtual-clock-pure stores for a stage-1 replay."""
+    """Build the engine's stores for replay: the virtual-clock-pure UBX/TICC
+    stores (stage 1) plus the correction state (stage 2a: SSRState +
+    BroadcastEphemeris, fed through the shared RTCM router)."""
     from realtime_ppp import (QErrStore, NavClockStore, NavTimeGpsStore,
                               Nav2PositionStore)
     from peppar_fix.extint_reader import TimTm2Store
+    from ssr_corrections import SSRState
+    from broadcast_eph import BroadcastEphemeris
     return {
         "qerr": QErrStore(),
         "nav_clock": NavClockStore(),
         "nav_time_gps": NavTimeGpsStore(),
         "nav2": Nav2PositionStore(),
         "nav_pvt": Nav2PositionStore(),
+        # Correction state — fed via realtime_ppp.route_rtcm_message (the SAME
+        # router the live ntrip_reader uses, so replay can't drift).  ssr =
+        # primary mount; ssr_bias routes bias-only into the same SSRState.
+        "ssr": SSRState(),
+        "beph": BroadcastEphemeris(),
         # disable the late-edge filter so re-feed is a pure passthrough — the
         # filter's trend state would make the store path order-dependent in a
         # way that's about the filter, not the replay determinism under test.
@@ -129,9 +145,33 @@ class ReplayDriver:
             return self._dispatch_ubx(payload, recv_mono)
         if stream == "ticc":
             return self._dispatch_ticc(payload, recv_mono)
-        if stream in _DEFERRED_STREAMS:
-            return stream                       # stage 2 applies these
+        if stream in ("ssr", "ssr_bias", "eph"):
+            return self._dispatch_rtcm(stream, payload, recv_mono)
         return stream
+
+    def _dispatch_rtcm(self, stream: str, payload: bytes,
+                       recv_mono: float) -> str:
+        """Apply a captured RTCM frame (SSR / eph) via the SHARED router, so
+        replay routing is identical to the live ntrip_reader by construction.
+        ``ssr_bias`` is the secondary mount → bias-only into the same SSRState.
+        """
+        from pyrtcm import RTCMReader
+        from realtime_ppp import route_rtcm_message, RtcmMessageView
+        from peppar_fix.event_time import RtcmEvent
+        try:
+            msg = RTCMReader.parse(payload)
+        except Exception:
+            return "rtcm?"
+        if msg is None:
+            return "rtcm?"
+        identity = str(getattr(msg, "identity", ""))
+        event = RtcmEvent(identity=identity, message=msg, recv_mono=recv_mono,
+                          recv_utc=None)
+        msg_view = RtcmMessageView(msg, event)
+        tag, _detail = route_rtcm_message(
+            identity, msg_view, self.stores["beph"], self.stores["ssr"],
+            label=stream, bias_only=(stream == "ssr_bias"))
+        return f"{stream}:{identity}"
 
     def _dispatch_ubx(self, payload: bytes, recv_mono: float) -> str:
         """Mirror serial_reader's identity→store map for the pure stores."""
@@ -221,6 +261,12 @@ class ReplayDriver:
             ex = s["extint"]
             out["extint"] = (ex.n_received, ex.n_dropped_acc_est,
                              ex.n_dropped_late_edge)
+        # correction state — deterministic counters (stage 2a)
+        if s.get("beph") is not None:
+            out["beph_n_sats"] = getattr(s["beph"], "n_satellites", None)
+        if s.get("ssr") is not None:
+            out["ssr_counts"] = (getattr(s["ssr"], "n_orbit", None),
+                                 getattr(s["ssr"], "n_clock", None))
         out["n_ticc_events"] = len(s.get("ticc_events", []))
         return out
 

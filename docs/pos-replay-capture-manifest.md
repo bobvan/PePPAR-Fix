@@ -247,13 +247,20 @@ Each is one bundle; `pos_replay` iterates the library.
      proving milestone-0's bit-identical reproduction.  Drives the
      virtual-clock-pure stores (qErr / NAV-CLOCK / NAV-TIMEGPS / TIM-TM2 /
      NAV-PVT); SSR / eph / RAWX are surfaced in the trace but applied in 5b.
-   - **5b — filter epoch step + `[PPP_STATE]`/`[METAR]` regeneration +
+   - **5b₁ — corrections applied** *(done: `route_rtcm_message`).*  Extract the
+     RTCM routing out of `ntrip_reader` into a shared `route_rtcm_message` and
+     drive `pos_replay`'s SSR / eph through it into `SSRState` /
+     `BroadcastEphemeris` — the same router live and replay, so routing can't
+     drift (the #236-F1 lesson).  This is the correction state the filter needs
+     and the seam where **product-swap** plugs in.
+   - **5b₂ — filter epoch step + `[PPP_STATE]`/`[METAR]` regeneration +
      product-swap.**  Factor the engine's per-epoch filter step out of the
      threaded `run_steady_state` into a reusable, thread-free callable; drive
-     it from 5a's re-feed to regenerate the engine outputs, score with the
-     `pos_sim` divergence monitor, and swap real-time SSR ↔ final products.
-     Carries Charlie's #230 obs↔PPS RAWX canonical-stamp once-over.  *The
-     remaining largest piece.*
+     it from 5a's re-feed + 5b₁'s corrections to regenerate the engine outputs,
+     score with the `pos_sim` divergence monitor, and swap real-time SSR ↔ final
+     products.  Carries Charlie's #230 obs↔PPS RAWX canonical-stamp once-over,
+     the #236-F2 `late_edge_filter` config, and the #236-F4 TICC recv-estimator
+     reconstruction.  *The remaining largest piece.*
 
 Sequence 1→2 first (cheap, unblock a first capture), then 3 (capture a
 real bundle), then 4+5 (truth + replay).  Per the parent doc, this is the
