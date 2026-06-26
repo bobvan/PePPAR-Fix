@@ -151,10 +151,23 @@ median (our − truth) offset** — which absorbs *both* trap 4's real-time lag
 *and* the residual-vs-total apriori difference (traps 1–3's constant parts) —
 and scores the *detrended* departure with the shared `DivergenceMonitor`.
 The `[PPP_STATE]` line carries a `gps=` (GPS-time) key so our series joins to
-the external time axis.  **Remaining for full rigor:** explicit total-ZTD
-assembly (ZHD from `[METAR]` pressure + the recorded mapping, traps 1–3) so
-our *residual* wet ZTD is compared against the truth *total* without leaning
-on offset-removal to hide a real apriori/mapping/height mismatch.
+the external time axis.
+
+**Total-ZTD assembly** (`ztd_total_series_from_ppp`): the filter's *total*
+zenith ZTD is `ENGINE_ZTD_APRIORI_M` (2.3 m, the fixed hydrostatic apriori the
+`IDX_ZTD` residual rides on) `+ residual`.  At zenith the wet mapping is 1, so
+a *total-vs-total* comparison needs no mapping function (trap 2 is a
+slant-domain concern only).  Assembling the total makes the constant 2.3 m
+apriori **explicit** instead of letting `compare_ztd`'s offset-removal absorb
+it together with the lag — which is what would otherwise hide a genuine
+*constant* total bias (a wrong antenna height → wrong ZHD, trap 3).  With
+totals, the removed offset is the physical `our_total − truth_total` median
+(lag + any real bias), and `abs_bias_warn_m` flags `|offset|` beyond a
+threshold — a constant bias the *detrended* divergence verdict structurally
+cannot see.  The `[METAR]` Saastamoinen ZHD/ZWD/ZTD (parsed, joined to
+`[PPP_STATE]` by epoch) provides an **independent weather-model total**
+cross-check on the truth's absolute level (trap 1), report-only — it is not
+the filter's ZTD, which is what the main comparison scores.
 
 
 ## 6. Determinism, product-matching, and the bundle
