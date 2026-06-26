@@ -35,7 +35,7 @@ if _SCRIPTS not in sys.path:
 # logger prefix).  Format (peppar_fix_engine, AntPosEstThread):
 #   [PPP_STATE] epoch=N n=M ecef=X,Y,Z sigma_pos=Sm ztd=+Zm sigma_ztd=Sm
 _PPP_RE = re.compile(
-    r"\[PPP_STATE\]\s+epoch=(\d+)\s+n=(-?\d+)\s+"
+    r"\[PPP_STATE\]\s+(?:gps=(\S+)\s+)?epoch=(\d+)\s+n=(-?\d+)\s+"
     r"ecef=(-?[\d.eE+]+),(-?[\d.eE+]+),(-?[\d.eE+]+)\s+"
     r"sigma_pos=([\d.eE+-]+)m\s+ztd=([-+\d.eE]+)m\s+sigma_ztd=([\d.eE+-]+)m"
 )
@@ -47,8 +47,9 @@ class PppRow:
     n_used: int
     ecef_m: tuple
     sigma_pos_m: float
-    ztd_m: float
+    ztd_m: float          # residual wet ZTD (engine IDX_ZTD), metres
     sigma_ztd_m: float
+    gps: Optional[object] = None   # datetime (GPS-time) if the log carried gps=
 
 
 @dataclass
@@ -65,11 +66,18 @@ def parse_ppp_state(lines: Iterable[str]) -> list:
         m = _PPP_RE.search(ln)
         if not m:
             continue
+        gps = None
+        if m.group(1):
+            try:
+                from datetime import datetime as _dt
+                gps = _dt.fromisoformat(m.group(1))
+            except ValueError:
+                gps = None
         rows.append(PppRow(
-            epoch=int(m.group(1)), n_used=int(m.group(2)),
-            ecef_m=(float(m.group(3)), float(m.group(4)), float(m.group(5))),
-            sigma_pos_m=float(m.group(6)),
-            ztd_m=float(m.group(7)), sigma_ztd_m=float(m.group(8))))
+            epoch=int(m.group(2)), n_used=int(m.group(3)),
+            ecef_m=(float(m.group(4)), float(m.group(5)), float(m.group(6))),
+            sigma_pos_m=float(m.group(7)),
+            ztd_m=float(m.group(8)), sigma_ztd_m=float(m.group(9)), gps=gps))
     return rows
 
 
@@ -106,6 +114,93 @@ def compare_position(rows, truth: StaticTruth, *, k_sigma: float = 3.0,
         "sigmas_m": sigmas,
         "final_error_m": errors[-1] if errors else None,
         "final_sigma_m": sigmas[-1] if sigmas else None,
+        "verdict": mon.verdict,
+    }
+
+
+@dataclass
+class ZtdPoint:
+    t_s: float            # seconds (GPS-time scale) — the alignment key
+    ztd_m: float
+    sigma_ztd_m: float
+
+
+def ztd_series_from_ppp(rows) -> list:
+    """Our time-keyed ZTD series from ``[PPP_STATE]`` rows that carried ``gps=``.
+
+    This is the engine's *residual* wet ZTD (IDX_ZTD).  The lag-aware compare
+    below absorbs the constant residual-vs-total apriori difference into its
+    offset term, so this residual series is directly usable against an external
+    *total* ZTD; explicit total-ZTD assembly (ZHD from [METAR] + mapping) is a
+    later refinement.
+    """
+    out = []
+    for r in rows:
+        if r.gps is None:
+            continue
+        out.append(ZtdPoint(t_s=r.gps.timestamp(), ztd_m=r.ztd_m,
+                            sigma_ztd_m=r.sigma_ztd_m))
+    return out
+
+
+def compare_ztd(our, truth, *, k_sigma: float = 3.0, window: int = 120,
+                align_tol_s: float = 60.0) -> dict:
+    """Lag-aware comparison of two time-keyed ZTD series (manifest §5).
+
+    NRCan ZTD is batch-smoothed and legitimately *leads* our real-time
+    random-walk ZTD, so a constant offset is expected and NOT a fault — as is
+    the constant residual-vs-total apriori difference.  We therefore remove the
+    **median (our − truth) offset** (lag + apriori, both constant) and score
+    the **detrended** residual: a *growing* detrended residual is a real
+    time-varying departure the DivergenceMonitor flags; a steady offset is not.
+    Align by nearest truth point within ``align_tol_s``.
+    """
+    import bisect
+    import statistics
+    from peppar_fix.pos_sim import DivergenceMonitor
+
+    _empty = {"n_aligned": 0, "inconclusive": True, "offset_m": None,
+              "verdict": {"fired": False, "fired_epoch": None}}
+    if not our or not truth:
+        return _empty
+    ts = sorted(truth, key=lambda p: p.t_s)
+    tt = [p.t_s for p in ts]
+    pairs = []
+    for p in our:
+        j = bisect.bisect_left(tt, p.t_s)
+        best = None
+        for k in (j - 1, j):
+            if 0 <= k < len(ts):
+                d = abs(ts[k].t_s - p.t_s)
+                if d <= align_tol_s and (best is None or d < best[0]):
+                    best = (d, ts[k])
+        if best is not None:
+            pairs.append((p, best[1]))
+    if not pairs:
+        return _empty
+    residuals = [op.ztd_m - tp.ztd_m for op, tp in pairs]
+    offset = statistics.median(residuals)
+    mon = DivergenceMonitor(k_sigma=k_sigma, window=window)
+    detrended = []
+    for (op, _tp), res in zip(pairs, residuals):
+        d = abs(res - offset)
+        detrended.append(d)
+        # Report the aligned GPS-time (int unix seconds), not the pair index,
+        # so verdict.fired_epoch is an honest, greppable timestamp — detection
+        # is index-relative, so this is reporting-only (mirrors compare_position
+        # passing the real engine epoch).
+        mon.update(int(op.t_s), d, max(op.sigma_ztd_m, 1e-6))
+    return {
+        "n_aligned": len(pairs),
+        "window": window,
+        # < window aligned pairs can never fill the monitor's window, so the
+        # verdict is necessarily "no fire" — surfaced as inconclusive rather
+        # than an implicit pass (the exact false-confidence this tool exists to
+        # catch).
+        "inconclusive": len(pairs) < window,
+        "offset_m": offset,
+        "detrended_m": detrended,
+        "final_detrended_m": detrended[-1],
         "verdict": mon.verdict,
     }
 

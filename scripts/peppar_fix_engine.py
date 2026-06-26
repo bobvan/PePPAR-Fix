@@ -3216,11 +3216,15 @@ class AntPosEstThread(threading.Thread):
                     _pzs = math.sqrt(max(0.0,
                         float(filt.P[PPP_IDX_ZTD, PPP_IDX_ZTD])))
                     log.info(
-                        "[PPP_STATE] epoch=%d n=%d ecef=%.4f,%.4f,%.4f "
+                        "[PPP_STATE] gps=%s epoch=%d n=%d ecef=%.4f,%.4f,%.4f "
                         "sigma_pos=%.4fm ztd=%+.4fm sigma_ztd=%.4fm",
-                        self._n_epochs, n_used, float(_pp[0]), float(_pp[1]),
+                        gps_time.isoformat(), self._n_epochs, n_used,
+                        float(_pp[0]), float(_pp[1]),
                         float(_pp[2]), float(_ps), _pz, _pzs)
-                except (IndexError, ValueError, TypeError):
+                except (IndexError, ValueError, TypeError, AttributeError):
+                    # AttributeError covers gps_time.isoformat() — a None
+                    # gps_time must never crash the filter thread (the whole
+                    # point of this guard is "logging can't take down _run_inner").
                     pass
 
             # Phase-residual admission gate ingest — feed this epoch's
