@@ -6,12 +6,13 @@
 > ⚠️ **OTC vs Mini — DPLL and CLK-input assignments DIFFER between the two
 > hosts. Do NOT cross-apply.** `otcBob1` is an **Open Time Card (OTC)**;
 > `ptBoat` is an **OTC Mini PT**. They are different boards with different
-> wiring. The clearest known difference (verified 2026-06-23 + Timebeat
-> confirmation): **F9T PPS is on CLK2 on the OTC (otcBob1)** but **CLK5 on
-> the Mini (ptBoat)**. Earlier revisions of this doc listed a single
-> "confirmed" mapping for both — that conflated the two. Every host-specific
-> fact below is now labelled OTC or Mini; treat any unlabelled legacy claim
-> as suspect until re-verified on the specific board.
+> wiring. The **board-specific CLK / DPLL / output wiring is Timebeat design
+> detail and is kept in the private lab repo** (`timebeat-mini-wiring.md`), not
+> in this public repo — only the generic 8A34002 register layout and our
+> runtime access notes live here. The one access-relevant difference: the chip
+> answers on a different **mux channel** (i2c-15 on the OTC vs i2c-16 on the
+> Mini). Treat any unlabelled legacy host-specific wiring claim below as
+> suspect until re-verified on the specific board.
 
 ## Chip and register addressing
 
@@ -44,11 +45,11 @@ docs that assumed page-register addressing:
 > (both at addr 0x58). This is a PCB-wiring difference (hardware-rooted, stable),
 > so the cleanest runtime board-type probe is: **0x58 answers on i2c-15 ⇒ OTC,
 > on i2c-16 ⇒ Mini.** (No HAT EEPROM / device-tree field distinguishes them.)
-> Secondary chip-config confirmations: DPLL3 (the DO on both) references
-> **CLK2 on OTC vs CLK5 on Mini** (= the F9T PPS input); active-input count is
-> 9 (OTC) vs 2 (Mini: CLK2=OCXO, CLK5=F9T). Combo setup is identical on both
-> (all DPLLs COMBO_SLAVE_CFG_0=0x28, SRC_ID=8 SW-combo) so the combo servo
-> ports to the Mini (DPLL3, ref CLK5).
+> The per-board CLK-input / DPLL / output wiring (which DPLL is the DO, where
+> the F9T PPS and OCXO land, the Output-TDC topology — and the fact that an
+> earlier "F9T on CLK5" claim for the Mini was wrong) is Timebeat design detail
+> and is maintained in the **private lab repo** (`timebeat-mini-wiring.md`),
+> not here.
 
 ```python
 import smbus2

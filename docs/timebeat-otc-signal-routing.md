@@ -8,6 +8,10 @@ doc for confirmed DPLL configurations on both hosts.
 
 **Status: Partially reverse-engineered. Some details unconfirmed.**
 
+> **Mini PT (ptBoat) wiring** — the authoritative CLK/DPLL/output map and the
+> OTC-vs-Mini DPLL topology are Timebeat board-specific detail and are kept in
+> the **private lab repo** (`timebeat-mini-wiring.md`), not in this public repo.
+
 ## Key insight: the OCXO is free-running
 
 The OCXO on the Timebeat OTC is a free-running oscillator — not a
