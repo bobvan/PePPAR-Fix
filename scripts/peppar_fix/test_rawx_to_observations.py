@@ -99,5 +99,34 @@ class TestRawxToObservations(unittest.TestCase):
         self.assertEqual(n_single, 1)
 
 
+class TestGfDiagPersistsAcrossEpochs(unittest.TestCase):
+    """Charlie #239: GF-DIAG is a two-epoch one-shot — its state dict must
+    PERSIST across calls (set epoch1 on call 1, reach epoch2 on call 2), not
+    reset every call.  An incomplete _gf_diag rename made hasattr() always
+    False → the dict reset each call → epoch2 never reached → diagnostic
+    silently never fired.  This pins persistence."""
+
+    def setUp(self):
+        # isolate from any state left by serial_reader / other tests
+        if hasattr(r.rawx_to_observations, "_gf_diag"):
+            del r.rawx_to_observations._gf_diag
+
+    def _epoch(self):
+        return _rawx([0, 0], [0, 3], [1, 1],
+                     [22_000_000.0, 22_000_000.0],
+                     [115_000_000.0, 90_000_000.0])
+
+    def test_state_persists_and_reaches_epoch2(self):
+        _run(self._epoch())                 # call 1 → epoch1 recorded
+        diag = r.rawx_to_observations._gf_diag
+        slot = diag[("gps", "G01")]
+        self.assertIsNotNone(slot["epoch1"])
+        self.assertIsNone(slot["epoch2"])   # not yet
+
+        _run(self._epoch())                 # call 2 → epoch2 reached (persisted)
+        slot = r.rawx_to_observations._gf_diag[("gps", "G01")]
+        self.assertIsNotNone(slot["epoch2"])  # would be None if dict reset
+
+
 if __name__ == "__main__":
     unittest.main()

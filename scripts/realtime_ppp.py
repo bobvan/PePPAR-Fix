@@ -1470,7 +1470,7 @@ def rawx_to_observations(rawx, systems, ssr, sig_names, sig_lookup,
         # so we can see whether the 60–190 m per-epoch GF on
         # BDS is a unit/wavelength bug or a receiver-side
         # measurement quirk.  One-shot per (sys, sv) pair.
-        if not hasattr(serial_reader, '_gf_diag'):
+        if not hasattr(rawx_to_observations, '_gf_diag'):
             rawx_to_observations._gf_diag = {}
         diag = rawx_to_observations._gf_diag
         key = (sys_name, sv)
