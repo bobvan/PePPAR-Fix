@@ -111,8 +111,8 @@ def main():
 
     # ── filter enclosure ────────────────────────────────────────────────────
     box(ax, 5.0, 0.7, 15.6, 7.95, "", C_FILT, lw=2.8, ec="#34495e")
-    ax.text(5.25, 7.62, "Four-State Extended Kalman Filter + LQR", ha="left",
-            va="center", fontsize=18, weight="bold", color="#34495e")
+    ax.text(5.25, 7.62, "Four-State Extended Kalman Filter + Linear Quadratic Regulator",
+            ha="left", va="center", fontsize=17, weight="bold", color="#34495e")
 
     # ── two state boxes (the oscillators) ───────────────────────────────────
     rxm = statebox(ax, 6.6, 5.0, 11.2, 6.7, "rx TCXO", "#d6eaf8",
@@ -140,28 +140,33 @@ def main():
     arrow(ax, (11.2, 3.05), (12.1, 3.05), color=C_CTRL, lw=2.6)
     label(ax, 11.65, 3.32, "state", C_CTRL, fs=11)
 
-    # ── physical hardware (left column, emphasised) ─────────────────────────
-    draw_antenna(ax, 0.95, 7.6, s=1.0)
-    box(ax, 0.55, 6.25, 4.55, 7.05, "GNSS receiver  (F9T)\nraw obs · qErr", C_HW,
-        fs=13, weight="bold")
-    box(ax, 0.55, 5.25, 4.55, 5.95, "PPP engine\ndt_rx · TDCP", C_PPP, fs=13,
+    # ── physical hardware (left column, narrowed to free the left margin) ────
+    draw_antenna(ax, 1.85, 7.6, s=1.0)
+    box(ax, 1.25, 6.25, 4.55, 7.05, "GNSS receiver  (F9T)\nraw obs · qErr", C_HW,
+        fs=12.5, weight="bold")
+    box(ax, 1.25, 5.25, 4.55, 5.95, "PPP engine\ndt_rx · TDCP", C_PPP, fs=12.5,
         weight="bold")
-    box(ax, 0.55, 4.30, 4.55, 4.95, "TICC\ndo_pps − gnss_pps", C_HW, fs=13,
+    box(ax, 1.25, 4.30, 4.55, 4.95, "TICC\ndo_pps − gnss_pps", C_HW, fs=12.5,
         weight="bold")
-    box(ax, 0.55, 2.95, 4.55, 3.65, "ClockMatrix DPLL\n(Timebeat OTC)", "#d0ece7",
-        fs=12.5, ec=C_CM, lw=2.0, ls=(0, (5, 2)), weight="bold")
-    box(ax, 0.55, 1.55, 4.55, 2.25, "Disciplined Oscillator\n→ do_pps    ← steer",
-        "#d5f0e0", fs=13, weight="bold")
+    box(ax, 1.25, 2.95, 4.55, 3.65, "ClockMatrix DPLL\n(Timebeat OTC)", "#d0ece7",
+        fs=12, ec=C_CM, lw=2.0, ls=(0, (5, 2)), weight="bold")
+    box(ax, 1.25, 1.55, 4.55, 2.25, "Disciplined Oscillator\n→ PPS    ← steer",
+        "#d5f0e0", fs=12.5, weight="bold")
 
-    arrow(ax, (0.95, 7.4), (0.95, 7.07), color="#333", lw=2.0)          # antenna->rx
-    arrow(ax, (1.5, 6.25), (1.5, 5.97), color="#555", lw=1.8)           # raw obs->PPP
-    label(ax, 2.2, 6.11, "raw obs", "#555", fs=9)
+    arrow(ax, (1.85, 7.4), (1.85, 7.07), color="#333", lw=2.0)          # antenna->rx
+    arrow(ax, (1.95, 6.25), (1.95, 5.97), color="#555", lw=1.8)         # raw obs->PPP
+    label(ax, 2.7, 6.11, "raw obs", "#555", fs=9)
 
-    # EXTINT: the DO's do_pps is wired up into the F9T's EXTINT input
-    elbow(ax, [(0.55, 2.0), (0.28, 2.0), (0.28, 6.62), (0.55, 6.62)], "#444", lw=2.2)
-    ax.text(0.46, 4.2, "EXTINT", rotation=90, ha="center", va="center",
-            fontsize=12, color="#444", weight="bold", zorder=8,
-            bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.95))
+    # PPS wiring in the freed left margin -------------------------------------
+    # The DO's PPS leaves the DO, branches into the TICC, and continues up into
+    # the F9T's EXTINT input.
+    elbow(ax, [(1.25, 1.9), (0.75, 1.9), (0.75, 6.75), (1.25, 6.75)], "#444", lw=2.2)
+    arrow(ax, (0.75, 4.5), (1.25, 4.5), color="#444", lw=2.2)           # branch -> TICC
+    label(ax, 1.04, 2.18, "PPS", "#444", fs=11)
+    label(ax, 0.95, 6.55, "EXTINT", "#444", fs=11)
+    # The F9T's own PPS goes to the TICC's reference channel (2nd input).
+    elbow(ax, [(1.25, 6.35), (0.38, 6.35), (0.38, 4.78), (1.25, 4.78)], "#777", lw=2.0)
+    label(ax, 0.6, 6.13, "PPS", "#777", fs=11)
 
     # ── the seven measurement arms (no Arm numbers, no state indices) ────────
     # rx-TCXO arms enter the rx box's LEFT edge.
@@ -180,14 +185,14 @@ def main():
     label(ax, 5.7, 3.0, "ClockMatrix", C_DO, fs=12)
     # EXTINT: the receiver's timestamp of do_pps -> reaches down to the DO state
     elbow(ax, [(4.55, 6.4), (4.85, 6.4), (4.85, 2.9), (6.6, 2.9)], C_DO, lw=2.2)
-    label(ax, 4.85, 4.55, "EXTINT", C_DO, fs=12)
+    label(ax, 5.35, 2.66, "EXTINT", C_DO, fs=12)
     # holdover pseudo-obs -> DO (synthetic, only during HOLDOVER)
     box(ax, 5.5, 0.95, 7.7, 1.65, "holdover", "#fdf2e9", fs=12, ec=C_DO, lw=1.6,
         weight="bold")
     elbow(ax, [(6.6, 1.65), (6.6, 2.2)], C_DO, lw=2.0, ls=(0, (4, 2)))
 
     # actuation feedback: LQR -> DO hardware (servo loop, emphasised)
-    elbow(ax, [(14.9, 2.4), (14.9, 0.42), (2.55, 0.42), (2.55, 1.55)],
+    elbow(ax, [(14.9, 2.4), (14.9, 0.42), (2.9, 0.42), (2.9, 1.55)],
           C_CTRL, lw=2.8)
     label(ax, 9.0, 0.42, "steer the DO   ·   servo loop", C_CTRL, fs=15)
 
