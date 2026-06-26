@@ -2884,6 +2884,1290 @@ class AntPosEstThread(threading.Thread):
         except Exception:
             log.exception("AntPosEstThread crashed")
 
+    def _process_epoch(self, gps_time, observations, obs_counts):
+        """Process one dequeued observation epoch (EKF predict/update, slip
+        handling, ambiguity mgmt, AR, NAV2/ZTD ties, [PPP_STATE] emit).
+        Factored verbatim out of _run_inner's per-epoch loop body so
+        pos_replay can drive a single epoch without the queue/heartbeat/thread
+        machinery (stage 2b, docs/pos-replay-stage2b-plan.md).  The body's two
+        epoch-level `continue`s (EKF dt-guard, n_used<4) became `return`
+        (skip-this-epoch); the 8 `continue`s inside the per-SV `for` loops
+        stay `continue` (verified by enclosing-loop analysis).
+        """
+        filt = self._filt
+        mw = self._mw
+        nl = self._nl
+        corrections = self._corrections
+        # EKF predict
+        if self._prev_t is not None:
+            dt = (gps_time - self._prev_t).total_seconds()
+            if dt <= 0 or dt > 120:
+                self._prev_t = gps_time
+                return
+            filt.predict(dt)
+        self._prev_t = gps_time
+
+        # Manage ambiguities — slip detector runs all four checks
+        # (UBX locktime, arc gap, geometry-free jump, MW residual
+        # jump) and flushes every per-SV phase-like state on any
+        # detected slip.  Shared clock/ISB/ZTD and receiver TCXO
+        # state are intentionally untouched.
+        current_svs = {o['sv'] for o in observations}
+        elevations = _compute_sv_elevations(
+            filt, corrections, observations, gps_time)
+        azimuths = _compute_sv_azimuths(
+            filt, corrections, observations, gps_time)
+        ipp_szas = _compute_sv_ipp_szas(
+            filt, azimuths, elevations, gps_time)
+        slip_events = self._slip_monitor.check(
+            observations, gps_time.timestamp(), self._n_epochs,
+            elevations=elevations,
+            azimuths=azimuths, ipp_szas=ipp_szas)
+        for ev in slip_events:
+            # PR-only slips (mw_jump alone) are PR-noise false
+            # positives; don't flush WL state or wind-up tracker.
+            # See is_pr_only_slip() docstring + I-155354 fix-I +
+            # docs/wl-integer-vs-pride-comparison.md.
+            if is_pr_only_slip(ev.reasons):
+                log.info("[SLIP_FILTERED] sv=%s mw_jump-only "
+                         "conf=%s mw=%s — PR-only, ambiguity "
+                         "preserved",
+                         ev.sv, ev.confidence,
+                         f"{ev.mw_jump_cyc:.2f}c"
+                         if ev.mw_jump_cyc is not None else "-")
+            else:
+                flush_sv_phase(
+                    ev.sv, filt=filt, mw_tracker=mw,
+                    nl_resolver=nl,
+                    slip_monitor=self._slip_monitor,
+                    sv_state=self._sv_state,
+                    confidence=ev.confidence,
+                    reason="|".join(ev.reasons), epoch=self._n_epochs)
+                # Wind-up tracker state is per-SV cumulative; drop it
+                # on slip so the next update seeds fresh (absolute
+                # zero absorbed into the re-floating ambiguity).
+                if self._windup_tracker is not None:
+                    self._windup_tracker.reset(ev.sv)
+            log.info("slip: sv=%s reasons=%s conf=%s lock=%.0fms"
+                     " cno=%.1f elev=%s az=%s ipp_sza=%s gap=%s gf=%s mw=%s",
+                     ev.sv, ",".join(ev.reasons), ev.confidence,
+                     ev.lock_ms, ev.cno,
+                     f"{ev.elevation_deg:.0f}°" if ev.elevation_deg is not None else "?",
+                     f"{ev.azimuth_deg:.0f}°" if ev.azimuth_deg is not None else "?",
+                     f"{ev.ipp_sza_deg:.0f}°" if ev.ipp_sza_deg is not None else "?",
+                     f"{ev.gap_s:.2f}s" if ev.gap_s is not None else "-",
+                     f"{ev.gf_jump_m*100:.1f}cm" if ev.gf_jump_m is not None else "-",
+                     f"{ev.mw_jump_cyc:.2f}c" if ev.mw_jump_cyc is not None else "-")
+            peer_publisher.publish_slip_event(
+                sv=ev.sv, reasons=ev.reasons, conf=ev.confidence,
+                elev_deg=ev.elevation_deg,
+                azimuth_deg=ev.azimuth_deg,
+                ipp_sza_deg=ev.ipp_sza_deg,
+                lock_duration_ms=int(ev.lock_ms) if ev.lock_ms is not None else None,
+                gf_jump_m=ev.gf_jump_m, mw_jump_cyc=ev.mw_jump_cyc,
+            )
+
+        for obs in observations:
+            sv = obs['sv']
+            if sv not in filt.sv_to_idx and obs.get('phi_if_m') is not None:
+                sat_pos, sat_clk = corrections.sat_position(sv, gps_time)
+                if sat_pos is not None:
+                    N_init = obs['pr_if'] - obs['phi_if_m']
+                    filt.add_ambiguity(sv, N_init)
+
+        filt.prev_obs = {o['sv']: o for o in observations}
+        for sv in list(filt.sv_to_idx.keys()):
+            if sv not in current_svs:
+                filt.remove_ambiguity(sv)
+
+        # Solid Earth tide displacement (IERS 2010 Step 1).  Added
+        # to the predicted receiver position for range calculation;
+        # does NOT modify the filter state.  Guard against cold-
+        # start where filt.x[:3] may be near-zero (no position yet)
+        # — the tide module needs a physical Earth-radius station
+        # to compute the r_hat unit vector.  100 km floor is a
+        # comfortable margin above filter init noise.
+        tide_offset = None
+        self._last_tide_3d_mm = None
+        self._last_tide_up_mm = None
+        pos_ecef = filt.x[:3]
+        pos_norm = float(np.linalg.norm(pos_ecef))
+        pos_usable = pos_norm > 100_000.0
+        if self._solid_tide and pos_usable:
+            tide_offset = solid_tide_displacement(gps_time, pos_ecef)
+            # Cache tide magnitude + radial projection for the
+            # AntPosEst status line.  Radial ≈ local up for a
+            # near-spherical station position; good to 0.1 mm.
+            r_hat = pos_ecef / pos_norm
+            self._last_tide_3d_mm = 1000.0 * float(
+                np.linalg.norm(tide_offset))
+            self._last_tide_up_mm = 1000.0 * float(
+                np.dot(tide_offset, r_hat))
+
+        # GMF update (Phase 4 of obs-model plan).  The filter's
+        # tropo/wet_mapping methods consult
+        # PPPFilter._GMF_PROVIDER when set (commit c00a6dd).
+        # Build the provider lazily on first epoch with a usable
+        # position — needs receiver lat/lon.  Update its epoch
+        # every tick.
+        if self._gmf_enabled and pos_usable:
+            if self._gmf_provider is None:
+                from peppar_fix.gmf import GMFProvider
+                from solve_ppp import PPPFilter as _PF
+                lat_deg, lon_deg, height_m = ecef_to_lla(
+                    pos_ecef[0], pos_ecef[1], pos_ecef[2])
+                lat_r = math.radians(lat_deg)
+                lon_r = math.radians(lon_deg)
+                self._gmf_provider = GMFProvider(
+                    lat_r, lon_r, height_m)
+                _PF._GMF_PROVIDER = self._gmf_provider
+                log.info(
+                    "[GMF] provider built (lat=%.4f° lon=%.4f° h=%.0f m)",
+                    math.degrees(lat_r), math.degrees(lon_r), height_m)
+            # Compute MJD from gps_time.  GPS epoch 1980-01-06 →
+            # MJD 44244.  gps_time is a UTC-aware datetime; MJD
+            # is a UT1 time tag but UTC-vs-UT1 gap < 1s doesn't
+            # affect GMF's day-of-year interpolation.
+            _unix = gps_time.timestamp()
+            _mjd = 40587.0 + _unix / 86400.0
+            self._gmf_provider.update_epoch(_mjd)
+
+        # PCV correction (Phase 2 of obs-model plan).  Per-SV
+        # antenna phase-center correction applied to obs pr_if +
+        # phi_if_m in-place.  Requires ANTEX parser + receiver
+        # antenna type + usable filter position.  Sun ECEF shared
+        # with solid tide (computed once per epoch).
+        self._last_pcv_applied = 0
+        self._last_pcv_skipped = 0
+        # Wind-up + PCV share sun_ecef, computed once per epoch.
+        _sun_ecef_cached = None
+        if (self._pcv_enabled or self._phase_windup_enabled) and pos_usable:
+            _sun_ecef_cached = sun_pos_ecef(gps_time)
+
+        # Phase wind-up (Phase 3 of obs-model plan).  Per-SV
+        # cumulative wind-up tracker; apply correction to
+        # phi_if_m in-place before filter.update().  Formula +
+        # sign convention in peppar_fix/phase_windup.py;
+        # lambda_eff for IF is c / (f1 + f2).
+        if self._phase_windup_enabled and pos_usable and _sun_ecef_cached is not None:
+            for obs in observations:
+                sv = obs['sv']
+                if obs.get('phi_if_m') is None:
+                    continue
+                wl_f1 = obs.get('wl_f1')
+                wl_f2 = obs.get('wl_f2')
+                if not wl_f1 or not wl_f2:
+                    continue
+                sat_pos, _ = corrections.sat_position(sv, gps_time)
+                if sat_pos is None:
+                    continue
+                self._windup_tracker.update(
+                    sv, np.asarray(sat_pos),
+                    np.asarray(_sun_ecef_cached),
+                    np.asarray(pos_ecef))
+                f1 = C / wl_f1
+                f2 = C / wl_f2
+                lambda_eff_m = C / (f1 + f2)
+                obs['phi_if_m'] += (
+                    self._windup_tracker.correction_m(sv, lambda_eff_m))
+
+        if self._pcv_enabled and pos_usable:
+            sun_ecef = _sun_ecef_cached
+            for obs in observations:
+                sv = obs['sv']
+                sat_pos, _ = corrections.sat_position(sv, gps_time)
+                if sat_pos is None:
+                    self._last_pcv_skipped += 1
+                    continue
+                if obs.get('pr_if') is None or obs.get('phi_if_m') is None:
+                    self._last_pcv_skipped += 1
+                    continue
+                delta, ok = compute_pcv_correction(
+                    obs, np.asarray(sat_pos), pos_ecef,
+                    self._antex, self._recv_ant_type, gps_time,
+                    sun_pos_ecef=sun_ecef)
+                if ok:
+                    obs['pr_if'] += delta
+                    obs['phi_if_m'] += delta
+                    self._last_pcv_applied += 1
+                else:
+                    self._last_pcv_skipped += 1
+
+        # EKF update — position-side per-filter gate
+        # (I-175645-charlie); see obs_for_position() at module top.
+        pos_observations = obs_for_position(observations)
+
+        # Phase A.5 of slipDetectUnified-main: log disagreement
+        # between receiver's NAV-SIG.prUsed verdict and engine's
+        # admit decision.  Per (sv, sig_name) granularity from
+        # f1_sig_name / f2_sig_name carried on each obs.  No
+        # behavior change — pure logger.  No-op when store is None.
+        if self._nav_sig_store is not None:
+            admit_set: dict[tuple[str, str], dict] = {}
+            for o in pos_observations:
+                sv = o.get('sv')
+                if sv is None:
+                    continue
+                cno = o.get('cno')
+                pr_ok = o.get('ar_phase_bias_ok')
+                reason = ("ar_phase_bias_ok" if pr_ok
+                          else "admit")
+                for f_key, sig_key, lock_key in (
+                        ('f1', 'f1_sig_name', 'f1_lock_ms'),
+                        ('f2', 'f2_sig_name', 'f2_lock_ms')):
+                    sig_name = o.get(sig_key)
+                    if not sig_name:
+                        continue
+                    admit_set[(sv, sig_name)] = {
+                        'cno': cno,
+                        'lock_time_ms': o.get(lock_key),
+                        'our_admission_reason': reason,
+                    }
+            try:
+                self._nav_sig_disagree.check_epoch(
+                    self._n_epochs, admit_set, self._nav_sig_store)
+            except Exception:
+                # Pure logger — never let a bug here break the EKF.
+                log.exception(
+                    "NavSigDisagreeMonitor.check_epoch failed; "
+                    "continuing without it.")
+
+        n_used, resid, sys_counts = filt.update(
+            pos_observations, corrections, gps_time, clk_file=corrections,
+            receiver_offset_ecef=tide_offset)
+        if n_used < 4:
+            return
+
+        # Soft prior on residual ZTD (post-update rank-1 EKF
+        # pseudo-measurement z=0).  Constrains the position-altitude/
+        # ZTD/clock null-mode that otherwise lets the filter wander
+        # m-scale.  No-op when self._ztd_tie_sigma is None or <= 0.
+        if getattr(self, "_ztd_tie_sigma", None):
+            filt.apply_ztd_tie(self._ztd_tie_sigma)
+
+        # NAV2 continuous covariance update (post-update 3D EKF
+        # variance-weighted measurement).  Per Bob's directive
+        # 2026-04-30 + I-200128-main.  Gated by NAV2 freshness +
+        # quality.  See solve_ppp.PPPFilter.apply_nav2_anchor for
+        # the misnomer note: this is variance-weighted Kalman, not
+        # a truth-pull anchor.  Static offset between filter and
+        # NAV2 is invisible once filter P has tightened.
+        if (self._nav2_anchor_enabled
+                and self._nav2_store is not None):
+            _nav2_op = self._nav2_store.get_opinion(max_age_s=10.0)
+            if (_nav2_op is not None
+                    and _nav2_op.get('fix_type') == 3
+                    and _nav2_op.get('h_acc_m') is not None
+                    and _nav2_op['h_acc_m']
+                    < self._nav2_anchor_max_hacc_m):
+                filt.apply_nav2_anchor(
+                    np.asarray(_nav2_op['ecef'], dtype=float),
+                    float(_nav2_op['h_acc_m']),
+                    (float(_nav2_op['v_acc_m'])
+                     if _nav2_op.get('v_acc_m') is not None
+                     else None),
+                )
+
+        self._n_epochs += 1
+
+        # [PPP_STATE] per-epoch position-filter estimate + σ for a
+        # pos_replay reference capture (Group B,
+        # docs/pos-replay-capture-manifest.md §3): the position-estimating
+        # PPPFilter's ECEF position, 3D position σ, and residual ZTD + σ —
+        # the error/own-σ inputs the divergence monitor scores.  The main
+        # servo loop's --filter-state-log only sees the clock filter; this
+        # is the position half it can't reach.  Opt-in (--ppp-state-log):
+        # an unconditional per-epoch INFO line would be ~86k lines/day at
+        # 1 Hz on every run, against this loop's own throttling
+        # convention — every-epoch detail is for captures only.
+        if getattr(self._args, 'ppp_state_log', False):
+            try:
+                _pp = filt.x[:3]
+                _ps = position_sigma_3d(filt.P)
+                _pz = float(filt.x[PPP_IDX_ZTD])
+                _pzs = math.sqrt(max(0.0,
+                    float(filt.P[PPP_IDX_ZTD, PPP_IDX_ZTD])))
+                # Shared formatter (pos_replay stage 2b re-emits the same
+                # line from a replayed bundle; one format definition keeps
+                # emitter + parser in step).  '%s' to log.info so the line
+                # passes through verbatim (it has its own % conversions).
+                log.info("%s", format_ppp_state_line(
+                    gps_time, self._n_epochs, n_used, _pp, _ps, _pz, _pzs))
+            except (IndexError, ValueError, TypeError, AttributeError):
+                # AttributeError covers gps_time.isoformat() — a None
+                # gps_time must never crash the filter thread (the whole
+                # point of this guard is "logging can't take down _run_inner").
+                pass
+
+        # Phase-residual admission gate ingest — feed this epoch's
+        # post-fit phase residuals into WlPhaseAdmissionGate so it
+        # has a current view when MW's admission decisions are
+        # checked below.  Per dayplan I-115539 / 2026-04-29.
+        _gate_labels = getattr(filt, 'last_residual_labels', [])
+        for _lab, _r in zip(_gate_labels, resid if resid is not None else ()):
+            if len(_lab) >= 2 and _lab[1] == 'phi':
+                self._wl_phase_admit.ingest(_lab[0], float(_r))
+        # Drop history for SVs not observed this epoch — the gate's
+        # per-SV deque should reflect actually-current data, not
+        # stale residuals from arcs that have set.
+        _observed_now = {o['sv'] for o in observations}
+        self._wl_phase_admit.evict_unobserved(_observed_now)
+
+        # MW wide-lane update.  Tell MW the current epoch so its
+        # tracker-driven transitions (FLOATING → CONVERGING on fix) log
+        # with a meaningful epoch field.
+        mw._current_epoch = self._n_epochs
+        nl._epoch = self._n_epochs  # resolver also uses _epoch for logs
+        readmit_blocked: list[str] = []
+        # Per-SV GF observation for this epoch.  Populated alongside
+        # the MW update; consumed by the GF step demoter below.
+        # Pure phase, geometry-free.  Per-filter gate
+        # (I-175645-charlie): MW combination needs phase biases on
+        # both bands, so iterate only the position-filtered list.
+        gf_now: dict[str, float] = {}
+        for obs in pos_observations:
+            sv = obs['sv']
+            phi1 = obs.get('phi1_cyc')
+            phi2 = obs.get('phi2_cyc')
+            pr1 = obs.get('pr1_m')
+            pr2 = obs.get('pr2_m')
+            wl1 = obs.get('wl_f1')
+            wl2 = obs.get('wl_f2')
+            if all(v is not None for v in (phi1, phi2, pr1, pr2, wl1, wl2)):
+                # Layer 3 re-admission gate: skip MW update if the
+                # drift monitor previously flushed this SV and its
+                # elevation hasn't moved enough yet.  See
+                # docs/sv-trust-layers.md.
+                if self._wl_readmit.is_blocked(sv, elevations.get(sv)):
+                    readmit_blocked.append(sv)
+                    continue
+                f1_hz = C / wl1
+                f2_hz = C / wl2
+                mw.update(sv, phi1, phi2, pr1, pr2, f1_hz, f2_hz)
+                gf_now[sv] = gf_phase_m(phi1, phi2, wl1, wl2)
+
+        # WL drift monitor: detect wrong WL integer commits via
+        # sustained post-fix MW residual drift.  Runs after MW
+        # updates so the residuals we ingest are current-epoch.
+        # Acting here (before NL attempt) keeps the NL path
+        # from seeing a suspect WL this epoch.
+        fixed_now = {sv for sv, st in mw._state.items() if st.get('fixed')}
+        # Phase-residual admission gate — for each NEWLY-fixed SV
+        # this epoch, check the per-SV phase consistency before
+        # the fix is allowed to land in the lifecycle.  If the
+        # gate refuses, revert the MW state so the SV stays in
+        # FLOATING / CONVERGING and MW will try again at the
+        # next epoch.  Per dayplan I-115539 workstream A.
+        _newly_fixed = fixed_now - self._wl_drift_prev_fixed
+        for sv in list(_newly_fixed):
+            if not self._wl_phase_admit.is_phase_consistent(sv):
+                detail = self._wl_phase_admit.evaluation_detail(sv)
+                if detail is not None:
+                    log.warning(
+                        "[WL_PHASE_ADMIT_BLOCK] %s mean=%+.4fm "
+                        "std=%.4fm mean_thr=±%.3fm std_thr=±%.3fm "
+                        "cohort_med=%+.4fm (n=%d): MW proposed "
+                        "admission rejected; phase residual not "
+                        "yet consistent",
+                        sv, detail['mean_m'], detail['std_m'],
+                        detail['threshold_m'],
+                        detail['std_threshold_m'],
+                        detail['cohort_median_m'], detail['n_samples'],
+                    )
+                # Revert MW state — clear the fix so the SV is not
+                # admitted this epoch.  MW will keep accumulating
+                # samples and may try to fix again next epoch.
+                _st = mw._state[sv]
+                _st['fixed'] = False
+                _st['n_wl'] = None
+                _st.pop('fix_frac', None)
+                _st.pop('fix_n_epochs', None)
+                fixed_now.discard(sv)
+                _newly_fixed.discard(sv)
+        for sv in _newly_fixed:
+            fix_n_wl = mw._state[sv].get('n_wl')
+            self._wl_drift.note_fix(sv, n_wl=fix_n_wl)
+            # Initialise the GF step demoter for this SV.  Skip
+            # when the GF observation is missing this epoch (would
+            # happen if the SV's MW updated from a prior-epoch
+            # latch with the current obs missing fields).
+            _gf_ref = gf_now.get(sv)
+            if _gf_ref is not None:
+                self._gf_step.note_fix(sv, gf_initial_m=_gf_ref)
+            # Newly-fixed SV passed the re-admission gate (or was
+            # never held).  Clear any prior hold so a subsequent
+            # drift-flush-readmit cycle starts fresh.
+            self._wl_readmit.note_admitted(sv)
+            # Fix-life logging — entry.  Records integer + elev +
+            # consistency level for post-hoc analysis of K_short /
+            # threshold tuning (per dayplan I-153334).
+            _life_elev = elevations.get(sv)
+            _life_cons = self._wl_drift.consistency_level(sv)
+            _life_hist = self._wl_drift.integer_history(sv)
+            log.info(
+                "[WL_FIX_LIFE] event=enter sv=%s n_wl=%s elev=%s "
+                "consistency=%s int_history=%s",
+                sv, fix_n_wl,
+                f"{_life_elev:.1f}" if _life_elev is not None else "?",
+                _life_cons, _life_hist,
+            )
+            self._wl_fix_life_t0[sv] = time.monotonic()
+            self._wl_fix_life_n_wl[sv] = fix_n_wl
+        for sv in self._wl_drift_prev_fixed - fixed_now:
+            self._wl_drift.note_unfix(sv)
+            self._gf_step.note_unfix(sv)
+            # Fix-life logging — exit (slip, dropout, or other
+            # exit path that didn't go through gf_step).
+            _t0 = self._wl_fix_life_t0.pop(sv, None)
+            _n_wl = self._wl_fix_life_n_wl.pop(sv, None)
+            _life_elev = elevations.get(sv)
+            _dur = time.monotonic() - _t0 if _t0 is not None else None
+            log.info(
+                "[WL_FIX_LIFE] event=exit sv=%s n_wl=%s elev=%s "
+                "duration_s=%s reason=other consistency=%s",
+                sv, _n_wl,
+                f"{_life_elev:.1f}" if _life_elev is not None else "?",
+                f"{_dur:.1f}" if _dur is not None else "?",
+                self._wl_drift.consistency_level(sv),
+            )
+        drift_actions: list[str] = []
+
+        # GF step demoter — phase-only, cohort-median Δgf
+        # detection.  Per I-194752-main, this replaces the
+        # MW-residual rolling-mean approach that the BNC
+        # validation showed is uncorrelated with real slips
+        # (Z = -0.17, p = 0.86).  Cohort-median across the
+        # currently-fixed-SV cohort cancels common-mode
+        # ionospheric drift (the dominant noise source on
+        # long-fixed SVs) without an explicit Klobuchar / SSR
+        # iono model.  Trips on per-SV residual exceeding
+        # threshold (4 cm) for ≥ 2 consecutive epochs.
+        gf_step_events = self._gf_step.update(gf_now)
+        for ev in gf_step_events:
+            sv = ev['sv']
+            flush_elev = elevations.get(sv)
+            log.warning(
+                "[GF_STEP] %s residual=%+.4fm cohort_median=%+.4fm "
+                "delta_gf=%+.4fm (n_cohort=%d, %d-epoch sustained, "
+                "thr=±%.3fm): flushing MW, demoting to FLOATING, "
+                "gate@elev=%s",
+                sv, ev['residual_m'], ev['cohort_median_m'],
+                ev['delta_gf_m'], ev['cohort_size'],
+                ev['consecutive_epochs'], ev['threshold_m'],
+                f"{flush_elev:.1f}°" if flush_elev is not None else "?",
+            )
+            # Fix-life exit before MW reset clears state.
+            _t0 = self._wl_fix_life_t0.pop(sv, None)
+            _n_wl_at_entry = self._wl_fix_life_n_wl.pop(sv, None)
+            _dur = time.monotonic() - _t0 if _t0 is not None else None
+            log.info(
+                "[WL_FIX_LIFE] event=exit sv=%s n_wl=%s elev=%s "
+                "duration_s=%s reason=gf_step consistency=%s",
+                sv, _n_wl_at_entry,
+                f"{flush_elev:.1f}" if flush_elev is not None else "?",
+                f"{_dur:.1f}" if _dur is not None else "?",
+                self._wl_drift.consistency_level(sv),
+            )
+            mw.reset(sv)
+            self._wl_drift.note_unfix(sv)
+            self._gf_step.note_unfix(sv)
+            # GF step is a real phase discontinuity (L1 or L5
+            # slipped) — wipe the SV's NL trust history so a
+            # post-slip re-admission is gated as NEW rather than
+            # held to its pre-slip integer.  I-172719.
+            nl.note_slip(sv)
+            # Layer 3: take a re-admission hold at the current
+            # elevation.  MW updates for this SV are skipped
+            # until elevation moves ≥ 2°.
+            self._wl_readmit.note_flush(sv, flush_elev)
+            fixed_now.discard(sv)
+            # Demote the per-SV state.  CONVERGING → FLOATING is
+            # a legal edge in the lifecycle; ANCHORING/ANCHORED
+            # shouldn't be reachable in wl-only mode but the
+            # path is defensive.
+            try:
+                cur = self._sv_state.state(sv)
+                if cur in (SvAmbState.CONVERGING,
+                           SvAmbState.ANCHORING,
+                           SvAmbState.ANCHORED):
+                    self._sv_state.transition(
+                        sv, SvAmbState.FLOATING,
+                        epoch=self._n_epochs,
+                        reason=f"gf_step:{ev['residual_m']:+.3f}m",
+                    )
+            except Exception:
+                pass
+            drift_actions.append(sv)
+        self._wl_drift_prev_fixed = fixed_now
+
+        # NL resolution attempt (after warmup).  Reuse elevations
+        # computed earlier this epoch for the slip monitor so the
+        # AR elevation mask can gate candidates.
+        nl.tick()  # advance blacklist expiry
+        if self._n_epochs >= 5:
+            # Per-SV phase-bias availability for the short-term
+            # promoter's candidate gate.  See Phase 1 call site
+            # above for the rationale.
+            ar_phase_bias_ok = {
+                o['sv']: o.get('ar_phase_bias_ok', True)
+                for o in observations
+            }
+            if not getattr(self._args, 'no_ar', False):
+                nl.attempt(filt, mw, elevations=elevations,
+                           ar_phase_bias_ok=ar_phase_bias_ok)
+
+        # Per-SV state machine: stream PR residuals into the monitors
+        # and the host RMS alarm.  Each monitor is stateless per-eval
+        # (no cascade) and drives SvStateTracker transitions directly.
+        # See docs/sv-lifecycle-and-pfr-split.md.
+        labels = getattr(filt, 'last_residual_labels', [])
+        self._false_fix.ingest(self._n_epochs, resid, labels)
+        self._setting_drop.ingest(self._n_epochs, resid, labels)
+        self._fix_set_integrity.ingest(self._n_epochs, resid, labels)
+        # NL-layer residual logger — per-epoch per-NL-fixed-SV PR
+        # and IF (phi) residuals.  Feeds the empirical case for
+        # IF-residual eviction (I-221332-main) — the IF residual
+        # is what Charlie's detector should be acting on, not PR.
+        # Volume: ~5-10 NL-fixed SVs * 2 residuals * 1 Hz =
+        # ~20 lines/sec max; one combined line per SV per epoch.
+        _sv_resid: dict[str, dict[str, float]] = {}
+        for _i, _lbl in enumerate(labels):
+            if _i >= len(resid):
+                break
+            _sv, _kind, *_ = _lbl
+            _sv_resid.setdefault(_sv, {})[_kind] = float(resid[_i])
+        try:
+            _nl_fixed_set = {
+                s for s in _sv_resid
+                if self._sv_state.state(s) in (
+                    SvAmbState.ANCHORING, SvAmbState.ANCHORED,
+                )
+            }
+        except Exception:
+            _nl_fixed_set = set()
+        for _sv in sorted(_nl_fixed_set):
+            _rs = _sv_resid[_sv]
+            _pr = _rs.get('pr')
+            _phi = _rs.get('phi')
+            log.info(
+                "[NL_RESID] sv=%s pr_resid=%s if_resid=%s",
+                _sv,
+                f"{_pr:+.3f}m" if _pr is not None else "?",
+                f"{_phi:+.4f}m" if _phi is not None else "?",
+            )
+            # Feed the AnchoringSvPromoter's IF-resid gate (I-224945).
+            # Only ANCHORING SVs accumulate; the call is a no-op
+            # for ANCHORED ones (gate has already passed).
+            if _phi is not None:
+                self._promoter.ingest_if_resid(
+                    _sv, _phi, self._n_epochs,
+                )
+        # ZTD state for the integrity monitor's ztd_impossible
+        # trigger.  PPPFilter carries a ZTD residual state; if
+        # the filter has absorbed position error into ZTD past
+        # the physical envelope, monitor returns an event with
+        # reason='ztd_impossible' and we revert NL fixes only
+        # (keep WL / MW / position).  See
+        # docs/ztd-impossibility-trigger-design.md.
+        ppp_ztd = None
+        # PPPFilter's IDX_ZTD is a module-level constant, not an
+        # instance/class attribute, so hasattr on the instance
+        # returns False.  Fall through to the imported module
+        # constant — matches the pattern used by the [AntPosEst]
+        # log line below.
+        ppp_ztd_idx = getattr(filt, 'IDX_ZTD', PPP_IDX_ZTD)
+        if filt.x.shape[0] > ppp_ztd_idx:
+            ppp_ztd = float(filt.x[ppp_ztd_idx])
+        # Fleet-consensus deltas (Part 2 of
+        # docs/fleet-consensus-monitors.md).  Computed every
+        # epoch so the monitor's sustained-epoch counter
+        # increments at the right rate.  None when no cohort
+        # is available (peer_subscriber inactive, no peers
+        # with matching antenna_ref/site_ref, or <2 members);
+        # the monitor silently skips those paths.
+        _cohort_pos_delta_m = None
+        _cohort_ztd_delta_m = None
+        try:
+            import peer_subscriber
+            if peer_subscriber.is_active():
+                _ant_ref = peer_subscriber.get_local_antenna_ref()
+                _site_ref = peer_subscriber.get_local_site_ref()
+                _self_pos_ecef = filt.x[:3]
+                _self_lat, _self_lon, _self_alt = ecef_to_lla(
+                    _self_pos_ecef[0], _self_pos_ecef[1],
+                    _self_pos_ecef[2])
+                _self_snap = peer_subscriber.build_self_snapshot(
+                    antenna_ref=_ant_ref, site_ref=_site_ref,
+                    lat_deg=_self_lat, lon_deg=_self_lon,
+                    alt_m=_self_alt, ztd_m=ppp_ztd,
+                )
+                if _ant_ref:
+                    _pm = peer_subscriber.cohort_median_position(
+                        _ant_ref, self_snapshot=_self_snap)
+                    if _pm is not None:
+                        from peppar_bus.cohort import ecef_distance_m
+                        _ml, _mo, _ma, _ = _pm
+                        _, _cohort_pos_delta_m = ecef_distance_m(
+                            _self_lat, _self_lon, _self_alt,
+                            _ml, _mo, _ma)
+                if _site_ref and ppp_ztd is not None:
+                    _zm = peer_subscriber.cohort_median_ztd(
+                        _site_ref, self_snapshot=_self_snap)
+                    if _zm is not None:
+                        _med_ztd, _ = _zm
+                        _cohort_ztd_delta_m = ppp_ztd - _med_ztd
+        except Exception:
+            log.exception("cohort delta compute failed (non-fatal)")
+        # Bead 4: stream azimuths for ANCHORING SVs so the
+        # promoter can accumulate Δaz toward the 15° threshold.  We
+        # compute azimuths only when there's at least one SV in
+        # ANCHORING — avoids the per-epoch sat_position call
+        # on hosts that haven't fixed anything yet.
+        prov_count = self._sv_state.count_in(SvAmbState.ANCHORING)
+        if prov_count > 0:
+            azimuths = _compute_sv_azimuths(
+                filt, corrections, observations, gps_time)
+            for sv, az in azimuths.items():
+                self._promoter.ingest_az(sv, az)
+        # FalseFixMonitor in observe-only mode: log trip candidates
+        # but don't evict.  IfStepMonitor (below) is the canonical
+        # NL-layer demoter.
+        for ev in self._false_fix.evaluate(self._n_epochs):
+            if ev.get('observe_only', False):
+                log.info(
+                    "[FALSE_FIX] %s |PR|=%.2fm > %.2fm (n=%d, "
+                    "elev=%s, %s) [observe-only — IF step is "
+                    "canonical demoter]",
+                    ev['sv'], ev['mean_resid_m'], ev['threshold_m'],
+                    ev['n'],
+                    f"{ev['elev_deg']:.0f}°"
+                    if ev['elev_deg'] is not None else "?",
+                    ev.get('tag', '?'),
+                )
+            else:
+                self._apply_false_fix(filt, mw, nl, ev)
+
+        # IfStepMonitor — NL-layer demoter via cohort-median
+        # post-fit phase residual.  Mirrors GfStepMonitor (WL
+        # layer) per dayplan I-221332-main.
+        nl_fixed_now = set(self._sv_state.svs_in(
+            SvAmbState.ANCHORING, SvAmbState.ANCHORED))
+        for sv in nl_fixed_now - self._if_step_prev_nl_fixed:
+            self._if_step.note_fix(sv)
+        for sv in self._if_step_prev_nl_fixed - nl_fixed_now:
+            self._if_step.note_unfix(sv)
+
+        # Extract per-SV post-fit phase (IF) residuals from the
+        # filter's last residual labels.  Filter to NL-fixed SVs
+        # — IfStepMonitor's update() also filters by tracked set,
+        # but doing it here keeps the cohort-median input clean.
+        phi_resid_by_sv: dict[str, float] = {}
+        for lab, r in zip(labels or (), resid if resid is not None else ()):
+            if len(lab) >= 2 and lab[1] == 'phi' and lab[0] in nl_fixed_now:
+                phi_resid_by_sv[lab[0]] = float(r)
+        # ANCHORED protection per I-140938-main: SVs that have
+        # earned ANCHORED state (survived Δaz=15° validation) get
+        # a 2× threshold, configurable via IfStepMonitor's
+        # anchored_threshold_mult.  Caller (us) supplies the set
+        # so the monitor stays decoupled from the SV state tracker.
+        anchored_svs = set(self._sv_state.svs_in(SvAmbState.ANCHORED))
+        if_step_events = self._if_step.update(
+            phi_resid_by_sv, anchored_svs=anchored_svs)
+        for ev in if_step_events:
+            sv = ev['sv']
+            elev = self._sv_state.get(sv).last_elev_deg
+            log.warning(
+                "[IF_STEP] %s residual=%+.4fm cohort_residual=%+.4fm "
+                "cohort_median=%+.4fm (n_cohort=%d/%d, %d-epoch "
+                "sustained, thr=±%.3fm%s): NL unfix + ambiguity "
+                "inflate, demoting to WAITING, elev=%s",
+                sv, ev['residual_m'], ev['cohort_residual_m'],
+                ev['cohort_median_m'], ev['cohort_size'],
+                ev.get('cohort_size_total', ev['cohort_size']),
+                ev['consecutive_epochs'], ev['threshold_m'],
+                " ANCHORED-2x" if ev.get('anchored', False) else "",
+                f"{elev:.1f}°" if elev is not None else "?",
+            )
+            # Standard NL eviction action — same as
+            # _apply_false_fix used to do, minus the PR-domain
+            # logging path.
+            cooldown = 120  # ~2 min default; tune later if needed
+            try:
+                self._sv_state.transition(
+                    sv, SvAmbState.WAITING,
+                    epoch=self._n_epochs,
+                    reason=f"if_step:{ev['cohort_residual_m']:+.3f}m",
+                    elev_deg=elev,
+                    cooldown_epochs=cooldown,
+                )
+            except Exception:
+                pass
+            nl.unfix(sv)
+            # IF step is a real post-fix phase residual jump —
+            # wipe the SV's NL trust so a post-slip re-admission
+            # is gated as NEW.  I-172719.
+            nl.note_slip(sv)
+            nl.blacklist(sv, epochs=cooldown)
+            filt.inflate_ambiguity(sv)
+            mw.reset(sv)
+            self._if_step.note_unfix(sv)
+            self._promoter.note_false_fix_rejection(sv, self._n_epochs)
+        self._if_step_prev_nl_fixed = nl_fixed_now
+
+        for ev in self._setting_drop.evaluate(self._n_epochs):
+            self._apply_setting_sv_drop(filt, mw, nl, ev)
+        host_ev = self._fix_set_integrity.evaluate(
+            self._n_epochs, ztd_m=ppp_ztd,
+            pos_consensus_delta_m=_cohort_pos_delta_m,
+            ztd_consensus_delta_m=_cohort_ztd_delta_m)
+        if host_ev is not None:
+            self._apply_integrity_trip(filt, mw, nl, host_ev)
+        # Elevation-stratified squelch: sweep WAITING records
+        # whose per-SV cooldown has expired and return them to FLOATING.
+        # Also drop records for SVs that haven't been observed in
+        # STALE_AFTER_EPOCHS — arc boundary, resets the unexpected-
+        # false-fix counter on the next rise.
+        self._sv_state.check_squelch_cooldowns(self._n_epochs)
+        # Mark SVs we saw this epoch; forget those we haven't seen
+        # for a while.  600 epochs ≈ 10 min at 1 Hz: long enough to
+        # survive brief tracking gaps without clobbering state,
+        # short enough to distinguish one arc from the next.
+        for obs in observations:
+            self._sv_state.mark_seen(obs['sv'], self._n_epochs)
+        if self._n_epochs % 60 == 0:  # sweep every ~1 min
+            dropped = self._sv_state.forget_stale_with_states(
+                self._n_epochs, 600)
+            # Keep the promoter's candidate map in sync — when a
+            # record is forgotten (arc boundary), any in-flight
+            # candidate for that SV is also stale.  Also emit a
+            # synthetic [SV_STATE] → SET transition so downstream
+            # log readers (peppar-mon) can drop the SV from their
+            # current-state view.  Without this, the SV stays
+            # visible in peppar-mon forever in its last-observed
+            # state — confusing because it sets out of view but
+            # we never log a transition out.
+            for sv, prev_state in dropped:
+                self._promoter.forget(sv)
+                self._false_fix.forget(sv)
+                self._setting_drop.forget(sv)
+                # peppar-mon contract: peppar_mon/log_reader.py
+                # treats ``→ SET`` as removal from sv_states.
+                # SET is not a real SvAmbState enum value; it's a
+                # synthetic transition tag the same _SV_STATE_LINE_RE
+                # parses from the standard transition format.
+                log.info(
+                    "[SV_STATE] %s: %s → SET (epoch=%d, "
+                    "reason=stale_obs:%d epochs)",
+                    sv, prev_state.value, self._n_epochs, 600)
+        for ev in self._promoter.evaluate(self._n_epochs):
+            log.info(
+                "Promoted %s → ANCHORED (Δaz=%.1f°, first=%s, now=%.0f°)",
+                ev['sv'], ev['accumulated_dphi_deg'],
+                f"{ev['first_fix_az_deg']:.0f}°"
+                if ev['first_fix_az_deg'] is not None else "?",
+                ev['latest_az_deg'] or 0.0,
+            )
+            # I-004810-main: record past-anchored reputation so a
+            # later integrity-trip / re-admit cycle gets the
+            # PROVISIONAL boost over NEW.  Cleared by note_slip
+            # (forget_history) on real cycle slips.
+            nl.note_sv_anchored(ev['sv'])
+
+        # Position quality
+        sigma_3d = position_sigma_3d(filt.P)
+        pos_ecef = filt.x[:3].copy()
+        # Periodic .ppp.toml snapshot for next-startup warm seed.
+        # Throttled + sigma-gated by PppStateWriter; no-op when
+        # receiver_uid is None.  Pass current NAV2 hAcc so the
+        # writer's preferred gate ("σ ≤ 0.5 × NAV2 hAcc") fires
+        # only when this PPP solution is meaningfully better than
+        # the NAV2 cold-start fallback.
+        _nav2_h_acc_for_writer = None
+        if self._nav2_store is not None:
+            _op_for_writer = self._nav2_store.get_opinion(max_age_s=30.0)
+            if _op_for_writer is not None:
+                _nav2_h_acc_for_writer = _op_for_writer.get('h_acc_m')
+        self._ppp_writer.maybe_write(
+            pos_ecef, sigma_3d, self._n_epochs,
+            nav2_h_acc_m=_nav2_h_acc_for_writer,
+        )
+        # AntPosEst-vs-pin watchdog (slice 6 instrumentation).
+        # State is published on self._antpos_watchdog.state for
+        # cross-thread read by run_steady_state's [CONFIDENCE] log.
+        self._antpos_watchdog.update(pos_ecef, sigma_3d)
+        # Two separate counts drive the two thresholds:
+        #   n_nl_fixed   — union of ANCHORING + ANCHORED.
+        #                  Drives CONVERGING ↔ ANCHORING (fallback:
+        #                  any NL integer committed, validated or not).
+        #   n_anchored   — ANCHORED only, survived ≥ 15° Δaz (I-224945).
+        #                  Drives ANCHORING ↔ ANCHORED (the strict
+        #                  "geometry-validated" milestone).
+        n_anchored = self._sv_state.count_in(SvAmbState.ANCHORED)
+        n_nl_fixed = sum(1 for sv in filt.sv_to_idx if nl.is_fixed(sv))
+
+        # Update state-machine metrics.  n_nl reports the union
+        # count — operators want the "NL fixes currently held"
+        # number, not just the subset that's geometry-validated.
+        self._ape_sm.update_metrics(
+            sigma_m=sigma_3d,
+            n_wl=mw.n_fixed,
+            n_nl=n_nl_fixed,
+            n_sv=len(filt.sv_to_idx),
+        )
+
+        # State transitions.  Message includes both counts so
+        # operators can see the ramp: "5 anchored (8 fixed)" vs
+        # "8 NL fixed" (pre-promotion).
+        tag = (f"{n_anchored} anchored ({n_nl_fixed} fixed)"
+               if n_anchored > 0 else f"{n_nl_fixed} NL fixed")
+        # Hysteresis: enter ANCHORED at ≥ 4 anchored, exit at < 3
+        # (4↑/3↓).  Matches the anchored_by_svs / anchored_by_position regime
+        # boundary in ppp_ar.NarrowLaneResolver (strong_anchor_min=3).
+        # Enter ANCHORING at ≥ 4 NL fixed (any kind), exit at < 4.
+        state = self._ape_sm.state
+        if state == AntPosEstState.CONVERGING:
+            if n_nl_fixed >= self._resolve_threshold:
+                self._ape_sm.transition(
+                    AntPosEstState.ANCHORING,
+                    f"{tag}, σ={sigma_3d:.3f}m",
+                )
+        elif state == AntPosEstState.ANCHORING:
+            if n_anchored >= self._resolve_threshold:
+                self._ape_sm.transition(
+                    AntPosEstState.ANCHORED,
+                    f"{tag}, σ={sigma_3d:.3f}m",
+                )
+            elif n_nl_fixed < self._resolve_threshold - 1:
+                # Hysteresis exit at < 3 (threshold - 1),
+                # matching the ANCHORED → ANCHORING boundary.
+                # Both reverse transitions use the same 4↑/3↓
+                # pattern so a single dropped fix doesn't
+                # chatter the state back across the threshold.
+                self._ape_sm.transition(
+                    AntPosEstState.CONVERGING,
+                    f"NL fix count dropped to {n_nl_fixed} ({tag})",
+                )
+        elif state == AntPosEstState.ANCHORED:
+            if n_anchored < self._resolve_threshold - 1:
+                # Hysteresis exit at < 3 (threshold - 1); falls
+                # back to ANCHORING, not all the way to CONVERGING.
+                self._ape_sm.transition(
+                    AntPosEstState.ANCHORING,
+                    f"anchored count dropped to {n_anchored} ({tag})",
+                )
+
+        # NAV2 position sanity check (every 10 epochs ≈ 10s)
+        if (self._nav2_store is not None
+                and self._n_epochs % 10 == 0
+                and self._n_epochs >= 30
+                and self._n_epochs >= self._nav2_cooldown_until):
+            self._check_nav2(filt, mw, nl, pos_ecef, sigma_3d, n_nl_fixed)
+
+        # SecondOpinionPosMonitor — 3D nav2Δ above threshold,
+        # sustained.  Catches the 'stable wrong' lock that
+        # _check_nav2 (horizontal-only) and FixSetIntegrityAlarm
+        # (internal-consistency) both miss.  See I-011533-main on
+        # dayplan/2026-04-28.  Evaluated every epoch but the
+        # NAV2 store is freshness-gated to ~30s.
+        if (self._nav2_store is not None
+                and self._n_epochs >= 30
+                and self._n_epochs >= self._nav2_cooldown_until):
+            _so_opinion = self._nav2_store.get_opinion(max_age_s=30.0)
+            _so_delta = None
+            _so_hacc = None
+            if _so_opinion is not None:
+                _so_delta = float(np.linalg.norm(
+                    pos_ecef - _so_opinion['ecef']))
+                _so_hacc = _so_opinion.get('h_acc_m')
+            _so_ev = self._second_opinion.evaluate(
+                self._n_epochs, _so_delta, _so_hacc)
+            if _so_ev is not None:
+                _rh = _so_ev.get('rolling_hacc_m')
+                _rh_tag = (
+                    f" rolling_hAcc={_rh:.2f}m" if _rh is not None
+                    else "")
+                _nav2_ecef = lla_to_ecef(_so_opinion['lat'],
+                                         _so_opinion['lon'],
+                                         _so_opinion['alt_m'])
+                _reset_ecef, _reset_label = select_reset_target(
+                    self._pin_position, self._pin_ecef, _nav2_ecef,
+                )
+                if _reset_label == "known_pos":
+                    _lat, _lon, _alt = ecef_to_lla(
+                        _reset_ecef[0], _reset_ecef[1], _reset_ecef[2])
+                    _reset_tag = (
+                        f"known_pos LLA ({_lat:.6f},{_lon:.6f},"
+                        f"{_alt:.1f}m) [pin]")
+                else:
+                    _reset_tag = (
+                        f"NAV2 LLA ({_so_opinion['lat']:.6f},"
+                        f"{_so_opinion['lon']:.6f},"
+                        f"{_so_opinion['alt_m']:.1f}m)")
+                log.warning(
+                    "[SECOND_OPINION_POS] tripped: nav2Δ=%.2fm > "
+                    "%.2fm sustained %d ep%s — full re-init at "
+                    "%s; unfixing %d NL.",
+                    _so_ev['nav2_delta_3d_m'],
+                    _so_ev['threshold_m'],
+                    _so_ev['sustained_epochs'],
+                    _rh_tag,
+                    _reset_tag,
+                    len(nl._fixed),
+                )
+                for _sv in list(nl._fixed.keys()):
+                    nl.unfix(_sv)
+                filt.initialize(_reset_ecef, 0.0,
+                                systems=self._systems)
+                self._prev_t = None
+                self._best_sigma = 999.0
+                self._second_opinion.note_recovery()
+                self._nav2_cooldown_until = self._n_epochs + 120
+                if self._ape_sm.state in (
+                        AntPosEstState.ANCHORING,
+                        AntPosEstState.ANCHORED):
+                    self._ape_sm.transition(
+                        AntPosEstState.CONVERGING,
+                        reason="second_opinion_pos_reset",
+                    )
+
+        # Position callback when improved
+        if sigma_3d < self._best_sigma:
+            self._best_sigma = sigma_3d
+            if self._position_callback is not None:
+                self._position_callback(pos_ecef, sigma_3d)
+
+        # Log every 10 epochs
+        if self._n_epochs % 10 == 0:
+            rms = np.sqrt(np.mean(resid ** 2)) if len(resid) > 0 else 0
+            lat, lon, alt = ecef_to_lla(pos_ecef[0], pos_ecef[1], pos_ecef[2])
+            nav2_tag = ""
+            nav2_opinion = None
+            if self._nav2_store is not None:
+                nav2_opinion = self._nav2_store.get_opinion(max_age_s=30.0)
+                if nav2_opinion is not None:
+                    d = float(np.linalg.norm(pos_ecef - nav2_opinion['ecef']))
+                    nav2_tag = f" nav2Δ={d:.1f}m"
+            ztd_tag = ""
+            # PPPFilter stores IDX_ZTD as a module-level constant
+            # (not a class attribute), so hasattr on the instance
+            # returns False.  Use the imported constant directly.
+            ztd_idx = getattr(filt, 'IDX_ZTD', PPP_IDX_ZTD)
+            if filt.x.shape[0] > ztd_idx:
+                dztd_mm = filt.x[ztd_idx] * 1000.0
+                dztd_sigma_mm = math.sqrt(max(0.0,
+                    filt.P[ztd_idx, ztd_idx])) * 1000.0
+                ztd_tag = f" ZTD={dztd_mm:+.0f}±{dztd_sigma_mm:.0f}mm"
+            # Lock-in strength: WL_fixed / σ_3d.  Unweighted first
+            # cut, per docs/position-strength-metric.md.  Logged
+            # for post-hoc analysis; not used as a decision gate
+            # (strength is orthogonal to correctness — high values
+            # can coincide with the biased-equilibrium trap).
+            wl_fixed_count = mw.n_fixed
+            strength = (float(wl_fixed_count) / sigma_3d
+                        if sigma_3d > 0 else 0.0)
+            strength_tag = f" strength={strength:.0f}"
+            readmit_held = self._wl_readmit.n_held()
+            readmit_tag = (f" readmit={readmit_held}"
+                           if readmit_held > 0 else "")
+            # Solid Earth tide magnitude + radial (approx local up)
+            # component for this epoch.  Radial is signed; total
+            # is magnitude only.  Tag omitted when tide is disabled
+            # or the filter hasn't produced a usable position yet.
+            tide_tag = ""
+            if self._last_tide_3d_mm is not None:
+                tide_tag = (f" tide={self._last_tide_3d_mm:.0f}mm"
+                            f"(U{self._last_tide_up_mm:+.0f})")
+            # PCV activity: N applied / M skipped this epoch.
+            # Tag omitted when PCV is disabled entirely.
+            pcv_tag = ""
+            if self._pcv_enabled:
+                pcv_tag = (f" pcv={self._last_pcv_applied}"
+                           f"/{self._last_pcv_applied + self._last_pcv_skipped}")
+            # Worst-σ diagnostic: largest σ (√ of largest
+            # eigenvalue) across P's base-state block.  Pairs
+            # with positionσ on this line — they share the same
+            # "σ in meters" semantics but scope differs.
+            # positionσ = position-only uncertainty.
+            # worstσ    = worst-case σ across ALL base states
+            #             including clock, ISBs, ZTD, capturing
+            #             near-rank-deficient coupling.
+            # A rising worstσ without matching rise in positionσ
+            # is the null-mode-excitation signature (Bravo
+            # 2026-04-23 PRIDE arc).  Diagnostic only, no action.
+            nm_sigma = self._null_mode_sigma_max(filt)
+            worst_tag = (f" worstσ={nm_sigma:.1f}m"
+                         if nm_sigma is not None else "")
+            # peppar-mon contract: peppar_mon/log_reader.py:
+            # _ANTPOSEST_LINE_RE parses this format (positionσ,
+            # pos, n=, plus optional nav2Δ/ZTD/tide/worstσ tags).
+            # The peppar-mon zombie-SV warning compares ``n=`` to
+            # the count in sv_states; keep n= present and accurate.
+            # Renaming or reordering fields requires updating the
+            # regex + tests.
+            log.info(
+                "  [AntPosEst %d] positionσ=%.3fm pos=(%.8f, %.8f, %.3f) "
+                "n=%d amb=%d %s %s%s%s%s%s%s%s%s",
+                self._n_epochs, sigma_3d, lat, lon, alt,
+                n_used, len(filt.sv_to_idx),
+                mw.summary(), nl.summary(), nav2_tag, ztd_tag,
+                strength_tag, readmit_tag, tide_tag, pcv_tag, worst_tag,
+            )
+
+            # METAR-tied periodic ZTD constraint on AntPosEst's
+            # filter (companion to run_steady_state's
+            # FixedPosFilter tie at line ~4856).  Wall-clock
+            # cadence — AntPosEst runs decimated so we can't reuse
+            # the epoch-modulo gate from run_steady_state.
+            if (self._args is not None
+                    and self._ztd_tie_lat_deg is not None
+                    and hasattr(filt, 'apply_ztd_tie')):
+                _tie_int_s = float(getattr(
+                    self._args, 'ztd_tie_interval_s', 300))
+                if _tie_int_s > 0:
+                    _now_t = time.monotonic()
+                    if (self._last_ztd_tie_t is None
+                            or _now_t - self._last_ztd_tie_t
+                            >= _tie_int_s):
+                        _periodic_ztd_tie(
+                            filt, self._args,
+                            self._ztd_tie_lat_deg,
+                            self._ztd_tie_alt_m,
+                            self._n_epochs, log)
+                        self._last_ztd_tie_t = _now_t
+            # [OBS_COUNTS] — fleet visibility breakdown for the
+            # peppar-mon Untracked + Tracking columns per dayplan
+            # I-143806-main.  Combines upstream counters from
+            # realtime_ppp (n_raw / n_off_const / n_single) with
+            # PPPFilter's per-iteration reject counters
+            # (filt.last_reject_counts: no_eph / clock_bad /
+            # below_mask).  Falls through gracefully when
+            # obs_counts isn't supplied (legacy / replay tests).
+            _filter_rej = getattr(filt, 'last_reject_counts', None)
+            if obs_counts is not None and _filter_rej is not None:
+                _n_raw = obs_counts.get('n_raw')
+                _n_off = obs_counts.get('n_off_const')
+                _n_single = obs_counts.get('n_single')
+                log.info(
+                    "  [OBS_COUNTS] raw=%s used=%d dual=%d "
+                    "single=%s off_const=%s below_mask=%d "
+                    "clock_bad=%d no_eph=%d",
+                    _n_raw if _n_raw is not None else "?",
+                    n_used, len(observations),
+                    _n_single if _n_single is not None else "?",
+                    _n_off if _n_off is not None else "?",
+                    _filter_rej.get('below_mask', 0),
+                    _filter_rej.get('clock_bad', 0),
+                    _filter_rej.get('no_eph', 0),
+                )
+            # WL Integer Bootstrap success rate (Teunissen 1998/1999).
+            # Per Charlie's AR-readiness literature memo: WL P_IB is
+            # the right gate for "is the float ready for WL AR?" —
+            # σ_pos is downstream.  Geng et al. 2010 thresholds:
+            # > 0.999 = full AR, > 0.99 = partial AR.  Logged every
+            # epoch as a diagnostic; current --wl-only mode doesn't
+            # gate AR on this yet (planned).
+            if self._n_epochs % 10 == 0:  # 1/10 epochs to bound log volume
+                p_wl_ib, n_wl = mw.wl_bootstrap_success_rate()
+                if p_wl_ib is None:
+                    log.info(
+                        "  [WL_AR_READINESS] p_wl_ib=- n=0 "
+                        "(no SVs warmed up)")
+                else:
+                    log.info(
+                        "  [WL_AR_READINESS] p_wl_ib=%.4f n=%d "
+                        "(>0.99=PAR-ready, >0.999=full)",
+                        p_wl_ib, n_wl,
+                    )
+                # NL AR readiness — Charlie A1.  Pulled from
+                # NlResolver.last_ar_readiness (set every resolve_nl
+                # call, regardless of whether LAMBDA attempted).
+                p_nl_ib = getattr(nl, 'last_ar_readiness', None)
+                n_screened = getattr(nl, 'last_screened_count', 0)
+                if p_nl_ib is None:
+                    log.info(
+                        "  [AR_READINESS] p_nl_ib=- n=%d "
+                        "(too few screened)", n_screened)
+                else:
+                    log.info(
+                        "  [AR_READINESS] p_nl_ib=%.4f n=%d "
+                        "(>0.99=PAR-ready, >0.999=full)",
+                        p_nl_ib, n_screened,
+                    )
+            # WL integrality snapshot every 60 epochs (~1/min).  Shows
+            # what WL integers the MW tracker would commit — even in
+            # wl-only mode where those commits aren't applied to the
+            # filter.  Per-SV: frac (|n_wl - round(n_wl)|), epochs
+            # averaged, fixed-flag (* suffix), MW residual std.
+            # Diagnostic only — no effect on filter.  See
+            # docs/pre-wl-foundation.md for the reframe that
+            # motivated this.
+            if self._n_epochs % 60 == 0:
+                snap = mw.integrality_snapshot()
+                if snap:
+                    # Sort by frac ascending — lowest-frac SVs (most
+                    # fix-eligible) first.
+                    snap.sort(key=lambda s: s['frac'])
+                    parts = []
+                    for s in snap:
+                        star = "*" if s['fixed'] else " "
+                        rstd = s['resid_std_cyc']
+                        rstd_str = (f"{rstd:.2f}"
+                                    if rstd is not None else "—")
+                        parts.append(
+                            f"{s['sv']}:{s['frac']:.2f}"
+                            f"/{s['n_epochs']}ep/{rstd_str}{star}")
+                    n_would = sum(1 for s in snap if s['fixed'])
+                    log.info(
+                        "  [WL_INTEGRALITY %d] %d SVs, %d would-fix: %s",
+                        self._n_epochs, len(snap), n_would,
+                        " ".join(parts))
+
+            # Per-SV post-fit residual snapshot every 60 epochs.
+            # Bob 2026-04-24 root-cause hunt: when the float PPP
+            # solution is biased by observation-model error
+            # (phase bias mismatch, PCV offset, code bias residual,
+            # hardware signal bias), individual SVs will show
+            # systematic residual offsets.  Per-SV mean + std over
+            # a rolling window would be ideal, but for a first
+            # pass we emit the raw post-fit residual per SV per
+            # measurement type (PR + phi) sorted by |resid|
+            # descending — worst SVs at the head of each line.
+            if self._n_epochs % 60 == 0 and resid is not None \
+                    and len(resid) > 0:
+                _labels = getattr(filt, 'last_residual_labels', [])
+                # Pair each residual with (sv, kind).  Sort by
+                # |resid| so operators see the worst offenders first.
+                tagged = [
+                    (lab[0], lab[1], float(r))
+                    for lab, r in zip(_labels, resid)
+                ]
+                tagged.sort(key=lambda t: -abs(t[2]))
+                pr_parts = [f"{sv}:{v:+.2f}" for sv, k, v in tagged
+                            if k == 'pr']
+                phi_parts = [f"{sv}:{v:+.3f}" for sv, k, v in tagged
+                             if k == 'phi']
+                if pr_parts:
+                    log.info(
+                        "  [RESID_PR %d] %d: %s",
+                        self._n_epochs, len(pr_parts),
+                        " ".join(pr_parts))
+                if phi_parts:
+                    log.info(
+                        "  [RESID_PHI %d] %d: %s",
+                        self._n_epochs, len(phi_parts),
+                        " ".join(phi_parts))
+            # Peer-bus publish — mirrors the [AntPosEst] log line's
+            # fields to any subscribers.  All three helpers no-op
+            # when --peer-bus is disabled.
+            peer_publisher.publish_position(
+                ant_pos_est_state=self._ape_sm.state.value,
+                lat_deg=lat, lon_deg=lon, alt_m=alt,
+                position_sigma_m=sigma_3d,
+                worst_sigma_m=nm_sigma,
+                reached_anchored=self._ape_sm.reached_anchored,
+            )
+            if filt.x.shape[0] > ztd_idx:
+                peer_publisher.publish_ztd(
+                    ztd_m=float(filt.x[ztd_idx]),
+                    ztd_sigma_mm=int(round(dztd_sigma_mm)),
+                )
+            if self._last_tide_3d_mm is not None:
+                peer_publisher.publish_tide(
+                    total_mm=int(round(self._last_tide_3d_mm)),
+                    u_mm=int(round(self._last_tide_up_mm)),
+                )
+            # SV state snapshot piggybacks the AntPosEst cadence.
+            # Adopts the same name convention (uppercase enum value)
+            # peppar-mon already parses.
+            sv_states_snapshot = {
+                sv: rec.state.name
+                for sv, rec in self._sv_state.all_records()
+            }
+            peer_publisher.publish_sv_state(
+                sv_states=sv_states_snapshot,
+                nl_capable="".join(sorted(
+                    getattr(self, '_nl_capable_constellations', set()) or set(),
+                )),
+            )
+            # Fleet consensus diagnostics (logging only in Part 1;
+            # Part 2 wires these into FixSetIntegrityMonitor as
+            # trip conditions).  Cohort medians are pulled via the
+            # peer_subscriber's snapshot of peer state.  Include
+            # self in the median so the cohort always has ≥ 2 when
+            # at least one peer is present.  Per cohort semantics
+            # in docs/fleet-consensus-monitors.md: position cohort
+            # uses antenna_ref; ZTD cohort uses site_ref.
+            import peer_subscriber
+            if peer_subscriber.is_active():
+                _ant_ref = peer_subscriber.get_local_antenna_ref()
+                _site_ref = peer_subscriber.get_local_site_ref()
+                _ztd_m = (float(filt.x[ztd_idx])
+                          if filt.x.shape[0] > ztd_idx else None)
+                _self_snap = peer_subscriber.build_self_snapshot(
+                    antenna_ref=_ant_ref, site_ref=_site_ref,
+                    lat_deg=lat, lon_deg=lon, alt_m=alt,
+                    ztd_m=_ztd_m,
+                )
+                _pos_med = (peer_subscriber.cohort_median_position(
+                                _ant_ref, self_snapshot=_self_snap)
+                            if _ant_ref else None)
+                _ztd_med = (peer_subscriber.cohort_median_ztd(
+                                _site_ref, self_snapshot=_self_snap)
+                            if _site_ref else None)
+                if _pos_med is not None or _ztd_med is not None:
+                    from peppar_bus.cohort import ecef_distance_m
+                    parts = []
+                    if _pos_med is not None:
+                        med_lat, med_lon, med_alt, n_pos = _pos_med
+                        dh, d3 = ecef_distance_m(
+                            lat, lon, alt,
+                            med_lat, med_lon, med_alt,
+                        )
+                        parts.append(
+                            f"pos_cohort_n={n_pos} "
+                            f"Δh={dh * 1000:.0f}mm Δ3d={d3 * 1000:.0f}mm")
+                    if _ztd_med is not None and _ztd_m is not None:
+                        med_ztd, n_ztd = _ztd_med
+                        delta_mm = (_ztd_m - med_ztd) * 1000.0
+                        parts.append(
+                            f"ztd_cohort_n={n_ztd} "
+                            f"Δztd={delta_mm:+.1f}mm")
+                    if parts:
+                        log.info("  [COHORT] %s", "  ".join(parts))
+            # Full-precision NAV2 log line.  NAV2-PVT's native format is
+            # LLA; lat/lon at 1e-7 deg (~1 cm resolution at our latitude)
+            # and height in mm.  Deriving ECEF from LLA doesn't add
+            # precision, so we emit LLA directly.  Post-hoc analysis of
+            # the cross-host NAV2 ensemble (three F9Ts on the shared
+            # antenna) uses these lines; each log entry is self-
+            # contained so an aligner can join by timestamp.
+            if nav2_opinion is not None:
+                h_acc = nav2_opinion.get('h_acc_m')
+                v_acc = nav2_opinion.get('v_acc_m')
+                pdop = nav2_opinion.get('pdop')
+                log.info(
+                    "  [NAV2 %d] lat=%.7f lon=%.7f alt=%.3fm "
+                    "hAcc=%s vAcc=%s pDOP=%s fix=%s sv=%d age=%.1fs",
+                    self._n_epochs,
+                    nav2_opinion['lat'],
+                    nav2_opinion['lon'],
+                    nav2_opinion['alt_m'],
+                    f"{h_acc:.3f}m" if h_acc is not None else "n/a",
+                    f"{v_acc:.3f}m" if v_acc is not None else "n/a",
+                    f"{pdop:.2f}" if pdop is not None else "n/a",
+                    nav2_opinion.get('fix_type', '?'),
+                    nav2_opinion.get('num_sv', 0),
+                    nav2_opinion.get('age_s', 0.0),
+                )
+
+        # Periodic SV-state summary (replaces the old PFR per-SV
+        # residual dump).  Emits a one-line histogram of states at
+        # the same cadence; per-SV residual detail lives in the
+        # [SV_STATE] transition log and the monitor event logs.
+        if self._n_epochs % 60 == 0 and self._n_epochs > 0:
+            log.info("  %s", self._sv_state.summary())
+
+
     def _run_inner(self):
         filt = self._filt
         mw = self._mw
@@ -2936,1275 +4220,7 @@ class AntPosEstThread(threading.Thread):
                 n_corr_skip += 1
                 continue
 
-            # EKF predict
-            if self._prev_t is not None:
-                dt = (gps_time - self._prev_t).total_seconds()
-                if dt <= 0 or dt > 120:
-                    self._prev_t = gps_time
-                    continue
-                filt.predict(dt)
-            self._prev_t = gps_time
-
-            # Manage ambiguities — slip detector runs all four checks
-            # (UBX locktime, arc gap, geometry-free jump, MW residual
-            # jump) and flushes every per-SV phase-like state on any
-            # detected slip.  Shared clock/ISB/ZTD and receiver TCXO
-            # state are intentionally untouched.
-            current_svs = {o['sv'] for o in observations}
-            elevations = _compute_sv_elevations(
-                filt, corrections, observations, gps_time)
-            azimuths = _compute_sv_azimuths(
-                filt, corrections, observations, gps_time)
-            ipp_szas = _compute_sv_ipp_szas(
-                filt, azimuths, elevations, gps_time)
-            slip_events = self._slip_monitor.check(
-                observations, gps_time.timestamp(), self._n_epochs,
-                elevations=elevations,
-                azimuths=azimuths, ipp_szas=ipp_szas)
-            for ev in slip_events:
-                # PR-only slips (mw_jump alone) are PR-noise false
-                # positives; don't flush WL state or wind-up tracker.
-                # See is_pr_only_slip() docstring + I-155354 fix-I +
-                # docs/wl-integer-vs-pride-comparison.md.
-                if is_pr_only_slip(ev.reasons):
-                    log.info("[SLIP_FILTERED] sv=%s mw_jump-only "
-                             "conf=%s mw=%s — PR-only, ambiguity "
-                             "preserved",
-                             ev.sv, ev.confidence,
-                             f"{ev.mw_jump_cyc:.2f}c"
-                             if ev.mw_jump_cyc is not None else "-")
-                else:
-                    flush_sv_phase(
-                        ev.sv, filt=filt, mw_tracker=mw,
-                        nl_resolver=nl,
-                        slip_monitor=self._slip_monitor,
-                        sv_state=self._sv_state,
-                        confidence=ev.confidence,
-                        reason="|".join(ev.reasons), epoch=self._n_epochs)
-                    # Wind-up tracker state is per-SV cumulative; drop it
-                    # on slip so the next update seeds fresh (absolute
-                    # zero absorbed into the re-floating ambiguity).
-                    if self._windup_tracker is not None:
-                        self._windup_tracker.reset(ev.sv)
-                log.info("slip: sv=%s reasons=%s conf=%s lock=%.0fms"
-                         " cno=%.1f elev=%s az=%s ipp_sza=%s gap=%s gf=%s mw=%s",
-                         ev.sv, ",".join(ev.reasons), ev.confidence,
-                         ev.lock_ms, ev.cno,
-                         f"{ev.elevation_deg:.0f}°" if ev.elevation_deg is not None else "?",
-                         f"{ev.azimuth_deg:.0f}°" if ev.azimuth_deg is not None else "?",
-                         f"{ev.ipp_sza_deg:.0f}°" if ev.ipp_sza_deg is not None else "?",
-                         f"{ev.gap_s:.2f}s" if ev.gap_s is not None else "-",
-                         f"{ev.gf_jump_m*100:.1f}cm" if ev.gf_jump_m is not None else "-",
-                         f"{ev.mw_jump_cyc:.2f}c" if ev.mw_jump_cyc is not None else "-")
-                peer_publisher.publish_slip_event(
-                    sv=ev.sv, reasons=ev.reasons, conf=ev.confidence,
-                    elev_deg=ev.elevation_deg,
-                    azimuth_deg=ev.azimuth_deg,
-                    ipp_sza_deg=ev.ipp_sza_deg,
-                    lock_duration_ms=int(ev.lock_ms) if ev.lock_ms is not None else None,
-                    gf_jump_m=ev.gf_jump_m, mw_jump_cyc=ev.mw_jump_cyc,
-                )
-
-            for obs in observations:
-                sv = obs['sv']
-                if sv not in filt.sv_to_idx and obs.get('phi_if_m') is not None:
-                    sat_pos, sat_clk = corrections.sat_position(sv, gps_time)
-                    if sat_pos is not None:
-                        N_init = obs['pr_if'] - obs['phi_if_m']
-                        filt.add_ambiguity(sv, N_init)
-
-            filt.prev_obs = {o['sv']: o for o in observations}
-            for sv in list(filt.sv_to_idx.keys()):
-                if sv not in current_svs:
-                    filt.remove_ambiguity(sv)
-
-            # Solid Earth tide displacement (IERS 2010 Step 1).  Added
-            # to the predicted receiver position for range calculation;
-            # does NOT modify the filter state.  Guard against cold-
-            # start where filt.x[:3] may be near-zero (no position yet)
-            # — the tide module needs a physical Earth-radius station
-            # to compute the r_hat unit vector.  100 km floor is a
-            # comfortable margin above filter init noise.
-            tide_offset = None
-            self._last_tide_3d_mm = None
-            self._last_tide_up_mm = None
-            pos_ecef = filt.x[:3]
-            pos_norm = float(np.linalg.norm(pos_ecef))
-            pos_usable = pos_norm > 100_000.0
-            if self._solid_tide and pos_usable:
-                tide_offset = solid_tide_displacement(gps_time, pos_ecef)
-                # Cache tide magnitude + radial projection for the
-                # AntPosEst status line.  Radial ≈ local up for a
-                # near-spherical station position; good to 0.1 mm.
-                r_hat = pos_ecef / pos_norm
-                self._last_tide_3d_mm = 1000.0 * float(
-                    np.linalg.norm(tide_offset))
-                self._last_tide_up_mm = 1000.0 * float(
-                    np.dot(tide_offset, r_hat))
-
-            # GMF update (Phase 4 of obs-model plan).  The filter's
-            # tropo/wet_mapping methods consult
-            # PPPFilter._GMF_PROVIDER when set (commit c00a6dd).
-            # Build the provider lazily on first epoch with a usable
-            # position — needs receiver lat/lon.  Update its epoch
-            # every tick.
-            if self._gmf_enabled and pos_usable:
-                if self._gmf_provider is None:
-                    from peppar_fix.gmf import GMFProvider
-                    from solve_ppp import PPPFilter as _PF
-                    lat_deg, lon_deg, height_m = ecef_to_lla(
-                        pos_ecef[0], pos_ecef[1], pos_ecef[2])
-                    lat_r = math.radians(lat_deg)
-                    lon_r = math.radians(lon_deg)
-                    self._gmf_provider = GMFProvider(
-                        lat_r, lon_r, height_m)
-                    _PF._GMF_PROVIDER = self._gmf_provider
-                    log.info(
-                        "[GMF] provider built (lat=%.4f° lon=%.4f° h=%.0f m)",
-                        math.degrees(lat_r), math.degrees(lon_r), height_m)
-                # Compute MJD from gps_time.  GPS epoch 1980-01-06 →
-                # MJD 44244.  gps_time is a UTC-aware datetime; MJD
-                # is a UT1 time tag but UTC-vs-UT1 gap < 1s doesn't
-                # affect GMF's day-of-year interpolation.
-                _unix = gps_time.timestamp()
-                _mjd = 40587.0 + _unix / 86400.0
-                self._gmf_provider.update_epoch(_mjd)
-
-            # PCV correction (Phase 2 of obs-model plan).  Per-SV
-            # antenna phase-center correction applied to obs pr_if +
-            # phi_if_m in-place.  Requires ANTEX parser + receiver
-            # antenna type + usable filter position.  Sun ECEF shared
-            # with solid tide (computed once per epoch).
-            self._last_pcv_applied = 0
-            self._last_pcv_skipped = 0
-            # Wind-up + PCV share sun_ecef, computed once per epoch.
-            _sun_ecef_cached = None
-            if (self._pcv_enabled or self._phase_windup_enabled) and pos_usable:
-                _sun_ecef_cached = sun_pos_ecef(gps_time)
-
-            # Phase wind-up (Phase 3 of obs-model plan).  Per-SV
-            # cumulative wind-up tracker; apply correction to
-            # phi_if_m in-place before filter.update().  Formula +
-            # sign convention in peppar_fix/phase_windup.py;
-            # lambda_eff for IF is c / (f1 + f2).
-            if self._phase_windup_enabled and pos_usable and _sun_ecef_cached is not None:
-                for obs in observations:
-                    sv = obs['sv']
-                    if obs.get('phi_if_m') is None:
-                        continue
-                    wl_f1 = obs.get('wl_f1')
-                    wl_f2 = obs.get('wl_f2')
-                    if not wl_f1 or not wl_f2:
-                        continue
-                    sat_pos, _ = corrections.sat_position(sv, gps_time)
-                    if sat_pos is None:
-                        continue
-                    self._windup_tracker.update(
-                        sv, np.asarray(sat_pos),
-                        np.asarray(_sun_ecef_cached),
-                        np.asarray(pos_ecef))
-                    f1 = C / wl_f1
-                    f2 = C / wl_f2
-                    lambda_eff_m = C / (f1 + f2)
-                    obs['phi_if_m'] += (
-                        self._windup_tracker.correction_m(sv, lambda_eff_m))
-
-            if self._pcv_enabled and pos_usable:
-                sun_ecef = _sun_ecef_cached
-                for obs in observations:
-                    sv = obs['sv']
-                    sat_pos, _ = corrections.sat_position(sv, gps_time)
-                    if sat_pos is None:
-                        self._last_pcv_skipped += 1
-                        continue
-                    if obs.get('pr_if') is None or obs.get('phi_if_m') is None:
-                        self._last_pcv_skipped += 1
-                        continue
-                    delta, ok = compute_pcv_correction(
-                        obs, np.asarray(sat_pos), pos_ecef,
-                        self._antex, self._recv_ant_type, gps_time,
-                        sun_pos_ecef=sun_ecef)
-                    if ok:
-                        obs['pr_if'] += delta
-                        obs['phi_if_m'] += delta
-                        self._last_pcv_applied += 1
-                    else:
-                        self._last_pcv_skipped += 1
-
-            # EKF update — position-side per-filter gate
-            # (I-175645-charlie); see obs_for_position() at module top.
-            pos_observations = obs_for_position(observations)
-
-            # Phase A.5 of slipDetectUnified-main: log disagreement
-            # between receiver's NAV-SIG.prUsed verdict and engine's
-            # admit decision.  Per (sv, sig_name) granularity from
-            # f1_sig_name / f2_sig_name carried on each obs.  No
-            # behavior change — pure logger.  No-op when store is None.
-            if self._nav_sig_store is not None:
-                admit_set: dict[tuple[str, str], dict] = {}
-                for o in pos_observations:
-                    sv = o.get('sv')
-                    if sv is None:
-                        continue
-                    cno = o.get('cno')
-                    pr_ok = o.get('ar_phase_bias_ok')
-                    reason = ("ar_phase_bias_ok" if pr_ok
-                              else "admit")
-                    for f_key, sig_key, lock_key in (
-                            ('f1', 'f1_sig_name', 'f1_lock_ms'),
-                            ('f2', 'f2_sig_name', 'f2_lock_ms')):
-                        sig_name = o.get(sig_key)
-                        if not sig_name:
-                            continue
-                        admit_set[(sv, sig_name)] = {
-                            'cno': cno,
-                            'lock_time_ms': o.get(lock_key),
-                            'our_admission_reason': reason,
-                        }
-                try:
-                    self._nav_sig_disagree.check_epoch(
-                        self._n_epochs, admit_set, self._nav_sig_store)
-                except Exception:
-                    # Pure logger — never let a bug here break the EKF.
-                    log.exception(
-                        "NavSigDisagreeMonitor.check_epoch failed; "
-                        "continuing without it.")
-
-            n_used, resid, sys_counts = filt.update(
-                pos_observations, corrections, gps_time, clk_file=corrections,
-                receiver_offset_ecef=tide_offset)
-            if n_used < 4:
-                continue
-
-            # Soft prior on residual ZTD (post-update rank-1 EKF
-            # pseudo-measurement z=0).  Constrains the position-altitude/
-            # ZTD/clock null-mode that otherwise lets the filter wander
-            # m-scale.  No-op when self._ztd_tie_sigma is None or <= 0.
-            if getattr(self, "_ztd_tie_sigma", None):
-                filt.apply_ztd_tie(self._ztd_tie_sigma)
-
-            # NAV2 continuous covariance update (post-update 3D EKF
-            # variance-weighted measurement).  Per Bob's directive
-            # 2026-04-30 + I-200128-main.  Gated by NAV2 freshness +
-            # quality.  See solve_ppp.PPPFilter.apply_nav2_anchor for
-            # the misnomer note: this is variance-weighted Kalman, not
-            # a truth-pull anchor.  Static offset between filter and
-            # NAV2 is invisible once filter P has tightened.
-            if (self._nav2_anchor_enabled
-                    and self._nav2_store is not None):
-                _nav2_op = self._nav2_store.get_opinion(max_age_s=10.0)
-                if (_nav2_op is not None
-                        and _nav2_op.get('fix_type') == 3
-                        and _nav2_op.get('h_acc_m') is not None
-                        and _nav2_op['h_acc_m']
-                        < self._nav2_anchor_max_hacc_m):
-                    filt.apply_nav2_anchor(
-                        np.asarray(_nav2_op['ecef'], dtype=float),
-                        float(_nav2_op['h_acc_m']),
-                        (float(_nav2_op['v_acc_m'])
-                         if _nav2_op.get('v_acc_m') is not None
-                         else None),
-                    )
-
-            self._n_epochs += 1
-
-            # [PPP_STATE] per-epoch position-filter estimate + σ for a
-            # pos_replay reference capture (Group B,
-            # docs/pos-replay-capture-manifest.md §3): the position-estimating
-            # PPPFilter's ECEF position, 3D position σ, and residual ZTD + σ —
-            # the error/own-σ inputs the divergence monitor scores.  The main
-            # servo loop's --filter-state-log only sees the clock filter; this
-            # is the position half it can't reach.  Opt-in (--ppp-state-log):
-            # an unconditional per-epoch INFO line would be ~86k lines/day at
-            # 1 Hz on every run, against this loop's own throttling
-            # convention — every-epoch detail is for captures only.
-            if getattr(self._args, 'ppp_state_log', False):
-                try:
-                    _pp = filt.x[:3]
-                    _ps = position_sigma_3d(filt.P)
-                    _pz = float(filt.x[PPP_IDX_ZTD])
-                    _pzs = math.sqrt(max(0.0,
-                        float(filt.P[PPP_IDX_ZTD, PPP_IDX_ZTD])))
-                    # Shared formatter (pos_replay stage 2b re-emits the same
-                    # line from a replayed bundle; one format definition keeps
-                    # emitter + parser in step).  '%s' to log.info so the line
-                    # passes through verbatim (it has its own % conversions).
-                    log.info("%s", format_ppp_state_line(
-                        gps_time, self._n_epochs, n_used, _pp, _ps, _pz, _pzs))
-                except (IndexError, ValueError, TypeError, AttributeError):
-                    # AttributeError covers gps_time.isoformat() — a None
-                    # gps_time must never crash the filter thread (the whole
-                    # point of this guard is "logging can't take down _run_inner").
-                    pass
-
-            # Phase-residual admission gate ingest — feed this epoch's
-            # post-fit phase residuals into WlPhaseAdmissionGate so it
-            # has a current view when MW's admission decisions are
-            # checked below.  Per dayplan I-115539 / 2026-04-29.
-            _gate_labels = getattr(filt, 'last_residual_labels', [])
-            for _lab, _r in zip(_gate_labels, resid if resid is not None else ()):
-                if len(_lab) >= 2 and _lab[1] == 'phi':
-                    self._wl_phase_admit.ingest(_lab[0], float(_r))
-            # Drop history for SVs not observed this epoch — the gate's
-            # per-SV deque should reflect actually-current data, not
-            # stale residuals from arcs that have set.
-            _observed_now = {o['sv'] for o in observations}
-            self._wl_phase_admit.evict_unobserved(_observed_now)
-
-            # MW wide-lane update.  Tell MW the current epoch so its
-            # tracker-driven transitions (FLOATING → CONVERGING on fix) log
-            # with a meaningful epoch field.
-            mw._current_epoch = self._n_epochs
-            nl._epoch = self._n_epochs  # resolver also uses _epoch for logs
-            readmit_blocked: list[str] = []
-            # Per-SV GF observation for this epoch.  Populated alongside
-            # the MW update; consumed by the GF step demoter below.
-            # Pure phase, geometry-free.  Per-filter gate
-            # (I-175645-charlie): MW combination needs phase biases on
-            # both bands, so iterate only the position-filtered list.
-            gf_now: dict[str, float] = {}
-            for obs in pos_observations:
-                sv = obs['sv']
-                phi1 = obs.get('phi1_cyc')
-                phi2 = obs.get('phi2_cyc')
-                pr1 = obs.get('pr1_m')
-                pr2 = obs.get('pr2_m')
-                wl1 = obs.get('wl_f1')
-                wl2 = obs.get('wl_f2')
-                if all(v is not None for v in (phi1, phi2, pr1, pr2, wl1, wl2)):
-                    # Layer 3 re-admission gate: skip MW update if the
-                    # drift monitor previously flushed this SV and its
-                    # elevation hasn't moved enough yet.  See
-                    # docs/sv-trust-layers.md.
-                    if self._wl_readmit.is_blocked(sv, elevations.get(sv)):
-                        readmit_blocked.append(sv)
-                        continue
-                    f1_hz = C / wl1
-                    f2_hz = C / wl2
-                    mw.update(sv, phi1, phi2, pr1, pr2, f1_hz, f2_hz)
-                    gf_now[sv] = gf_phase_m(phi1, phi2, wl1, wl2)
-
-            # WL drift monitor: detect wrong WL integer commits via
-            # sustained post-fix MW residual drift.  Runs after MW
-            # updates so the residuals we ingest are current-epoch.
-            # Acting here (before NL attempt) keeps the NL path
-            # from seeing a suspect WL this epoch.
-            fixed_now = {sv for sv, st in mw._state.items() if st.get('fixed')}
-            # Phase-residual admission gate — for each NEWLY-fixed SV
-            # this epoch, check the per-SV phase consistency before
-            # the fix is allowed to land in the lifecycle.  If the
-            # gate refuses, revert the MW state so the SV stays in
-            # FLOATING / CONVERGING and MW will try again at the
-            # next epoch.  Per dayplan I-115539 workstream A.
-            _newly_fixed = fixed_now - self._wl_drift_prev_fixed
-            for sv in list(_newly_fixed):
-                if not self._wl_phase_admit.is_phase_consistent(sv):
-                    detail = self._wl_phase_admit.evaluation_detail(sv)
-                    if detail is not None:
-                        log.warning(
-                            "[WL_PHASE_ADMIT_BLOCK] %s mean=%+.4fm "
-                            "std=%.4fm mean_thr=±%.3fm std_thr=±%.3fm "
-                            "cohort_med=%+.4fm (n=%d): MW proposed "
-                            "admission rejected; phase residual not "
-                            "yet consistent",
-                            sv, detail['mean_m'], detail['std_m'],
-                            detail['threshold_m'],
-                            detail['std_threshold_m'],
-                            detail['cohort_median_m'], detail['n_samples'],
-                        )
-                    # Revert MW state — clear the fix so the SV is not
-                    # admitted this epoch.  MW will keep accumulating
-                    # samples and may try to fix again next epoch.
-                    _st = mw._state[sv]
-                    _st['fixed'] = False
-                    _st['n_wl'] = None
-                    _st.pop('fix_frac', None)
-                    _st.pop('fix_n_epochs', None)
-                    fixed_now.discard(sv)
-                    _newly_fixed.discard(sv)
-            for sv in _newly_fixed:
-                fix_n_wl = mw._state[sv].get('n_wl')
-                self._wl_drift.note_fix(sv, n_wl=fix_n_wl)
-                # Initialise the GF step demoter for this SV.  Skip
-                # when the GF observation is missing this epoch (would
-                # happen if the SV's MW updated from a prior-epoch
-                # latch with the current obs missing fields).
-                _gf_ref = gf_now.get(sv)
-                if _gf_ref is not None:
-                    self._gf_step.note_fix(sv, gf_initial_m=_gf_ref)
-                # Newly-fixed SV passed the re-admission gate (or was
-                # never held).  Clear any prior hold so a subsequent
-                # drift-flush-readmit cycle starts fresh.
-                self._wl_readmit.note_admitted(sv)
-                # Fix-life logging — entry.  Records integer + elev +
-                # consistency level for post-hoc analysis of K_short /
-                # threshold tuning (per dayplan I-153334).
-                _life_elev = elevations.get(sv)
-                _life_cons = self._wl_drift.consistency_level(sv)
-                _life_hist = self._wl_drift.integer_history(sv)
-                log.info(
-                    "[WL_FIX_LIFE] event=enter sv=%s n_wl=%s elev=%s "
-                    "consistency=%s int_history=%s",
-                    sv, fix_n_wl,
-                    f"{_life_elev:.1f}" if _life_elev is not None else "?",
-                    _life_cons, _life_hist,
-                )
-                self._wl_fix_life_t0[sv] = time.monotonic()
-                self._wl_fix_life_n_wl[sv] = fix_n_wl
-            for sv in self._wl_drift_prev_fixed - fixed_now:
-                self._wl_drift.note_unfix(sv)
-                self._gf_step.note_unfix(sv)
-                # Fix-life logging — exit (slip, dropout, or other
-                # exit path that didn't go through gf_step).
-                _t0 = self._wl_fix_life_t0.pop(sv, None)
-                _n_wl = self._wl_fix_life_n_wl.pop(sv, None)
-                _life_elev = elevations.get(sv)
-                _dur = time.monotonic() - _t0 if _t0 is not None else None
-                log.info(
-                    "[WL_FIX_LIFE] event=exit sv=%s n_wl=%s elev=%s "
-                    "duration_s=%s reason=other consistency=%s",
-                    sv, _n_wl,
-                    f"{_life_elev:.1f}" if _life_elev is not None else "?",
-                    f"{_dur:.1f}" if _dur is not None else "?",
-                    self._wl_drift.consistency_level(sv),
-                )
-            drift_actions: list[str] = []
-
-            # GF step demoter — phase-only, cohort-median Δgf
-            # detection.  Per I-194752-main, this replaces the
-            # MW-residual rolling-mean approach that the BNC
-            # validation showed is uncorrelated with real slips
-            # (Z = -0.17, p = 0.86).  Cohort-median across the
-            # currently-fixed-SV cohort cancels common-mode
-            # ionospheric drift (the dominant noise source on
-            # long-fixed SVs) without an explicit Klobuchar / SSR
-            # iono model.  Trips on per-SV residual exceeding
-            # threshold (4 cm) for ≥ 2 consecutive epochs.
-            gf_step_events = self._gf_step.update(gf_now)
-            for ev in gf_step_events:
-                sv = ev['sv']
-                flush_elev = elevations.get(sv)
-                log.warning(
-                    "[GF_STEP] %s residual=%+.4fm cohort_median=%+.4fm "
-                    "delta_gf=%+.4fm (n_cohort=%d, %d-epoch sustained, "
-                    "thr=±%.3fm): flushing MW, demoting to FLOATING, "
-                    "gate@elev=%s",
-                    sv, ev['residual_m'], ev['cohort_median_m'],
-                    ev['delta_gf_m'], ev['cohort_size'],
-                    ev['consecutive_epochs'], ev['threshold_m'],
-                    f"{flush_elev:.1f}°" if flush_elev is not None else "?",
-                )
-                # Fix-life exit before MW reset clears state.
-                _t0 = self._wl_fix_life_t0.pop(sv, None)
-                _n_wl_at_entry = self._wl_fix_life_n_wl.pop(sv, None)
-                _dur = time.monotonic() - _t0 if _t0 is not None else None
-                log.info(
-                    "[WL_FIX_LIFE] event=exit sv=%s n_wl=%s elev=%s "
-                    "duration_s=%s reason=gf_step consistency=%s",
-                    sv, _n_wl_at_entry,
-                    f"{flush_elev:.1f}" if flush_elev is not None else "?",
-                    f"{_dur:.1f}" if _dur is not None else "?",
-                    self._wl_drift.consistency_level(sv),
-                )
-                mw.reset(sv)
-                self._wl_drift.note_unfix(sv)
-                self._gf_step.note_unfix(sv)
-                # GF step is a real phase discontinuity (L1 or L5
-                # slipped) — wipe the SV's NL trust history so a
-                # post-slip re-admission is gated as NEW rather than
-                # held to its pre-slip integer.  I-172719.
-                nl.note_slip(sv)
-                # Layer 3: take a re-admission hold at the current
-                # elevation.  MW updates for this SV are skipped
-                # until elevation moves ≥ 2°.
-                self._wl_readmit.note_flush(sv, flush_elev)
-                fixed_now.discard(sv)
-                # Demote the per-SV state.  CONVERGING → FLOATING is
-                # a legal edge in the lifecycle; ANCHORING/ANCHORED
-                # shouldn't be reachable in wl-only mode but the
-                # path is defensive.
-                try:
-                    cur = self._sv_state.state(sv)
-                    if cur in (SvAmbState.CONVERGING,
-                               SvAmbState.ANCHORING,
-                               SvAmbState.ANCHORED):
-                        self._sv_state.transition(
-                            sv, SvAmbState.FLOATING,
-                            epoch=self._n_epochs,
-                            reason=f"gf_step:{ev['residual_m']:+.3f}m",
-                        )
-                except Exception:
-                    pass
-                drift_actions.append(sv)
-            self._wl_drift_prev_fixed = fixed_now
-
-            # NL resolution attempt (after warmup).  Reuse elevations
-            # computed earlier this epoch for the slip monitor so the
-            # AR elevation mask can gate candidates.
-            nl.tick()  # advance blacklist expiry
-            if self._n_epochs >= 5:
-                # Per-SV phase-bias availability for the short-term
-                # promoter's candidate gate.  See Phase 1 call site
-                # above for the rationale.
-                ar_phase_bias_ok = {
-                    o['sv']: o.get('ar_phase_bias_ok', True)
-                    for o in observations
-                }
-                if not getattr(self._args, 'no_ar', False):
-                    nl.attempt(filt, mw, elevations=elevations,
-                               ar_phase_bias_ok=ar_phase_bias_ok)
-
-            # Per-SV state machine: stream PR residuals into the monitors
-            # and the host RMS alarm.  Each monitor is stateless per-eval
-            # (no cascade) and drives SvStateTracker transitions directly.
-            # See docs/sv-lifecycle-and-pfr-split.md.
-            labels = getattr(filt, 'last_residual_labels', [])
-            self._false_fix.ingest(self._n_epochs, resid, labels)
-            self._setting_drop.ingest(self._n_epochs, resid, labels)
-            self._fix_set_integrity.ingest(self._n_epochs, resid, labels)
-            # NL-layer residual logger — per-epoch per-NL-fixed-SV PR
-            # and IF (phi) residuals.  Feeds the empirical case for
-            # IF-residual eviction (I-221332-main) — the IF residual
-            # is what Charlie's detector should be acting on, not PR.
-            # Volume: ~5-10 NL-fixed SVs * 2 residuals * 1 Hz =
-            # ~20 lines/sec max; one combined line per SV per epoch.
-            _sv_resid: dict[str, dict[str, float]] = {}
-            for _i, _lbl in enumerate(labels):
-                if _i >= len(resid):
-                    break
-                _sv, _kind, *_ = _lbl
-                _sv_resid.setdefault(_sv, {})[_kind] = float(resid[_i])
-            try:
-                _nl_fixed_set = {
-                    s for s in _sv_resid
-                    if self._sv_state.state(s) in (
-                        SvAmbState.ANCHORING, SvAmbState.ANCHORED,
-                    )
-                }
-            except Exception:
-                _nl_fixed_set = set()
-            for _sv in sorted(_nl_fixed_set):
-                _rs = _sv_resid[_sv]
-                _pr = _rs.get('pr')
-                _phi = _rs.get('phi')
-                log.info(
-                    "[NL_RESID] sv=%s pr_resid=%s if_resid=%s",
-                    _sv,
-                    f"{_pr:+.3f}m" if _pr is not None else "?",
-                    f"{_phi:+.4f}m" if _phi is not None else "?",
-                )
-                # Feed the AnchoringSvPromoter's IF-resid gate (I-224945).
-                # Only ANCHORING SVs accumulate; the call is a no-op
-                # for ANCHORED ones (gate has already passed).
-                if _phi is not None:
-                    self._promoter.ingest_if_resid(
-                        _sv, _phi, self._n_epochs,
-                    )
-            # ZTD state for the integrity monitor's ztd_impossible
-            # trigger.  PPPFilter carries a ZTD residual state; if
-            # the filter has absorbed position error into ZTD past
-            # the physical envelope, monitor returns an event with
-            # reason='ztd_impossible' and we revert NL fixes only
-            # (keep WL / MW / position).  See
-            # docs/ztd-impossibility-trigger-design.md.
-            ppp_ztd = None
-            # PPPFilter's IDX_ZTD is a module-level constant, not an
-            # instance/class attribute, so hasattr on the instance
-            # returns False.  Fall through to the imported module
-            # constant — matches the pattern used by the [AntPosEst]
-            # log line below.
-            ppp_ztd_idx = getattr(filt, 'IDX_ZTD', PPP_IDX_ZTD)
-            if filt.x.shape[0] > ppp_ztd_idx:
-                ppp_ztd = float(filt.x[ppp_ztd_idx])
-            # Fleet-consensus deltas (Part 2 of
-            # docs/fleet-consensus-monitors.md).  Computed every
-            # epoch so the monitor's sustained-epoch counter
-            # increments at the right rate.  None when no cohort
-            # is available (peer_subscriber inactive, no peers
-            # with matching antenna_ref/site_ref, or <2 members);
-            # the monitor silently skips those paths.
-            _cohort_pos_delta_m = None
-            _cohort_ztd_delta_m = None
-            try:
-                import peer_subscriber
-                if peer_subscriber.is_active():
-                    _ant_ref = peer_subscriber.get_local_antenna_ref()
-                    _site_ref = peer_subscriber.get_local_site_ref()
-                    _self_pos_ecef = filt.x[:3]
-                    _self_lat, _self_lon, _self_alt = ecef_to_lla(
-                        _self_pos_ecef[0], _self_pos_ecef[1],
-                        _self_pos_ecef[2])
-                    _self_snap = peer_subscriber.build_self_snapshot(
-                        antenna_ref=_ant_ref, site_ref=_site_ref,
-                        lat_deg=_self_lat, lon_deg=_self_lon,
-                        alt_m=_self_alt, ztd_m=ppp_ztd,
-                    )
-                    if _ant_ref:
-                        _pm = peer_subscriber.cohort_median_position(
-                            _ant_ref, self_snapshot=_self_snap)
-                        if _pm is not None:
-                            from peppar_bus.cohort import ecef_distance_m
-                            _ml, _mo, _ma, _ = _pm
-                            _, _cohort_pos_delta_m = ecef_distance_m(
-                                _self_lat, _self_lon, _self_alt,
-                                _ml, _mo, _ma)
-                    if _site_ref and ppp_ztd is not None:
-                        _zm = peer_subscriber.cohort_median_ztd(
-                            _site_ref, self_snapshot=_self_snap)
-                        if _zm is not None:
-                            _med_ztd, _ = _zm
-                            _cohort_ztd_delta_m = ppp_ztd - _med_ztd
-            except Exception:
-                log.exception("cohort delta compute failed (non-fatal)")
-            # Bead 4: stream azimuths for ANCHORING SVs so the
-            # promoter can accumulate Δaz toward the 15° threshold.  We
-            # compute azimuths only when there's at least one SV in
-            # ANCHORING — avoids the per-epoch sat_position call
-            # on hosts that haven't fixed anything yet.
-            prov_count = self._sv_state.count_in(SvAmbState.ANCHORING)
-            if prov_count > 0:
-                azimuths = _compute_sv_azimuths(
-                    filt, corrections, observations, gps_time)
-                for sv, az in azimuths.items():
-                    self._promoter.ingest_az(sv, az)
-            # FalseFixMonitor in observe-only mode: log trip candidates
-            # but don't evict.  IfStepMonitor (below) is the canonical
-            # NL-layer demoter.
-            for ev in self._false_fix.evaluate(self._n_epochs):
-                if ev.get('observe_only', False):
-                    log.info(
-                        "[FALSE_FIX] %s |PR|=%.2fm > %.2fm (n=%d, "
-                        "elev=%s, %s) [observe-only — IF step is "
-                        "canonical demoter]",
-                        ev['sv'], ev['mean_resid_m'], ev['threshold_m'],
-                        ev['n'],
-                        f"{ev['elev_deg']:.0f}°"
-                        if ev['elev_deg'] is not None else "?",
-                        ev.get('tag', '?'),
-                    )
-                else:
-                    self._apply_false_fix(filt, mw, nl, ev)
-
-            # IfStepMonitor — NL-layer demoter via cohort-median
-            # post-fit phase residual.  Mirrors GfStepMonitor (WL
-            # layer) per dayplan I-221332-main.
-            nl_fixed_now = set(self._sv_state.svs_in(
-                SvAmbState.ANCHORING, SvAmbState.ANCHORED))
-            for sv in nl_fixed_now - self._if_step_prev_nl_fixed:
-                self._if_step.note_fix(sv)
-            for sv in self._if_step_prev_nl_fixed - nl_fixed_now:
-                self._if_step.note_unfix(sv)
-
-            # Extract per-SV post-fit phase (IF) residuals from the
-            # filter's last residual labels.  Filter to NL-fixed SVs
-            # — IfStepMonitor's update() also filters by tracked set,
-            # but doing it here keeps the cohort-median input clean.
-            phi_resid_by_sv: dict[str, float] = {}
-            for lab, r in zip(labels or (), resid if resid is not None else ()):
-                if len(lab) >= 2 and lab[1] == 'phi' and lab[0] in nl_fixed_now:
-                    phi_resid_by_sv[lab[0]] = float(r)
-            # ANCHORED protection per I-140938-main: SVs that have
-            # earned ANCHORED state (survived Δaz=15° validation) get
-            # a 2× threshold, configurable via IfStepMonitor's
-            # anchored_threshold_mult.  Caller (us) supplies the set
-            # so the monitor stays decoupled from the SV state tracker.
-            anchored_svs = set(self._sv_state.svs_in(SvAmbState.ANCHORED))
-            if_step_events = self._if_step.update(
-                phi_resid_by_sv, anchored_svs=anchored_svs)
-            for ev in if_step_events:
-                sv = ev['sv']
-                elev = self._sv_state.get(sv).last_elev_deg
-                log.warning(
-                    "[IF_STEP] %s residual=%+.4fm cohort_residual=%+.4fm "
-                    "cohort_median=%+.4fm (n_cohort=%d/%d, %d-epoch "
-                    "sustained, thr=±%.3fm%s): NL unfix + ambiguity "
-                    "inflate, demoting to WAITING, elev=%s",
-                    sv, ev['residual_m'], ev['cohort_residual_m'],
-                    ev['cohort_median_m'], ev['cohort_size'],
-                    ev.get('cohort_size_total', ev['cohort_size']),
-                    ev['consecutive_epochs'], ev['threshold_m'],
-                    " ANCHORED-2x" if ev.get('anchored', False) else "",
-                    f"{elev:.1f}°" if elev is not None else "?",
-                )
-                # Standard NL eviction action — same as
-                # _apply_false_fix used to do, minus the PR-domain
-                # logging path.
-                cooldown = 120  # ~2 min default; tune later if needed
-                try:
-                    self._sv_state.transition(
-                        sv, SvAmbState.WAITING,
-                        epoch=self._n_epochs,
-                        reason=f"if_step:{ev['cohort_residual_m']:+.3f}m",
-                        elev_deg=elev,
-                        cooldown_epochs=cooldown,
-                    )
-                except Exception:
-                    pass
-                nl.unfix(sv)
-                # IF step is a real post-fix phase residual jump —
-                # wipe the SV's NL trust so a post-slip re-admission
-                # is gated as NEW.  I-172719.
-                nl.note_slip(sv)
-                nl.blacklist(sv, epochs=cooldown)
-                filt.inflate_ambiguity(sv)
-                mw.reset(sv)
-                self._if_step.note_unfix(sv)
-                self._promoter.note_false_fix_rejection(sv, self._n_epochs)
-            self._if_step_prev_nl_fixed = nl_fixed_now
-
-            for ev in self._setting_drop.evaluate(self._n_epochs):
-                self._apply_setting_sv_drop(filt, mw, nl, ev)
-            host_ev = self._fix_set_integrity.evaluate(
-                self._n_epochs, ztd_m=ppp_ztd,
-                pos_consensus_delta_m=_cohort_pos_delta_m,
-                ztd_consensus_delta_m=_cohort_ztd_delta_m)
-            if host_ev is not None:
-                self._apply_integrity_trip(filt, mw, nl, host_ev)
-            # Elevation-stratified squelch: sweep WAITING records
-            # whose per-SV cooldown has expired and return them to FLOATING.
-            # Also drop records for SVs that haven't been observed in
-            # STALE_AFTER_EPOCHS — arc boundary, resets the unexpected-
-            # false-fix counter on the next rise.
-            self._sv_state.check_squelch_cooldowns(self._n_epochs)
-            # Mark SVs we saw this epoch; forget those we haven't seen
-            # for a while.  600 epochs ≈ 10 min at 1 Hz: long enough to
-            # survive brief tracking gaps without clobbering state,
-            # short enough to distinguish one arc from the next.
-            for obs in observations:
-                self._sv_state.mark_seen(obs['sv'], self._n_epochs)
-            if self._n_epochs % 60 == 0:  # sweep every ~1 min
-                dropped = self._sv_state.forget_stale_with_states(
-                    self._n_epochs, 600)
-                # Keep the promoter's candidate map in sync — when a
-                # record is forgotten (arc boundary), any in-flight
-                # candidate for that SV is also stale.  Also emit a
-                # synthetic [SV_STATE] → SET transition so downstream
-                # log readers (peppar-mon) can drop the SV from their
-                # current-state view.  Without this, the SV stays
-                # visible in peppar-mon forever in its last-observed
-                # state — confusing because it sets out of view but
-                # we never log a transition out.
-                for sv, prev_state in dropped:
-                    self._promoter.forget(sv)
-                    self._false_fix.forget(sv)
-                    self._setting_drop.forget(sv)
-                    # peppar-mon contract: peppar_mon/log_reader.py
-                    # treats ``→ SET`` as removal from sv_states.
-                    # SET is not a real SvAmbState enum value; it's a
-                    # synthetic transition tag the same _SV_STATE_LINE_RE
-                    # parses from the standard transition format.
-                    log.info(
-                        "[SV_STATE] %s: %s → SET (epoch=%d, "
-                        "reason=stale_obs:%d epochs)",
-                        sv, prev_state.value, self._n_epochs, 600)
-            for ev in self._promoter.evaluate(self._n_epochs):
-                log.info(
-                    "Promoted %s → ANCHORED (Δaz=%.1f°, first=%s, now=%.0f°)",
-                    ev['sv'], ev['accumulated_dphi_deg'],
-                    f"{ev['first_fix_az_deg']:.0f}°"
-                    if ev['first_fix_az_deg'] is not None else "?",
-                    ev['latest_az_deg'] or 0.0,
-                )
-                # I-004810-main: record past-anchored reputation so a
-                # later integrity-trip / re-admit cycle gets the
-                # PROVISIONAL boost over NEW.  Cleared by note_slip
-                # (forget_history) on real cycle slips.
-                nl.note_sv_anchored(ev['sv'])
-
-            # Position quality
-            sigma_3d = position_sigma_3d(filt.P)
-            pos_ecef = filt.x[:3].copy()
-            # Periodic .ppp.toml snapshot for next-startup warm seed.
-            # Throttled + sigma-gated by PppStateWriter; no-op when
-            # receiver_uid is None.  Pass current NAV2 hAcc so the
-            # writer's preferred gate ("σ ≤ 0.5 × NAV2 hAcc") fires
-            # only when this PPP solution is meaningfully better than
-            # the NAV2 cold-start fallback.
-            _nav2_h_acc_for_writer = None
-            if self._nav2_store is not None:
-                _op_for_writer = self._nav2_store.get_opinion(max_age_s=30.0)
-                if _op_for_writer is not None:
-                    _nav2_h_acc_for_writer = _op_for_writer.get('h_acc_m')
-            self._ppp_writer.maybe_write(
-                pos_ecef, sigma_3d, self._n_epochs,
-                nav2_h_acc_m=_nav2_h_acc_for_writer,
-            )
-            # AntPosEst-vs-pin watchdog (slice 6 instrumentation).
-            # State is published on self._antpos_watchdog.state for
-            # cross-thread read by run_steady_state's [CONFIDENCE] log.
-            self._antpos_watchdog.update(pos_ecef, sigma_3d)
-            # Two separate counts drive the two thresholds:
-            #   n_nl_fixed   — union of ANCHORING + ANCHORED.
-            #                  Drives CONVERGING ↔ ANCHORING (fallback:
-            #                  any NL integer committed, validated or not).
-            #   n_anchored   — ANCHORED only, survived ≥ 15° Δaz (I-224945).
-            #                  Drives ANCHORING ↔ ANCHORED (the strict
-            #                  "geometry-validated" milestone).
-            n_anchored = self._sv_state.count_in(SvAmbState.ANCHORED)
-            n_nl_fixed = sum(1 for sv in filt.sv_to_idx if nl.is_fixed(sv))
-
-            # Update state-machine metrics.  n_nl reports the union
-            # count — operators want the "NL fixes currently held"
-            # number, not just the subset that's geometry-validated.
-            self._ape_sm.update_metrics(
-                sigma_m=sigma_3d,
-                n_wl=mw.n_fixed,
-                n_nl=n_nl_fixed,
-                n_sv=len(filt.sv_to_idx),
-            )
-
-            # State transitions.  Message includes both counts so
-            # operators can see the ramp: "5 anchored (8 fixed)" vs
-            # "8 NL fixed" (pre-promotion).
-            tag = (f"{n_anchored} anchored ({n_nl_fixed} fixed)"
-                   if n_anchored > 0 else f"{n_nl_fixed} NL fixed")
-            # Hysteresis: enter ANCHORED at ≥ 4 anchored, exit at < 3
-            # (4↑/3↓).  Matches the anchored_by_svs / anchored_by_position regime
-            # boundary in ppp_ar.NarrowLaneResolver (strong_anchor_min=3).
-            # Enter ANCHORING at ≥ 4 NL fixed (any kind), exit at < 4.
-            state = self._ape_sm.state
-            if state == AntPosEstState.CONVERGING:
-                if n_nl_fixed >= self._resolve_threshold:
-                    self._ape_sm.transition(
-                        AntPosEstState.ANCHORING,
-                        f"{tag}, σ={sigma_3d:.3f}m",
-                    )
-            elif state == AntPosEstState.ANCHORING:
-                if n_anchored >= self._resolve_threshold:
-                    self._ape_sm.transition(
-                        AntPosEstState.ANCHORED,
-                        f"{tag}, σ={sigma_3d:.3f}m",
-                    )
-                elif n_nl_fixed < self._resolve_threshold - 1:
-                    # Hysteresis exit at < 3 (threshold - 1),
-                    # matching the ANCHORED → ANCHORING boundary.
-                    # Both reverse transitions use the same 4↑/3↓
-                    # pattern so a single dropped fix doesn't
-                    # chatter the state back across the threshold.
-                    self._ape_sm.transition(
-                        AntPosEstState.CONVERGING,
-                        f"NL fix count dropped to {n_nl_fixed} ({tag})",
-                    )
-            elif state == AntPosEstState.ANCHORED:
-                if n_anchored < self._resolve_threshold - 1:
-                    # Hysteresis exit at < 3 (threshold - 1); falls
-                    # back to ANCHORING, not all the way to CONVERGING.
-                    self._ape_sm.transition(
-                        AntPosEstState.ANCHORING,
-                        f"anchored count dropped to {n_anchored} ({tag})",
-                    )
-
-            # NAV2 position sanity check (every 10 epochs ≈ 10s)
-            if (self._nav2_store is not None
-                    and self._n_epochs % 10 == 0
-                    and self._n_epochs >= 30
-                    and self._n_epochs >= self._nav2_cooldown_until):
-                self._check_nav2(filt, mw, nl, pos_ecef, sigma_3d, n_nl_fixed)
-
-            # SecondOpinionPosMonitor — 3D nav2Δ above threshold,
-            # sustained.  Catches the 'stable wrong' lock that
-            # _check_nav2 (horizontal-only) and FixSetIntegrityAlarm
-            # (internal-consistency) both miss.  See I-011533-main on
-            # dayplan/2026-04-28.  Evaluated every epoch but the
-            # NAV2 store is freshness-gated to ~30s.
-            if (self._nav2_store is not None
-                    and self._n_epochs >= 30
-                    and self._n_epochs >= self._nav2_cooldown_until):
-                _so_opinion = self._nav2_store.get_opinion(max_age_s=30.0)
-                _so_delta = None
-                _so_hacc = None
-                if _so_opinion is not None:
-                    _so_delta = float(np.linalg.norm(
-                        pos_ecef - _so_opinion['ecef']))
-                    _so_hacc = _so_opinion.get('h_acc_m')
-                _so_ev = self._second_opinion.evaluate(
-                    self._n_epochs, _so_delta, _so_hacc)
-                if _so_ev is not None:
-                    _rh = _so_ev.get('rolling_hacc_m')
-                    _rh_tag = (
-                        f" rolling_hAcc={_rh:.2f}m" if _rh is not None
-                        else "")
-                    _nav2_ecef = lla_to_ecef(_so_opinion['lat'],
-                                             _so_opinion['lon'],
-                                             _so_opinion['alt_m'])
-                    _reset_ecef, _reset_label = select_reset_target(
-                        self._pin_position, self._pin_ecef, _nav2_ecef,
-                    )
-                    if _reset_label == "known_pos":
-                        _lat, _lon, _alt = ecef_to_lla(
-                            _reset_ecef[0], _reset_ecef[1], _reset_ecef[2])
-                        _reset_tag = (
-                            f"known_pos LLA ({_lat:.6f},{_lon:.6f},"
-                            f"{_alt:.1f}m) [pin]")
-                    else:
-                        _reset_tag = (
-                            f"NAV2 LLA ({_so_opinion['lat']:.6f},"
-                            f"{_so_opinion['lon']:.6f},"
-                            f"{_so_opinion['alt_m']:.1f}m)")
-                    log.warning(
-                        "[SECOND_OPINION_POS] tripped: nav2Δ=%.2fm > "
-                        "%.2fm sustained %d ep%s — full re-init at "
-                        "%s; unfixing %d NL.",
-                        _so_ev['nav2_delta_3d_m'],
-                        _so_ev['threshold_m'],
-                        _so_ev['sustained_epochs'],
-                        _rh_tag,
-                        _reset_tag,
-                        len(nl._fixed),
-                    )
-                    for _sv in list(nl._fixed.keys()):
-                        nl.unfix(_sv)
-                    filt.initialize(_reset_ecef, 0.0,
-                                    systems=self._systems)
-                    self._prev_t = None
-                    self._best_sigma = 999.0
-                    self._second_opinion.note_recovery()
-                    self._nav2_cooldown_until = self._n_epochs + 120
-                    if self._ape_sm.state in (
-                            AntPosEstState.ANCHORING,
-                            AntPosEstState.ANCHORED):
-                        self._ape_sm.transition(
-                            AntPosEstState.CONVERGING,
-                            reason="second_opinion_pos_reset",
-                        )
-
-            # Position callback when improved
-            if sigma_3d < self._best_sigma:
-                self._best_sigma = sigma_3d
-                if self._position_callback is not None:
-                    self._position_callback(pos_ecef, sigma_3d)
-
-            # Log every 10 epochs
-            if self._n_epochs % 10 == 0:
-                rms = np.sqrt(np.mean(resid ** 2)) if len(resid) > 0 else 0
-                lat, lon, alt = ecef_to_lla(pos_ecef[0], pos_ecef[1], pos_ecef[2])
-                nav2_tag = ""
-                nav2_opinion = None
-                if self._nav2_store is not None:
-                    nav2_opinion = self._nav2_store.get_opinion(max_age_s=30.0)
-                    if nav2_opinion is not None:
-                        d = float(np.linalg.norm(pos_ecef - nav2_opinion['ecef']))
-                        nav2_tag = f" nav2Δ={d:.1f}m"
-                ztd_tag = ""
-                # PPPFilter stores IDX_ZTD as a module-level constant
-                # (not a class attribute), so hasattr on the instance
-                # returns False.  Use the imported constant directly.
-                ztd_idx = getattr(filt, 'IDX_ZTD', PPP_IDX_ZTD)
-                if filt.x.shape[0] > ztd_idx:
-                    dztd_mm = filt.x[ztd_idx] * 1000.0
-                    dztd_sigma_mm = math.sqrt(max(0.0,
-                        filt.P[ztd_idx, ztd_idx])) * 1000.0
-                    ztd_tag = f" ZTD={dztd_mm:+.0f}±{dztd_sigma_mm:.0f}mm"
-                # Lock-in strength: WL_fixed / σ_3d.  Unweighted first
-                # cut, per docs/position-strength-metric.md.  Logged
-                # for post-hoc analysis; not used as a decision gate
-                # (strength is orthogonal to correctness — high values
-                # can coincide with the biased-equilibrium trap).
-                wl_fixed_count = mw.n_fixed
-                strength = (float(wl_fixed_count) / sigma_3d
-                            if sigma_3d > 0 else 0.0)
-                strength_tag = f" strength={strength:.0f}"
-                readmit_held = self._wl_readmit.n_held()
-                readmit_tag = (f" readmit={readmit_held}"
-                               if readmit_held > 0 else "")
-                # Solid Earth tide magnitude + radial (approx local up)
-                # component for this epoch.  Radial is signed; total
-                # is magnitude only.  Tag omitted when tide is disabled
-                # or the filter hasn't produced a usable position yet.
-                tide_tag = ""
-                if self._last_tide_3d_mm is not None:
-                    tide_tag = (f" tide={self._last_tide_3d_mm:.0f}mm"
-                                f"(U{self._last_tide_up_mm:+.0f})")
-                # PCV activity: N applied / M skipped this epoch.
-                # Tag omitted when PCV is disabled entirely.
-                pcv_tag = ""
-                if self._pcv_enabled:
-                    pcv_tag = (f" pcv={self._last_pcv_applied}"
-                               f"/{self._last_pcv_applied + self._last_pcv_skipped}")
-                # Worst-σ diagnostic: largest σ (√ of largest
-                # eigenvalue) across P's base-state block.  Pairs
-                # with positionσ on this line — they share the same
-                # "σ in meters" semantics but scope differs.
-                # positionσ = position-only uncertainty.
-                # worstσ    = worst-case σ across ALL base states
-                #             including clock, ISBs, ZTD, capturing
-                #             near-rank-deficient coupling.
-                # A rising worstσ without matching rise in positionσ
-                # is the null-mode-excitation signature (Bravo
-                # 2026-04-23 PRIDE arc).  Diagnostic only, no action.
-                nm_sigma = self._null_mode_sigma_max(filt)
-                worst_tag = (f" worstσ={nm_sigma:.1f}m"
-                             if nm_sigma is not None else "")
-                # peppar-mon contract: peppar_mon/log_reader.py:
-                # _ANTPOSEST_LINE_RE parses this format (positionσ,
-                # pos, n=, plus optional nav2Δ/ZTD/tide/worstσ tags).
-                # The peppar-mon zombie-SV warning compares ``n=`` to
-                # the count in sv_states; keep n= present and accurate.
-                # Renaming or reordering fields requires updating the
-                # regex + tests.
-                log.info(
-                    "  [AntPosEst %d] positionσ=%.3fm pos=(%.8f, %.8f, %.3f) "
-                    "n=%d amb=%d %s %s%s%s%s%s%s%s%s",
-                    self._n_epochs, sigma_3d, lat, lon, alt,
-                    n_used, len(filt.sv_to_idx),
-                    mw.summary(), nl.summary(), nav2_tag, ztd_tag,
-                    strength_tag, readmit_tag, tide_tag, pcv_tag, worst_tag,
-                )
-
-                # METAR-tied periodic ZTD constraint on AntPosEst's
-                # filter (companion to run_steady_state's
-                # FixedPosFilter tie at line ~4856).  Wall-clock
-                # cadence — AntPosEst runs decimated so we can't reuse
-                # the epoch-modulo gate from run_steady_state.
-                if (self._args is not None
-                        and self._ztd_tie_lat_deg is not None
-                        and hasattr(filt, 'apply_ztd_tie')):
-                    _tie_int_s = float(getattr(
-                        self._args, 'ztd_tie_interval_s', 300))
-                    if _tie_int_s > 0:
-                        _now_t = time.monotonic()
-                        if (self._last_ztd_tie_t is None
-                                or _now_t - self._last_ztd_tie_t
-                                >= _tie_int_s):
-                            _periodic_ztd_tie(
-                                filt, self._args,
-                                self._ztd_tie_lat_deg,
-                                self._ztd_tie_alt_m,
-                                self._n_epochs, log)
-                            self._last_ztd_tie_t = _now_t
-                # [OBS_COUNTS] — fleet visibility breakdown for the
-                # peppar-mon Untracked + Tracking columns per dayplan
-                # I-143806-main.  Combines upstream counters from
-                # realtime_ppp (n_raw / n_off_const / n_single) with
-                # PPPFilter's per-iteration reject counters
-                # (filt.last_reject_counts: no_eph / clock_bad /
-                # below_mask).  Falls through gracefully when
-                # obs_counts isn't supplied (legacy / replay tests).
-                _filter_rej = getattr(filt, 'last_reject_counts', None)
-                if obs_counts is not None and _filter_rej is not None:
-                    _n_raw = obs_counts.get('n_raw')
-                    _n_off = obs_counts.get('n_off_const')
-                    _n_single = obs_counts.get('n_single')
-                    log.info(
-                        "  [OBS_COUNTS] raw=%s used=%d dual=%d "
-                        "single=%s off_const=%s below_mask=%d "
-                        "clock_bad=%d no_eph=%d",
-                        _n_raw if _n_raw is not None else "?",
-                        n_used, len(observations),
-                        _n_single if _n_single is not None else "?",
-                        _n_off if _n_off is not None else "?",
-                        _filter_rej.get('below_mask', 0),
-                        _filter_rej.get('clock_bad', 0),
-                        _filter_rej.get('no_eph', 0),
-                    )
-                # WL Integer Bootstrap success rate (Teunissen 1998/1999).
-                # Per Charlie's AR-readiness literature memo: WL P_IB is
-                # the right gate for "is the float ready for WL AR?" —
-                # σ_pos is downstream.  Geng et al. 2010 thresholds:
-                # > 0.999 = full AR, > 0.99 = partial AR.  Logged every
-                # epoch as a diagnostic; current --wl-only mode doesn't
-                # gate AR on this yet (planned).
-                if self._n_epochs % 10 == 0:  # 1/10 epochs to bound log volume
-                    p_wl_ib, n_wl = mw.wl_bootstrap_success_rate()
-                    if p_wl_ib is None:
-                        log.info(
-                            "  [WL_AR_READINESS] p_wl_ib=- n=0 "
-                            "(no SVs warmed up)")
-                    else:
-                        log.info(
-                            "  [WL_AR_READINESS] p_wl_ib=%.4f n=%d "
-                            "(>0.99=PAR-ready, >0.999=full)",
-                            p_wl_ib, n_wl,
-                        )
-                    # NL AR readiness — Charlie A1.  Pulled from
-                    # NlResolver.last_ar_readiness (set every resolve_nl
-                    # call, regardless of whether LAMBDA attempted).
-                    p_nl_ib = getattr(nl, 'last_ar_readiness', None)
-                    n_screened = getattr(nl, 'last_screened_count', 0)
-                    if p_nl_ib is None:
-                        log.info(
-                            "  [AR_READINESS] p_nl_ib=- n=%d "
-                            "(too few screened)", n_screened)
-                    else:
-                        log.info(
-                            "  [AR_READINESS] p_nl_ib=%.4f n=%d "
-                            "(>0.99=PAR-ready, >0.999=full)",
-                            p_nl_ib, n_screened,
-                        )
-                # WL integrality snapshot every 60 epochs (~1/min).  Shows
-                # what WL integers the MW tracker would commit — even in
-                # wl-only mode where those commits aren't applied to the
-                # filter.  Per-SV: frac (|n_wl - round(n_wl)|), epochs
-                # averaged, fixed-flag (* suffix), MW residual std.
-                # Diagnostic only — no effect on filter.  See
-                # docs/pre-wl-foundation.md for the reframe that
-                # motivated this.
-                if self._n_epochs % 60 == 0:
-                    snap = mw.integrality_snapshot()
-                    if snap:
-                        # Sort by frac ascending — lowest-frac SVs (most
-                        # fix-eligible) first.
-                        snap.sort(key=lambda s: s['frac'])
-                        parts = []
-                        for s in snap:
-                            star = "*" if s['fixed'] else " "
-                            rstd = s['resid_std_cyc']
-                            rstd_str = (f"{rstd:.2f}"
-                                        if rstd is not None else "—")
-                            parts.append(
-                                f"{s['sv']}:{s['frac']:.2f}"
-                                f"/{s['n_epochs']}ep/{rstd_str}{star}")
-                        n_would = sum(1 for s in snap if s['fixed'])
-                        log.info(
-                            "  [WL_INTEGRALITY %d] %d SVs, %d would-fix: %s",
-                            self._n_epochs, len(snap), n_would,
-                            " ".join(parts))
-
-                # Per-SV post-fit residual snapshot every 60 epochs.
-                # Bob 2026-04-24 root-cause hunt: when the float PPP
-                # solution is biased by observation-model error
-                # (phase bias mismatch, PCV offset, code bias residual,
-                # hardware signal bias), individual SVs will show
-                # systematic residual offsets.  Per-SV mean + std over
-                # a rolling window would be ideal, but for a first
-                # pass we emit the raw post-fit residual per SV per
-                # measurement type (PR + phi) sorted by |resid|
-                # descending — worst SVs at the head of each line.
-                if self._n_epochs % 60 == 0 and resid is not None \
-                        and len(resid) > 0:
-                    _labels = getattr(filt, 'last_residual_labels', [])
-                    # Pair each residual with (sv, kind).  Sort by
-                    # |resid| so operators see the worst offenders first.
-                    tagged = [
-                        (lab[0], lab[1], float(r))
-                        for lab, r in zip(_labels, resid)
-                    ]
-                    tagged.sort(key=lambda t: -abs(t[2]))
-                    pr_parts = [f"{sv}:{v:+.2f}" for sv, k, v in tagged
-                                if k == 'pr']
-                    phi_parts = [f"{sv}:{v:+.3f}" for sv, k, v in tagged
-                                 if k == 'phi']
-                    if pr_parts:
-                        log.info(
-                            "  [RESID_PR %d] %d: %s",
-                            self._n_epochs, len(pr_parts),
-                            " ".join(pr_parts))
-                    if phi_parts:
-                        log.info(
-                            "  [RESID_PHI %d] %d: %s",
-                            self._n_epochs, len(phi_parts),
-                            " ".join(phi_parts))
-                # Peer-bus publish — mirrors the [AntPosEst] log line's
-                # fields to any subscribers.  All three helpers no-op
-                # when --peer-bus is disabled.
-                peer_publisher.publish_position(
-                    ant_pos_est_state=self._ape_sm.state.value,
-                    lat_deg=lat, lon_deg=lon, alt_m=alt,
-                    position_sigma_m=sigma_3d,
-                    worst_sigma_m=nm_sigma,
-                    reached_anchored=self._ape_sm.reached_anchored,
-                )
-                if filt.x.shape[0] > ztd_idx:
-                    peer_publisher.publish_ztd(
-                        ztd_m=float(filt.x[ztd_idx]),
-                        ztd_sigma_mm=int(round(dztd_sigma_mm)),
-                    )
-                if self._last_tide_3d_mm is not None:
-                    peer_publisher.publish_tide(
-                        total_mm=int(round(self._last_tide_3d_mm)),
-                        u_mm=int(round(self._last_tide_up_mm)),
-                    )
-                # SV state snapshot piggybacks the AntPosEst cadence.
-                # Adopts the same name convention (uppercase enum value)
-                # peppar-mon already parses.
-                sv_states_snapshot = {
-                    sv: rec.state.name
-                    for sv, rec in self._sv_state.all_records()
-                }
-                peer_publisher.publish_sv_state(
-                    sv_states=sv_states_snapshot,
-                    nl_capable="".join(sorted(
-                        getattr(self, '_nl_capable_constellations', set()) or set(),
-                    )),
-                )
-                # Fleet consensus diagnostics (logging only in Part 1;
-                # Part 2 wires these into FixSetIntegrityMonitor as
-                # trip conditions).  Cohort medians are pulled via the
-                # peer_subscriber's snapshot of peer state.  Include
-                # self in the median so the cohort always has ≥ 2 when
-                # at least one peer is present.  Per cohort semantics
-                # in docs/fleet-consensus-monitors.md: position cohort
-                # uses antenna_ref; ZTD cohort uses site_ref.
-                import peer_subscriber
-                if peer_subscriber.is_active():
-                    _ant_ref = peer_subscriber.get_local_antenna_ref()
-                    _site_ref = peer_subscriber.get_local_site_ref()
-                    _ztd_m = (float(filt.x[ztd_idx])
-                              if filt.x.shape[0] > ztd_idx else None)
-                    _self_snap = peer_subscriber.build_self_snapshot(
-                        antenna_ref=_ant_ref, site_ref=_site_ref,
-                        lat_deg=lat, lon_deg=lon, alt_m=alt,
-                        ztd_m=_ztd_m,
-                    )
-                    _pos_med = (peer_subscriber.cohort_median_position(
-                                    _ant_ref, self_snapshot=_self_snap)
-                                if _ant_ref else None)
-                    _ztd_med = (peer_subscriber.cohort_median_ztd(
-                                    _site_ref, self_snapshot=_self_snap)
-                                if _site_ref else None)
-                    if _pos_med is not None or _ztd_med is not None:
-                        from peppar_bus.cohort import ecef_distance_m
-                        parts = []
-                        if _pos_med is not None:
-                            med_lat, med_lon, med_alt, n_pos = _pos_med
-                            dh, d3 = ecef_distance_m(
-                                lat, lon, alt,
-                                med_lat, med_lon, med_alt,
-                            )
-                            parts.append(
-                                f"pos_cohort_n={n_pos} "
-                                f"Δh={dh * 1000:.0f}mm Δ3d={d3 * 1000:.0f}mm")
-                        if _ztd_med is not None and _ztd_m is not None:
-                            med_ztd, n_ztd = _ztd_med
-                            delta_mm = (_ztd_m - med_ztd) * 1000.0
-                            parts.append(
-                                f"ztd_cohort_n={n_ztd} "
-                                f"Δztd={delta_mm:+.1f}mm")
-                        if parts:
-                            log.info("  [COHORT] %s", "  ".join(parts))
-                # Full-precision NAV2 log line.  NAV2-PVT's native format is
-                # LLA; lat/lon at 1e-7 deg (~1 cm resolution at our latitude)
-                # and height in mm.  Deriving ECEF from LLA doesn't add
-                # precision, so we emit LLA directly.  Post-hoc analysis of
-                # the cross-host NAV2 ensemble (three F9Ts on the shared
-                # antenna) uses these lines; each log entry is self-
-                # contained so an aligner can join by timestamp.
-                if nav2_opinion is not None:
-                    h_acc = nav2_opinion.get('h_acc_m')
-                    v_acc = nav2_opinion.get('v_acc_m')
-                    pdop = nav2_opinion.get('pdop')
-                    log.info(
-                        "  [NAV2 %d] lat=%.7f lon=%.7f alt=%.3fm "
-                        "hAcc=%s vAcc=%s pDOP=%s fix=%s sv=%d age=%.1fs",
-                        self._n_epochs,
-                        nav2_opinion['lat'],
-                        nav2_opinion['lon'],
-                        nav2_opinion['alt_m'],
-                        f"{h_acc:.3f}m" if h_acc is not None else "n/a",
-                        f"{v_acc:.3f}m" if v_acc is not None else "n/a",
-                        f"{pdop:.2f}" if pdop is not None else "n/a",
-                        nav2_opinion.get('fix_type', '?'),
-                        nav2_opinion.get('num_sv', 0),
-                        nav2_opinion.get('age_s', 0.0),
-                    )
-
-            # Periodic SV-state summary (replaces the old PFR per-SV
-            # residual dump).  Emits a one-line histogram of states at
-            # the same cadence; per-SV residual detail lives in the
-            # [SV_STATE] transition log and the monitor event logs.
-            if self._n_epochs % 60 == 0 and self._n_epochs > 0:
-                log.info("  %s", self._sv_state.summary())
-
+            self._process_epoch(gps_time, observations, obs_counts)
         log.info("AntPosEstThread stopped after %d epochs", self._n_epochs)
 
 
