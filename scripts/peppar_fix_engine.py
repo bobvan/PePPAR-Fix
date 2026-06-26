@@ -10025,6 +10025,10 @@ def run(args):
     if _raw_bundle is not None:
         import atexit
         atexit.register(_raw_bundle.close)
+        # Periodic flush bounds crash/power-loss loss to the unflushed tail on
+        # long gt captures (atexit only covers clean exit).
+        _raw_bundle.start_flusher(
+            interval_s=float(getattr(args, 'raw_capture_flush_s', 5.0)))
         log.info("raw-capture bundle → %s", args.raw_capture_dir)
 
     # Start NTRIP threads (tapped into the raw-capture bundle when set)
@@ -12220,6 +12224,11 @@ Two-phase operation:
                            "Taps UBX (RAWX/SFRBX/NAV-*/TIM-TP), RTCM SSR, "
                            "broadcast eph, and TICC chA/chB lines.  Write to "
                            "gt/RAIDZ (not lab eMMC/SD) for long captures.")
+    ticc.add_argument("--raw-capture-flush-s", type=float, default=5.0,
+                      help="Periodic flush interval (s) for --raw-capture-dir, "
+                           "bounding crash/power-loss loss to the unflushed "
+                           "tail (read is truncation-safe).  0 disables.  "
+                           "Default 5.")
     ticc.add_argument("--r-calibration", default=None,
                       help="Path to a per-host R-calibration TOML "
                            "(produced by scripts/peppar_fix/fit_r_"
