@@ -78,6 +78,42 @@ class TestTroParse(unittest.TestCase):
         self.assertAlmostEqual(pts[0].ztd_m, 2.4516, places=6)
         self.assertAlmostEqual(pts[0].sigma_ztd_m, 0.0012, places=6)
 
+    def test_solution_fields_continuation_does_not_clobber_trotot(self):
+        # TROTOT in _1, a _2 continuation must not reset the indices to default
+        text = _TRO.replace(
+            "SOLUTION_FIELDS_1             TROTOT STDDEV TGNTOT STDDEV TGETOT STDDEV",
+            "SOLUTION_FIELDS_1             TROTOT STDDEV TGNTOT STDDEV\n"
+            " SOLUTION_FIELDS_2             TGETOT STDDEV")
+        pts = tro.parse_tro_lines(text.splitlines())
+        self.assertEqual(len(pts), 3)
+        self.assertAlmostEqual(pts[0].ztd_m, 2.4516, places=6)  # still TROTOT col
+        self.assertAlmostEqual(pts[0].sigma_ztd_m, 0.0012, places=6)
+
+    def test_trotot_in_second_continuation_line(self):
+        # TROTOT lands in _2 → absolute index across accumulated fields; the
+        # following STDDEV (also in _2) must resolve too
+        text = _TRO.replace(
+            "SOLUTION_FIELDS_1             TROTOT STDDEV TGNTOT STDDEV TGETOT STDDEV",
+            "SOLUTION_FIELDS_1             TGNTOT STDDEV\n"
+            " SOLUTION_FIELDS_2             TROTOT STDDEV").replace(
+            " ABCD 26:001:00000 2451.6    1.2   -0.4    0.3    0.1    0.3",
+            " ABCD 26:001:00000   -0.4    0.3 2451.6    1.2").replace(
+            " ABCD 26:001:00300 2452.0    1.1   -0.3    0.3    0.2    0.3",
+            " ABCD 26:001:00300   -0.3    0.3 2452.0    1.1").replace(
+            " ABCD 26:001:00600 2453.4    1.0   -0.2    0.3    0.2    0.3",
+            " ABCD 26:001:00600   -0.2    0.3 2453.4    1.0")
+        pts = tro.parse_tro_lines(text.splitlines())
+        self.assertAlmostEqual(pts[0].ztd_m, 2.4516, places=6)
+        self.assertAlmostEqual(pts[0].sigma_ztd_m, 0.0012, places=6)
+
+    def test_block_present_without_trotot_skips_rows(self):
+        # a SOLUTION_FIELDS block that names no TROTOT must NOT mis-read col 0
+        text = _TRO.replace(
+            "SOLUTION_FIELDS_1             TROTOT STDDEV TGNTOT STDDEV TGETOT STDDEV",
+            "SOLUTION_FIELDS_1             TGNTOT STDDEV TGETOT STDDEV")
+        pts = tro.parse_tro_lines(text.splitlines())
+        self.assertEqual(pts, [])     # skipped, not mislabeled
+
     def test_ignores_lines_outside_solution_block(self):
         # a stray data-looking line in TROP/DESCRIPTION must not parse
         pts = tro.parse_tro_lines(_TRO.splitlines())

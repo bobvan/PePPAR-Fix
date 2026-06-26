@@ -36,6 +36,11 @@ product's epochs are actually UTC rather than GPS, the residual is a constant
 ~18 s lag — absorbed by ``compare_ztd``'s offset removal and negligible
 against ZTD's slow variation.  ``time_offset_s`` is exposed for an explicit
 correction if a product ever needs it.
+
+TODO (provenance, not correctness): confirm against a real CSRS-PPP ``.tro``
+whether its solution epochs are GPS or UTC, so the default ``time_offset_s=0``
+is *known* correct rather than assumed.  No such file is in-tree yet; the
+magnitude impact is sub-ZTD-slope either way (see above).
 """
 from __future__ import annotations
 
@@ -100,7 +105,9 @@ def iter_tro_ztd(lines: Iterable[str], *, site: Optional[str] = None,
     """
     want = site.upper() if site else None
     in_solution = False
-    ti, si = None, None           # column indices from SOLUTION_FIELDS
+    fields_seen = False           # any SOLUTION_FIELDS line seen
+    field_names = []              # accumulated across SOLUTION_FIELDS_1/_2/...
+    ti, si = None, None           # TROTOT + following-STDDEV column indices
     for raw in lines:
         ln = raw.rstrip("\n")
         stripped = ln.strip()
@@ -111,8 +118,13 @@ def iter_tro_ztd(lines: Iterable[str], *, site: Optional[str] = None,
             in_solution = False
             continue
         if stripped.upper().startswith("SOLUTION_FIELDS"):
-            # 'SOLUTION_FIELDS_1   TROTOT STDDEV ...' → field names after the key
-            ti, si = _solution_field_indices(stripped.split()[1:])
+            # 'SOLUTION_FIELDS_1 TROTOT STDDEV ...' (+ optional _2 continuation).
+            # ACCUMULATE field names across continuation lines and recompute
+            # from the full list, so a _2 line can't clobber a TROTOT found in
+            # _1 (and TROTOT-in-_1 / STDDEV-in-_2 still resolves).
+            fields_seen = True
+            field_names.extend(stripped.split()[1:])
+            ti, si = _solution_field_indices(field_names)
             continue
         if not in_solution or not stripped or stripped.startswith("*"):
             continue
@@ -125,8 +137,12 @@ def iter_tro_ztd(lines: Iterable[str], *, site: Optional[str] = None,
         t_s = _parse_tro_epoch(epoch_str, time_offset_s=time_offset_s)
         if t_s is None:
             continue
-        # Resolve columns: SOLUTION_FIELDS if seen, else CSRS-PPP default
-        # (TROTOT then STDDEV as the first two value columns).
+        # Resolve columns.  A SOLUTION_FIELDS block that named no TROTOT must
+        # NOT silently fall through to column 0 (a plausible-but-wrong label);
+        # skip instead.  Only with NO block at all do we use the CSRS-PPP
+        # default (TROTOT then STDDEV as the first two value columns).
+        if fields_seen and ti is None:
+            continue
         _ti = ti if ti is not None else 0
         _si = si if (ti is not None) else 1
         if _ti >= len(values):

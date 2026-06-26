@@ -201,6 +201,11 @@ def compare_ztd(our, truth, *, k_sigma: float = 3.0, window: int = 120,
     the **detrended** residual: a *growing* detrended residual is a real
     time-varying departure the DivergenceMonitor flags; a steady offset is not.
     Align by nearest truth point within ``align_tol_s``.
+
+    NOTE: ``align_tol_s`` only bites when ``truth`` is a *raw* (non-interpolated)
+    series.  The CLI path runs ``interpolate_ztd`` first, putting truth on our
+    exact timestamps, so every pair aligns with ``d=0`` and the tolerance is
+    moot there — it exists for callers comparing two natively-sampled series.
     """
     import bisect
     import statistics
