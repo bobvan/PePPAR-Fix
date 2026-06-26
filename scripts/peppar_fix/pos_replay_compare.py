@@ -86,7 +86,7 @@ def compare_position(rows, truth: StaticTruth, *, k_sigma: float = 3.0,
     mon = DivergenceMonitor(k_sigma=k_sigma, window=window)
     tx, ty, tz = truth.ecef_m
     errors, sigmas = [], []
-    for i, r in enumerate(rows):
+    for r in rows:
         dx = r.ecef_m[0] - tx
         dy = r.ecef_m[1] - ty
         dz = r.ecef_m[2] - tz
@@ -96,9 +96,12 @@ def compare_position(rows, truth: StaticTruth, *, k_sigma: float = 3.0,
             sig = math.sqrt(sig * sig + truth.sigma_m * truth.sigma_m)
         errors.append(err)
         sigmas.append(sig)
-        mon.update(i, err, sig)
+        # report the ACTUAL engine epoch (greppable in the log), not the row
+        # index — detection is index-relative, so this is reporting-only.
+        mon.update(r.epoch, err, sig)
     return {
         "n": len(rows),
+        "window": window,
         "errors_m": errors,
         "sigmas_m": sigmas,
         "final_error_m": errors[-1] if errors else None,
@@ -139,12 +142,20 @@ def main():
     v = res["verdict"]
     print(f"[PPP_STATE] rows: {res['n']}")
     if res["final_error_m"] is not None:
+        _fs = res["final_sigma_m"] or 0.0
+        _ratio = f"{res['final_error_m'] / _fs:.2f}" if _fs > 0 else "n/a (σ=0)"
         print(f"final error: {res['final_error_m']:.3f} m  "
-              f"σ: {res['final_sigma_m']:.3f} m  "
-              f"err/σ: {res['final_error_m'] / res['final_sigma_m']:.2f}")
-    print("verdict: " + (f"DIVERGED @ epoch {v['fired_epoch']} "
-                         "(confident, wrong, and growing — no point continuing)"
-                         if v["fired"] else "stayed in corridor"))
+              f"σ: {res['final_sigma_m']:.3f} m  err/σ: {_ratio}")
+    if res["n"] < res["window"]:
+        # the monitor needs a full window before it can fire — fewer rows than
+        # that always reads "in corridor", which would be false reassurance.
+        print(f"verdict: INCONCLUSIVE — {res['n']} rows < window={res['window']}"
+              " (too short for the divergence monitor to fire)")
+    else:
+        print("verdict: " + (
+            f"DIVERGED @ epoch {v['fired_epoch']} "
+            "(confident, wrong, and growing — no point continuing)"
+            if v["fired"] else "stayed in corridor"))
 
 
 if __name__ == "__main__":
