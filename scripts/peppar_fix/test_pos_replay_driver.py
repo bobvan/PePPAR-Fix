@@ -199,6 +199,58 @@ class TestRtcmApplication(unittest.TestCase):
             self.assertTrue(captured["bias_only"])   # secondary mount = bias-only
 
 
+class TestRunConfig(unittest.TestCase):
+    def test_reads_bias_skip_from_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="2026-01-01T00:00:00+00:00",
+                             conventions={"skip_phase_biases": True,
+                                          "skip_code_biases": False})
+            b.close()
+            cfg = drv.read_run_config(d)
+            self.assertTrue(cfg["skip_phase_biases"])
+            self.assertFalse(cfg["skip_code_biases"])
+            self.assertFalse(cfg["skip_biases"])        # absent → default False
+
+    def test_missing_manifest_defaults_all_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            RawCaptureBundle(d).close()                 # no manifest written
+            cfg = drv.read_run_config(d)
+            self.assertEqual(set(cfg.values()), {False})
+
+    def test_driver_passes_captured_bias_skip_to_router(self):
+        # #237: a capture made with --no-ssr-phase-bias dropped phase biases
+        # LIVE, so replay must drop them too — the flag flows manifest → router.
+        import types
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="2026-01-01T00:00:00+00:00",
+                             conventions={"skip_phase_biases": True})
+            b.record("ssr", b"\xd3rawframe", recv_mono=200.0)
+            b.close()
+            fake_msg = types.SimpleNamespace(identity="1265")
+            seen = {}
+
+            def _fake_route(identity, msg_view, beph, ssr, label, **kw):
+                seen.update(kw)
+                return "skip_phase_bias", None
+
+            with mock.patch("pyrtcm.RTCMReader.parse", return_value=fake_msg), \
+                 mock.patch("realtime_ppp.route_rtcm_message", _fake_route):
+                drv.ReplayDriver(d).run()
+            self.assertTrue(seen.get("skip_phase_biases"))
+            self.assertFalse(seen.get("skip_code_biases"))
+
+    def test_run_config_override_wins(self):
+        with tempfile.TemporaryDirectory() as d:
+            RawCaptureBundle(d).close()
+            r = drv.ReplayDriver(d, run_config={"skip_biases": True,
+                                                "skip_code_biases": False,
+                                                "skip_phase_biases": False})
+            self.assertTrue(r.run_config["skip_biases"])
+
+
 class TestEmptyBundle(unittest.TestCase):
     def test_empty_bundle_is_clean(self):
         with tempfile.TemporaryDirectory() as d:

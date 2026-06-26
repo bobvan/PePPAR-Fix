@@ -242,6 +242,15 @@ def make_raw_capture_bundle(args, systems, log):
                 "known_pos": getattr(args, 'known_pos', '') or '',
                 # sorted → deterministic manifest regardless of set/list input
                 "systems": sorted(systems) if systems else [],
+                # Per-run RTCM bias-skip config (--no-primary-biases /
+                # --no-ssr-code-bias / --no-ssr-phase-bias).  Load-bearing for
+                # replay: a capture made with these dropped biases LIVE, so the
+                # replay must drop them too or its SSRState diverges — and
+                # --verify-deterministic can't catch that (Charlie #237).  The
+                # replay reads these back wholesale (read_run_config).
+                "skip_biases": bool(getattr(args, 'no_primary_biases', False)),
+                "skip_code_biases": bool(getattr(args, 'no_ssr_code_bias', False)),
+                "skip_phase_biases": bool(getattr(args, 'no_ssr_phase_bias', False)),
             },
             notes="pos_replay reference capture (UBX stream)")
     except OSError as exc:

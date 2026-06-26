@@ -96,7 +96,33 @@ class TestRawCaptureBundleSetup(unittest.TestCase):
             self.assertEqual(m["conventions"]["systems"], ["gal", "gps"])
             self.assertEqual(m["conventions"]["known_pos"],
                              "-2730000,-4440000,3975000")
+            # bias-skip flags default False when the args don't set them
+            self.assertFalse(m["conventions"]["skip_biases"])
+            self.assertFalse(m["conventions"]["skip_code_biases"])
+            self.assertFalse(m["conventions"]["skip_phase_biases"])
             self.assertNotEqual(m["software"]["git_rev"], "unknown")
+
+    def test_manifest_records_bias_skip_flags(self):
+        # #237: a --no-ssr-phase-bias run must record it so replay drops phase
+        # biases too (else replayed SSRState diverges from live).
+        import tempfile
+        import tomllib
+        with tempfile.TemporaryDirectory() as d:
+            args = types.SimpleNamespace(
+                raw_capture_dir=d, init_ztd_station="KORD",
+                no_ssr_phase_bias=True, no_primary_biases=False)
+            bundle = eng.make_raw_capture_bundle(
+                args, ["gps"], logging.getLogger("t"))
+            bundle.close()
+            with open(os.path.join(d, "manifest.toml"), "rb") as f:
+                conv = tomllib.load(f)["conventions"]
+            self.assertTrue(conv["skip_phase_biases"])
+            self.assertFalse(conv["skip_biases"])
+
+            # and the replay reads it back wholesale
+            from peppar_fix.pos_replay_driver import read_run_config
+            cfg = read_run_config(d)
+            self.assertTrue(cfg["skip_phase_biases"])
 
 
 if __name__ == "__main__":

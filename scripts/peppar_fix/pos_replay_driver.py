@@ -63,6 +63,35 @@ if _SCRIPTS not in sys.path:
 
 from peppar_fix.raw_capture import merged_records  # noqa: E402
 
+# Per-run engine config the replay must mirror to stay faithful to live (the
+# generalization of the #236-F1 / #237 "a per-run flag must reach replay"
+# lesson — read the run config wholesale instead of one-off-ing each flag).
+# Each entry: manifest [conventions] key → default when absent.
+_BIAS_SKIP_KEYS = ("skip_biases", "skip_code_biases", "skip_phase_biases")
+
+
+def read_run_config(bundle_dir: str) -> dict:
+    """Read the run-config knobs from the bundle's ``manifest.toml`` wholesale.
+
+    Today: the RTCM bias-skip flags (``--no-primary-biases`` /
+    ``--no-ssr-code-bias`` / ``--no-ssr-phase-bias``) the engine recorded in
+    ``[conventions]``.  Missing manifest / missing keys → all False (the engine
+    default).  Returns a dict the driver passes straight to
+    ``route_rtcm_message`` so replay routing matches the captured run.
+    """
+    cfg = {k: False for k in _BIAS_SKIP_KEYS}
+    path = os.path.join(bundle_dir, "manifest.toml")
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            conv = tomllib.load(f).get("conventions", {})
+        for k in _BIAS_SKIP_KEYS:
+            if k in conv:
+                cfg[k] = bool(conv[k])
+    except (OSError, ValueError):
+        pass            # no/garbled manifest → engine defaults (all False)
+    return cfg
+
 
 class VirtualClock:
     """``now_mono`` advanced by the replay stream — the single time source.
@@ -125,10 +154,15 @@ class ReplayDriver:
     """
 
     def __init__(self, bundle_dir: str, *,
-                 build_stores: Optional[Callable[[], dict]] = None):
+                 build_stores: Optional[Callable[[], dict]] = None,
+                 run_config: Optional[dict] = None):
         self.bundle_dir = bundle_dir
         self.clock = VirtualClock()
         self.stores = (build_stores or default_replay_stores)()
+        # Mirror the captured run's RTCM bias-skip config (read from the
+        # manifest unless overridden) so replay SSRState matches live (#237).
+        self.run_config = (run_config if run_config is not None
+                           else read_run_config(bundle_dir))
         self.trace: list = []
         self.counts: dict = defaultdict(int)
 
@@ -165,12 +199,16 @@ class ReplayDriver:
         if msg is None:
             return "rtcm?"
         identity = str(getattr(msg, "identity", ""))
+        # recv_utc=None is the correct determinism choice (no wall-clock); the
+        # apply path (update_from_rtcm + monotonic freshness) never reads it.
         event = RtcmEvent(identity=identity, message=msg, recv_mono=recv_mono,
                           recv_utc=None)
         msg_view = RtcmMessageView(msg, event)
         tag, _detail = route_rtcm_message(
             identity, msg_view, self.stores["beph"], self.stores["ssr"],
-            label=stream, bias_only=(stream == "ssr_bias"))
+            label=stream, bias_only=(stream == "ssr_bias"),
+            # mirror the captured run's bias-skip flags (#237)
+            **self.run_config)
         return f"{stream}:{identity}"
 
     def _dispatch_ubx(self, payload: bytes, recv_mono: float) -> str:
