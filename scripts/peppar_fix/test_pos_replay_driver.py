@@ -24,9 +24,10 @@ def _ubx_nav_clock(itow, clkb):
                       clkD=1, tAcc=2, fAcc=3).serialize()
 
 
-def _ubx_tim_tp(tow_ms, qerr):
+def _ubx_tim_tp(tow_ms, qerr, qerr_invalid=0):
     from pyubx2 import UBXMessage, GET
-    return UBXMessage("TIM", "TIM-TP", GET, towMS=tow_ms, qErr=qerr).serialize()
+    return UBXMessage("TIM", "TIM-TP", GET, towMS=tow_ms, qErr=qerr,
+                      qErrInvalid=qerr_invalid).serialize()
 
 
 def _make_bundle(d):
@@ -102,6 +103,32 @@ class TestReplayDispatch(unittest.TestCase):
             self.assertEqual([e.channel for e in evs], ["chA", "chB"])
             self.assertEqual(evs[0].ref_sec, 0)
             self.assertEqual(evs[0].recv_mono, 100.5)   # captured stamp, not live
+
+    def test_qerr_invalid_filtered_like_live(self):
+        # Charlie #236 F1: a captured qErrInvalid=1 sample must be filtered out
+        # of the deque get() reads, EXACTLY as serial_reader→update() does live
+        # — not appended just because replay omitted the flag.
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.record("ubx", _ubx_tim_tp(900, 1234, qerr_invalid=1),
+                     recv_mono=100.0)
+            b.close()
+            r = drv.ReplayDriver(d); r.run()
+            # invalid sample present in the trace (it was dispatched) ...
+            self.assertIn("TIM-TP", [i for _t, _s, i in r.trace])
+            # ... but NOT in the deque get() reads (filtered, like live)
+            self.assertIsNone(
+                r.stores["qerr"].get(max_age_s=5.0, now_mono=100.5)[0])
+
+    def test_qerr_valid_admitted(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.record("ubx", _ubx_tim_tp(900, 1234, qerr_invalid=0),
+                     recv_mono=100.0)
+            b.close()
+            r = drv.ReplayDriver(d); r.run()
+            self.assertIsNotNone(
+                r.stores["qerr"].get(max_age_s=5.0, now_mono=100.5)[0])
 
     def test_counts(self):
         with tempfile.TemporaryDirectory() as d:

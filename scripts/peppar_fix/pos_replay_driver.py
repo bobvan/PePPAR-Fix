@@ -10,12 +10,25 @@ from the captured stream, each store's state is a *pure function of the bundle*,
 so two replays of one bundle are bit-identical and independent of when they run
 (the precondition for using replay as a regression).
 
-Faithful by construction: it parses each stream with the engine's own decoders
-(``pyubx2.UBXReader``, ``ticc._LINE_RE``) and updates the engine's own store
-classes (``QErrStore``, ``NavClockStore``, ``NavTimeGpsStore``,
-``Nav2PositionStore``, ``TimTm2Store``) via their ``recv_mono=`` ingest path —
-no reimplementation of the parse/correlation logic.  The UBX ``identity → store``
-dispatch mirrors ``realtime_ppp.serial_reader``; keep the two in step.
+Two distinct properties, don't conflate them (Charlie #236):
+
+- **Deterministic** — replay is a pure function of the bundle: same bundle →
+  bit-identical trace + store state, independent of wall-clock.  This is what
+  stage 1 *proves* (``--verify-deterministic`` / the determinism tests).
+- **Faithful to the live engine** — the replayed store state equals what the
+  live engine actually held.  This is *bounded*, not proven: it holds only
+  insofar as the dispatch mirrors ``serial_reader`` EXACTLY.  Note the trap —
+  ``--verify-deterministic`` compares replay-vs-replay, so a dispatch that
+  diverges from live *identically on both runs* stays green; fidelity gaps
+  must be closed by matching ``serial_reader``, not by the determinism check.
+  The qErr-invalid handling is mirrored for exactly this reason; the
+  ``late_edge_filter`` divergence is deliberate and flagged for stage 2.
+
+It parses each stream with the engine's own decoders (``pyubx2.UBXReader``,
+``ticc._LINE_RE``) and updates the engine's own store classes via their
+``recv_mono=`` ingest path — no reimplementation of parse/correlation logic.
+The UBX ``identity → store`` dispatch mirrors ``realtime_ppp.serial_reader``;
+keep the two in step (fidelity depends on it).
 
 **Scope boundary (stage 1 vs stage 2).**  This drives the *virtual-clock-pure*
 stores — the qErr / NAV-CLOCK / NAV-TIMEGPS / TIM-TM2 / NAV-PVT chain whose
@@ -75,6 +88,12 @@ def default_replay_stores() -> dict:
         # disable the late-edge filter so re-feed is a pure passthrough — the
         # filter's trend state would make the store path order-dependent in a
         # way that's about the filter, not the replay determinism under test.
+        # STAGE-2 TODO (Charlie #236 F2): the live engine runs extint WITH a
+        # late-edge filter, so this is a deliberate replay-vs-live divergence.
+        # Once stage 2 feeds the TIM-TM2 arm into the servo to regenerate
+        # [PPP_STATE], it must use the SAME late_edge_filter config the captured
+        # run used (record it in the bundle manifest) or the extint arm won't
+        # match the live filter's state.
         "extint": TimTm2Store(late_edge_filter=None),
         "ticc_events": [],     # accumulated TiccEvents (filter consumes in stage 2)
     }
@@ -129,7 +148,22 @@ class ReplayDriver:
             qerr_ps = getattr(parsed, "qErr", None)
             tow_ms = getattr(parsed, "towMS", None)
             if qerr_ps is not None:
-                s["qerr"].update(qerr_ps, tow_ms, recv_mono=recv_mono)
+                # Mirror serial_reader EXACTLY (incl. the invalid-sample path):
+                # an invalid qErr is filtered out of the deque get() reads, so
+                # omitting qerr_invalid would let a captured-invalid sample
+                # appear in replay though it was dropped live — a replay-vs-live
+                # divergence INVISIBLE to --verify-deterministic (both replays
+                # omit it identically).  F9T TIM fw does set qErrInvalid on
+                # reacquisition, so real captures hit this (Charlie #236 F1).
+                flags = getattr(parsed, "flags", 0)
+                decoded_invalid = getattr(parsed, "qErrInvalid", None)
+                if decoded_invalid is None:
+                    qerr_invalid = bool(flags & 0x10) if isinstance(flags, int) \
+                        else False
+                else:
+                    qerr_invalid = bool(decoded_invalid)
+                s["qerr"].update(qerr_ps, tow_ms, qerr_invalid=qerr_invalid,
+                                 recv_mono=recv_mono)
         elif ident == "NAV2-PVT" and s.get("nav2") is not None:
             s["nav2"].update(parsed, recv_mono=recv_mono)
         elif ident == "NAV-PVT" and s.get("nav_pvt") is not None:
@@ -149,6 +183,11 @@ class ReplayDriver:
         m = _LINE_RE.match(line)
         if not m:
             return "ticc?"
+        # STAGE-2 TODO (Charlie #236 F4): this omits the estimator-derived fields
+        # iter_events populates (correlation_confidence, estimator_residual_s,
+        # queue_remains).  Fine for stage-1 counting; before stage 2 lets the
+        # filter consume these events it must run the recv-estimator over the
+        # replayed (source_time_s, recv_mono) pairs to reconstruct them.
         ev = TiccEvent(channel=m.group(3), ref_sec=int(m.group(1)),
                        ref_ps=int(m.group(2).ljust(12, "0")),
                        recv_mono=recv_mono, raw_line=line)
@@ -172,6 +211,16 @@ class ReplayDriver:
             out["nav_clock"] = s["nav_clock"].get(now_mono=now)
         if s.get("nav_time_gps") is not None:
             out["nav_time_gps"] = s["nav_time_gps"].get(now_mono=now)
+        # nav2/nav_pvt via the non-destructive get_opinion; extint via its
+        # deterministic public counters (consume_latest is destructive) — so the
+        # fingerprint certifies the whole store set, not a subset (Charlie #236 M3).
+        for key in ("nav2", "nav_pvt"):
+            if s.get(key) is not None:
+                out[key] = s[key].get_opinion(now_mono=now)
+        if s.get("extint") is not None:
+            ex = s["extint"]
+            out["extint"] = (ex.n_received, ex.n_dropped_acc_est,
+                             ex.n_dropped_late_edge)
         out["n_ticc_events"] = len(s.get("ticc_events", []))
         return out
 
