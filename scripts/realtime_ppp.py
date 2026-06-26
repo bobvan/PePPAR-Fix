@@ -1131,6 +1131,428 @@ def _emit_nav_time_gps_log(parsed_msg):
              bool(valid & 0x01), bool(valid & 0x02), bool(valid & 0x04))
 
 
+def rawx_to_observations(rawx, systems, ssr, sig_names, sig_lookup,
+                         bds_l1_ref_cycles):
+    """Decode one RXM-RAWX epoch into IF observations (the engine's obs
+    construction, factored out of serial_reader so pos_replay can rebuild the
+    exact (gps_time, observations) the live engine queued — stage 2b,
+    docs/pos-replay-stage2b-plan.md).
+
+    Builds raw_obs from the vectorized rawx arrays, forms the IF combination
+    per dual-freq SV (applying SSR code+phase biases when ``ssr`` is given,
+    incl. the [CB_APPLIED]/[PB_APPLIED]/[PB_STEP]/GF-DIAG diagnostics), and
+    returns ``(observations, raw_obs, n_off_const, n_single)``.  ``sig_names``
+    (driver.signal_names), ``sig_lookup`` and ``bds_l1_ref_cycles`` are the
+    per-receiver signal config serial_reader already built.  Pure transform —
+    no queue, no timing, no filter state; the ssr-internal logging caches are
+    the only side effect (same as live).
+    """
+    numMeas = rawx.numMeas
+    # Build observation set
+    raw_obs = defaultdict(dict)  # sv → role → data
+    for i in range(numMeas):
+        gnss_id = int(rawx.gnssId[i])
+        sig_id = int(rawx.sigId[i])
+
+        sig_name = sig_names.get((gnss_id, sig_id))
+        if sig_name is None or sig_name not in sig_lookup:
+            continue
+
+        _, prefix, role, a1, a2, _ = sig_lookup[sig_name]
+        sv_id = int(rawx.svId[i])
+        sv = f"{prefix}{sv_id:02d}"
+
+        # BDS-2 GEO/IGSO exclusion
+        if prefix == 'C' and sv_id < BDS_MIN_PRN:
+            continue
+
+        pr = float(rawx.prMes[i])
+        cp = float(rawx.cpMes[i])
+        cno = int(rawx.cno[i])
+        lock_ms = float(rawx.locktime[i])
+        pr_valid = bool(rawx.prValid[i])
+        cp_valid = bool(rawx.cpValid[i])
+        half_cyc = bool(rawx.halfCyc[i])
+
+        if not pr_valid:
+            continue
+        if pr < 1e6 or pr > 4e7:
+            continue
+
+        # u-blox F9T quirk: BDS-3 modernized signal cpMes is
+        # reported in L1-reference cycles, not native carrier
+        # cycles.  Legacy BDS-2 signals (B1I, B2I) are in
+        # native cycles.  Confirmed 2026-04-19 on MadHat via
+        # GF-DIAG: cp * λ_native of B2a overshoots the code
+        # pseudorange by factor F_L1/F_B2a ≈ 1.339, producing
+        # unphysical 175 m per-epoch GF jumps that cascaded
+        # into 8.4 km nav2Δ on GAL+BDS runs (see
+        # memory/project_bds_gf_phase_units_bug.md).
+        #
+        # Convert to native cycles so every downstream
+        # consumer (GF slip detector, MW wide-lane, IF
+        # ambiguity, integer resolution) sees the physical
+        # quantity it was designed for.
+        if cp is not None and cp_valid and sig_name in bds_l1_ref_cycles:
+            # cp_native = cp_L1 * (f_native / f_L1)
+            #           = cp_L1 * λ_L1 / λ_native
+            cp *= _LAMBDA_L1 / SIG_WAVELENGTH[sig_name]
+
+        raw_obs[sv][role] = {
+            'pr': pr, 'cno': cno,
+            'cp': cp if cp_valid else None,
+            'lock_ms': lock_ms or 0.0,
+            'half_cyc': half_cyc,
+            'alpha_f1': a1, 'alpha_f2': a2,
+            'sig_name': sig_name,
+        }
+
+    # Form IF observations
+    observations = []
+    # Counters for the [OBS_COUNTS] emit downstream
+    # (peppar_fix_engine.py reads them off the
+    # ObservationEvent).  Per dayplan I-143806-main.
+    n_off_const = 0
+    n_single = 0
+    PREFIX_TO_SYS = {'G': 'gps', 'E': 'gal', 'C': 'bds'}
+    for sv, roles in raw_obs.items():
+        prefix = sv[0]
+        sys_name = PREFIX_TO_SYS.get(prefix)
+
+        # System filter
+        if systems and sys_name not in systems:
+            n_off_const += 1
+            continue
+
+        if 'f1' not in roles or 'f2' not in roles:
+            # Single-frequency only — PR-only contributor;
+            # invisible to MW/IF math but counted as
+            # 'Tracking' in the peppar-mon column.  We
+            # only count this for in-constellation SVs;
+            # off-constellation SVs are already accounted.
+            n_single += 1
+            continue
+        f1 = roles['f1']
+        f2 = roles['f2']
+        if f1['cp'] is None or f2['cp'] is None:
+            continue
+        # Half-cycle ambiguity check
+        if not f1['half_cyc'] or not f2['half_cyc']:
+            continue
+
+        a1 = f1['alpha_f1']
+        a2 = f1['alpha_f2']
+
+        pr_f1 = f1['pr']
+        pr_f2 = f2['pr']
+        cp_f1 = f1['cp']
+        cp_f2 = f2['cp']
+
+        # RINEX signal codes for SSR bias lookup
+        rinex_f1 = SIG_TO_RINEX.get(f1['sig_name'])
+        rinex_f2 = SIG_TO_RINEX.get(f2['sig_name'])
+
+        # Apply SSR code biases before IF combination
+        if ssr is not None and rinex_f1 and rinex_f2:
+            cb_f1 = ssr.get_code_bias(sv, rinex_f1[0])
+            cb_f2 = ssr.get_code_bias(sv, rinex_f2[0])
+            if cb_f1 is not None and cb_f2 is not None:
+                pr_f1 -= cb_f1
+                pr_f2 -= cb_f2
+            # Symmetric diagnostic to phase-bias lookup below:
+            # log once per (sv, f1_sig, f2_sig) whether both
+            # code biases are available.  Atomic application
+            # means a single miss leaves the IF pseudorange
+            # uncorrected — this is the mode that bit L5 hosts
+            # on WHU and is a prime suspect for the ptpmon L2
+            # drift.
+            if not hasattr(ssr, '_cb_lookup_logged'):
+                ssr._cb_lookup_logged = {}
+            if not hasattr(ssr, '_cb_lookup_heartbeat'):
+                ssr._cb_lookup_heartbeat = {}
+            # Key by (sv, f1_sig, f2_sig); value snapshot
+            # includes cb VALUES (rounded to mm) AND src_mount
+            # so we re-emit whenever the publisher's bias
+            # updates OR the source mount flips (e.g. dual-mount
+            # CNES↔WHU last-write-wins flip).  Critical for
+            # WHU stepwise bringup (I-122350 / I-003751): per-SV
+            # per-signal applied bias-value with source attribution
+            # is the diff signal we need.  See
+            # docs/ssr-cross-ac-diagnostic-2026-04-25.md.
+            lk_cb = (sv, f1['sig_name'], f2['sig_name'])
+            avail_cb = tuple(sorted(ssr._code_bias.get(sv, {}).keys()))
+            cb_f1_q = round(cb_f1, 3) if cb_f1 is not None else None
+            cb_f2_q = round(cb_f2, 3) if cb_f2 is not None else None
+            cb_f1_src = (ssr._code_bias.get(sv, {}).get(rinex_f1[0]).src_mount
+                         if cb_f1 is not None else None)
+            cb_f2_src = (ssr._code_bias.get(sv, {}).get(rinex_f2[0]).src_mount
+                         if cb_f2 is not None else None)
+            snap = (cb_f1_q, cb_f2_q, cb_f1_src, cb_f2_src, avail_cb)
+            # Heartbeat: re-emit every 60th invocation per-key
+            # even if value unchanged, so steady-state biases
+            # are visible in the log for diff/replay analysis
+            # (Bravo's spec on I-122350 review).
+            hb_count = ssr._cb_lookup_heartbeat.get(lk_cb, 0) + 1
+            ssr._cb_lookup_heartbeat[lk_cb] = hb_count
+            is_change = ssr._cb_lookup_logged.get(lk_cb) != snap
+            is_heartbeat = (hb_count % 60) == 0
+            if is_change or is_heartbeat:
+                log.info(
+                    "[CB_APPLIED] %s f1=%s→%s val=%sm src=%s "
+                    "f2=%s→%s val=%sm src=%s avail=%s%s",
+                    sv, f1['sig_name'], rinex_f1[0],
+                    f"{cb_f1:+.3f}" if cb_f1 is not None else "MISS",
+                    cb_f1_src or "?",
+                    f2['sig_name'], rinex_f2[0],
+                    f"{cb_f2:+.3f}" if cb_f2 is not None else "MISS",
+                    cb_f2_src or "?",
+                    list(avail_cb),
+                    " hb" if (is_heartbeat and not is_change) else "")
+                ssr._cb_lookup_logged[lk_cb] = snap
+
+        # Apply SSR phase biases before IF combination.
+        # Phase biases make float ambiguities integer-valued,
+        # enabling PPP-AR.  Requires a single-AC SSR source
+        # (e.g., CAS SSRA01CAS1).  Combined IGS streams have
+        # no phase biases (bias = 0, no effect).
+        wl_f1 = SIG_WAVELENGTH[f1['sig_name']]
+        wl_f2 = SIG_WAVELENGTH[f2['sig_name']]
+        # AR phase-bias availability: only true when BOTH signals
+        # of the IF combination have matched phase biases in the
+        # active SSR stream(s).  A single-signal match produces
+        # a biased IF ambiguity — the short-term promoter in
+        # ppp_ar.py uses this flag to exclude such SVs from
+        # integer-fix candidacy (they still contribute PR for
+        # geometry).  Defaults False when ssr is absent.
+        ar_phase_bias_ok = False
+        phase_bias_stepped = False
+        if ssr is not None and rinex_f1 and rinex_f2:
+            # Phase biases are indexed by code signal identifier
+            # in SSR (e.g., 'C1C' not 'L1C') — try both
+            pb_f1 = (ssr.get_phase_bias(sv, rinex_f1[1]) or
+                     ssr.get_phase_bias(sv, rinex_f1[0]))
+            pb_f2 = (ssr.get_phase_bias(sv, rinex_f2[1]) or
+                     ssr.get_phase_bias(sv, rinex_f2[0]))
+            # Path A bias-step detection (see
+            # docs/ssr-phase-bias-step-handling.md).  Compare
+            # current bias (meters) to the previously-applied
+            # value for the same (SV, sig); convert delta to
+            # cycles via wavelength; flag when |Δ| > 0.5 cyc.
+            # Flag rides on the obs dict to suppress a single
+            # MW-jump check at the slip detector — preserves
+            # MW WL-fix state across the AC's segment boundary
+            # while preventing the false-positive slip storm
+            # that destabilized day0426 smoke runs (E11/E12/
+            # E36 mw=5-7c with lock=64.5s, gf<1cm).
+            if not hasattr(ssr, '_pb_prev_value'):
+                ssr._pb_prev_value = {}
+            if not hasattr(ssr, '_pb_prev_disc'):
+                ssr._pb_prev_disc = {}
+            # Path B detection: compare IGS-SSR IDF031
+            # discontinuity counter against prior epoch's
+            # value.  AC increments on segment boundary
+            # (yaw maneuver, datum change, integer rollover).
+            # Catches sub-threshold AC-driven drift that
+            # Path A's |Δ|>0.5 cyc test misses.  Both
+            # triggers OR together — flag set on either
+            # condition.
+            disc_f1 = ssr.get_phase_bias_disc(
+                sv, rinex_f1[1]) if (
+                ssr is not None and rinex_f1) else None
+            if disc_f1 is None and rinex_f1:
+                disc_f1 = ssr.get_phase_bias_disc(
+                    sv, rinex_f1[0])
+            disc_f2 = ssr.get_phase_bias_disc(
+                sv, rinex_f2[1]) if (
+                ssr is not None and rinex_f2) else None
+            if disc_f2 is None and rinex_f2:
+                disc_f2 = ssr.get_phase_bias_disc(
+                    sv, rinex_f2[0])
+            if pb_f1 is not None:
+                prev = ssr._pb_prev_value.get((sv, 'f1'))
+                if prev is not None and wl_f1:
+                    if abs((pb_f1 - prev) / wl_f1) > 0.5:
+                        phase_bias_stepped = True  # Path A
+                ssr._pb_prev_value[(sv, 'f1')] = pb_f1
+            if disc_f1 is not None:
+                prev_disc = ssr._pb_prev_disc.get(
+                    (sv, 'f1'))
+                if (prev_disc is not None
+                        and disc_f1 != prev_disc):
+                    phase_bias_stepped = True  # Path B
+                ssr._pb_prev_disc[(sv, 'f1')] = disc_f1
+            if pb_f2 is not None:
+                prev = ssr._pb_prev_value.get((sv, 'f2'))
+                if prev is not None and wl_f2:
+                    if abs((pb_f2 - prev) / wl_f2) > 0.5:
+                        phase_bias_stepped = True  # Path A
+                ssr._pb_prev_value[(sv, 'f2')] = pb_f2
+            if disc_f2 is not None:
+                prev_disc = ssr._pb_prev_disc.get(
+                    (sv, 'f2'))
+                if (prev_disc is not None
+                        and disc_f2 != prev_disc):
+                    phase_bias_stepped = True  # Path B
+                ssr._pb_prev_disc[(sv, 'f2')] = disc_f2
+            if pb_f1 is not None:
+                cp_f1 -= pb_f1 / wl_f1  # meters → cycles
+            if pb_f2 is not None:
+                cp_f2 -= pb_f2 / wl_f2
+            ar_phase_bias_ok = (pb_f1 is not None
+                                and pb_f2 is not None)
+            if phase_bias_stepped:
+                log.info(
+                    "[PB_STEP] %s phase-bias segment boundary "
+                    "(suppressing MW jump check this epoch)",
+                    sv)
+            # Phase-bias diagnostic: log VALUES on every
+            # change, not just first occurrence.  Lets the
+            # cross-AC compare pick up CNES vs WHU value
+            # differences per (SV, signal) over time.  See
+            # docs/ssr-cross-ac-diagnostic-2026-04-25.md.
+            if not hasattr(ssr, '_pb_lookup_logged'):
+                ssr._pb_lookup_logged = {}
+            if not hasattr(ssr, '_pb_lookup_heartbeat'):
+                ssr._pb_lookup_heartbeat = {}
+            lk = (sv, f1['sig_name'], f2['sig_name'])
+            avail_pb = tuple(sorted(ssr._phase_bias.get(sv, {}).keys()))
+            pb_f1_q = round(pb_f1, 3) if pb_f1 is not None else None
+            pb_f2_q = round(pb_f2, 3) if pb_f2 is not None else None
+            # Source-mount tagging: phase biases are looked up
+            # by code-signal first then phase-signal; reflect
+            # the actual applied value's source.  Per I-122350
+            # P1 / I-003751 stepwise bringup: cross-mount
+            # last-write-wins is the diagnostic axis we need.
+            def _pb_src(rinex):
+                for k in (rinex[1], rinex[0]):
+                    bc = ssr._phase_bias.get(sv, {}).get(k)
+                    if bc is not None:
+                        return bc.src_mount
+                return None
+            pb_f1_src = _pb_src(rinex_f1) if pb_f1 is not None else None
+            pb_f2_src = _pb_src(rinex_f2) if pb_f2 is not None else None
+            snap_pb = (pb_f1_q, pb_f2_q, pb_f1_src, pb_f2_src, avail_pb)
+            hb_count = ssr._pb_lookup_heartbeat.get(lk, 0) + 1
+            ssr._pb_lookup_heartbeat[lk] = hb_count
+            is_change = ssr._pb_lookup_logged.get(lk) != snap_pb
+            is_heartbeat = (hb_count % 60) == 0
+            if is_change or is_heartbeat:
+                # peppar-mon contract:
+                # peppar_mon/log_reader.py:_PB_APPLIED_RE
+                # parses this format.  HIT vs MISS is
+                # detected from the ``val=...m`` field —
+                # numeric value = HIT, literal "MISS" =
+                # MISS.  peppar-mon latches NL-capable
+                # constellations on first HIT-HIT.
+                # ``src=`` field added 2026-05-02 (P1 of
+                # I-122350); peppar-mon parser tolerates
+                # the additional field.
+                log.info(
+                    "[PB_APPLIED] %s f1=%s→%s val=%sm src=%s "
+                    "f2=%s→%s val=%sm src=%s avail=%s%s",
+                    sv, f1['sig_name'], rinex_f1[0],
+                    f"{pb_f1:+.3f}" if pb_f1 is not None else "MISS",
+                    pb_f1_src or "?",
+                    f2['sig_name'], rinex_f2[0],
+                    f"{pb_f2:+.3f}" if pb_f2 is not None else "MISS",
+                    pb_f2_src or "?",
+                    list(avail_pb),
+                    " hb" if (is_heartbeat and not is_change) else "")
+                ssr._pb_lookup_logged[lk] = snap_pb
+
+        pr_if = a1 * pr_f1 - a2 * pr_f2
+        phi_if_m = a1 * wl_f1 * cp_f1 - a2 * wl_f2 * cp_f2
+
+        # Dual-freq raw-obs diagnostic for the BDS GF blow-up
+        # investigation (2026-04-19).  Logs two consecutive
+        # epochs of raw cp/pr/wl for the FIRST SV of each
+        # constellation, plus a manually-computed GF delta,
+        # so we can see whether the 60–190 m per-epoch GF on
+        # BDS is a unit/wavelength bug or a receiver-side
+        # measurement quirk.  One-shot per (sys, sv) pair.
+        if not hasattr(serial_reader, '_gf_diag'):
+            rawx_to_observations._gf_diag = {}
+        diag = rawx_to_observations._gf_diag
+        key = (sys_name, sv)
+        if key not in diag:
+            diag[key] = {'epoch1': None, 'epoch2': None}
+        slot = diag[key]
+        cp1_raw = f1['cp']
+        cp2_raw = f2['cp']
+        if slot['epoch1'] is None:
+            slot['epoch1'] = (cp1_raw, cp2_raw, wl_f1, wl_f2,
+                              pr_f1, pr_f2, f1['sig_name'],
+                              f2['sig_name'])
+        elif slot['epoch2'] is None:
+            slot['epoch2'] = (cp1_raw, cp2_raw, wl_f1, wl_f2,
+                              pr_f1, pr_f2, f1['sig_name'],
+                              f2['sig_name'])
+            e1 = slot['epoch1']
+            e2 = slot['epoch2']
+            gf1 = e1[0]*e1[2] - e1[1]*e1[3]
+            gf2 = e2[0]*e2[2] - e2[1]*e2[3]
+            d_phi1 = e2[0] - e1[0]
+            d_phi2 = e2[1] - e1[1]
+            d_pr1 = e2[4] - e1[4]
+            d_pr2 = e2[5] - e1[5]
+            log.info(
+                "GF-DIAG %s %s f1=%s(%.4fm) f2=%s(%.4fm) "
+                "cp1=[%.3f→%.3f Δ%.3f cyc] "
+                "cp2=[%.3f→%.3f Δ%.3f cyc] "
+                "pr1_Δ=%.2fm pr2_Δ=%.2fm "
+                "gf1=%.3fm gf2=%.3fm gf_Δ=%.3fm "
+                "expected_gf_Δ_from_phi=%.3fm",
+                sys_name, sv,
+                e1[6], e1[2], e1[7], e1[3],
+                e1[0], e2[0], d_phi1,
+                e1[1], e2[1], d_phi2,
+                d_pr1, d_pr2,
+                gf1, gf2, gf2 - gf1,
+                d_phi1*e1[2] - d_phi2*e1[3])
+        observations.append({
+            'sv': sv,
+            'sys': sys_name,
+            'pr_if': pr_if,
+            'phi_if_m': phi_if_m,
+            'cno': min(f1['cno'], f2['cno']),
+            'lock_duration_ms': min(f1['lock_ms'], f2['lock_ms']),
+            'half_cyc_ok': True,
+            # Per-frequency data for MW wide-lane (PPP-AR).
+            # phi*_cyc is bias-corrected; MW needs that so the
+            # wide-lane integer converges to the right value.
+            'phi1_cyc': cp_f1,
+            'phi2_cyc': cp_f2,
+            # Raw tracking phase BEFORE SSR phase-bias correction.
+            # CycleSlipMonitor's GF detector uses these — SSR
+            # phase-bias integer-indicator updates can step by a
+            # full wavelength, which spoofs gf_jump on bias-
+            # corrected phase (7-SV false-positive slip burst
+            # observed on ptpmon 2026-04-19).
+            'phi1_raw_cyc': f1['cp'],
+            'phi2_raw_cyc': f2['cp'],
+            'pr1_m': pr_f1,
+            'pr2_m': pr_f2,
+            'wl_f1': wl_f1,
+            'wl_f2': wl_f2,
+            # Per-signal lock duration (CycleSlipMonitor attributes
+            # an SV-wide slip to the signal with the lower lock).
+            'f1_lock_ms': f1['lock_ms'],
+            'f2_lock_ms': f2['lock_ms'],
+            'f1_sig_name': f1['sig_name'],
+            'f2_sig_name': f2['sig_name'],
+            'ar_phase_bias_ok': ar_phase_bias_ok,
+            # Set when an SSR phase-bias for this SV stepped
+            # by >0.5 cycles since the previous epoch — the
+            # AC published a new bias-segment.  MW jump
+            # detector skips this epoch to avoid spoofed
+            # multi-cycle slips (Path A; see
+            # docs/ssr-phase-bias-step-handling.md).
+            'phase_bias_stepped': phase_bias_stepped,
+        })
+
+    return observations, raw_obs, n_off_const, n_single
+
+
 def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                    ssr=None, qerr_store=None, config_queue=None, driver=None,
                    raw_callback=None, nav2_store=None, rinex_writer=None,
@@ -1412,408 +1834,9 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                 leapS = rawx.leapS
                 numMeas = rawx.numMeas
 
-                # Build observation set
-                raw_obs = defaultdict(dict)  # sv → role → data
-                for i in range(numMeas):
-                    gnss_id = int(rawx.gnssId[i])
-                    sig_id = int(rawx.sigId[i])
-
-                    sig_name = SIG_NAMES.get((gnss_id, sig_id))
-                    if sig_name is None or sig_name not in sig_lookup:
-                        continue
-
-                    _, prefix, role, a1, a2, _ = sig_lookup[sig_name]
-                    sv_id = int(rawx.svId[i])
-                    sv = f"{prefix}{sv_id:02d}"
-
-                    # BDS-2 GEO/IGSO exclusion
-                    if prefix == 'C' and sv_id < BDS_MIN_PRN:
-                        continue
-
-                    pr = float(rawx.prMes[i])
-                    cp = float(rawx.cpMes[i])
-                    cno = int(rawx.cno[i])
-                    lock_ms = float(rawx.locktime[i])
-                    pr_valid = bool(rawx.prValid[i])
-                    cp_valid = bool(rawx.cpValid[i])
-                    half_cyc = bool(rawx.halfCyc[i])
-
-                    if not pr_valid:
-                        continue
-                    if pr < 1e6 or pr > 4e7:
-                        continue
-
-                    # u-blox F9T quirk: BDS-3 modernized signal cpMes is
-                    # reported in L1-reference cycles, not native carrier
-                    # cycles.  Legacy BDS-2 signals (B1I, B2I) are in
-                    # native cycles.  Confirmed 2026-04-19 on MadHat via
-                    # GF-DIAG: cp * λ_native of B2a overshoots the code
-                    # pseudorange by factor F_L1/F_B2a ≈ 1.339, producing
-                    # unphysical 175 m per-epoch GF jumps that cascaded
-                    # into 8.4 km nav2Δ on GAL+BDS runs (see
-                    # memory/project_bds_gf_phase_units_bug.md).
-                    #
-                    # Convert to native cycles so every downstream
-                    # consumer (GF slip detector, MW wide-lane, IF
-                    # ambiguity, integer resolution) sees the physical
-                    # quantity it was designed for.
-                    if cp is not None and cp_valid and sig_name in bds_l1_ref_cycles:
-                        # cp_native = cp_L1 * (f_native / f_L1)
-                        #           = cp_L1 * λ_L1 / λ_native
-                        cp *= _LAMBDA_L1 / SIG_WAVELENGTH[sig_name]
-
-                    raw_obs[sv][role] = {
-                        'pr': pr, 'cno': cno,
-                        'cp': cp if cp_valid else None,
-                        'lock_ms': lock_ms or 0.0,
-                        'half_cyc': half_cyc,
-                        'alpha_f1': a1, 'alpha_f2': a2,
-                        'sig_name': sig_name,
-                    }
-
-                # Form IF observations
-                observations = []
-                # Counters for the [OBS_COUNTS] emit downstream
-                # (peppar_fix_engine.py reads them off the
-                # ObservationEvent).  Per dayplan I-143806-main.
-                n_off_const = 0
-                n_single = 0
-                PREFIX_TO_SYS = {'G': 'gps', 'E': 'gal', 'C': 'bds'}
-                for sv, roles in raw_obs.items():
-                    prefix = sv[0]
-                    sys_name = PREFIX_TO_SYS.get(prefix)
-
-                    # System filter
-                    if systems and sys_name not in systems:
-                        n_off_const += 1
-                        continue
-
-                    if 'f1' not in roles or 'f2' not in roles:
-                        # Single-frequency only — PR-only contributor;
-                        # invisible to MW/IF math but counted as
-                        # 'Tracking' in the peppar-mon column.  We
-                        # only count this for in-constellation SVs;
-                        # off-constellation SVs are already accounted.
-                        n_single += 1
-                        continue
-                    f1 = roles['f1']
-                    f2 = roles['f2']
-                    if f1['cp'] is None or f2['cp'] is None:
-                        continue
-                    # Half-cycle ambiguity check
-                    if not f1['half_cyc'] or not f2['half_cyc']:
-                        continue
-
-                    a1 = f1['alpha_f1']
-                    a2 = f1['alpha_f2']
-
-                    pr_f1 = f1['pr']
-                    pr_f2 = f2['pr']
-                    cp_f1 = f1['cp']
-                    cp_f2 = f2['cp']
-
-                    # RINEX signal codes for SSR bias lookup
-                    rinex_f1 = SIG_TO_RINEX.get(f1['sig_name'])
-                    rinex_f2 = SIG_TO_RINEX.get(f2['sig_name'])
-
-                    # Apply SSR code biases before IF combination
-                    if ssr is not None and rinex_f1 and rinex_f2:
-                        cb_f1 = ssr.get_code_bias(sv, rinex_f1[0])
-                        cb_f2 = ssr.get_code_bias(sv, rinex_f2[0])
-                        if cb_f1 is not None and cb_f2 is not None:
-                            pr_f1 -= cb_f1
-                            pr_f2 -= cb_f2
-                        # Symmetric diagnostic to phase-bias lookup below:
-                        # log once per (sv, f1_sig, f2_sig) whether both
-                        # code biases are available.  Atomic application
-                        # means a single miss leaves the IF pseudorange
-                        # uncorrected — this is the mode that bit L5 hosts
-                        # on WHU and is a prime suspect for the ptpmon L2
-                        # drift.
-                        if not hasattr(ssr, '_cb_lookup_logged'):
-                            ssr._cb_lookup_logged = {}
-                        if not hasattr(ssr, '_cb_lookup_heartbeat'):
-                            ssr._cb_lookup_heartbeat = {}
-                        # Key by (sv, f1_sig, f2_sig); value snapshot
-                        # includes cb VALUES (rounded to mm) AND src_mount
-                        # so we re-emit whenever the publisher's bias
-                        # updates OR the source mount flips (e.g. dual-mount
-                        # CNES↔WHU last-write-wins flip).  Critical for
-                        # WHU stepwise bringup (I-122350 / I-003751): per-SV
-                        # per-signal applied bias-value with source attribution
-                        # is the diff signal we need.  See
-                        # docs/ssr-cross-ac-diagnostic-2026-04-25.md.
-                        lk_cb = (sv, f1['sig_name'], f2['sig_name'])
-                        avail_cb = tuple(sorted(ssr._code_bias.get(sv, {}).keys()))
-                        cb_f1_q = round(cb_f1, 3) if cb_f1 is not None else None
-                        cb_f2_q = round(cb_f2, 3) if cb_f2 is not None else None
-                        cb_f1_src = (ssr._code_bias.get(sv, {}).get(rinex_f1[0]).src_mount
-                                     if cb_f1 is not None else None)
-                        cb_f2_src = (ssr._code_bias.get(sv, {}).get(rinex_f2[0]).src_mount
-                                     if cb_f2 is not None else None)
-                        snap = (cb_f1_q, cb_f2_q, cb_f1_src, cb_f2_src, avail_cb)
-                        # Heartbeat: re-emit every 60th invocation per-key
-                        # even if value unchanged, so steady-state biases
-                        # are visible in the log for diff/replay analysis
-                        # (Bravo's spec on I-122350 review).
-                        hb_count = ssr._cb_lookup_heartbeat.get(lk_cb, 0) + 1
-                        ssr._cb_lookup_heartbeat[lk_cb] = hb_count
-                        is_change = ssr._cb_lookup_logged.get(lk_cb) != snap
-                        is_heartbeat = (hb_count % 60) == 0
-                        if is_change or is_heartbeat:
-                            log.info(
-                                "[CB_APPLIED] %s f1=%s→%s val=%sm src=%s "
-                                "f2=%s→%s val=%sm src=%s avail=%s%s",
-                                sv, f1['sig_name'], rinex_f1[0],
-                                f"{cb_f1:+.3f}" if cb_f1 is not None else "MISS",
-                                cb_f1_src or "?",
-                                f2['sig_name'], rinex_f2[0],
-                                f"{cb_f2:+.3f}" if cb_f2 is not None else "MISS",
-                                cb_f2_src or "?",
-                                list(avail_cb),
-                                " hb" if (is_heartbeat and not is_change) else "")
-                            ssr._cb_lookup_logged[lk_cb] = snap
-
-                    # Apply SSR phase biases before IF combination.
-                    # Phase biases make float ambiguities integer-valued,
-                    # enabling PPP-AR.  Requires a single-AC SSR source
-                    # (e.g., CAS SSRA01CAS1).  Combined IGS streams have
-                    # no phase biases (bias = 0, no effect).
-                    wl_f1 = SIG_WAVELENGTH[f1['sig_name']]
-                    wl_f2 = SIG_WAVELENGTH[f2['sig_name']]
-                    # AR phase-bias availability: only true when BOTH signals
-                    # of the IF combination have matched phase biases in the
-                    # active SSR stream(s).  A single-signal match produces
-                    # a biased IF ambiguity — the short-term promoter in
-                    # ppp_ar.py uses this flag to exclude such SVs from
-                    # integer-fix candidacy (they still contribute PR for
-                    # geometry).  Defaults False when ssr is absent.
-                    ar_phase_bias_ok = False
-                    phase_bias_stepped = False
-                    if ssr is not None and rinex_f1 and rinex_f2:
-                        # Phase biases are indexed by code signal identifier
-                        # in SSR (e.g., 'C1C' not 'L1C') — try both
-                        pb_f1 = (ssr.get_phase_bias(sv, rinex_f1[1]) or
-                                 ssr.get_phase_bias(sv, rinex_f1[0]))
-                        pb_f2 = (ssr.get_phase_bias(sv, rinex_f2[1]) or
-                                 ssr.get_phase_bias(sv, rinex_f2[0]))
-                        # Path A bias-step detection (see
-                        # docs/ssr-phase-bias-step-handling.md).  Compare
-                        # current bias (meters) to the previously-applied
-                        # value for the same (SV, sig); convert delta to
-                        # cycles via wavelength; flag when |Δ| > 0.5 cyc.
-                        # Flag rides on the obs dict to suppress a single
-                        # MW-jump check at the slip detector — preserves
-                        # MW WL-fix state across the AC's segment boundary
-                        # while preventing the false-positive slip storm
-                        # that destabilized day0426 smoke runs (E11/E12/
-                        # E36 mw=5-7c with lock=64.5s, gf<1cm).
-                        if not hasattr(ssr, '_pb_prev_value'):
-                            ssr._pb_prev_value = {}
-                        if not hasattr(ssr, '_pb_prev_disc'):
-                            ssr._pb_prev_disc = {}
-                        # Path B detection: compare IGS-SSR IDF031
-                        # discontinuity counter against prior epoch's
-                        # value.  AC increments on segment boundary
-                        # (yaw maneuver, datum change, integer rollover).
-                        # Catches sub-threshold AC-driven drift that
-                        # Path A's |Δ|>0.5 cyc test misses.  Both
-                        # triggers OR together — flag set on either
-                        # condition.
-                        disc_f1 = ssr.get_phase_bias_disc(
-                            sv, rinex_f1[1]) if (
-                            ssr is not None and rinex_f1) else None
-                        if disc_f1 is None and rinex_f1:
-                            disc_f1 = ssr.get_phase_bias_disc(
-                                sv, rinex_f1[0])
-                        disc_f2 = ssr.get_phase_bias_disc(
-                            sv, rinex_f2[1]) if (
-                            ssr is not None and rinex_f2) else None
-                        if disc_f2 is None and rinex_f2:
-                            disc_f2 = ssr.get_phase_bias_disc(
-                                sv, rinex_f2[0])
-                        if pb_f1 is not None:
-                            prev = ssr._pb_prev_value.get((sv, 'f1'))
-                            if prev is not None and wl_f1:
-                                if abs((pb_f1 - prev) / wl_f1) > 0.5:
-                                    phase_bias_stepped = True  # Path A
-                            ssr._pb_prev_value[(sv, 'f1')] = pb_f1
-                        if disc_f1 is not None:
-                            prev_disc = ssr._pb_prev_disc.get(
-                                (sv, 'f1'))
-                            if (prev_disc is not None
-                                    and disc_f1 != prev_disc):
-                                phase_bias_stepped = True  # Path B
-                            ssr._pb_prev_disc[(sv, 'f1')] = disc_f1
-                        if pb_f2 is not None:
-                            prev = ssr._pb_prev_value.get((sv, 'f2'))
-                            if prev is not None and wl_f2:
-                                if abs((pb_f2 - prev) / wl_f2) > 0.5:
-                                    phase_bias_stepped = True  # Path A
-                            ssr._pb_prev_value[(sv, 'f2')] = pb_f2
-                        if disc_f2 is not None:
-                            prev_disc = ssr._pb_prev_disc.get(
-                                (sv, 'f2'))
-                            if (prev_disc is not None
-                                    and disc_f2 != prev_disc):
-                                phase_bias_stepped = True  # Path B
-                            ssr._pb_prev_disc[(sv, 'f2')] = disc_f2
-                        if pb_f1 is not None:
-                            cp_f1 -= pb_f1 / wl_f1  # meters → cycles
-                        if pb_f2 is not None:
-                            cp_f2 -= pb_f2 / wl_f2
-                        ar_phase_bias_ok = (pb_f1 is not None
-                                            and pb_f2 is not None)
-                        if phase_bias_stepped:
-                            log.info(
-                                "[PB_STEP] %s phase-bias segment boundary "
-                                "(suppressing MW jump check this epoch)",
-                                sv)
-                        # Phase-bias diagnostic: log VALUES on every
-                        # change, not just first occurrence.  Lets the
-                        # cross-AC compare pick up CNES vs WHU value
-                        # differences per (SV, signal) over time.  See
-                        # docs/ssr-cross-ac-diagnostic-2026-04-25.md.
-                        if not hasattr(ssr, '_pb_lookup_logged'):
-                            ssr._pb_lookup_logged = {}
-                        if not hasattr(ssr, '_pb_lookup_heartbeat'):
-                            ssr._pb_lookup_heartbeat = {}
-                        lk = (sv, f1['sig_name'], f2['sig_name'])
-                        avail_pb = tuple(sorted(ssr._phase_bias.get(sv, {}).keys()))
-                        pb_f1_q = round(pb_f1, 3) if pb_f1 is not None else None
-                        pb_f2_q = round(pb_f2, 3) if pb_f2 is not None else None
-                        # Source-mount tagging: phase biases are looked up
-                        # by code-signal first then phase-signal; reflect
-                        # the actual applied value's source.  Per I-122350
-                        # P1 / I-003751 stepwise bringup: cross-mount
-                        # last-write-wins is the diagnostic axis we need.
-                        def _pb_src(rinex):
-                            for k in (rinex[1], rinex[0]):
-                                bc = ssr._phase_bias.get(sv, {}).get(k)
-                                if bc is not None:
-                                    return bc.src_mount
-                            return None
-                        pb_f1_src = _pb_src(rinex_f1) if pb_f1 is not None else None
-                        pb_f2_src = _pb_src(rinex_f2) if pb_f2 is not None else None
-                        snap_pb = (pb_f1_q, pb_f2_q, pb_f1_src, pb_f2_src, avail_pb)
-                        hb_count = ssr._pb_lookup_heartbeat.get(lk, 0) + 1
-                        ssr._pb_lookup_heartbeat[lk] = hb_count
-                        is_change = ssr._pb_lookup_logged.get(lk) != snap_pb
-                        is_heartbeat = (hb_count % 60) == 0
-                        if is_change or is_heartbeat:
-                            # peppar-mon contract:
-                            # peppar_mon/log_reader.py:_PB_APPLIED_RE
-                            # parses this format.  HIT vs MISS is
-                            # detected from the ``val=...m`` field —
-                            # numeric value = HIT, literal "MISS" =
-                            # MISS.  peppar-mon latches NL-capable
-                            # constellations on first HIT-HIT.
-                            # ``src=`` field added 2026-05-02 (P1 of
-                            # I-122350); peppar-mon parser tolerates
-                            # the additional field.
-                            log.info(
-                                "[PB_APPLIED] %s f1=%s→%s val=%sm src=%s "
-                                "f2=%s→%s val=%sm src=%s avail=%s%s",
-                                sv, f1['sig_name'], rinex_f1[0],
-                                f"{pb_f1:+.3f}" if pb_f1 is not None else "MISS",
-                                pb_f1_src or "?",
-                                f2['sig_name'], rinex_f2[0],
-                                f"{pb_f2:+.3f}" if pb_f2 is not None else "MISS",
-                                pb_f2_src or "?",
-                                list(avail_pb),
-                                " hb" if (is_heartbeat and not is_change) else "")
-                            ssr._pb_lookup_logged[lk] = snap_pb
-
-                    pr_if = a1 * pr_f1 - a2 * pr_f2
-                    phi_if_m = a1 * wl_f1 * cp_f1 - a2 * wl_f2 * cp_f2
-
-                    # Dual-freq raw-obs diagnostic for the BDS GF blow-up
-                    # investigation (2026-04-19).  Logs two consecutive
-                    # epochs of raw cp/pr/wl for the FIRST SV of each
-                    # constellation, plus a manually-computed GF delta,
-                    # so we can see whether the 60–190 m per-epoch GF on
-                    # BDS is a unit/wavelength bug or a receiver-side
-                    # measurement quirk.  One-shot per (sys, sv) pair.
-                    if not hasattr(serial_reader, '_gf_diag'):
-                        serial_reader._gf_diag = {}
-                    diag = serial_reader._gf_diag
-                    key = (sys_name, sv)
-                    if key not in diag:
-                        diag[key] = {'epoch1': None, 'epoch2': None}
-                    slot = diag[key]
-                    cp1_raw = f1['cp']
-                    cp2_raw = f2['cp']
-                    if slot['epoch1'] is None:
-                        slot['epoch1'] = (cp1_raw, cp2_raw, wl_f1, wl_f2,
-                                          pr_f1, pr_f2, f1['sig_name'],
-                                          f2['sig_name'])
-                    elif slot['epoch2'] is None:
-                        slot['epoch2'] = (cp1_raw, cp2_raw, wl_f1, wl_f2,
-                                          pr_f1, pr_f2, f1['sig_name'],
-                                          f2['sig_name'])
-                        e1 = slot['epoch1']
-                        e2 = slot['epoch2']
-                        gf1 = e1[0]*e1[2] - e1[1]*e1[3]
-                        gf2 = e2[0]*e2[2] - e2[1]*e2[3]
-                        d_phi1 = e2[0] - e1[0]
-                        d_phi2 = e2[1] - e1[1]
-                        d_pr1 = e2[4] - e1[4]
-                        d_pr2 = e2[5] - e1[5]
-                        log.info(
-                            "GF-DIAG %s %s f1=%s(%.4fm) f2=%s(%.4fm) "
-                            "cp1=[%.3f→%.3f Δ%.3f cyc] "
-                            "cp2=[%.3f→%.3f Δ%.3f cyc] "
-                            "pr1_Δ=%.2fm pr2_Δ=%.2fm "
-                            "gf1=%.3fm gf2=%.3fm gf_Δ=%.3fm "
-                            "expected_gf_Δ_from_phi=%.3fm",
-                            sys_name, sv,
-                            e1[6], e1[2], e1[7], e1[3],
-                            e1[0], e2[0], d_phi1,
-                            e1[1], e2[1], d_phi2,
-                            d_pr1, d_pr2,
-                            gf1, gf2, gf2 - gf1,
-                            d_phi1*e1[2] - d_phi2*e1[3])
-                    observations.append({
-                        'sv': sv,
-                        'sys': sys_name,
-                        'pr_if': pr_if,
-                        'phi_if_m': phi_if_m,
-                        'cno': min(f1['cno'], f2['cno']),
-                        'lock_duration_ms': min(f1['lock_ms'], f2['lock_ms']),
-                        'half_cyc_ok': True,
-                        # Per-frequency data for MW wide-lane (PPP-AR).
-                        # phi*_cyc is bias-corrected; MW needs that so the
-                        # wide-lane integer converges to the right value.
-                        'phi1_cyc': cp_f1,
-                        'phi2_cyc': cp_f2,
-                        # Raw tracking phase BEFORE SSR phase-bias correction.
-                        # CycleSlipMonitor's GF detector uses these — SSR
-                        # phase-bias integer-indicator updates can step by a
-                        # full wavelength, which spoofs gf_jump on bias-
-                        # corrected phase (7-SV false-positive slip burst
-                        # observed on ptpmon 2026-04-19).
-                        'phi1_raw_cyc': f1['cp'],
-                        'phi2_raw_cyc': f2['cp'],
-                        'pr1_m': pr_f1,
-                        'pr2_m': pr_f2,
-                        'wl_f1': wl_f1,
-                        'wl_f2': wl_f2,
-                        # Per-signal lock duration (CycleSlipMonitor attributes
-                        # an SV-wide slip to the signal with the lower lock).
-                        'f1_lock_ms': f1['lock_ms'],
-                        'f2_lock_ms': f2['lock_ms'],
-                        'f1_sig_name': f1['sig_name'],
-                        'f2_sig_name': f2['sig_name'],
-                        'ar_phase_bias_ok': ar_phase_bias_ok,
-                        # Set when an SSR phase-bias for this SV stepped
-                        # by >0.5 cycles since the previous epoch — the
-                        # AC published a new bias-segment.  MW jump
-                        # detector skips this epoch to avoid spoofed
-                        # multi-cycle slips (Path A; see
-                        # docs/ssr-phase-bias-step-handling.md).
-                        'phase_bias_stepped': phase_bias_stepped,
-                    })
-
+                observations, raw_obs, n_off_const, n_single = \
+                    rawx_to_observations(rawx, systems, ssr, SIG_NAMES,
+                                         sig_lookup, bds_l1_ref_cycles)
                 # Per-epoch admit counters for peppar-mon Untracked /
                 # Tracking / Dual columns.  Partition: raw = untracked +
                 # tracking + dual.
