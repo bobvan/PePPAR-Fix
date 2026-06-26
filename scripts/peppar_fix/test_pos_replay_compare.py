@@ -171,6 +171,68 @@ class TestZtdCompare(unittest.TestCase):
         self.assertAlmostEqual(series[0].ztd_m, 0.07)
 
 
+class TestTotalZtdAssembly(unittest.TestCase):
+    def test_total_is_apriori_plus_residual(self):
+        rows = prc.parse_ppp_state([
+            _ppp_line(1, _TRUTH, 0.1, ztd=0.07,
+                      gps="2026-06-25T12:00:01+00:00")])
+        series = prc.ztd_total_series_from_ppp(rows, apriori_m=2.3)
+        self.assertAlmostEqual(series[0].ztd_m, 2.37, places=6)   # 2.3 + 0.07
+
+    def test_total_default_apriori_is_engine_constant(self):
+        from peppar_fix.saastamoinen import ENGINE_ZTD_APRIORI_M
+        rows = prc.parse_ppp_state([
+            _ppp_line(1, _TRUTH, 0.1, ztd=0.05,
+                      gps="2026-06-25T12:00:01+00:00")])
+        series = prc.ztd_total_series_from_ppp(rows)
+        self.assertAlmostEqual(series[0].ztd_m, ENGINE_ZTD_APRIORI_M + 0.05,
+                               places=6)
+
+    def test_total_skips_rows_without_gps(self):
+        rows = prc.parse_ppp_state([_ppp_line(1, _TRUTH, 0.1, ztd=0.05)])
+        self.assertEqual(prc.ztd_total_series_from_ppp(rows), [])
+
+
+class TestAbsoluteBias(unittest.TestCase):
+    def _pt(self, t, ztd, sig=0.01):
+        return prc.ZtdPoint(t_s=float(t), ztd_m=ztd, sigma_ztd_m=sig)
+
+    def test_large_constant_bias_warns(self):
+        # our_total sits 0.2 m above truth, flat → detrended verdict can't see
+        # it, but the absolute-bias check warns.
+        truth = [self._pt(i, 2.45) for i in range(200)]
+        our = [self._pt(i, 2.65) for i in range(200)]
+        res = prc.compare_ztd(our, truth, abs_bias_warn_m=0.10)
+        self.assertFalse(res["verdict"]["fired"])     # flat → no divergence
+        self.assertTrue(res["abs_bias_warned"])        # but biased
+        self.assertAlmostEqual(res["offset_m"], 0.20, places=6)
+
+    def test_small_bias_does_not_warn(self):
+        truth = [self._pt(i, 2.45) for i in range(200)]
+        our = [self._pt(i, 2.47) for i in range(200)]   # 2 cm, within tol
+        res = prc.compare_ztd(our, truth, abs_bias_warn_m=0.10)
+        self.assertFalse(res["abs_bias_warned"])
+
+    def test_abs_bias_disabled_by_default(self):
+        truth = [self._pt(i, 2.45) for i in range(200)]
+        our = [self._pt(i, 4.75) for i in range(200)]   # huge (residual-style)
+        res = prc.compare_ztd(our, truth)               # no warn arg
+        self.assertFalse(res["abs_bias_warned"])
+
+
+class TestMetarParse(unittest.TestCase):
+    def test_parses_metar_line(self):
+        ln = ("2026-06-25 INFO [METAR] epoch=42 KDPA age=12min T=21.0C "
+              "dewp=10.0C altim=1013.2hPa Pstn=1000.0hPa e=12.3hPa "
+              "ZHD=2.3000m ZWD=0.1500m ZTD=2.4500m")
+        rows = prc.parse_metar([ln, "noise"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].epoch, 42)
+        self.assertAlmostEqual(rows[0].zhd_m, 2.30, places=6)
+        self.assertAlmostEqual(rows[0].zwd_m, 0.15, places=6)
+        self.assertAlmostEqual(rows[0].ztd_m, 2.45, places=6)
+
+
 class TestInterpolateZtd(unittest.TestCase):
     def _pt(self, t, ztd, sig=0.01):
         return prc.ZtdPoint(t_s=float(t), ztd_m=ztd, sigma_ztd_m=sig)
