@@ -6248,6 +6248,33 @@ def _resolve_do_uid(args):
     return None
 
 
+_ACTUATOR_PLUGINS = None
+
+
+def _actuator_plugins():
+    """Load optional out-of-tree frequency-actuator drivers.
+
+    Board-specific ClockMatrix drivers (register maps + steering recipes that
+    are vendor design detail) live in a PRIVATE package, not in this public
+    tree.  A plugin module simply exposes
+    ``ACTUATORS = {name: factory(i2c, dpll_id=..., **params) -> FrequencyActuator}``.
+    This loader is deliberately generic — no hardware knowledge lives here; if
+    no plugin is installed it returns an empty registry and the built-in
+    actuators are used.
+    """
+    global _ACTUATOR_PLUGINS
+    if _ACTUATOR_PLUGINS is None:
+        _ACTUATOR_PLUGINS = {}
+        import importlib
+        for mod in ("peppar_clockmatrix",):   # private lab-repo plugin package
+            try:
+                _ACTUATOR_PLUGINS.update(
+                    getattr(importlib.import_module(mod), "ACTUATORS", {}))
+            except ImportError:
+                pass
+    return _ACTUATOR_PLUGINS
+
+
 def _build_clockmatrix_actuator(cm_i2c, cm_dpll, combo_params):
     """Select the ClockMatrix actuator from the DO's measured characterization.
 
@@ -6255,6 +6282,9 @@ def _build_clockmatrix_actuator(cm_i2c, cm_dpll, combo_params):
       * ``{'combo_gain': g}`` → ``ClockMatrixComboActuator`` (the one-DPLL
         no-wire combo-bus servo — steers DPLL3 via the combo bus while its
         PFD/PHASE_STATUS stays live, so the same DPLL both steers and observes).
+      * ``{'combo_gain': g, 'driver': name}`` → a PRIVATE plugin actuator (e.g.
+        the Mini's DPLL2 combo driver); raises if the named plugin isn't
+        installed on this host.
       * ``None`` → ``ClockMatrixActuator`` (write_freq/FCW — the two-DPLL path:
         steers one DPLL, a separate DPLL measures phase).
 
@@ -6266,6 +6296,17 @@ def _build_clockmatrix_actuator(cm_i2c, cm_dpll, combo_params):
     resolve_combo_actuator_params (it raises) — Bob's no-default-gain rule.
     """
     if combo_params is not None:
+        driver = combo_params.get('driver')
+        if driver:
+            plugins = _actuator_plugins()
+            if driver not in plugins:
+                raise RuntimeError(
+                    "DO config requests ClockMatrix driver %r but no actuator "
+                    "plugin provides it on this host — install the private "
+                    "peppar_clockmatrix package." % driver)
+            act = plugins[driver](cm_i2c, dpll_id=cm_dpll,
+                                  combo_gain=combo_params['combo_gain'])
+            return (act, "clockmatrix_%s" % driver, True)
         from peppar_fix.clockmatrix_combo_actuator import ClockMatrixComboActuator
         return (ClockMatrixComboActuator(cm_i2c, dpll_id=cm_dpll,
                                          combo_gain=combo_params['combo_gain']),
