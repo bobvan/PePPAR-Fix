@@ -171,5 +171,58 @@ class TestZtdCompare(unittest.TestCase):
         self.assertAlmostEqual(series[0].ztd_m, 0.07)
 
 
+class TestInterpolateZtd(unittest.TestCase):
+    def _pt(self, t, ztd, sig=0.01):
+        return prc.ZtdPoint(t_s=float(t), ztd_m=ztd, sigma_ztd_m=sig)
+
+    def test_linear_interp_onto_dense_times(self):
+        # sparse truth at 0 and 300 s; interpolate onto a mid time
+        truth = [self._pt(0, 2.450), self._pt(300, 2.456)]
+        out = prc.interpolate_ztd(truth, [150.0])
+        self.assertEqual(len(out), 1)
+        self.assertAlmostEqual(out[0].ztd_m, 2.453, places=6)  # midpoint
+        self.assertAlmostEqual(out[0].t_s, 150.0)
+
+    def test_exact_time_passes_through(self):
+        truth = [self._pt(0, 2.450), self._pt(300, 2.456)]
+        out = prc.interpolate_ztd(truth, [300.0])
+        self.assertAlmostEqual(out[0].ztd_m, 2.456, places=6)
+
+    def test_outside_span_is_dropped_not_extrapolated(self):
+        truth = [self._pt(100, 2.450), self._pt(400, 2.456)]
+        out = prc.interpolate_ztd(truth, [50.0, 250.0, 500.0])
+        self.assertEqual([round(p.t_s) for p in out], [250])  # only in-span kept
+
+    def test_empty_truth(self):
+        self.assertEqual(prc.interpolate_ztd([], [1.0, 2.0]), [])
+
+    def test_interp_makes_whole_dense_series_usable(self):
+        # 5-min truth, 1 Hz ours: nearest-tol would drop most; interp keeps all
+        truth = [self._pt(300 * i, 2.45 + 0.001 * i) for i in range(5)]   # 0..1200
+        our_t = [float(t) for t in range(0, 1201)]
+        out = prc.interpolate_ztd(truth, our_t)
+        self.assertEqual(len(out), len(our_t))   # every 1 Hz point covered
+
+
+class TestZtdSeriesFromTro(unittest.TestCase):
+    def test_adapts_tro_to_ztdpoints(self):
+        import tempfile
+        text = ("+TROP/SOLUTION\n"
+                "*SITE ____EPOCH___ TROTOT STDDEV\n"
+                " ABCD 26:001:00000 2451.6    1.2\n"
+                " ABCD 26:001:00300 2452.0    1.1\n"
+                "-TROP/SOLUTION\n")
+        with tempfile.NamedTemporaryFile("w", suffix=".tro", delete=False) as f:
+            f.write(text)
+            path = f.name
+        try:
+            series = prc.ztd_series_from_tro(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(len(series), 2)
+        self.assertAlmostEqual(series[0].ztd_m, 2.4516, places=6)
+        self.assertIsInstance(series[0], prc.ZtdPoint)
+
+
 if __name__ == "__main__":
     unittest.main()
