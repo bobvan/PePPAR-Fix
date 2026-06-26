@@ -1252,19 +1252,24 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
 
         try:
             raw, parsed = ubr.read()   # parsing=False → parsed is None
+            # ONE canonical CLOCK_MONOTONIC stamp per UBX frame (milestone-0b):
+            # taken at arrival (earliest point) and used for BOTH the raw
+            # capture AND every store ingest below, so the captured recv_mono
+            # equals the value the live engine correlated with — the property
+            # that makes UBX-side replay bit-identical (pos_replay manifest §2;
+            # drives the now_mono/recv_mono gates of #224).
+            _recv_mono = time.monotonic()
             if ubx_log_file is not None and raw:
                 try:
                     ubx_log_file.write(raw)
                 except (OSError, ValueError):
                     log.warning("--ubx-out write failed; disabling capture")
                     ubx_log_file = None
-            # pos_replay raw-capture tap: record the raw UBX frame + its
-            # CLOCK_MONOTONIC arrival stamp.  This recv_mono defines the
-            # captured timeline a deterministic replay reproduces (manifest
-            # §2; the now_mono/recv_mono gates of #224 are driven from it).
+            # pos_replay raw-capture tap: record the raw UBX frame + the
+            # canonical per-frame recv_mono.
             if raw_bundle is not None and raw:
                 try:
-                    raw_bundle.record("ubx", raw, time.monotonic())
+                    raw_bundle.record("ubx", raw, _recv_mono)
                 except (OSError, ValueError):
                     log.warning("--raw-capture-dir UBX record failed; "
                                 "disabling raw capture")
@@ -1327,7 +1332,8 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                     # update(), but they're useful for accounting in
                     # post-processing.
                     qerr_store.update(qerr_ps, tow_ms,
-                                      qerr_invalid=qerr_invalid)
+                                      qerr_invalid=qerr_invalid,
+                                      recv_mono=_recv_mono)
                 if qerr_invalid:
                     now = time.monotonic()
                     if now - last_qerr_invalid_log > 30.0:
@@ -1339,7 +1345,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
 
             # NAV2-PVT: secondary navigation engine position fix
             if msg_id == 'NAV2-PVT' and nav2_store is not None:
-                nav2_store.update(parsed)
+                nav2_store.update(parsed, recv_mono=_recv_mono)
 
             # NAV-PVT: primary navigation engine position fix.  Captured
             # into a parallel store as the seed fallback for receivers
@@ -1347,7 +1353,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
             # isn't emitting.  Same message structure as NAV2-PVT, so the
             # same store type consumes it.
             if msg_id == 'NAV-PVT' and nav_pvt_store is not None:
-                nav_pvt_store.update(parsed)
+                nav_pvt_store.update(parsed, recv_mono=_recv_mono)
 
             # NAV-SIG: per-(SV, signal) usage verdict from the receiver.
             # Updates Nav2SignalStore + emits structured per-epoch log line
@@ -1355,7 +1361,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
             # Phase A.5 disagreement detector.  Sampled every NAV-SIG
             # epoch (default 1 Hz when CFG-MSGOUT-UBX_NAV_SIG_*=1).
             if msg_id == 'NAV-SIG' and nav_sig_store is not None:
-                nav_sig_store.update_decoded(nav_sig)
+                nav_sig_store.update_decoded(nav_sig, recv_mono=_recv_mono)
                 # Store updates every epoch (gate + disagree detector);
                 # the verbose ~50-line dump is throttled to a periodic
                 # sample to spare the SD/eMMC write life + avoid the
@@ -1368,14 +1374,14 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
             # the chip-slip / command-envelope cascade hypotheses
             # (recoveryRetry-main work item 2).
             if msg_id == 'NAV-CLOCK' and nav_clock_store is not None:
-                nav_clock_store.update(parsed)
+                nav_clock_store.update(parsed, recv_mono=_recv_mono)
                 _emit_nav_clock_log(parsed)
 
             # NAV-TIMEGPS: receiver's GPS time solution (week, leapS,
             # tAcc, valid flags).  Detects receiver-side time-
             # discontinuity events.
             if msg_id == 'NAV-TIMEGPS' and nav_time_gps_store is not None:
-                nav_time_gps_store.update(parsed)
+                nav_time_gps_store.update(parsed, recv_mono=_recv_mono)
                 _emit_nav_time_gps_log(parsed)
 
             # gnss-phase-experiment Arm 3: DO PPS edge time from
@@ -1385,7 +1391,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
             # wired to F9T EXTINT.  No-op when those preconditions
             # don't hold (extint_store is None or no messages arrive).
             if msg_id == 'TIM-TM2' and extint_store is not None:
-                extint_store.update(parsed)
+                extint_store.update(parsed, recv_mono=_recv_mono)
 
             if msg_id == 'RXM-RAWX':
                 # Fire raw callback before IF processing (for NTRIP caster).

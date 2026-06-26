@@ -194,13 +194,18 @@ class TimTm2Store:
         self.n_dropped_late_edge = 0
         self.n_consumed = 0
 
-    def update(self, parsed):
+    def update(self, parsed, recv_mono=None):
         """Push a parsed TIM-TM2 message.
 
         `parsed` must have rising-edge fields:
             wnR, towMsR, towSubMsR, accEst, count, flags
+
+        ``recv_mono`` overrides the ingest stamp (None = live).  Pass the
+        captured per-frame recv_mono when replaying so freshness is a pure
+        function of the captured stream (pos_replay milestone-0b /
+        docs/pos-replay-capture-manifest.md §6).
         """
-        host_mono = time.monotonic()
+        host_mono = time.monotonic() if recv_mono is None else recv_mono
         host_wall = time.time()
         wnR = int(getattr(parsed, "wnR", 0))
         tow_ms = int(getattr(parsed, "towMsR", 0))
@@ -240,7 +245,7 @@ class TimTm2Store:
         with self._lock:
             self._latest = (host_mono, residual_ns, acc_est)
 
-    def consume_latest(self, max_age_s=2.0):
+    def consume_latest(self, max_age_s=2.0, now_mono=None):
         """Return the freshest unconsumed sample as
         (phase_ns, acc_est_ns), or None if none is available or it
         is older than `max_age_s` seconds.
@@ -248,13 +253,17 @@ class TimTm2Store:
         After a successful read, the store returns None on the next
         call until update() is called again.  This keeps the engine
         from feeding the same TIM-TM2 measurement to the EKF twice.
+
+        ``now_mono`` overrides the freshness reference (None = live) —
+        pos_replay milestone-0b virtual clock.
         """
+        now = time.monotonic() if now_mono is None else now_mono
         with self._lock:
             if self._latest is None:
                 return None
             recv_mono, phase_ns, acc_est_ns = self._latest
             self._latest = None
-        if time.monotonic() - recv_mono > max_age_s:
+        if now - recv_mono > max_age_s:
             return None
         self.n_consumed += 1
         return phase_ns, acc_est_ns

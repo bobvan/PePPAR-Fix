@@ -106,5 +106,33 @@ class TestNavStoreAgeNowMono(unittest.TestCase):
         self.assertLess(out["age_s"], 1.0)
 
 
+class TestTimTm2StoreNowMono(unittest.TestCase):
+    """milestone-0b completes the EXTTS store (TimTm2Store) that milestone-0
+    missed: its ingest stamp takes recv_mono and consume_latest's freshness
+    takes now_mono, so capture + live converge on one captured clock."""
+
+    def _store_with_sample(self, recv_mono):
+        from peppar_fix.extint_reader import TimTm2Store
+        s = TimTm2Store(late_edge_filter=None)   # no late-edge rejection
+        parsed = types.SimpleNamespace(wnR=2300, towMsR=1000, towSubMsR=0,
+                                       accEst=10, count=1, flags=0)
+        s.update(parsed, recv_mono=recv_mono)
+        return s
+
+    def test_age_is_pure_in_captured_recv_mono_and_now_mono(self):
+        # ingest stamp from recv_mono + read from now_mono → freshness is a
+        # pure function of captured time, no live clock anywhere.
+        self.assertIsNotNone(
+            self._store_with_sample(200.0).consume_latest(
+                max_age_s=10.0, now_mono=209.0))      # age 9 < 10 → fresh
+        self.assertIsNone(
+            self._store_with_sample(200.0).consume_latest(
+                max_age_s=10.0, now_mono=211.0))      # age 11 > 10 → stale
+
+    def test_default_uses_live_clock(self):
+        s = self._store_with_sample(time.monotonic())
+        self.assertIsNotNone(s.consume_latest(max_age_s=5.0))   # live → fresh
+
+
 if __name__ == "__main__":
     unittest.main()
