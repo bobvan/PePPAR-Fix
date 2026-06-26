@@ -13,9 +13,14 @@ engine under ``--ppp-state-log``) against it.  Two normalizations matter
 (manifest §3): error vs the filter's *own* σ (the false-confidence signal) and,
 optionally, error vs (own-σ ⊕ truth-σ).
 
-The time-varying **ZTD** comparison vs NRCan's external ZTD(t) is the next
-increment (it needs a per-epoch GPS-time key the ``[PPP_STATE]`` line doesn't
-yet carry, and the §5 ZHD/mapping/height/lag conventions).
+The time-varying **ZTD** comparison vs NRCan's external ZTD(t) (manifest §5)
+is also here: ``ztd_series_from_tro`` reads the CSRS-PPP ``.tro`` total ZTD,
+``interpolate_ztd`` puts that ~5-min truth onto our 1 Hz timestamps, and
+``compare_ztd`` removes the constant lag+apriori offset and scores the
+time-varying departure with the same DivergenceMonitor.  Explicit total-ZTD
+assembly (ZHD from ``[METAR]`` + mapping, to compare our *residual* wet ZTD
+against the truth *total* without leaning on offset-removal) is the remaining
+refinement.
 """
 from __future__ import annotations
 
@@ -143,6 +148,48 @@ def ztd_series_from_ppp(rows) -> list:
     return out
 
 
+def ztd_series_from_tro(path, *, site=None, time_offset_s: float = 0.0) -> list:
+    """External *total* ZTD truth series from an NRCan CSRS-PPP ``.tro`` file."""
+    from peppar_fix.nrcan_tro_reader import parse_tro
+    return [ZtdPoint(t_s=p.t_s, ztd_m=p.ztd_m, sigma_ztd_m=p.sigma_ztd_m)
+            for p in parse_tro(path, site=site, time_offset_s=time_offset_s)]
+
+
+def interpolate_ztd(series, at_times_s) -> list:
+    """Linearly interpolate a (sparse) ZTD ``series`` onto ``at_times_s``.
+
+    NRCan ``.tro`` ZTD is ~5-min cadence; our ``[PPP_STATE]`` ZTD is 1 Hz.
+    Nearest-within-tol alignment would use only our points near each 5-min
+    mark and drop the rest (Charlie's #233 Minor 2).  Interpolating the
+    truth onto our timestamps lets the **whole** series be compared, 1:1.
+
+    Points outside the truth's covered span ``[t0, tN]`` are dropped (no
+    extrapolation — a truth value we don't have isn't invented).  σ is
+    interpolated linearly alongside the value.
+    """
+    if not series:
+        return []
+    s = sorted(series, key=lambda p: p.t_s)
+    ts = [p.t_s for p in s]
+    import bisect
+    out = []
+    for t in at_times_s:
+        if t < ts[0] or t > ts[-1]:
+            continue
+        j = bisect.bisect_left(ts, t)
+        if j < len(ts) and ts[j] == t:
+            out.append(ZtdPoint(t_s=t, ztd_m=s[j].ztd_m,
+                                sigma_ztd_m=s[j].sigma_ztd_m))
+            continue
+        a, b = s[j - 1], s[j]                 # bracketing samples (a.t < t < b.t)
+        f = (t - a.t_s) / (b.t_s - a.t_s)
+        out.append(ZtdPoint(
+            t_s=t,
+            ztd_m=a.ztd_m + f * (b.ztd_m - a.ztd_m),
+            sigma_ztd_m=a.sigma_ztd_m + f * (b.sigma_ztd_m - a.sigma_ztd_m)))
+    return out
+
+
 def compare_ztd(our, truth, *, k_sigma: float = 3.0, window: int = 120,
                 align_tol_s: float = 60.0) -> dict:
     """Lag-aware comparison of two time-keyed ZTD series (manifest §5).
@@ -154,6 +201,11 @@ def compare_ztd(our, truth, *, k_sigma: float = 3.0, window: int = 120,
     the **detrended** residual: a *growing* detrended residual is a real
     time-varying departure the DivergenceMonitor flags; a steady offset is not.
     Align by nearest truth point within ``align_tol_s``.
+
+    NOTE: ``align_tol_s`` only bites when ``truth`` is a *raw* (non-interpolated)
+    series.  The CLI path runs ``interpolate_ztd`` first, putting truth on our
+    exact timestamps, so every pair aligns with ``d=0`` and the tolerance is
+    moot there — it exists for callers comparing two natively-sampled series.
     """
     import bisect
     import statistics
@@ -218,19 +270,7 @@ def truth_from_ecef(ecef_str: str, sigma_m: float = 0.0) -> StaticTruth:
     return StaticTruth(ecef_m=(x, y, z), sigma_m=float(sigma_m))
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("log", help="engine run.log containing [PPP_STATE] lines")
-    g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--pride", help="PRIDE .pos file → static position truth")
-    g.add_argument("--ecef", help="explicit 'X,Y,Z' ECEF truth (m)")
-    ap.add_argument("--truth-sigma-m", type=float, default=0.0)
-    ap.add_argument("--k-sigma", type=float, default=3.0)
-    ap.add_argument("--window", type=int, default=120)
-    args = ap.parse_args()
-
-    with open(args.log) as f:
-        rows = parse_ppp_state(f)
+def _print_position(rows, args):
     truth = (truth_from_pride(args.pride) if args.pride
              else truth_from_ecef(args.ecef, args.truth_sigma_m))
     res = compare_position(rows, truth, k_sigma=args.k_sigma, window=args.window)
@@ -239,18 +279,73 @@ def main():
     if res["final_error_m"] is not None:
         _fs = res["final_sigma_m"] or 0.0
         _ratio = f"{res['final_error_m'] / _fs:.2f}" if _fs > 0 else "n/a (σ=0)"
-        print(f"final error: {res['final_error_m']:.3f} m  "
+        print(f"position final error: {res['final_error_m']:.3f} m  "
               f"σ: {res['final_sigma_m']:.3f} m  err/σ: {_ratio}")
     if res["n"] < res["window"]:
         # the monitor needs a full window before it can fire — fewer rows than
         # that always reads "in corridor", which would be false reassurance.
-        print(f"verdict: INCONCLUSIVE — {res['n']} rows < window={res['window']}"
-              " (too short for the divergence monitor to fire)")
+        print(f"position verdict: INCONCLUSIVE — {res['n']} rows < "
+              f"window={res['window']} (too short for the monitor to fire)")
     else:
-        print("verdict: " + (
+        print("position verdict: " + (
             f"DIVERGED @ epoch {v['fired_epoch']} "
             "(confident, wrong, and growing — no point continuing)"
             if v["fired"] else "stayed in corridor"))
+
+
+def _print_ztd(rows, args):
+    our = ztd_series_from_ppp(rows)
+    if not our:
+        print("ZTD: no gps=-keyed [PPP_STATE] rows (need a recent engine "
+              "build); skipping ZTD comparison")
+        return
+    truth_raw = ztd_series_from_tro(args.tro, site=args.tro_site,
+                                    time_offset_s=args.tro_time_offset_s)
+    # Interpolate the sparse (~5-min) truth onto our 1 Hz timestamps so the
+    # whole series compares 1:1 (Charlie #233 Minor 2), then a tight tol.
+    truth = interpolate_ztd(truth_raw, [p.t_s for p in our])
+    res = compare_ztd(our, truth, k_sigma=args.k_sigma, window=args.window,
+                      align_tol_s=1.0)
+    print(f"\nZTD: our {len(our)} pts, truth {len(truth_raw)} pts → "
+          f"{res['n_aligned']} aligned")
+    if res["offset_m"] is not None:
+        print(f"ZTD offset removed (lag+apriori): {res['offset_m'] * 1e3:+.1f} mm"
+              f"   final detrended: {res['final_detrended_m'] * 1e3:.1f} mm")
+    if res.get("inconclusive"):
+        print(f"ZTD verdict: INCONCLUSIVE — {res['n_aligned']} aligned < "
+              f"window={args.window}")
+    else:
+        zv = res["verdict"]
+        print("ZTD verdict: " + (
+            f"DIVERGED @ gps-time {zv['fired_epoch']} "
+            "(time-varying departure growing — ZTD misallocation)"
+            if zv["fired"] else "stayed in corridor"))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("log", help="engine run.log containing [PPP_STATE] lines")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--pride", help="PRIDE .pos file → static position truth")
+    g.add_argument("--ecef", help="explicit 'X,Y,Z' ECEF truth (m)")
+    ap.add_argument("--truth-sigma-m", type=float, default=0.0)
+    ap.add_argument("--tro", help="NRCan CSRS-PPP .tro file → external ZTD truth")
+    ap.add_argument("--tro-site", help="station code if the .tro has >1 site")
+    ap.add_argument("--tro-time-offset-s", type=float, default=0.0,
+                    help="add to .tro epochs (e.g. a known GPS−UTC offset)")
+    ap.add_argument("--k-sigma", type=float, default=3.0)
+    ap.add_argument("--window", type=int, default=120)
+    args = ap.parse_args()
+
+    if not (args.pride or args.ecef or args.tro):
+        ap.error("need a truth source: --pride/--ecef (position) and/or --tro (ZTD)")
+
+    with open(args.log) as f:
+        rows = parse_ppp_state(f)
+    if args.pride or args.ecef:
+        _print_position(rows, args)
+    if args.tro:
+        _print_ztd(rows, args)
 
 
 if __name__ == "__main__":

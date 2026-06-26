@@ -141,6 +141,21 @@ pin these in `manifest.toml` and the compare tool:
    instantaneous difference — a convention mismatch otherwise reads as a
    physics finding.
 
+**Implemented** (`scripts/peppar_fix/`): `nrcan_tro_reader.py` parses the
+CSRS-PPP SINEX_TRO `.tro` total-ZTD series (TROTOT mm→m, `YY:DOY:SSSSS`
+epochs, `SOLUTION_FIELDS`-driven columns).  `pos_replay_compare`:
+`ztd_series_from_tro` adapts it; `interpolate_ztd` puts the ~5-min truth onto
+our 1 Hz `[PPP_STATE]` timestamps so the **whole** series compares 1:1 (not
+just our points near each 5-min mark); `compare_ztd` removes the **constant
+median (our − truth) offset** — which absorbs *both* trap 4's real-time lag
+*and* the residual-vs-total apriori difference (traps 1–3's constant parts) —
+and scores the *detrended* departure with the shared `DivergenceMonitor`.
+The `[PPP_STATE]` line carries a `gps=` (GPS-time) key so our series joins to
+the external time axis.  **Remaining for full rigor:** explicit total-ZTD
+assembly (ZHD from `[METAR]` pressure + the recorded mapping, traps 1–3) so
+our *residual* wet ZTD is compared against the truth *total* without leaning
+on offset-removal to hide a real apriori/mapping/height mismatch.
+
 
 ## 6. Determinism, product-matching, and the bundle
 
