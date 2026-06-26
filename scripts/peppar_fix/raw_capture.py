@@ -161,7 +161,10 @@ class RawCaptureBundle:
 
     def close(self) -> None:
         if self._flush_stop is not None:
-            self._flush_stop.set()        # stop the periodic flusher
+            self._flush_stop.set()         # stop the periodic flusher ...
+            if self._flusher is not None:
+                self._flusher.join(timeout=2.0)   # ... and wait it out, so it
+                # can't touch a handle we're about to close (deterministic).
         self.flush()                       # flush() takes the lock itself
         with self._lock:
             for fh in self._files.values():
@@ -178,7 +181,14 @@ class RawCaptureBundle:
 def read_stream(cap_path: str) -> Iterator[Tuple[float, bytes]]:
     """Yield ``(recv_mono, payload)`` per record from a ``.cap`` file, in
     order.  A truncated trailing record (e.g. a killed capture) ends the
-    iteration cleanly rather than raising."""
+    iteration cleanly rather than raising.
+
+    For **quiescent/closed** bundles (the replay use case).  A short trailing
+    record is treated as a clean end — so a *live tailer* reading a still-being-
+    written bundle would stop early the instant it hit a mid-flush boundary
+    (header flushed, payload pending) and miss everything after; a tailer must
+    retry on a short payload instead of stopping.  Replay reads after close,
+    so this is correct there."""
     with open(cap_path, "rb") as f:
         while True:
             hdr = f.read(_REC_HDR.size)
