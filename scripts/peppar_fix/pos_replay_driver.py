@@ -390,9 +390,21 @@ class ReplayDriver:
         # ~600 s freshness), so sub-second queue latency doesn't move the bias
         # correction.  If a case ever needs processing-time SSR, the bundle's
         # recv_mono lets a replay reconstruct it.
+        ssr = self.stores.get("ssr")
         observations, raw_obs, n_off, n_single = rawx_to_observations(
-            rawx, self._systems, self.stores.get("ssr"),
+            rawx, self._systems, ssr,
             self._sig_names, self._sig_lookup, self._bds_l1_ref_cycles)
+        # Float-PPP fallback (runner bootstrap gap, I-175208): with no SSR
+        # phase-bias source, rawx_to_observations sets ar_phase_bias_ok=False on
+        # every SV, and obs_for_position then DROPS them all (its "no-SSR → pass"
+        # intent is defeated by the flag being set rather than absent) → empty
+        # pos_observations → n_used=0.  No phase biases ⇒ AR is impossible
+        # anyway, so pass the obs through for float PPP (the flag only gates AR
+        # candidacy, not the filter math).  When phase biases ARE present (AR
+        # mode), the per-SV flag is respected unchanged.
+        if ssr is None or not getattr(ssr, "_phase_bias", None):
+            for o in observations:
+                o["ar_phase_bias_ok"] = True
         obs_counts = {"n_raw": len(raw_obs), "n_off_const": n_off,
                       "n_single": n_single}
         self.epochs.append((gps_time, observations, obs_counts))
