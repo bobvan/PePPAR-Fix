@@ -243,6 +243,11 @@ def make_raw_capture_bundle(args, systems, log):
                 "known_pos": getattr(args, 'known_pos', '') or '',
                 # sorted → deterministic manifest regardless of set/list input
                 "systems": sorted(systems) if systems else [],
+                # Receiver type — pos_replay reconstructs the per-receiver signal
+                # config (signal_names / sig_lookup / bds_l1_ref_cycles via
+                # get_driver + build_sig_lookup) to decode captured RAWX into
+                # observations, so it must match the capture run (per-run-config).
+                "receiver": getattr(args, 'receiver', '') or '',
                 # Per-run RTCM bias-skip config (--no-primary-biases /
                 # --no-ssr-code-bias / --no-ssr-phase-bias).  Load-bearing for
                 # replay: a capture made with these dropped biases LIVE, so the

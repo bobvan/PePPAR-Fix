@@ -1137,6 +1137,24 @@ def _emit_nav_time_gps_log(parsed_msg):
              bool(valid & 0x01), bool(valid & 0x02), bool(valid & 0x04))
 
 
+def build_sig_lookup(driver):
+    """Build the ``sig_name → (gnss_id, prefix, role, a1, a2, sig_name)`` IF
+    lookup from a receiver driver's IF pairs.  Shared by serial_reader and
+    pos_replay so both derive identical sig config from the same driver — the
+    replay can't drift from live (the #239 lesson, now also pyflakes-gated)."""
+    pair_config = getattr(driver, 'if_pairs', None) or IF_PAIRS
+    sig_lookup = {}
+    for gnss_id, sig_f1, sig_f2, prefix in pair_config:
+        pair_params = IF_PAIR_PARAMS.get((sig_f1, sig_f2))
+        if pair_params is None:
+            raise ValueError(
+                f"Unsupported IF pair for {driver.name}: {sig_f1} + {sig_f2}")
+        _, a1, a2 = pair_params
+        sig_lookup[sig_f1] = (gnss_id, prefix, 'f1', a1, a2, sig_f1)
+        sig_lookup[sig_f2] = (gnss_id, prefix, 'f2', a1, a2, sig_f2)
+    return sig_lookup
+
+
 def rawx_to_observations(rawx, systems, ssr, sig_names, sig_lookup,
                          bds_l1_ref_cycles):
     """Decode one RXM-RAWX epoch into IF observations (the engine's obs
@@ -1643,15 +1661,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
     if nav_sig_store is not None:
         nav_sig_store.set_signal_names(SIG_NAMES)
 
-    pair_config = getattr(driver, 'if_pairs', None) or IF_PAIRS
-    sig_lookup = {}
-    for gnss_id, sig_f1, sig_f2, prefix in pair_config:
-        pair_params = IF_PAIR_PARAMS.get((sig_f1, sig_f2))
-        if pair_params is None:
-            raise ValueError(f"Unsupported IF pair for {driver.name}: {sig_f1} + {sig_f2}")
-        _, a1, a2 = pair_params
-        sig_lookup[sig_f1] = (gnss_id, prefix, 'f1', a1, a2, sig_f1)
-        sig_lookup[sig_f2] = (gnss_id, prefix, 'f2', a1, a2, sig_f2)
+    sig_lookup = build_sig_lookup(driver)
 
     epoch_data = {}   # sv → {f1: {...}, f2: {...}}
     epoch_ts = None
