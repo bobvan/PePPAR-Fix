@@ -94,7 +94,7 @@ def build_filter_thread(driver: ReplayDriver, known_ecef, *, systems=None,
 
 
 def run_pos_replay(bundle_dir: str, known_ecef, *, systems=None, args=None,
-                   truth=None, corrections_loader=None) -> dict:
+                   truth=None, corrections_loader=None, swap_streams=None) -> dict:
     """Replay a bundle through the real position filter; return the regenerated
     ``[PPP_STATE]`` lines (and an optional position score vs ``truth``).
 
@@ -102,18 +102,28 @@ def run_pos_replay(bundle_dir: str, known_ecef, *, systems=None, args=None,
     the divergence-monitor position score.
 
     **Product-swap** — pass ``corrections_loader``, a ``callable(stores)`` that
-    populates ``stores['ssr']`` / ``stores['beph']`` from an ALTERNATE source
-    (final products instead of the captured real-time SSR).  When given, the
-    bundle's captured SSR/eph are NOT applied (``apply_captured_corrections=
-    False``), so the filter — and the RAWX obs bias correction — run against the
-    swapped corrections.  This is the knob that separates *our filter* from *our
-    corrections*: if a ZTD drift disappears under final products, the gap was
-    products; if it persists, it's the filter/observability (manifest §6)."""
+    populates ``stores['ssr']`` / ``stores['beph']`` from an ALTERNATE source.
+    ``swap_streams`` controls which captured correction streams are swapped OUT
+    (default: all three — for a precise-orbit swap).  For an **ssr-source** swap
+    (different SSR/biases over the SAME broadcast orbits, e.g.
+    :func:`make_ssr_records_loader`), pass ``swap_streams={'ssr','ssr_bias'}`` so
+    the captured broadcast ``eph`` — the orbit base those corrections ride on —
+    is KEPT (Charlie #245-1/#246).  This is the knob that separates *our filter*
+    from *our corrections*: if a ZTD drift disappears under the swapped
+    corrections, the gap was products; if it persists, it's the
+    filter/observability (manifest §6).
+
+    ``swap_streams`` *with* a loader = **swap-and-replace** (the loader supplies
+    the substitute corrections).  ``swap_streams`` *without* a loader = a
+    deliberate **ablation** — those streams are dropped with nothing replacing
+    them (e.g. "how does the filter do with no SSR, on broadcast orbits?").
+    Legitimate as an experiment, just not an accident (Charlie #247)."""
     if systems is None:
         systems = read_manifest_conventions(bundle_dir).get("systems") or None
     swap = corrections_loader is not None
     driver = ReplayDriver(bundle_dir, decode_obs=True,
-                          apply_captured_corrections=not swap)
+                          apply_captured_corrections=not swap,
+                          swap_streams=swap_streams)
     if swap:
         # load the alternate corrections BEFORE replay so they're in place for
         # the first epoch (final products are slowly-varying; a snapshot over a
@@ -134,3 +144,28 @@ def run_pos_replay(bundle_dir: str, known_ecef, *, systems=None, args=None,
         from peppar_fix.pos_replay_compare import parse_ppp_state, compare_position
         result["position"] = compare_position(parse_ppp_state(cap.lines), truth)
     return result
+
+
+def make_ssr_records_loader(path):
+    """An **ssr-source** product-swap loader (the first concrete one): populate
+    the replay's ``SSRState`` from an external SSR-records JSON — the HAS-bridge
+    format (``load_ssr_records`` / ``SSRState.update_from_records``: per-SV
+    orbit/clock/code-bias corrections to broadcast).  Pair with
+    ``swap_streams={'ssr','ssr_bias'}`` so the captured broadcast ``eph`` (the
+    orbit base these corrections ride on) is kept.
+
+    Deterministic by construction — loads from a fixed local file, not a timed
+    network fetch, so ``--verify-deterministic`` holds under swap (Charlie
+    #245-2).  Raises if the file has no records (a loud coverage check beats
+    silently feeding empty corrections — Charlie #245-2)."""
+    def _load(stores):
+        from realtime_ppp import load_ssr_records
+        epoch_s, records = load_ssr_records(path)
+        if not records:
+            # load_ssr_records returns (None, None) for missing/garbled/empty —
+            # all of which would silently feed empty corrections; fail loud.
+            raise ValueError(
+                f"ssr-records product file missing/garbled/empty (no records): "
+                f"{path} (coverage check — would silently feed no corrections)")
+        stores["ssr"].update_from_records(records, epoch_s)
+    return _load

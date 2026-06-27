@@ -35,7 +35,9 @@ def run_case(case: dict, *, default_args=None) -> dict:
     """Run one case through the filter, guarded.  ``case`` keys:
     ``name``, ``bundle_dir``, ``known_ecef`` (required); ``truth`` (StaticTruth,
     enables the position score); ``corrections_loader`` (→ product-swap);
-    ``args``.  Returns a result dict with ``status`` ``ok``/``failed``."""
+    ``swap_streams`` (which captured correction streams to swap out — for an
+    ssr-source loader use ``{'ssr','ssr_bias'}`` to keep ``eph``); ``args``.
+    Returns a result dict with ``status`` ``ok``/``failed``."""
     name = case.get("name") or case.get("bundle_dir", "?")
     try:
         res = run_pos_replay(
@@ -43,6 +45,11 @@ def run_case(case: dict, *, default_args=None) -> dict:
             systems=case.get("systems"),
             truth=case.get("truth"),
             corrections_loader=case.get("corrections_loader"),
+            # plumb the per-stream swap (Charlie #247): an ssr-source loader is
+            # unusable through the orchestrator without it — it must pair with
+            # swap_streams={'ssr','ssr_bias'} to KEEP eph, else all-three swap
+            # drops eph → n_used<4 → empty output (the bug per-stream fixes).
+            swap_streams=case.get("swap_streams"),
             args=case.get("args") or default_args)
     except Exception as e:                       # noqa: BLE001 — batch guard
         return {"name": name, "status": "failed",
