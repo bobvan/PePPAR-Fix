@@ -131,7 +131,11 @@ def _comparable(v):
     except ImportError:
         np = None
     if np is not None and isinstance(v, np.ndarray):
-        return tuple(v.tolist())
+        # a 0-d array (e.g. np.array(5.0)) is still an ndarray, but .tolist()
+        # returns a bare scalar → tuple(scalar) would raise; .item() it instead
+        # (Charlie #250 — make the sanitizer total over numpy).
+        return (v.item() if v.ndim == 0
+                else tuple(_comparable(x) for x in v.tolist()))
     if np is not None and isinstance(v, np.generic):
         return v.item()
     if isinstance(v, dict):

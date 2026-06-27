@@ -281,3 +281,30 @@ class TestFreshnessSnapshotNumpySafe(unittest.TestCase):
         self.assertEqual(a["ecef"], (1.0, 2.0, 3.0))
         self.assertEqual(a["n"], 5)
         self.assertNotIsInstance(a["ecef"], np.ndarray)
+
+    def test_comparable_handles_0d_array(self):
+        # Charlie #250: a 0-d ndarray (np.array(5.0)) is an ndarray but
+        # .tolist() → bare scalar → tuple(scalar) would raise; .item() it.
+        import numpy as np
+        self.assertEqual(drv._comparable(np.array(5.0)), 5.0)
+        self.assertEqual(drv._comparable({"x": np.array(7)}), {"x": 7})
+        # 2-D rows become tuples, not lists
+        self.assertEqual(drv._comparable(np.array([[1.0, 2.0], [3.0, 4.0]])),
+                         ((1.0, 2.0), (3.0, 4.0)))
+
+    def test_freshness_snapshot_round_trip_with_numpy_store(self):
+        # the actual call site (Charlie #250): a store whose get_opinion returns
+        # a numpy ecef must not break snapshot() == snapshot().
+        import numpy as np
+
+        class _StubNav2:
+            def get_opinion(self, now_mono=None):
+                return {"ecef": np.array([1.0, 2.0, 3.0]),
+                        "h_acc_m": np.float64(0.5)}
+
+        with tempfile.TemporaryDirectory() as d:
+            RawCaptureBundle(d).close()
+            r = drv.ReplayDriver(
+                d, build_stores=lambda: {"nav2": _StubNav2(), "ticc_events": []})
+            r.run()
+            self.assertEqual(r.freshness_snapshot(), r.freshness_snapshot())
