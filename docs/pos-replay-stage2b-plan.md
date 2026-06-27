@@ -80,6 +80,39 @@ the *filter/observability* (manifest §6).  The specific products ingest
 (SP3/CLK / Bias-SINEX → `SSRState`/`BroadcastEphemeris`) is the loader the
 caller supplies — the case-library step wires concrete ones.
 
+## Product-swap orbit-representation feasibility (Charlie #245-1)
+
+The question: with `apply_captured_corrections=False` the captured *eph* is also
+swapped out, but final orbits are SP3 *tabulated* positions while `beph` is
+`BroadcastEphemeris` (Keplerian).  Can the filter ingest a precise orbit?
+
+**Answer: yes, via the interface — not via `beph`.**  The filter's orbit/clock
+contract is `eph_source.sat_position(sv, t) → (pos, clk)` and
+`clk_file.sat_clock(sv, t)` (`filt.update(obs, eph_source, t, clk_file=…)`).
+Two implementations already satisfy it: `RealtimeCorrections(beph, ssr)`
+(broadcast Keplerian + SSR delta, the live path) and `SP3` (solve_pseudorange) +
+`CLKFile` (precise tabulated, the regression-harness path —
+`run_regression.py` passes `SP3(args.sp3)` / `CLKFile(args.clk)` as exactly this
+pair).  So a precise-products swap **swaps the corrections *object*** (SP3 +
+CLKFile), it does not shoehorn SP3 into `beph`.
+
+Implications for the concrete loaders:
+- **Two swap classes, two mechanisms.**  (a) *SSR-source swap* (a different
+  real-time SSR / Bias-SINEX biases over the SAME broadcast orbits) fits the
+  current `corrections_loader(stores)` seam — but needs the seam refined to swap
+  `ssr` while KEEPING the captured `eph` (today `apply_captured_corrections=
+  False` drops both, leaving no orbits → `n_used<4`).  (b) *precise-orbit swap*
+  (SP3+CLK) swaps the corrections object at `build_filter_thread`, distinct from
+  the `stores` fill.
+- **Biases always need an `ssr`-like provider.**  SP3/CLK carry no code/phase
+  biases; the obs bias correction + AR read `ssr.get_code_bias`/`get_phase_bias`,
+  so a precise swap still needs a Bias-SINEX-backed bias provider alongside the
+  SP3 orbits.
+
+So the seam is sound; the loaders split into "ssr-source" (stores fill, keep
+eph) and "precise-object" (swap corrections) — a per-stream granularity the
+case-library wires concretely.
+
 ## Carries (open notes to honor here)
 
 - **#230** — obs↔PPS RAWX canonical-stamp once-over, when RAWX→obs lands.
@@ -103,6 +136,10 @@ caller supplies — the case-library step wires concrete ones.
    via `pos_replay_compare`).  End-to-end `[PPP_STATE]` output needs a real
    bundle (broadcast eph for sat positions) — the wiring is unit-tested with a
    synthetic RAWX + the real filter construction.**
-5. Product-swap **(done — `corrections_loader` seam)** + the case-library
-   replays on real bundles (manifest §7) — **next** (concrete products loaders +
-   the per-bundle batch guard for #244's note 2).
+5. Product-swap **(done — `corrections_loader` seam)** + the case-library batch
+   runner **(done — `pos_replay_case_library.run_case_library`, per-bundle guard
+   for #244 note 2)**.  Remaining: concrete products loaders (the two classes
+   from the feasibility note — ssr-source via stores-fill keeping eph, and
+   precise-orbit via corrections-object swap with a Bias-SINEX bias provider) +
+   **real captured bundles** for the end-to-end `[PPP_STATE]` / real-RAWX /
+   real-eph / `.tro` confirmations (field artifacts, not in-repo).
