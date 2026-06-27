@@ -88,8 +88,15 @@ that separates our filter from our corrections (manifest §6).
 
 ## Order of work
 
-1. `format_ppp_state_line` shared output seam **(done — this PR).**
-2. `rawx_to_observations` extraction (behavior-preserving) + replay wiring.
-3. `_process_epoch` extraction (behavior-preserving) + direct-call test.
-4. `pos_replay_filter` runner: epoch loop → `[PPP_STATE]` → compare.
-5. Product-swap + the case-library replays (manifest §7).
+1. `format_ppp_state_line` shared output seam **(done — #238).**
+2. `rawx_to_observations` extraction (behavior-preserving) + replay wiring
+   **(done — #239; sig config to replay #242; RAWX decode #243).**
+3. `_process_epoch` extraction (behavior-preserving) + direct-call test
+   **(done — #240).**
+4. `pos_replay_filter` runner: epoch loop → `[PPP_STATE]` → compare
+   **(done — drives the real `AntPosEstThread._process_epoch` inline via the
+   driver's `epoch_sink`, captures `[PPP_STATE]` with `PppStateCapture`, scores
+   via `pos_replay_compare`).  End-to-end `[PPP_STATE]` output needs a real
+   bundle (broadcast eph for sat positions) — the wiring is unit-tested with a
+   synthetic RAWX + the real filter construction.**
+5. Product-swap + the case-library replays (manifest §7) — **next.**
