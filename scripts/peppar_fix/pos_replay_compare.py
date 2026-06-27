@@ -66,6 +66,24 @@ class PppRow:
     gps: Optional[object] = None   # datetime (GPS-time) if the log carried gps=
 
 
+_ZTD_APRIORI_RE = re.compile(r"\[ZTD_APRIORI\]\s+m=([-+\d.eE]+)")
+
+
+def parse_ztd_apriori(lines) -> Optional[float]:
+    """The engine's logged ZTD apriori (``[ZTD_APRIORI] m=…``), or None if the
+    log predates logZtdApriori.  Lets the total-ZTD assembly use the run's
+    ACTUAL apriori instead of assuming the current ``ENGINE_ZTD_APRIORI_M`` — so
+    a capture made before an apriori retune still assembles correctly."""
+    for ln in lines:
+        m = _ZTD_APRIORI_RE.search(ln)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return None
+    return None
+
+
 @dataclass
 class StaticTruth:
     """A fixed reference position with its own 1-σ (survey / PRIDE formal)."""
@@ -468,6 +486,10 @@ def main():
         lines = f.readlines()
     rows = parse_ppp_state(lines)
     metar_rows = parse_metar(lines)
+    # logZtdApriori: prefer an explicit --ztd-apriori-m, else the run's logged
+    # [ZTD_APRIORI] (the actual apriori the capture used), else the constant.
+    if args.ztd_apriori_m is None:
+        args.ztd_apriori_m = parse_ztd_apriori(lines)
     if args.pride or args.ecef:
         _print_position(rows, args)
     if args.tro:
