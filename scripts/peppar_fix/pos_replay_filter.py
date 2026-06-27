@@ -105,28 +105,38 @@ class PreciseCorrections:
     clocks, bridged into the engine's ``sat_position(sv,t) → (pos, clk)`` /
     ``sat_clock(prn,t)`` interface.
 
-    Note the shape bridge: ``SP3.sat_position`` returns ``(x,y,z)`` (or
-    ``(None,None)`` outside its safe window), while the engine's
-    ``_process_epoch`` unpacks ``(pos, clk)`` — so this pairs the SP3 position
-    with the CLKFile clock.  Biases are NOT here (SP3/CLK carry none); the obs
-    leg reads ``stores['ssr']``, so pair this with a Bias-SINEX ssr-fill loader
-    (the second half of a precise swap)."""
+    ``SP3.sat_position`` already returns the engine's ``(pos_array, clk)`` 2-tuple
+    (same shape as ``RealtimeCorrections.sat_position``; its docstring's "(x,y,z)"
+    describes only the position part — verified at solve_pseudorange.py:133), so
+    this just unpacks it and substitutes the precise CLK clock when a ``clk_file``
+    is given (Charlie #248).  Like ``RealtimeCorrections`` it returns
+    ``(None, None)`` whenever it can't form a COMPLETE correction (outside the SP3
+    window, or no precise clock for the SV) so the engine's ``sat_pos is not
+    None`` guard skips the SV cleanly — never ``(pos, None)``.  Biases are NOT
+    here (SP3/CLK carry none); the obs leg reads ``stores['ssr']``, so pair this
+    with a Bias-SINEX ssr-fill loader (the second half of a precise swap)."""
 
     def __init__(self, sp3, clk_file=None):
         self.sp3 = sp3
         self.clk_file = clk_file
 
     def sat_position(self, sv, t):
-        import numpy as np
-        p = self.sp3.sat_position(sv, t)
-        if p is None or p[0] is None:
+        pos, sp3_clk = self.sp3.sat_position(sv, t)   # SP3 returns (pos, clk)
+        if pos is None:
             return None, None              # outside SP3 window → skip SV cleanly
-        clk = self.clk_file.sat_clock(sv, t) if self.clk_file is not None else 0.0
-        return np.asarray(p, dtype=float), clk
+        if self.clk_file is not None:
+            clk = self.clk_file.sat_clock(sv, t)
+            if clk is None:
+                return None, None          # no precise clock for SV → skip
+        else:
+            clk = sp3_clk                  # no CLK file → SP3's own clock (NOT 0)
+        return pos, clk
 
     def sat_clock(self, prn, t):
-        return (self.clk_file.sat_clock(prn, t)
-                if self.clk_file is not None else 0.0)
+        if self.clk_file is not None:
+            return self.clk_file.sat_clock(prn, t)
+        _pos, sp3_clk = self.sp3.sat_position(prn, t)  # SP3's own clock, not 0
+        return sp3_clk
 
 
 def make_precise_corrections(sp3_path, clk_path=None):
