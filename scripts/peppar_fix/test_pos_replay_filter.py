@@ -122,6 +122,63 @@ class TestRunPosReplayDrivesFilter(unittest.TestCase):
         self.assertEqual(len(calls), 3)            # driven once per RAWX epoch
 
 
+class TestEmitPppStateToBundle(unittest.TestCase):
+    """AntPosEstThread._emit_ppp_state Group-B routing: when a raw-capture
+    bundle is attached, the per-epoch [PPP_STATE] (+ one-shot [ZTD_APRIORI])
+    lands in the bundle's engine/ dir — independent of the noisy --ppp-state-log
+    main-log gate (a capture must be self-sufficient).  Driven on a bare thread
+    instance (no heavy filter/eph setup needed to exercise the sink routing)."""
+
+    def _bare_thread(self, bundle, ppp_state_log):
+        import numpy as np
+        import peppar_fix_engine as eng
+        t = eng.AntPosEstThread.__new__(eng.AntPosEstThread)
+        t._args = SimpleNamespace(ppp_state_log=ppp_state_log)
+        t._raw_bundle = bundle
+        t._n_epochs = 7
+        t._ztd_apriori_logged = False
+        filt = SimpleNamespace(
+            x=np.zeros(eng.N_BASE), P=np.eye(eng.N_BASE) * 0.04)
+        return t, filt
+
+    def _gps_time(self):
+        from datetime import datetime, timezone
+        return datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def test_bundle_gets_ppp_state_even_without_main_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            t, filt = self._bare_thread(b, ppp_state_log=False)
+            t._emit_ppp_state(self._gps_time(), 8, filt)
+            t._n_epochs = 8
+            t._emit_ppp_state(self._gps_time(), 9, filt)
+            b.close()
+            with open(os.path.join(d, "engine", "ppp_state.log")) as f:
+                lines = f.read().splitlines()
+        self.assertEqual(lines[0], "[ZTD_APRIORI] m=2.3000")  # one-shot, first
+        self.assertEqual(sum(1 for ln in lines if ln.startswith("[ZTD_APRIORI]")), 1)
+        ps = [ln for ln in lines if ln.startswith("[PPP_STATE]")]
+        self.assertEqual(len(ps), 2)                          # one per epoch
+        self.assertIn("n=8", ps[0])
+
+    def test_no_bundle_no_main_log_is_noop(self):
+        t, filt = self._bare_thread(None, ppp_state_log=False)
+        # must not raise and must not mark the apriori as logged (nothing emitted)
+        t._emit_ppp_state(self._gps_time(), 8, filt)
+        self.assertFalse(t._ztd_apriori_logged)
+
+    def test_bundle_write_failure_does_not_raise(self):
+        # a closed/failing sink must never take down the filter thread
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            t, filt = self._bare_thread(b, ppp_state_log=False)
+            b.close()                       # engine handles now closed
+            # force a write attempt to a closed handle
+            b._engine_files["ppp_state.log"] = open(os.devnull, "ab")
+            b._engine_files["ppp_state.log"].close()
+            t._emit_ppp_state(self._gps_time(), 8, filt)   # swallowed, no raise
+
+
 class TestProductSwapDriver(unittest.TestCase):
     def test_captured_ssr_not_applied_when_swapped(self):
         with tempfile.TemporaryDirectory() as d:

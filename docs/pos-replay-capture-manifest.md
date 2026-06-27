@@ -81,7 +81,7 @@ Notes:
 
 | What | Existing hook | Gap to close |
 |---|---|---|
-| Per-epoch position estimate (ECEF/ENU) **+ position σ** | `--filter-state-log` | today it logs `FixedPosFilter` (pinned-clock) internals; **extend to dump `PPPFilter` pos E/N/U + √P_pos and ZTD + √P_ztd** |
+| Per-epoch position estimate (ECEF) **+ position σ + residual ZTD + σ** | `[PPP_STATE]` (`AntPosEstThread._emit_ppp_state`) | **closed**: when `--raw-capture-dir` is set the per-epoch `PPPFilter` ECEF + √P_pos + residual ZTD + √P_ztd (+ one-shot `[ZTD_APRIORI]`) are written to `<bundle>/engine/ppp_state.log` — independent of the noisy main-log `--ppp-state-log` gate, so a capture is self-sufficient.  `pos_replay_compare.parse_ppp_state` reads this back as the captured-live truth for the regenerated≈captured score.  (`--filter-state-log` remains `FixedPosFilter` clock-only; the position half lives here.) |
 | Per-epoch residual ZTD estimate **+ ZTD σ** | `--dt-rx-log` writes `ztd_mm` on some runs | make it **always-on** in capture mode, with σ |
 | Per-SV residuals, admit/reject, slip flags | `--per-sv-resid-log`, `--slip-log` | reuse as-is (diagnostic context) |
 | Correction provenance (which AC, age, gaps) | `log_ssr_corrections.py` | run alongside; tags the product-quality axis |

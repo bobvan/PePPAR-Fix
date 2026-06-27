@@ -2093,8 +2093,15 @@ class AntPosEstThread(threading.Thread):
                  receiver_uid=None,
                  ppp_state_write_period_s=600.0,
                  ppp_state_write_max_sigma_m=1.0,
+                 raw_bundle=None,
                  args=None):
         super().__init__(daemon=True, name="AntPosEst")
+        # pos_replay Group-B sink: when a --raw-capture-dir bundle is active,
+        # the per-epoch [PPP_STATE]/[ZTD_APRIORI] the filter emits is also
+        # written into the bundle's engine/ dir, giving the replay the captured
+        # live trajectory to score against.  None outside capture (incl. replay,
+        # which regenerates rather than captures).
+        self._raw_bundle = raw_bundle
         # Phase 3 wind-up (Wu 1993): per-SV cumulative wind-up tracker
         # + carrier-phase correction applied before filter.update().
         # Phase 4 GMF (Boehm 2006): hydrostatic + wet mapping functions
@@ -2901,6 +2908,56 @@ class AntPosEstThread(threading.Thread):
         except Exception:
             log.exception("AntPosEstThread crashed")
 
+    def _emit_ppp_state(self, gps_time, n_used, filt):
+        """Route this epoch's [PPP_STATE] (+ the one-shot [ZTD_APRIORI]) to its
+        sinks: the main run.log (opt-in --ppp-state-log, off by default — an
+        unconditional per-epoch INFO line is ~86k lines/day at 1 Hz) and/or a
+        --raw-capture-dir bundle's engine/ dir (pos_replay Group B,
+        docs/pos-replay-capture-manifest.md §3).
+
+        The two sinks are decoupled on purpose: a capture must be
+        self-sufficient for the regenerated≈captured comparison, so the bundle
+        gets the trajectory even when the operator didn't also opt into the
+        noisy main-log line — that footgun is what left engine/ empty before.
+        Never raises: a logging or capture-sink hiccup must not take down the
+        filter thread."""
+        emit_main = getattr(self._args, 'ppp_state_log', False)
+        bundle = self._raw_bundle
+        if not (emit_main or bundle is not None):
+            return
+        try:
+            # Log the ZTD apriori ONCE (the residual ztd= rides on it).
+            # pos_replay_compare reads this to assemble the total ZTD with the
+            # run's ACTUAL apriori instead of assuming the current constant — so
+            # an old capture still replays correctly if the apriori is ever
+            # retuned (Charlie #235 finding 2 / logZtdApriori).
+            if not getattr(self, '_ztd_apriori_logged', False):
+                za = "[ZTD_APRIORI] m=%.4f" % ENGINE_ZTD_APRIORI_M
+                if emit_main:
+                    log.info("%s", za)
+                if bundle is not None:
+                    bundle.engine_log("ppp_state.log", za)
+                self._ztd_apriori_logged = True
+            pp = filt.x[:3]
+            ps = position_sigma_3d(filt.P)
+            pz = float(filt.x[PPP_IDX_ZTD])
+            pzs = math.sqrt(max(0.0, float(filt.P[PPP_IDX_ZTD, PPP_IDX_ZTD])))
+            # Shared formatter (pos_replay stage 2b re-emits the same line from a
+            # replayed bundle; one format definition keeps emitter + parser in
+            # step).  '%s' to log.info so the line passes through verbatim (it
+            # has its own % conversions).
+            line = format_ppp_state_line(
+                gps_time, self._n_epochs, n_used, pp, ps, pz, pzs)
+            if emit_main:
+                log.info("%s", line)
+            if bundle is not None:
+                bundle.engine_log("ppp_state.log", line)
+        except (IndexError, ValueError, TypeError, AttributeError, OSError):
+            # AttributeError covers gps_time.isoformat() — a None gps_time must
+            # never crash the filter thread.  OSError covers a bundle write
+            # failing (disk full / closed fh) — same rule.
+            pass
+
     def _process_epoch(self, gps_time, observations, obs_counts):
         """Process one dequeued observation epoch (EKF predict/update, slip
         handling, ambiguity mgmt, AR, NAV2/ZTD ties, [PPP_STATE] emit).
@@ -3197,32 +3254,7 @@ class AntPosEstThread(threading.Thread):
         # an unconditional per-epoch INFO line would be ~86k lines/day at
         # 1 Hz on every run, against this loop's own throttling
         # convention — every-epoch detail is for captures only.
-        if getattr(self._args, 'ppp_state_log', False):
-            try:
-                # Log the ZTD apriori ONCE (the residual ztd= rides on it).
-                # pos_replay_compare reads this to assemble the total ZTD with
-                # the run's ACTUAL apriori instead of assuming the current
-                # constant — so an old capture still replays correctly if the
-                # apriori is ever retuned (Charlie #235 finding 2 / logZtdApriori).
-                if not getattr(self, '_ztd_apriori_logged', False):
-                    log.info("[ZTD_APRIORI] m=%.4f", ENGINE_ZTD_APRIORI_M)
-                    self._ztd_apriori_logged = True
-                _pp = filt.x[:3]
-                _ps = position_sigma_3d(filt.P)
-                _pz = float(filt.x[PPP_IDX_ZTD])
-                _pzs = math.sqrt(max(0.0,
-                    float(filt.P[PPP_IDX_ZTD, PPP_IDX_ZTD])))
-                # Shared formatter (pos_replay stage 2b re-emits the same
-                # line from a replayed bundle; one format definition keeps
-                # emitter + parser in step).  '%s' to log.info so the line
-                # passes through verbatim (it has its own % conversions).
-                log.info("%s", format_ppp_state_line(
-                    gps_time, self._n_epochs, n_used, _pp, _ps, _pz, _pzs))
-            except (IndexError, ValueError, TypeError, AttributeError):
-                # AttributeError covers gps_time.isoformat() — a None
-                # gps_time must never crash the filter thread (the whole
-                # point of this guard is "logging can't take down _run_inner").
-                pass
+        self._emit_ppp_state(gps_time, n_used, filt)
 
         # Phase-residual admission gate ingest — feed this epoch's
         # post-fit phase residuals into WlPhaseAdmissionGate so it
@@ -10747,6 +10779,7 @@ def run(args):
                 pin_position=bool(getattr(args, "pin_position", False)),
                 nav_sig_store=nav_sig_store,
                 receiver_uid=getattr(args, 'receiver_unique_id', None),
+                raw_bundle=_raw_bundle,
                 args=args,
             )
             # Phase B NAV-SIG L0 admission gate — attach store + flags to

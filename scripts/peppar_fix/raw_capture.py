@@ -62,6 +62,10 @@ class RawCaptureBundle:
             os.makedirs(os.path.join(bundle_dir, sub), exist_ok=True)
         self._files: dict[str, "object"] = {}
         self._counts: dict[str, int] = {}
+        # Group-B engine outputs (manifest §3): text sinks under engine/, keyed
+        # by filename.  The live [PPP_STATE]/[ZTD_APRIORI] trajectory lands here
+        # so pos_replay can score regenerated-vs-captured, not just convergence.
+        self._engine_files: dict[str, "object"] = {}
         self._lock = threading.Lock()
         self._flush_stop: "threading.Event | None" = None
         self._flusher: "threading.Thread | None" = None
@@ -90,6 +94,25 @@ class RawCaptureBundle:
         if not b.endswith(b"\n"):
             b += b"\n"
         self.record(stream, b, recv_mono)
+
+    def engine_log(self, filename: str, line: str) -> None:
+        """Append one engine-output text ``line`` to ``engine/<filename>``.
+
+        Group-B sink (manifest §3): the captured live ``[PPP_STATE]`` /
+        ``[ZTD_APRIORI]`` trajectory the position filter emits, so a replay can
+        be scored against what the live engine actually produced (the
+        regenerated≈captured gate), not just whether it converged.  Same lazy-
+        open + short-lock discipline as :meth:`record`; the periodic flusher and
+        :meth:`close` cover these handles too."""
+        b = line.encode("utf-8", "replace") if isinstance(line, str) else bytes(line)
+        if not b.endswith(b"\n"):
+            b += b"\n"
+        with self._lock:
+            fh = self._engine_files.get(filename)
+            if fh is None:
+                fh = open(os.path.join(self.dir, "engine", filename), "ab")
+                self._engine_files[filename] = fh
+            fh.write(b)
 
     @property
     def counts(self) -> dict:
@@ -135,7 +158,7 @@ class RawCaptureBundle:
         handles under the lock, then flushes OUTSIDE it — never holds the lock
         across disk I/O (the no-long-GIL-holds rule)."""
         with self._lock:
-            handles = list(self._files.values())
+            handles = list(self._files.values()) + list(self._engine_files.values())
         for fh in handles:
             try:
                 fh.flush()
@@ -169,7 +192,10 @@ class RawCaptureBundle:
         with self._lock:
             for fh in self._files.values():
                 fh.close()
+            for fh in self._engine_files.values():
+                fh.close()
             self._files.clear()
+            self._engine_files.clear()
 
     def __enter__(self) -> "RawCaptureBundle":
         return self
