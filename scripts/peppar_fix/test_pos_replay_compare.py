@@ -171,6 +171,30 @@ class TestZtdCompare(unittest.TestCase):
         self.assertAlmostEqual(series[0].ztd_m, 0.07)
 
 
+class TestZtdApriori(unittest.TestCase):
+    """logZtdApriori (Charlie #235 finding 2): the engine logs its ZTD apriori
+    so the total assembly uses the run's ACTUAL value, not the current constant
+    — old captures stay correct across an apriori retune."""
+
+    def test_parses_logged_apriori(self):
+        self.assertAlmostEqual(prc.parse_ztd_apriori(
+            ["2026-06-25 INFO [ZTD_APRIORI] m=2.3000", "noise"]), 2.3)
+
+    def test_returns_none_when_absent(self):
+        self.assertIsNone(prc.parse_ztd_apriori(["[PPP_STATE] gps=x epoch=1"]))
+
+    def test_parses_retuned_apriori(self):
+        # a future retune → the compare reads THAT value, not the constant
+        self.assertAlmostEqual(
+            prc.parse_ztd_apriori(["[ZTD_APRIORI] m=2.2500"]), 2.25)
+
+    def test_total_assembly_uses_parsed_apriori(self):
+        rows = prc.parse_ppp_state([_ppp_line(
+            1, _TRUTH, 0.1, ztd=0.07, gps="2026-06-25T12:00:01+00:00")])
+        series = prc.ztd_total_series_from_ppp(rows, apriori_m=2.25)
+        self.assertAlmostEqual(series[0].ztd_m, 2.32)   # 2.25 + 0.07, not 2.37
+
+
 class TestTotalZtdAssembly(unittest.TestCase):
     def test_total_is_apriori_plus_residual(self):
         rows = prc.parse_ppp_state([

@@ -78,7 +78,8 @@ from peppar_fix.wl_phase_admission_gate import WlPhaseAdmissionGate
 from peppar_fix.wl_readmission_gate import WlReAdmissionGate
 from peppar_fix.anchoring_sv_promoter import AnchoringSvPromoter
 from peppar_fix.nl_diag import NlDiagLogger
-from peppar_fix.saastamoinen import metar_to_init_ztd_residual
+from peppar_fix.saastamoinen import (metar_to_init_ztd_residual,
+                                     ENGINE_ZTD_APRIORI_M)
 from peppar_fix.metar import (
     DEFAULT_STATION, MetarReadError,
     fetch_latest_metar, metar_age_seconds,
@@ -3198,6 +3199,14 @@ class AntPosEstThread(threading.Thread):
         # convention — every-epoch detail is for captures only.
         if getattr(self._args, 'ppp_state_log', False):
             try:
+                # Log the ZTD apriori ONCE (the residual ztd= rides on it).
+                # pos_replay_compare reads this to assemble the total ZTD with
+                # the run's ACTUAL apriori instead of assuming the current
+                # constant — so an old capture still replays correctly if the
+                # apriori is ever retuned (Charlie #235 finding 2 / logZtdApriori).
+                if not getattr(self, '_ztd_apriori_logged', False):
+                    log.info("[ZTD_APRIORI] m=%.4f", ENGINE_ZTD_APRIORI_M)
+                    self._ztd_apriori_logged = True
                 _pp = filt.x[:3]
                 _ps = position_sigma_3d(filt.P)
                 _pz = float(filt.x[PPP_IDX_ZTD])
