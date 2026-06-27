@@ -262,3 +262,22 @@ class TestEmptyBundle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFreshnessSnapshotNumpySafe(unittest.TestCase):
+    """Real NAV2/clock reads contain numpy arrays (get_opinion's ecef), which
+    made the snapshot dict `==` raise 'truth value of an array is ambiguous' —
+    found on the first REAL captured bundle (TimeHat 2026-06-27). The snapshot
+    must sanitize numpy → plain types so two snapshots compare with `==`."""
+
+    def test_snapshot_with_numpy_is_comparable(self):
+        import numpy as np
+        # _comparable is the sanitizer freshness_snapshot applies
+        a = drv._comparable({"ecef": np.array([1.0, 2.0, 3.0]),
+                             "n": np.int64(5), "nested": [np.array([4.0, 5.0])]})
+        b = drv._comparable({"ecef": np.array([1.0, 2.0, 3.0]),
+                             "n": np.int64(5), "nested": [np.array([4.0, 5.0])]})
+        self.assertEqual(a, b)            # would raise without sanitizing
+        self.assertEqual(a["ecef"], (1.0, 2.0, 3.0))
+        self.assertEqual(a["n"], 5)
+        self.assertNotIsInstance(a["ecef"], np.ndarray)

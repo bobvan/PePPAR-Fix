@@ -121,6 +121,26 @@ def replay_sig_config(bundle_dir: str):
     return driver.signal_names, build_sig_lookup(driver), driver.bds_l1_ref_cycles
 
 
+def _comparable(v):
+    """Recursively convert numpy arrays/scalars to plain, ``==``-comparable
+    Python types, so a ``freshness_snapshot`` dict containing real NAV2/clock
+    numpy arrays can be compared with ``==`` (a plain ``dict ==`` raises "truth
+    value of an array is ambiguous" otherwise)."""
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None and isinstance(v, np.ndarray):
+        return tuple(v.tolist())
+    if np is not None and isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, dict):
+        return {k: _comparable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return tuple(_comparable(x) for x in v)
+    return v
+
+
 class VirtualClock:
     """``now_mono`` advanced by the replay stream — the single time source.
 
@@ -429,7 +449,11 @@ class ReplayDriver:
             out["ssr_counts"] = (getattr(s["ssr"], "n_orbit", None),
                                  getattr(s["ssr"], "n_clock", None))
         out["n_ticc_events"] = len(s.get("ticc_events", []))
-        return out
+        # Real NAV2/clock reads contain numpy arrays (e.g. get_opinion's ecef),
+        # which make a plain dict `==` raise "truth value of an array is
+        # ambiguous" — found on the first real captured bundle.  Sanitize to
+        # plain ==-comparable types so the fingerprint comparison works.
+        return _comparable(out)
 
 
 def main():
