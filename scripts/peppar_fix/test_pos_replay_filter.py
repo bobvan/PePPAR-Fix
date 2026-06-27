@@ -254,5 +254,48 @@ class TestSsrRecordsLoader(unittest.TestCase):
             os.unlink(path)
 
 
+class TestSsrSourceSwapSeam(unittest.TestCase):
+    """The seam the per-stream knob exists to make safe (Charlie #247): the
+    ssr-source loader + swap_streams + run_pos_replay together — loader supplies
+    the SSR, captured SSR is swapped out, captured eph is KEPT (else no orbits)."""
+
+    def test_loader_supplies_ssr_and_eph_is_kept(self):
+        import json
+        from types import SimpleNamespace
+        rawx = _synthetic_rawx()
+        recs = {"epoch_s": 100.0,
+                "records": [{"prn": "G01", "code_bias": {"C1C": -1.0}}]}
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="2026-01-01T00:00:00+00:00",
+                             conventions={"receiver": "f9t", "systems": ["gps"]})
+            b.record("ssr", b"\xd3\x00\x05ssr", recv_mono=98.0)
+            b.record("eph", b"\xd3\x00\x05eph", recv_mono=99.0)
+            b.record("ubx", b"RAWX-0", recv_mono=100.0)
+            b.close()
+            rec_path = os.path.join(d, "records.json")
+            with open(rec_path, "w") as f:
+                json.dump(recs, f)
+            loader = prf.make_ssr_records_loader(rec_path)
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx), \
+                 mock.patch("pyrtcm.RTCMReader.parse",
+                            return_value=SimpleNamespace(identity="1019")), \
+                 mock.patch("realtime_ppp.route_rtcm_message",
+                            return_value=("eph", 5)) as route:
+                res = prf.run_pos_replay(
+                    d, _TRUTH, corrections_loader=loader,
+                    swap_streams={"ssr", "ssr_bias"})
+            self.assertTrue(res["product_swapped"])
+            ssr = res["driver"].stores["ssr"]
+            # the loader's SSR is in place (captured SSR was swapped out, so this
+            # bias can only come from the loader)
+            self.assertAlmostEqual(ssr.get_code_bias("G01", "C1C"), -1.0)
+            idents = [i for _t, _s, i in res["driver"].trace]
+            self.assertIn("ssr:swapped-out", idents)     # captured SSR swapped
+            self.assertIn("eph:1019", idents)            # captured eph KEPT
+            route.assert_called_once()                   # only eph routed
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -111,7 +111,13 @@ def run_pos_replay(bundle_dir: str, known_ecef, *, systems=None, args=None,
     is KEPT (Charlie #245-1/#246).  This is the knob that separates *our filter*
     from *our corrections*: if a ZTD drift disappears under the swapped
     corrections, the gap was products; if it persists, it's the
-    filter/observability (manifest §6)."""
+    filter/observability (manifest §6).
+
+    ``swap_streams`` *with* a loader = **swap-and-replace** (the loader supplies
+    the substitute corrections).  ``swap_streams`` *without* a loader = a
+    deliberate **ablation** — those streams are dropped with nothing replacing
+    them (e.g. "how does the filter do with no SSR, on broadcast orbits?").
+    Legitimate as an experiment, just not an accident (Charlie #247)."""
     if systems is None:
         systems = read_manifest_conventions(bundle_dir).get("systems") or None
     swap = corrections_loader is not None
@@ -156,8 +162,10 @@ def make_ssr_records_loader(path):
         from realtime_ppp import load_ssr_records
         epoch_s, records = load_ssr_records(path)
         if not records:
+            # load_ssr_records returns (None, None) for missing/garbled/empty —
+            # all of which would silently feed empty corrections; fail loud.
             raise ValueError(
-                f"ssr-records product file has no records: {path} "
-                "(coverage check — would silently feed empty corrections)")
+                f"ssr-records product file missing/garbled/empty (no records): "
+                f"{path} (coverage check — would silently feed no corrections)")
         stores["ssr"].update_from_records(records, epoch_s)
     return _load
