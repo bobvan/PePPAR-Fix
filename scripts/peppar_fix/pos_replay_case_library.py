@@ -36,8 +36,9 @@ def run_case(case: dict, *, default_args=None) -> dict:
     ``name``, ``bundle_dir``, ``known_ecef`` (required); ``truth`` (StaticTruth,
     enables the position score); ``corrections_loader`` (→ product-swap);
     ``swap_streams`` (which captured correction streams to swap out — for an
-    ssr-source loader use ``{'ssr','ssr_bias'}`` to keep ``eph``); ``args``.
-    Returns a result dict with ``status`` ``ok``/``failed``."""
+    ssr-source loader use ``{'ssr','ssr_bias'}`` to keep ``eph``);
+    ``corrections_override`` (a corrections OBJECT for a precise-orbit swap);
+    ``args``.  Returns a result dict with ``status`` ``ok``/``failed``."""
     name = case.get("name") or case.get("bundle_dir", "?")
     try:
         res = run_pos_replay(
@@ -50,6 +51,9 @@ def run_case(case: dict, *, default_args=None) -> dict:
             # swap_streams={'ssr','ssr_bias'} to KEEP eph, else all-three swap
             # drops eph → n_used<4 → empty output (the bug per-stream fixes).
             swap_streams=case.get("swap_streams"),
+            # precise-orbit swap: the corrections OBJECT (SP3+CLK) — plumbed for
+            # the same reason, so a precise case is reachable through the batch.
+            corrections_override=case.get("corrections_override"),
             args=case.get("args") or default_args)
     except Exception as e:                       # noqa: BLE001 — batch guard
         return {"name": name, "status": "failed",

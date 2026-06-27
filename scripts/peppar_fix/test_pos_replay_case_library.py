@@ -156,6 +156,18 @@ class TestCaseLibrary(unittest.TestCase):
         self.assertEqual(rp.call_args.kwargs["swap_streams"], {"ssr", "ssr_bias"})
         self.assertIsNotNone(rp.call_args.kwargs["corrections_loader"])
 
+    def test_corrections_override_plumbed_through_run_case(self):
+        # precise-orbit case must be reachable through the orchestrator too
+        # (same lesson as #247) — assert the override reaches run_pos_replay.
+        sentinel = object()
+        with mock.patch("peppar_fix.pos_replay_case_library.run_pos_replay",
+                        return_value={"ppp_state_lines": [], "n_epochs_decoded": 0,
+                                      "product_swapped": True}) as rp:
+            cl.run_case({"name": "precise", "bundle_dir": "b",
+                         "known_ecef": _TRUTH,
+                         "corrections_override": sentinel})
+        self.assertIs(rp.call_args.kwargs["corrections_override"], sentinel)
+
     def test_format_summary(self):
         summary = {"n_ok": 1, "n_failed": 1, "n_diverged": 0, "results": [
             {"name": "a", "status": "ok", "n_epochs": 5, "n_ppp_state": 0,

@@ -115,12 +115,22 @@ case-library wires concretely.
 
 **Implemented:** `ReplayDriver(swap_streams={…})` is the per-stream knob (swap
 `{ssr, ssr_bias}`, KEEP `eph`); `run_pos_replay(..., swap_streams=…)` plumbs it.
-First concrete loader: `pos_replay_filter.make_ssr_records_loader(path)` — an
-**ssr-source** loader from an SSR-records JSON (`load_ssr_records` /
-`SSRState.update_from_records`), deterministic (fixed local file) with a loud
-empty-records coverage check (Charlie #245-2).  **Still to build:** the
-**precise-orbit** loader (SP3+CLK corrections-object swap + a Bias-SINEX bias
-provider), and the real captured bundles for end-to-end confirmation.
+Both concrete loader classes are built:
+- **ssr-source** — `make_ssr_records_loader(path)` (SSR-records JSON →
+  `SSRState.update_from_records`), deterministic + loud empty-records coverage
+  check (Charlie #245-2); pair with `swap_streams={'ssr','ssr_bias'}` (keep eph).
+- **precise-orbit** — `PreciseCorrections(sp3, clk_file)` /
+  `make_precise_corrections(sp3_path, clk_path)`: SP3 orbits + CLKFile clocks
+  bridged into the engine's `sat_position→(pos,clk)` interface, swapped in as
+  the filter's corrections OBJECT via `run_pos_replay(corrections_override=…)` /
+  `build_filter_thread(corrections=…)` (captured eph/ssr swapped out; pair with
+  an ssr-bias loader for the obs-leg biases, since SP3/CLK carry none).
+
+Both are plumbed through `run_case` (`swap_streams` / `corrections_override`), so
+each is reachable through the case-library orchestrator (the #247 lesson applied
+proactively).  **Remaining:** real captured bundles (+ real SP3/CLK/Bias-SINEX
+product files) for the end-to-end `[PPP_STATE]` / real-RAWX / real-eph / `.tro`
+confirmations — field artifacts, not in-repo.
 
 ## Carries (open notes to honor here)
 

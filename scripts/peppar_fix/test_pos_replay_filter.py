@@ -297,5 +297,94 @@ class TestSsrSourceSwapSeam(unittest.TestCase):
             route.assert_called_once()                   # only eph routed
 
 
+import numpy as _np                            # noqa: E402
+
+_DEFAULT_SP3_POS = _np.array([1.0, 2.0, 3.0])
+
+
+class _StubSP3:
+    # The REAL SP3.sat_position contract (solve_pseudorange.py:133): returns the
+    # (pos_array, clk) 2-tuple — or (None, None) outside its window — NOT (x,y,z).
+    # Deriving the stub from the real return is the #239 lesson (Charlie #248).
+    def __init__(self, pos=_DEFAULT_SP3_POS, clk=2.0e-7):
+        self.pos = pos
+        self.clk = clk
+
+    def sat_position(self, sv, t):
+        return self.pos, self.clk
+
+
+class _StubClk:
+    def __init__(self, clk=1.5e-6):
+        self.clk = clk
+
+    def sat_clock(self, prn, t):
+        return self.clk                        # seconds, or None
+
+
+class TestPreciseCorrections(unittest.TestCase):
+    """The precise-orbit corrections OBJECT (Charlie #245-1/#248): SP3 orbits +
+    CLK clocks via the engine's sat_position→(pos,clk) interface — SP3 already
+    returns that 2-tuple, the precise CLK substitutes the clock."""
+
+    def test_bridges_sp3_position_and_clk_clock(self):
+        pc = prf.PreciseCorrections(_StubSP3(), _StubClk(1.5e-6))
+        pos, clk = pc.sat_position("G01", None)
+        self.assertTrue(_np.allclose(pos, [1.0, 2.0, 3.0]))   # SP3 position
+        self.assertAlmostEqual(clk, 1.5e-6)    # CLKFile clock substituted for SP3's
+        self.assertAlmostEqual(pc.sat_clock("G01", None), 1.5e-6)
+
+    def test_outside_sp3_window_returns_none(self):
+        pc = prf.PreciseCorrections(_StubSP3(pos=None, clk=None), _StubClk())
+        self.assertEqual(pc.sat_position("G01", None), (None, None))
+
+    def test_clkfile_none_clock_skips_sv(self):
+        # CLKFile.sat_clock returns None (PRN absent / out of range) → must
+        # return (None,None), NOT (pos,None) which the engine's pos-only guard
+        # would let propagate a None clock (Charlie #248 bug 2).
+        pc = prf.PreciseCorrections(_StubSP3(), _StubClk(clk=None))
+        self.assertEqual(pc.sat_position("G01", None), (None, None))
+
+    def test_no_clk_file_uses_sp3_clock(self):
+        # no CLK file → SP3's OWN clock, not 0.0 (0.0 = ~100s-km error, #248 bug 3)
+        pc = prf.PreciseCorrections(_StubSP3(clk=7.0e-7), clk_file=None)
+        _pos, clk = pc.sat_position("G01", None)
+        self.assertAlmostEqual(clk, 7.0e-7)
+        self.assertAlmostEqual(pc.sat_clock("G01", None), 7.0e-7)  # not 0.0
+
+
+class TestCorrectionsOverride(unittest.TestCase):
+    def test_build_filter_thread_uses_override(self):
+        rawx = _synthetic_rawx()
+        sentinel = prf.PreciseCorrections(_StubSP3(), _StubClk())
+        with tempfile.TemporaryDirectory() as d:
+            _bundle(d, n_rawx=0)
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True)
+                thread = prf.build_filter_thread(rd, _TRUTH, systems=["gps"],
+                                                 corrections=sentinel)
+        self.assertIs(thread._corrections, sentinel)
+
+    def test_run_pos_replay_precise_override_swaps_captured(self):
+        rawx = _synthetic_rawx()
+        override = prf.PreciseCorrections(_StubSP3(), _StubClk())
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="2026-01-01T00:00:00+00:00",
+                             conventions={"receiver": "f9t", "systems": ["gps"]})
+            b.record("eph", b"\xd3\x00\x05eph", recv_mono=99.0)
+            b.record("ubx", b"RAWX-0", recv_mono=100.0)
+            b.close()
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                res = prf.run_pos_replay(d, _TRUTH,
+                                         corrections_override=override)
+        self.assertTrue(res["product_swapped"])
+        self.assertIs(res["thread"]._corrections, override)
+        # captured eph swapped out by default (override supplies orbits)
+        self.assertIn("eph:swapped-out", [i for _t, _s, i in res["driver"].trace])
+
+
 if __name__ == "__main__":
     unittest.main()
