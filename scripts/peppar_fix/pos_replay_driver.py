@@ -321,6 +321,14 @@ class ReplayDriver:
             return "RXM-RAWX?"          # mirror serial_reader's decode-skip
         gps_time = (datetime(1980, 1, 6, tzinfo=timezone.utc)
                     + timedelta(weeks=int(rawx.week), seconds=float(rawx.rcvTow)))
+        # Faithfulness boundary (Charlie #243, same class as the #230 canonical-
+        # stamp item): this applies the SSRState as it stood at the RAWX frame's
+        # RECEIPT recv_mono, whereas live queues the RAWX and corrects it at
+        # PROCESSING time — by which a little more SSR may have arrived.  For SSR
+        # this is negligible (it updates every few seconds and is consumed with
+        # ~600 s freshness), so sub-second queue latency doesn't move the bias
+        # correction.  If a case ever needs processing-time SSR, the bundle's
+        # recv_mono lets a replay reconstruct it.
         observations, raw_obs, n_off, n_single = rawx_to_observations(
             rawx, self._systems, self.stores.get("ssr"),
             self._sig_names, self._sig_lookup, self._bds_l1_ref_cycles)
