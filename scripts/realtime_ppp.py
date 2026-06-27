@@ -144,6 +144,12 @@ BIAS_MSG_TYPES = CODE_BIAS_MSG_TYPES | PHASE_BIAS_MSG_TYPES
 # stays in module scope because the correction math doesn't change.
 _LAMBDA_L1 = C / F_L1
 
+# SV-prefix → constellation.  Module-level so BOTH rawx_to_observations and
+# serial_reader's downstream OBS_ADMIT/diag code can use it (the latter use was
+# orphaned when the obs-build block — which defined this locally — was extracted
+# into rawx_to_observations in #239; pyflakes caught the undefined-name leak).
+PREFIX_TO_SYS = {'G': 'gps', 'E': 'gal', 'C': 'bds'}
+
 # B1C sits at the L1 carrier (1575.42 MHz); B2a sits at the L5 carrier
 # (1176.45 MHz).  Wavelengths and IF coefficients reuse the GPS L1/L5
 # constants exactly — the carriers are identical, only the modulation
@@ -1214,7 +1220,6 @@ def rawx_to_observations(rawx, systems, ssr, sig_names, sig_lookup,
     # ObservationEvent).  Per dayplan I-143806-main.
     n_off_const = 0
     n_single = 0
-    PREFIX_TO_SYS = {'G': 'gps', 'E': 'gal', 'C': 'bds'}
     for sv, roles in raw_obs.items():
         prefix = sv[0]
         sys_name = PREFIX_TO_SYS.get(prefix)

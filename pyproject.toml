@@ -42,7 +42,7 @@ analysis = ["allantools", "matplotlib", "pandas"]
 # the engine and is explicitly forbidden from importing peppar_fix — see
 # peppar_mon/tests/test_boundary.py for the enforcement.
 mon = ["textual>=0.50"]
-dev = ["pytest", "peppar-fix[analysis,timebeat,mon]"]
+dev = ["pytest", "pyflakes", "peppar-fix[analysis,timebeat,mon]"]
 
 # Entry points — these become CLI commands after `pip install`.
 # Not yet functional: requires the import refactor (all bare imports

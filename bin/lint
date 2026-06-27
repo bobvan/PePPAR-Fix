@@ -1,0 +1,74 @@
+#!/bin/bash
+# Static undefined-name gate (pyflakes).
+#
+# Catches free-variable / leaked-local bugs that behavioral tests miss — e.g.
+# the #239 PREFIX_TO_SYS regression: an extraction moved a local's definition
+# into the new function but left uses behind in the caller, an undefined-name
+# NameError on a path no unit test exercised.  pyflakes finds it statically on
+# EVERY path; the suite was green.  Charlie's #240 process note: make the static
+# layer automatic so this class of bug can't reach review.
+#
+# Gates ONLY on "undefined name" (real NameError-class bugs), not pyflakes'
+# unused-import/unused-var noise (hundreds, pre-existing).  A small allowlist
+# covers KNOWN pre-existing undefined-names under separate investigation
+# (dayplan: preexistingUndefinedNames) so the gate is enableable now and
+# ratchets — anything NEW fails.
+#
+# Scope note (Charlie #241): this covers FREE-VARIABLE / leaked-local bugs
+# (pyflakes "undefined name 'X'").  It does NOT cover use-before-assignment
+# (pyflakes "local variable 'X' ... referenced before assignment"), a different
+# string though also NameError-class — don't assume total NameError coverage.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+VENV_PY=/home/bob/git/PePPAR-Fix/venv/bin/python
+
+if ! "$VENV_PY" -c "import pyflakes" 2>/dev/null; then
+    echo "lint: pyflakes not in the dev venv — skipping undefined-name gate" >&2
+    echo "      install once:  $VENV_PY -m pip install pyflakes  (it's in [dev])" >&2
+    exit 0
+fi
+
+# Known pre-existing undefined-names, normalized to 'path: undefined name X'
+# (line/col stripped so the allowlist is stable across edits).  These are
+# pre-existing latent bugs in run_steady_state's noise-buffer + TICC-sanity
+# blocks (ctx should be servo_ctx, _time should be time) — filed for separate
+# investigation; NOT introduced by the pos_replay work.
+ALLOW=$(cat <<'EOF'
+scripts/peppar_fix_engine.py: undefined name 'ctx'
+scripts/peppar_fix_engine.py: undefined name '_time'
+EOF
+)
+# Total RAW occurrences the allowlist accounts for.  Asserting the count closes
+# the same-name/same-file blind spot (Charlie #241): a NEW undefined `ctx` in
+# peppar_fix_engine.py normalizes to an allowlisted entry (so the set check
+# misses it), but it bumps the raw count 7→8 and trips here.
+ALLOW_COUNT=7
+
+findings=$("$VENV_PY" -m pyflakes scripts/ tests/ 2>&1 | grep "undefined name" || true)
+total=$(printf '%s\n' "$findings" | grep -c . || true)
+# Normalize away the line[:col] (col optional — pyflakes-version-robust) so the
+# allowlist key is a stable 'path: undefined name X'.
+norm=$(printf '%s\n' "$findings" | grep . \
+        | sed -E 's/:[0-9]+(:[0-9]+)?: undefined/: undefined/' | sort -u)
+new=$(comm -23 <(printf '%s\n' "$norm" | grep . || true) <(printf '%s\n' "$ALLOW" | sort -u))
+
+if [ -n "$new" ]; then
+    echo "lint: NEW undefined name(s) — likely a leaked local / free-var bug:" >&2
+    printf '%s\n' "$new" >&2
+    echo "" >&2
+    echo "Fix the reference (or, if genuinely pre-existing and out of scope," >&2
+    echo "add it to the ALLOW list in bin/lint with a filed finding)." >&2
+    exit 1
+fi
+if [ "$total" -gt "$ALLOW_COUNT" ]; then
+    echo "lint: an allowlisted undefined name REAPPEARED ($total > $ALLOW_COUNT known)" >&2
+    echo "      a new occurrence of an already-known name (likely in" >&2
+    echo "      peppar_fix_engine.py) — fix it; don't let the allowlist mask it." >&2
+    printf '%s\n' "$findings" >&2
+    exit 1
+fi
+if [ "$total" -lt "$ALLOW_COUNT" ]; then
+    echo "lint: only $total known undefined names remain (< $ALLOW_COUNT) —" \
+         "lower ALLOW_COUNT in bin/lint (allowlist is now over-counting)." >&2
+fi
+echo "lint: undefined-name gate clean ($total known/allowlisted)"
