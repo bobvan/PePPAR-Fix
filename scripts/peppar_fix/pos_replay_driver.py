@@ -43,12 +43,18 @@ keep the two in step (fidelity depends on it).
   step needs, and the seam where **product-swap** plugs in (point the SSR
   stream at final products instead of the captured real-time SSR).
 
-**Still ahead — stage 2b.**  Regenerating ``[PPP_STATE]`` / ``[METAR]`` needs
-the per-epoch filter step (RAWX → obs → ``filt.update`` → emit), which lives
-inside the threaded ``run_steady_state`` and must be factored into a reusable,
-thread-free callable.  That carries Charlie's #230 obs↔PPS RAWX canonical-stamp
-once-over, the #236-F2 ``late_edge_filter`` config, and the #236-F4 TICC
-recv-estimator reconstruction.
+**Stage 2b — obs reconstruction (here, opt-in ``decode_obs=True``).**  Decodes
+the captured RAWX inline (in ``recv_mono`` order, so the SSRState used for bias
+correction matches the live interleave) into a ``(gps_time, observations,
+obs_counts)`` timeline (``self.epochs``) via the engine's own ``rawx_decode`` +
+``rawx_to_observations`` (#239) with the manifest-derived sig config (#242).
+This is the input the filter step consumes.
+
+**Still ahead.**  Driving ``AntPosEstThread._process_epoch`` (#240) over
+``self.epochs`` to regenerate ``[PPP_STATE]`` via ``format_ppp_state_line``,
+scored by ``pos_replay_compare`` / the ``pos_sim`` DivergenceMonitor; plus the
+#236-F2 ``late_edge_filter`` config and the #236-F4 TICC recv-estimator
+reconstruction.
 """
 from __future__ import annotations
 
@@ -177,7 +183,8 @@ class ReplayDriver:
 
     def __init__(self, bundle_dir: str, *,
                  build_stores: Optional[Callable[[], dict]] = None,
-                 run_config: Optional[dict] = None):
+                 run_config: Optional[dict] = None,
+                 decode_obs: bool = False):
         self.bundle_dir = bundle_dir
         self.clock = VirtualClock()
         self.stores = (build_stores or default_replay_stores)()
@@ -187,6 +194,18 @@ class ReplayDriver:
                            else read_run_config(bundle_dir))
         self.trace: list = []
         self.counts: dict = defaultdict(int)
+        # Obs reconstruction (runner): decode the captured RAWX into a
+        # (gps_time, observations, obs_counts) timeline.  Opt-in — stage-1
+        # determinism replays don't need it, and replay_sig_config raises when
+        # the manifest names no receiver (correct for a capture meant to be
+        # decoded; not something a pure re-feed should hit).
+        self.decode_obs = decode_obs
+        self.epochs: list = []
+        if decode_obs:
+            (self._sig_names, self._sig_lookup,
+             self._bds_l1_ref_cycles) = replay_sig_config(bundle_dir)
+            self._systems = read_manifest_conventions(bundle_dir).get(
+                "systems", [])
 
     def run(self) -> list:
         for recv_mono, stream, payload in merged_records(self.bundle_dir):
@@ -235,6 +254,14 @@ class ReplayDriver:
 
     def _dispatch_ubx(self, payload: bytes, recv_mono: float) -> str:
         """Mirror serial_reader's identity→store map for the pure stores."""
+        # RAWX → observations (runner): decode inline, so the SSRState used for
+        # bias correction is exactly what was applied up to THIS recv_mono — the
+        # same interleave the live engine saw.  Only when reconstructing obs;
+        # otherwise RAWX falls through to UBXReader.parse (no store touches it).
+        if self.decode_obs:
+            from peppar_fix import rawx_decode
+            if rawx_decode.is_rawx(payload):
+                return self._decode_rawx_epoch(payload)
         from pyubx2 import UBXReader
         try:
             parsed = UBXReader.parse(payload)
@@ -275,6 +302,40 @@ class ReplayDriver:
         elif ident == "TIM-TM2" and s.get("extint") is not None:
             s["extint"].update(parsed, recv_mono=recv_mono)
         return ident
+
+    def _decode_rawx_epoch(self, payload: bytes) -> str:
+        """Decode one captured RAWX frame → (gps_time, observations, obs_counts)
+        appended to ``self.epochs`` (the input the filter step consumes).
+
+        Reuses the engine's own ``rawx_decode`` + ``rawx_to_observations`` with
+        the manifest-derived sig config and the live SSRState, so the rebuilt
+        observations match what the engine queued at capture.  gps_time is the
+        canonical RAWX-header time (GPS epoch + week + rcvTow), same as
+        serial_reader."""
+        from datetime import datetime, timedelta, timezone
+        from peppar_fix import rawx_decode
+        from realtime_ppp import rawx_to_observations
+        try:
+            rawx = rawx_decode.decode_rawx(payload)
+        except ValueError:
+            return "RXM-RAWX?"          # mirror serial_reader's decode-skip
+        gps_time = (datetime(1980, 1, 6, tzinfo=timezone.utc)
+                    + timedelta(weeks=int(rawx.week), seconds=float(rawx.rcvTow)))
+        # Faithfulness boundary (Charlie #243, same class as the #230 canonical-
+        # stamp item): this applies the SSRState as it stood at the RAWX frame's
+        # RECEIPT recv_mono, whereas live queues the RAWX and corrects it at
+        # PROCESSING time — by which a little more SSR may have arrived.  For SSR
+        # this is negligible (it updates every few seconds and is consumed with
+        # ~600 s freshness), so sub-second queue latency doesn't move the bias
+        # correction.  If a case ever needs processing-time SSR, the bundle's
+        # recv_mono lets a replay reconstruct it.
+        observations, raw_obs, n_off, n_single = rawx_to_observations(
+            rawx, self._systems, self.stores.get("ssr"),
+            self._sig_names, self._sig_lookup, self._bds_l1_ref_cycles)
+        obs_counts = {"n_raw": len(raw_obs), "n_off_const": n_off,
+                      "n_single": n_single}
+        self.epochs.append((gps_time, observations, obs_counts))
+        return "RXM-RAWX"
 
     def _dispatch_ticc(self, payload: bytes, recv_mono: float) -> str:
         from ticc import _LINE_RE
