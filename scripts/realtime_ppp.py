@@ -1238,6 +1238,15 @@ def rawx_to_observations(rawx, systems, ssr, sig_names, sig_lookup,
     # ObservationEvent).  Per dayplan I-143806-main.
     n_off_const = 0
     n_single = 0
+    # Is there a phase-bias SOURCE at all this epoch?  Distinguishes pure-float
+    # (no SSR phase biases anywhere → AR impossible) from the MIXED case (source
+    # present, but some SVs lack a both-band match).  obs_for_position's
+    # documented contract is "no SSR stream → every obs passes"; with no source
+    # we honor it by leaving ar_phase_bias_ok True (pure float), and keep the
+    # per-SV False only for the mixed/MISS case it was built for (I-175645).
+    # This makes the live engine AND pos_replay behave identically in a
+    # phase-bias-free capture (Charlie #251) — no replay-side override.
+    has_pb_source = ssr is not None and bool(getattr(ssr, '_phase_bias', None))
     for sv, roles in raw_obs.items():
         prefix = sv[0]
         sys_name = PREFIX_TO_SYS.get(prefix)
@@ -1346,8 +1355,10 @@ def rawx_to_observations(rawx, systems, ssr, sig_names, sig_lookup,
         # a biased IF ambiguity — the short-term promoter in
         # ppp_ar.py uses this flag to exclude such SVs from
         # integer-fix candidacy (they still contribute PR for
-        # geometry).  Defaults False when ssr is absent.
-        ar_phase_bias_ok = False
+        # geometry).  Default: pure-float (no phase-bias source) → True so the
+        # obs passes obs_for_position (float PPP, no AR); mixed → False until a
+        # both-band match is found below.
+        ar_phase_bias_ok = not has_pb_source
         phase_bias_stepped = False
         if ssr is not None and rinex_f1 and rinex_f2:
             # Phase biases are indexed by code signal identifier
@@ -1421,8 +1432,11 @@ def rawx_to_observations(rawx, systems, ssr, sig_names, sig_lookup,
                 cp_f1 -= pb_f1 / wl_f1  # meters → cycles
             if pb_f2 is not None:
                 cp_f2 -= pb_f2 / wl_f2
-            ar_phase_bias_ok = (pb_f1 is not None
-                                and pb_f2 is not None)
+            # Only a real phase-bias SOURCE flips the flag per-SV (mixed/AR
+            # mode); pure-float left it True above.
+            if has_pb_source:
+                ar_phase_bias_ok = (pb_f1 is not None
+                                    and pb_f2 is not None)
             if phase_bias_stepped:
                 log.info(
                     "[PB_STEP] %s phase-bias segment boundary "

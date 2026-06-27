@@ -73,11 +73,11 @@ class TestRawxDecodeBuildsEpochs(unittest.TestCase):
                 rd.run()
             self.assertEqual(rd.epochs, [])
 
-    def test_float_ppp_marks_obs_when_no_phase_biases(self):
-        # runner bootstrap gap (I-175208): no SSR phase-bias source →
-        # rawx_to_observations sets ar_phase_bias_ok=False on every SV, which
-        # obs_for_position then drops → n_used=0.  The decode must mark them
-        # True for float PPP so they survive.
+    def test_float_ppp_obs_survive_when_no_phase_biases(self):
+        # Integration (I-175208 / Charlie #251): a phase-bias-free bundle
+        # reconstructs obs that pass obs_for_position — pure-float pass-through
+        # is in rawx_to_observations itself (shared live/replay), so the replay
+        # obs carry ar_phase_bias_ok=True with no replay-side override.
         rawx = _synthetic_rawx_for_f9t()
         with tempfile.TemporaryDirectory() as d:
             _bundle(d)                      # no ssr stream → no phase biases
@@ -87,34 +87,6 @@ class TestRawxDecodeBuildsEpochs(unittest.TestCase):
             _gt, obs, _c = rd.epochs[0]
             self.assertTrue(obs)
             self.assertTrue(all(o["ar_phase_bias_ok"] for o in obs))
-
-    def test_ar_flag_respected_when_phase_biases_present(self):
-        # WITH a phase-bias source (ssr._phase_bias non-empty) the per-SV flag is
-        # respected (AR mode) — the float fallback must not clobber it.  Mock
-        # rawx_to_observations so the obs carry ar_phase_bias_ok=False; the test
-        # isolates the float-skip decision (the real SSR phase-bias lookup is the
-        # engine's concern, tested elsewhere).
-        rawx = _synthetic_rawx_for_f9t()
-
-        def _stores_with_pb():
-            from ssr_corrections import SSRState
-            from broadcast_eph import BroadcastEphemeris
-            ssr = SSRState()
-            ssr._phase_bias["G01"] = {"L1C": None}       # non-empty → AR mode
-            return {"ssr": ssr, "beph": BroadcastEphemeris(), "ticc_events": []}
-
-        obs_false = [{"sv": "G01", "ar_phase_bias_ok": False}]
-        with tempfile.TemporaryDirectory() as d:
-            _bundle(d)
-            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
-                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx), \
-                 mock.patch("realtime_ppp.rawx_to_observations",
-                            return_value=(obs_false, {}, 0, 0)):
-                rd = drv.ReplayDriver(d, decode_obs=True,
-                                      build_stores=_stores_with_pb)
-                rd.run()
-            _gt, obs, _c = rd.epochs[0]
-            self.assertFalse(obs[0]["ar_phase_bias_ok"])   # AR mode: not forced
 
     def test_decode_obs_requires_receiver(self):
         with tempfile.TemporaryDirectory() as d:
