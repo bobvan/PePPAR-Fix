@@ -184,7 +184,8 @@ class ReplayDriver:
     def __init__(self, bundle_dir: str, *,
                  build_stores: Optional[Callable[[], dict]] = None,
                  run_config: Optional[dict] = None,
-                 decode_obs: bool = False):
+                 decode_obs: bool = False,
+                 epoch_sink: Optional[Callable] = None):
         self.bundle_dir = bundle_dir
         self.clock = VirtualClock()
         self.stores = (build_stores or default_replay_stores)()
@@ -201,6 +202,15 @@ class ReplayDriver:
         # decoded; not something a pure re-feed should hit).
         self.decode_obs = decode_obs
         self.epochs: list = []
+        # Called inline with (gps_time, observations, obs_counts) the instant an
+        # epoch is decoded — the runner wires it to AntPosEstThread._process_epoch
+        # so the filter sees each epoch with the SSR/eph state as of THAT
+        # recv_mono (the same per-epoch interleave as the obs bias correction);
+        # driving over a post-run self.epochs would feed every epoch the FINAL
+        # correction state.  Implies decode_obs.
+        self.epoch_sink = epoch_sink
+        if epoch_sink is not None:
+            decode_obs = self.decode_obs = True
         if decode_obs:
             (self._sig_names, self._sig_lookup,
              self._bds_l1_ref_cycles) = replay_sig_config(bundle_dir)
@@ -335,6 +345,9 @@ class ReplayDriver:
         obs_counts = {"n_raw": len(raw_obs), "n_off_const": n_off,
                       "n_single": n_single}
         self.epochs.append((gps_time, observations, obs_counts))
+        if self.epoch_sink is not None:
+            # inline → corrections (beph/ssr) reflect state up to this recv_mono
+            self.epoch_sink(gps_time, observations, obs_counts)
         return "RXM-RAWX"
 
     def _dispatch_ticc(self, payload: bytes, recv_mono: float) -> str:
