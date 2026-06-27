@@ -186,7 +186,8 @@ class ReplayDriver:
                  run_config: Optional[dict] = None,
                  decode_obs: bool = False,
                  epoch_sink: Optional[Callable] = None,
-                 apply_captured_corrections: bool = True):
+                 apply_captured_corrections: bool = True,
+                 swap_streams=None):
         self.bundle_dir = bundle_dir
         self.clock = VirtualClock()
         self.stores = (build_stores or default_replay_stores)()
@@ -199,6 +200,14 @@ class ReplayDriver:
         # into ZTD disappears under final products, the gap was products; if it
         # persists, it's the filter/observability.
         self.apply_captured_corrections = apply_captured_corrections
+        # Per-stream swap granularity (Charlie #245-1/#246): swap_streams is the
+        # set of correction streams ("ssr"/"ssr_bias"/"eph") to swap OUT (not
+        # apply), the rest applied.  The all-or-nothing bool is too coarse for an
+        # ssr-source swap (different SSR/biases over the SAME broadcast orbits),
+        # which must swap {ssr, ssr_bias} but KEEP eph (else no orbits →
+        # n_used<4).  None → fall back to apply_captured_corrections (all/none).
+        self.swap_streams = (frozenset(swap_streams)
+                             if swap_streams is not None else None)
         # Mirror the captured run's RTCM bias-skip config (read from the
         # manifest unless overridden) so replay SSRState matches live (#237).
         self.run_config = (run_config if run_config is not None
@@ -241,10 +250,16 @@ class ReplayDriver:
         if stream == "ticc":
             return self._dispatch_ticc(payload, recv_mono)
         if stream in ("ssr", "ssr_bias", "eph"):
-            if not self.apply_captured_corrections:
+            if self._is_swapped(stream):
                 return f"{stream}:swapped-out"   # product-swap: don't apply
             return self._dispatch_rtcm(stream, payload, recv_mono)
         return stream
+
+    def _is_swapped(self, stream: str) -> bool:
+        """Whether a captured correction stream is swapped out (not applied)."""
+        if self.swap_streams is not None:
+            return stream in self.swap_streams
+        return not self.apply_captured_corrections
 
     def _dispatch_rtcm(self, stream: str, payload: bytes,
                        recv_mono: float) -> str:

@@ -113,6 +113,15 @@ So the seam is sound; the loaders split into "ssr-source" (stores fill, keep
 eph) and "precise-object" (swap corrections) — a per-stream granularity the
 case-library wires concretely.
 
+**Implemented:** `ReplayDriver(swap_streams={…})` is the per-stream knob (swap
+`{ssr, ssr_bias}`, KEEP `eph`); `run_pos_replay(..., swap_streams=…)` plumbs it.
+First concrete loader: `pos_replay_filter.make_ssr_records_loader(path)` — an
+**ssr-source** loader from an SSR-records JSON (`load_ssr_records` /
+`SSRState.update_from_records`), deterministic (fixed local file) with a loud
+empty-records coverage check (Charlie #245-2).  **Still to build:** the
+**precise-orbit** loader (SP3+CLK corrections-object swap + a Bias-SINEX bias
+provider), and the real captured bundles for end-to-end confirmation.
+
 ## Carries (open notes to honor here)
 
 - **#230** — obs↔PPS RAWX canonical-stamp once-over, when RAWX→obs lands.

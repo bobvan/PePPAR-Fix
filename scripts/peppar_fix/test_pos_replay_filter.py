@@ -194,5 +194,65 @@ class TestProductSwapRunner(unittest.TestCase):
             self.assertFalse(res["product_swapped"])
 
 
+class TestPerStreamSwap(unittest.TestCase):
+    def test_swap_ssr_keep_eph(self):
+        # ssr-source swap: swap {ssr} but KEEP eph (orbits) — eph still routed,
+        # ssr traced swapped-out
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="2026-01-01T00:00:00+00:00",
+                             conventions={"receiver": "f9t"})
+            b.record("ssr", b"\xd3\x00\x05ssr", recv_mono=99.0)
+            b.record("eph", b"\xd3\x00\x05eph", recv_mono=99.5)
+            b.close()
+            with mock.patch("pyrtcm.RTCMReader.parse",
+                            return_value=SimpleNamespace(identity="1019")), \
+                 mock.patch("realtime_ppp.route_rtcm_message",
+                            return_value=("eph", 5)) as route:
+                rd = drv.ReplayDriver(d, swap_streams={"ssr", "ssr_bias"})
+                rd.run()
+            idents = [i for _t, _s, i in rd.trace]
+            self.assertIn("ssr:swapped-out", idents)     # ssr swapped
+            self.assertIn("eph:1019", idents)            # eph KEPT (routed)
+            route.assert_called_once()                   # only eph routed
+
+
+class TestSsrRecordsLoader(unittest.TestCase):
+    def test_loads_records_into_ssrstate(self):
+        import json
+        from ssr_corrections import SSRState
+        recs = {"epoch_s": 100.0, "records": [
+            {"prn": "G01", "iode": 7, "orbit": [0.1, 0.2, 0.3],
+             "clock": 0.05, "code_bias": {"C1C": -1.2, "C5Q": -1.5}}]}
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump(recs, f)
+            path = f.name
+        try:
+            loader = prf.make_ssr_records_loader(path)
+            ssr = SSRState()
+            loader({"ssr": ssr})
+            self.assertAlmostEqual(ssr.get_code_bias("G01", "C1C"), -1.2)
+            self.assertAlmostEqual(ssr.get_code_bias("G01", "C5Q"), -1.5)
+            self.assertEqual(ssr.n_orbit, 1)
+            self.assertEqual(ssr.n_clock, 1)
+        finally:
+            os.unlink(path)
+
+    def test_empty_records_raises_coverage_check(self):
+        import json
+        from ssr_corrections import SSRState
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"epoch_s": 0.0, "records": []}, f)
+            path = f.name
+        try:
+            with self.assertRaises(ValueError):
+                prf.make_ssr_records_loader(path)({"ssr": SSRState()})
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main()
