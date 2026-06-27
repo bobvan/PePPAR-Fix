@@ -70,27 +70,49 @@ from peppar_fix.raw_capture import merged_records  # noqa: E402
 _BIAS_SKIP_KEYS = ("skip_biases", "skip_code_biases", "skip_phase_biases")
 
 
-def read_run_config(bundle_dir: str) -> dict:
-    """Read the run-config knobs from the bundle's ``manifest.toml`` wholesale.
+def read_manifest_conventions(bundle_dir: str) -> dict:
+    """The bundle's ``manifest.toml`` ``[conventions]`` table (or {} if absent).
 
-    Today: the RTCM bias-skip flags (``--no-primary-biases`` /
-    ``--no-ssr-code-bias`` / ``--no-ssr-phase-bias``) the engine recorded in
-    ``[conventions]``.  Missing manifest / missing keys → all False (the engine
-    default).  Returns a dict the driver passes straight to
-    ``route_rtcm_message`` so replay routing matches the captured run.
-    """
-    cfg = {k: False for k in _BIAS_SKIP_KEYS}
+    The single reader for every per-run config the replay mirrors (bias-skip
+    flags, receiver, systems, …) — read wholesale so the next field is a lookup,
+    not a new I/O path (Charlie #237)."""
     path = os.path.join(bundle_dir, "manifest.toml")
     try:
         import tomllib
         with open(path, "rb") as f:
-            conv = tomllib.load(f).get("conventions", {})
-        for k in _BIAS_SKIP_KEYS:
-            if k in conv:
-                cfg[k] = bool(conv[k])
+            return tomllib.load(f).get("conventions", {})
     except (OSError, ValueError):
-        pass            # no/garbled manifest → engine defaults (all False)
-    return cfg
+        return {}           # no/garbled manifest
+
+
+def read_run_config(bundle_dir: str) -> dict:
+    """The RTCM bias-skip flags (``--no-primary-biases`` / ``--no-ssr-code-bias``
+    / ``--no-ssr-phase-bias``) the engine recorded in ``[conventions]``.  Missing
+    keys → all False (engine default).  Passed straight to ``route_rtcm_message``
+    so replay routing matches the captured run."""
+    conv = read_manifest_conventions(bundle_dir)
+    return {k: bool(conv.get(k, False)) for k in _BIAS_SKIP_KEYS}
+
+
+def replay_sig_config(bundle_dir: str):
+    """Per-receiver signal config for RAWX→obs reconstruction, from the bundle's
+    manifest ``receiver``: ``(signal_names, sig_lookup, bds_l1_ref_cycles)``
+    ready for ``realtime_ppp.rawx_to_observations``.
+
+    The replay can't decode the captured RAWX without knowing which receiver
+    produced it (signal map + IF pairs are receiver-specific), so a manifest
+    that names no receiver is an error here — unlike the bias-skip flags, there
+    is no safe default.  Reuses the engine's own ``get_driver`` + the shared
+    ``build_sig_lookup`` so the replay's sig config is identical to live's."""
+    receiver = read_manifest_conventions(bundle_dir).get("receiver", "")
+    if not receiver:
+        raise ValueError(
+            "bundle manifest names no receiver; RAWX→obs reconstruction needs "
+            "it (the engine records it in [conventions] at capture)")
+    from peppar_fix.receiver import get_driver
+    from realtime_ppp import build_sig_lookup
+    driver = get_driver(receiver)
+    return driver.signal_names, build_sig_lookup(driver), driver.bds_l1_ref_cycles
 
 
 class VirtualClock:

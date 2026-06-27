@@ -233,6 +233,17 @@ def make_raw_capture_bundle(args, systems, log):
         return None
     import socket
     from peppar_fix.raw_capture import RawCaptureBundle
+    # Fail loud at CAPTURE if the receiver is unset (Charlie #242): today
+    # args.receiver is unconditionally defaulted, so the manifest records the
+    # exact get_driver key the engine used — but if a future entry path (e.g.
+    # re-enabled auto-detect) leaves it empty, the manifest would record '' and
+    # pos_replay's replay_sig_config can't decode the RAWX → unreplayable.
+    # Surface it here, not at replay time. (driver.name is NOT recorded: it's a
+    # human label get_driver can't resolve back to a driver.)
+    if not (getattr(args, 'receiver', '') or ''):
+        log.warning("raw-capture: args.receiver is empty — the bundle manifest "
+                    "won't name a receiver, so pos_replay can't reconstruct the "
+                    "RAWX→obs sig config (this capture will be unreplayable)")
     bundle = RawCaptureBundle(args.raw_capture_dir)
     try:
         bundle.write_manifest(
@@ -243,6 +254,11 @@ def make_raw_capture_bundle(args, systems, log):
                 "known_pos": getattr(args, 'known_pos', '') or '',
                 # sorted → deterministic manifest regardless of set/list input
                 "systems": sorted(systems) if systems else [],
+                # Receiver type — pos_replay reconstructs the per-receiver signal
+                # config (signal_names / sig_lookup / bds_l1_ref_cycles via
+                # get_driver + build_sig_lookup) to decode captured RAWX into
+                # observations, so it must match the capture run (per-run-config).
+                "receiver": getattr(args, 'receiver', '') or '',
                 # Per-run RTCM bias-skip config (--no-primary-biases /
                 # --no-ssr-code-bias / --no-ssr-phase-bias).  Load-bearing for
                 # replay: a capture made with these dropped biases LIVE, so the
