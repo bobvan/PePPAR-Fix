@@ -297,5 +297,76 @@ class TestSsrSourceSwapSeam(unittest.TestCase):
             route.assert_called_once()                   # only eph routed
 
 
+class _StubSP3:
+    def __init__(self, pos=(1.0, 2.0, 3.0)):
+        self.pos = pos
+
+    def sat_position(self, sv, t):
+        return self.pos
+
+
+class _StubClk:
+    def sat_clock(self, prn, t):
+        return 1.5e-6                          # seconds
+
+
+class TestPreciseCorrections(unittest.TestCase):
+    """The precise-orbit corrections OBJECT (Charlie #245-1): SP3 orbits + CLK
+    clocks bridged into the engine's sat_position→(pos,clk) interface."""
+
+    def test_bridges_sp3_position_and_clk_clock(self):
+        import numpy as np
+        pc = prf.PreciseCorrections(_StubSP3((1.0, 2.0, 3.0)), _StubClk())
+        from datetime import datetime, timezone
+        pos, clk = pc.sat_position("G01", datetime(2026, 1, 1, tzinfo=timezone.utc))
+        self.assertTrue(np.allclose(np.asarray(pos), [1.0, 2.0, 3.0]))
+        self.assertAlmostEqual(clk, 1.5e-6)    # from CLKFile, not SP3
+        self.assertAlmostEqual(pc.sat_clock("G01", None), 1.5e-6)
+
+    def test_outside_sp3_window_returns_none(self):
+        pc = prf.PreciseCorrections(_StubSP3((None, None)), _StubClk())
+        pos, clk = pc.sat_position("G01", None)
+        self.assertIsNone(pos)                 # skip SV cleanly
+        self.assertIsNone(clk)
+
+    def test_no_clk_file_uses_zero(self):
+        pc = prf.PreciseCorrections(_StubSP3(), clk_file=None)
+        _pos, clk = pc.sat_position("G01", None)
+        self.assertEqual(clk, 0.0)
+
+
+class TestCorrectionsOverride(unittest.TestCase):
+    def test_build_filter_thread_uses_override(self):
+        rawx = _synthetic_rawx()
+        sentinel = prf.PreciseCorrections(_StubSP3(), _StubClk())
+        with tempfile.TemporaryDirectory() as d:
+            _bundle(d, n_rawx=0)
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True)
+                thread = prf.build_filter_thread(rd, _TRUTH, systems=["gps"],
+                                                 corrections=sentinel)
+        self.assertIs(thread._corrections, sentinel)
+
+    def test_run_pos_replay_precise_override_swaps_captured(self):
+        rawx = _synthetic_rawx()
+        override = prf.PreciseCorrections(_StubSP3(), _StubClk())
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="2026-01-01T00:00:00+00:00",
+                             conventions={"receiver": "f9t", "systems": ["gps"]})
+            b.record("eph", b"\xd3\x00\x05eph", recv_mono=99.0)
+            b.record("ubx", b"RAWX-0", recv_mono=100.0)
+            b.close()
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                res = prf.run_pos_replay(d, _TRUTH,
+                                         corrections_override=override)
+        self.assertTrue(res["product_swapped"])
+        self.assertIs(res["thread"]._corrections, override)
+        # captured eph swapped out by default (override supplies orbits)
+        self.assertIn("eph:swapped-out", [i for _t, _s, i in res["driver"].trace])
+
+
 if __name__ == "__main__":
     unittest.main()
