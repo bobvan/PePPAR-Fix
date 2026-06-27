@@ -99,6 +99,19 @@ class TestRawxToObservations(unittest.TestCase):
         self.assertEqual(n_single, 1)
 
 
+class TestPrefixToSysModuleLevel(unittest.TestCase):
+    """#239 regression: PREFIX_TO_SYS was defined inside the extracted
+    obs-build block but still used by serial_reader's downstream OBS_ADMIT/diag
+    code → undefined-name NameError there (caught by pyflakes, missed by the
+    suite).  Pin that it's module-level so both can resolve it."""
+
+    def test_prefix_to_sys_is_module_level(self):
+        self.assertTrue(hasattr(r, "PREFIX_TO_SYS"))
+        self.assertEqual(r.PREFIX_TO_SYS["G"], "gps")
+        self.assertEqual(r.PREFIX_TO_SYS["E"], "gal")
+        self.assertEqual(r.PREFIX_TO_SYS["C"], "bds")
+
+
 class TestGfDiagPersistsAcrossEpochs(unittest.TestCase):
     """Charlie #239: GF-DIAG is a two-epoch one-shot — its state dict must
     PERSIST across calls (set epoch1 on call 1, reach epoch2 on call 2), not

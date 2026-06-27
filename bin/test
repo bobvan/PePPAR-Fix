@@ -42,4 +42,12 @@ fi
 # Previously this script hardcoded the no-arg dirs, which masked a stale
 # testpaths=["tests"] and let flagged runs silently skip
 # scripts/peppar_fix/.  Single source of truth avoids that recurring.
+
+# Static undefined-name gate first (fast; catches free-variable / leaked-local
+# bugs the behavioral suite can miss — e.g. the #239 PREFIX_TO_SYS regression).
+# bin/lint skips cleanly if pyflakes isn't installed.  PEPPAR_SKIP_LINT=1 bypasses.
+if [[ "${PEPPAR_SKIP_LINT:-0}" != "1" ]]; then
+    "$(dirname "$0")/lint"
+fi
+
 exec "$VENV_PYTEST" "$@"

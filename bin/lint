@@ -1,0 +1,49 @@
+#!/bin/bash
+# Static undefined-name gate (pyflakes).
+#
+# Catches free-variable / leaked-local bugs that behavioral tests miss — e.g.
+# the #239 PREFIX_TO_SYS regression: an extraction moved a local's definition
+# into the new function but left uses behind in the caller, an undefined-name
+# NameError on a path no unit test exercised.  pyflakes finds it statically on
+# EVERY path; the suite was green.  Charlie's #240 process note: make the static
+# layer automatic so this class of bug can't reach review.
+#
+# Gates ONLY on "undefined name" (real NameError-class bugs), not pyflakes'
+# unused-import/unused-var noise (hundreds, pre-existing).  A small allowlist
+# covers KNOWN pre-existing undefined-names under separate investigation
+# (dayplan: preexistingUndefinedNames) so the gate is enableable now and
+# ratchets — anything NEW fails.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+VENV_PY=/home/bob/git/PePPAR-Fix/venv/bin/python
+
+if ! "$VENV_PY" -c "import pyflakes" 2>/dev/null; then
+    echo "lint: pyflakes not in the dev venv — skipping undefined-name gate" >&2
+    echo "      install once:  $VENV_PY -m pip install pyflakes  (it's in [dev])" >&2
+    exit 0
+fi
+
+# Known pre-existing undefined-names, normalized to 'path: undefined name X'
+# (line/col stripped so the allowlist is stable across edits).  These are
+# pre-existing latent bugs in run_steady_state's noise-buffer + TICC-sanity
+# blocks (ctx should be servo_ctx, _time should be time) — filed for separate
+# investigation; NOT introduced by the pos_replay work.
+ALLOW=$(cat <<'EOF'
+scripts/peppar_fix_engine.py: undefined name 'ctx'
+scripts/peppar_fix_engine.py: undefined name '_time'
+EOF
+)
+
+findings=$("$VENV_PY" -m pyflakes scripts/ tests/ 2>&1 | grep "undefined name" || true)
+norm=$(printf '%s\n' "$findings" | grep . | sed -E 's/:[0-9]+:[0-9]+: undefined/: undefined/' | sort -u)
+new=$(comm -23 <(printf '%s\n' "$norm" | grep . || true) <(printf '%s\n' "$ALLOW" | sort -u))
+
+if [ -n "$new" ]; then
+    echo "lint: NEW undefined name(s) — likely a leaked local / free-var bug:" >&2
+    printf '%s\n' "$new" >&2
+    echo "" >&2
+    echo "Fix the reference (or, if genuinely pre-existing and out of scope," >&2
+    echo "add it to the ALLOW list in bin/lint with a filed finding)." >&2
+    exit 1
+fi
+echo "lint: undefined-name gate clean ($(printf '%s\n' "$findings" | grep -c . ) known/allowlisted)"
