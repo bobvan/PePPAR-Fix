@@ -233,6 +233,17 @@ def make_raw_capture_bundle(args, systems, log):
         return None
     import socket
     from peppar_fix.raw_capture import RawCaptureBundle
+    # Fail loud at CAPTURE if the receiver is unset (Charlie #242): today
+    # args.receiver is unconditionally defaulted, so the manifest records the
+    # exact get_driver key the engine used — but if a future entry path (e.g.
+    # re-enabled auto-detect) leaves it empty, the manifest would record '' and
+    # pos_replay's replay_sig_config can't decode the RAWX → unreplayable.
+    # Surface it here, not at replay time. (driver.name is NOT recorded: it's a
+    # human label get_driver can't resolve back to a driver.)
+    if not (getattr(args, 'receiver', '') or ''):
+        log.warning("raw-capture: args.receiver is empty — the bundle manifest "
+                    "won't name a receiver, so pos_replay can't reconstruct the "
+                    "RAWX→obs sig config (this capture will be unreplayable)")
     bundle = RawCaptureBundle(args.raw_capture_dir)
     try:
         bundle.write_manifest(
