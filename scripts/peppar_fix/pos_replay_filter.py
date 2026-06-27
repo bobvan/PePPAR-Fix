@@ -94,15 +94,31 @@ def build_filter_thread(driver: ReplayDriver, known_ecef, *, systems=None,
 
 
 def run_pos_replay(bundle_dir: str, known_ecef, *, systems=None, args=None,
-                   truth=None) -> dict:
+                   truth=None, corrections_loader=None) -> dict:
     """Replay a bundle through the real position filter; return the regenerated
     ``[PPP_STATE]`` lines (and an optional position score vs ``truth``).
 
     ``systems`` defaults to the manifest's; ``truth`` (a ``StaticTruth``) enables
-    the divergence-monitor position score."""
+    the divergence-monitor position score.
+
+    **Product-swap** — pass ``corrections_loader``, a ``callable(stores)`` that
+    populates ``stores['ssr']`` / ``stores['beph']`` from an ALTERNATE source
+    (final products instead of the captured real-time SSR).  When given, the
+    bundle's captured SSR/eph are NOT applied (``apply_captured_corrections=
+    False``), so the filter — and the RAWX obs bias correction — run against the
+    swapped corrections.  This is the knob that separates *our filter* from *our
+    corrections*: if a ZTD drift disappears under final products, the gap was
+    products; if it persists, it's the filter/observability (manifest §6)."""
     if systems is None:
         systems = read_manifest_conventions(bundle_dir).get("systems") or None
-    driver = ReplayDriver(bundle_dir, decode_obs=True)
+    swap = corrections_loader is not None
+    driver = ReplayDriver(bundle_dir, decode_obs=True,
+                          apply_captured_corrections=not swap)
+    if swap:
+        # load the alternate corrections BEFORE replay so they're in place for
+        # the first epoch (final products are slowly-varying; a snapshot over a
+        # replay window is the right first model)
+        corrections_loader(driver.stores)
     thread = build_filter_thread(driver, known_ecef, systems=systems, args=args)
     driver.epoch_sink = thread._process_epoch
     with PppStateCapture() as cap:
@@ -110,6 +126,7 @@ def run_pos_replay(bundle_dir: str, known_ecef, *, systems=None, args=None,
     result = {
         "ppp_state_lines": cap.lines,
         "n_epochs_decoded": len(driver.epochs),
+        "product_swapped": swap,
         "thread": thread,
         "driver": driver,
     }

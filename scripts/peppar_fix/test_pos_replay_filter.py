@@ -122,5 +122,77 @@ class TestRunPosReplayDrivesFilter(unittest.TestCase):
         self.assertEqual(len(calls), 3)            # driven once per RAWX epoch
 
 
+class TestProductSwapDriver(unittest.TestCase):
+    def test_captured_ssr_not_applied_when_swapped(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="2026-01-01T00:00:00+00:00",
+                             conventions={"receiver": "f9t", "systems": ["gps"]})
+            b.record("ssr", b"\xd3\x00\x05dummy", recv_mono=100.0)
+            b.close()
+            # product-swap: captured SSR is traced but NOT routed
+            with mock.patch("realtime_ppp.route_rtcm_message") as route:
+                rd = drv.ReplayDriver(d, apply_captured_corrections=False)
+                rd.run()
+            route.assert_not_called()
+            self.assertIn("ssr:swapped-out", [i for _t, _s, i in rd.trace])
+            self.assertEqual(rd.counts["ssr"], 1)        # still counted
+
+    def test_captured_ssr_applied_by_default(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="2026-01-01T00:00:00+00:00",
+                             conventions={"receiver": "f9t"})
+            b.record("ssr", b"\xd3\x00\x05dummy", recv_mono=100.0)
+            b.close()
+            # mock the parser (dummy bytes don't parse) so dispatch reaches the
+            # router; assert the captured SSR IS routed by default (vs swapped)
+            with mock.patch("pyrtcm.RTCMReader.parse",
+                            return_value=SimpleNamespace(identity="1060")), \
+                 mock.patch("realtime_ppp.route_rtcm_message",
+                            return_value=("ssr", None)) as route:
+                rd = drv.ReplayDriver(d)                 # default: apply
+                rd.run()
+            route.assert_called_once()                   # captured SSR applied
+
+
+class TestProductSwapRunner(unittest.TestCase):
+    def test_loader_called_and_captured_swapped_out(self):
+        rawx = _synthetic_rawx()
+        seen = {}
+
+        def _loader(stores):
+            seen["called"] = True
+            seen["has_ssr"] = "ssr" in stores and "beph" in stores
+
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="2026-01-01T00:00:00+00:00",
+                             conventions={"receiver": "f9t", "systems": ["gps"]})
+            b.record("ssr", b"\xd3\x00\x05dummy", recv_mono=99.0)
+            b.record("ubx", b"RAWX-0", recv_mono=100.0)
+            b.close()
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx), \
+                 mock.patch("realtime_ppp.route_rtcm_message") as route:
+                res = prf.run_pos_replay(d, _TRUTH, corrections_loader=_loader)
+            self.assertTrue(res["product_swapped"])
+            self.assertTrue(seen.get("called"))          # loader ran ...
+            self.assertTrue(seen.get("has_ssr"))         # ... with the stores
+            route.assert_not_called()                    # captured SSR swapped out
+            self.assertIn("ssr:swapped-out",
+                          [i for _t, _s, i in res["driver"].trace])
+
+    def test_no_loader_means_no_swap(self):
+        rawx = _synthetic_rawx()
+        with tempfile.TemporaryDirectory() as d:
+            _bundle(d, n_rawx=1)
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                res = prf.run_pos_replay(d, _TRUTH)
+            self.assertFalse(res["product_swapped"])
+
+
 if __name__ == "__main__":
     unittest.main()

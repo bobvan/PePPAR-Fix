@@ -67,14 +67,18 @@ lines straight into `pos_replay_compare` (position + ZTD scoring with the
 `DivergenceMonitor`).  Bob's "no point continuing" rule then applies to a
 *replayed* run, not just a captured one.
 
-## Product-swap
+## Product-swap **(done)**
 
-The seam is already in place (stage 2a routes SSR through `route_rtcm_message`
-into a `ReplayDriver` store).  Swap = build the correction state from a different
-source — final products instead of the captured real-time SSR — and re-run the
-runner.  If a drift into ZTD disappears under final products, the gap was
-*products*; if it persists, it's the *filter/observability*.  That is the knob
-that separates our filter from our corrections (manifest §6).
+`run_pos_replay(..., corrections_loader=fn)`: with a `corrections_loader`
+(`callable(stores)` that populates `stores['ssr']`/`stores['beph']` from an
+alternate source), `ReplayDriver(apply_captured_corrections=False)` traces the
+captured SSR/eph as `<stream>:swapped-out` but does **not** apply them — so the
+filter *and* the RAWX obs bias correction run against the swapped corrections
+(final products instead of the captured real-time SSR).  If a ZTD drift
+disappears under final products, the gap was *products*; if it persists, it's
+the *filter/observability* (manifest §6).  The specific products ingest
+(SP3/CLK / Bias-SINEX → `SSRState`/`BroadcastEphemeris`) is the loader the
+caller supplies — the case-library step wires concrete ones.
 
 ## Carries (open notes to honor here)
 
@@ -99,4 +103,6 @@ that separates our filter from our corrections (manifest §6).
    via `pos_replay_compare`).  End-to-end `[PPP_STATE]` output needs a real
    bundle (broadcast eph for sat positions) — the wiring is unit-tested with a
    synthetic RAWX + the real filter construction.**
-5. Product-swap + the case-library replays (manifest §7) — **next.**
+5. Product-swap **(done — `corrections_loader` seam)** + the case-library
+   replays on real bundles (manifest §7) — **next** (concrete products loaders +
+   the per-bundle batch guard for #244's note 2).
