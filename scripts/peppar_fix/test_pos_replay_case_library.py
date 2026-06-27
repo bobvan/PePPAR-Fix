@@ -98,6 +98,50 @@ class TestCaseLibrary(unittest.TestCase):
         self.assertEqual(summary["n_failed"], 1)
         self.assertIn("RuntimeError", summary["results"][0]["error"])
 
+    def test_truth_bearing_case_inconclusive(self):
+        # Charlie #246: exercise the SCORING path (truth → verdict).  Synthetic
+        # RAWX with no eph → n_used<4 → 0 [PPP_STATE] → n=0 < window →
+        # inconclusive.  Pins that compare_position keeps returning n/window
+        # (a future return-dict change can't silently break the library).
+        from peppar_fix.pos_replay_compare import StaticTruth
+        rawx = _synthetic_rawx()
+        with tempfile.TemporaryDirectory() as d:
+            _good_bundle(d)
+            cases = [{"name": "calm", "bundle_dir": d, "known_ecef": _TRUTH,
+                      "truth": StaticTruth(_TRUTH, sigma_m=0.012)}]
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                summary = cl.run_case_library(cases)
+        r0 = summary["results"][0]
+        self.assertEqual(r0["status"], "ok")
+        self.assertIn("position_diverged", r0)          # scored
+        self.assertFalse(r0["position_diverged"])
+        self.assertTrue(r0["position_inconclusive"])    # n=0 < window
+        self.assertEqual(summary["n_diverged"], 0)
+        self.assertIn("inconclusive", cl.format_summary(summary))
+
+    def test_diverged_case_counted_and_summarized(self):
+        # mock run_pos_replay to return a FIRED verdict → exercises
+        # position_diverged, n_diverged, and the DIVERGED summary line.
+        fired = {
+            "ppp_state_lines": ["[PPP_STATE] ..."] * 200,
+            "n_epochs_decoded": 200,
+            "product_swapped": True,
+            "position": {"verdict": {"fired": True}, "n": 200, "window": 120},
+        }
+        with mock.patch("peppar_fix.pos_replay_case_library.run_pos_replay",
+                        return_value=fired):
+            summary = cl.run_case_library(
+                [{"name": "active", "bundle_dir": "x", "known_ecef": _TRUTH,
+                  "truth": object()}])
+        r0 = summary["results"][0]
+        self.assertTrue(r0["position_diverged"])
+        self.assertFalse(r0["position_inconclusive"])   # n=200 >= window
+        self.assertEqual(summary["n_diverged"], 1)
+        out = cl.format_summary(summary)
+        self.assertIn("DIVERGED", out)
+        self.assertIn("[swapped]", out)                 # product_swapped True
+
     def test_format_summary(self):
         summary = {"n_ok": 1, "n_failed": 1, "n_diverged": 0, "results": [
             {"name": "a", "status": "ok", "n_epochs": 5, "n_ppp_state": 0,
