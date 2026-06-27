@@ -185,10 +185,20 @@ class ReplayDriver:
                  build_stores: Optional[Callable[[], dict]] = None,
                  run_config: Optional[dict] = None,
                  decode_obs: bool = False,
-                 epoch_sink: Optional[Callable] = None):
+                 epoch_sink: Optional[Callable] = None,
+                 apply_captured_corrections: bool = True):
         self.bundle_dir = bundle_dir
         self.clock = VirtualClock()
         self.stores = (build_stores or default_replay_stores)()
+        # Product-swap seam (manifest §6): when False, the captured SSR/eph
+        # frames are counted + traced but NOT applied to SSRState/beph — so the
+        # filter runs against an ALTERNATE correction source the caller loads
+        # instead (final products vs the captured real-time SSR).  The RAWX obs
+        # bias correction then uses that alternate SSRState too.  This is the
+        # knob that separates "our filter" from "our corrections": if a drift
+        # into ZTD disappears under final products, the gap was products; if it
+        # persists, it's the filter/observability.
+        self.apply_captured_corrections = apply_captured_corrections
         # Mirror the captured run's RTCM bias-skip config (read from the
         # manifest unless overridden) so replay SSRState matches live (#237).
         self.run_config = (run_config if run_config is not None
@@ -231,6 +241,8 @@ class ReplayDriver:
         if stream == "ticc":
             return self._dispatch_ticc(payload, recv_mono)
         if stream in ("ssr", "ssr_bias", "eph"):
+            if not self.apply_captured_corrections:
+                return f"{stream}:swapped-out"   # product-swap: don't apply
             return self._dispatch_rtcm(stream, payload, recv_mono)
         return stream
 
