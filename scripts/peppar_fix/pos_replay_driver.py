@@ -113,6 +113,14 @@ def read_run_config(bundle_dir: str) -> dict:
 # (pos,ZTD,clk) null and diverged ~8 m from the captured-live trajectory even
 # seeded at truth.  None-valued args are omitted at capture (TOML has no null)
 # and fall back to the default here at read — so a default-None arg round-trips.
+#
+# KNOWN BOUNDARY (Charlie #253 finding 3): the NAV-SIG L0 admission gate
+# (``--nav-sig-gate``, default off) IS trajectory-affecting when on but is NOT
+# captured here — it needs a reconstructed nav_sig_store too.  A capture made
+# with ``--nav-sig-gate`` won't replay the gate faithfully; that's a documented
+# limitation, not a silent one.  (The other live kwargs left out —
+# position_callback / nl_diag / receiver_uid — are output/diagnostic hooks that
+# don't move the trajectory, so dropping them is correct.)
 FILTER_CONFIG_SPEC = (
     ("solid_tide", True), ("pcv", True), ("clock_model", "random_walk"),
     ("ar_elev_mask", 25.0), ("ztd_tie_sigma", None), ("ztd_tie_interval_s", 60),
@@ -120,6 +128,7 @@ FILTER_CONFIG_SPEC = (
     ("phase_windup", False), ("gmf", False), ("wl_only", False),
     ("no_ar", False), ("pin_position", False), ("slip_rate_limit_s", 0.0),
     ("rx_tcxo_adev_1s", None), ("join_test", True), ("receiver_antenna", None),
+    ("antex_path", None),
 )
 
 

@@ -124,6 +124,42 @@ class TestFilterConfigFaithfulness(unittest.TestCase):
         self.assertFalse(thread._nav2_anchor_enabled)         # captured override
         self.assertEqual(thread._filt.clock_model, "wno")
 
+    def test_pcv_parser_wired_so_pcv_is_not_silently_inert(self):
+        # Charlie #253 finding 1: passing receiver_antenna WITHOUT antex_parser
+        # left _pcv_enabled False (silent inert).  build_filter_thread must build
+        # the parser so the replay applies the SAME PCV the live filter did.
+        rawx = _synthetic_rawx()
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="t",
+                             conventions={"receiver": "f9t", "systems": ["gps"]},
+                             filter_config={"pcv": True,
+                                            "receiver_antenna": "SFESPK6618H     NONE"})
+            b.record("ubx", b"R", recv_mono=1.0)
+            b.close()
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True)
+                thread = prf.build_filter_thread(rd, _TRUTH, systems=["gps"])
+        self.assertIsNotNone(thread._antex)            # parser wired
+        self.assertTrue(thread._pcv_enabled)           # PCV actually on (not inert)
+
+    def test_no_pcv_capture_leaves_pcv_off(self):
+        rawx = _synthetic_rawx()
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="t",
+                             conventions={"receiver": "f9t", "systems": ["gps"]},
+                             filter_config={"pcv": False,
+                                            "receiver_antenna": "SFESPK6618H     NONE"})
+            b.record("ubx", b"R", recv_mono=1.0)
+            b.close()
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True)
+                thread = prf.build_filter_thread(rd, _TRUTH, systems=["gps"])
+        self.assertFalse(thread._pcv_enabled)          # --no-pcv run → off
+
     def test_filter_config_roundtrip_drops_none_restores_default(self):
         from types import SimpleNamespace
         args = SimpleNamespace(solid_tide=False, clock_model="wno",
