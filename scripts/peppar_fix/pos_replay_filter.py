@@ -30,7 +30,8 @@ if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
 from peppar_fix.pos_replay_driver import (ReplayDriver,  # noqa: E402
-                                          read_manifest_conventions)
+                                          read_manifest_conventions,
+                                          read_filter_config)
 
 _ENGINE_LOGGER = "peppar-fix"
 
@@ -74,6 +75,42 @@ class PppStateCapture(logging.Handler):
             self._saved_level = None
 
 
+def _build_replay_antex_parser(args):
+    """The antenna PCV parser for replay, or None (logged) when unavailable.
+
+    Mirrors the engine's PCV resolution (resolve_pcv_defaults → ANTEXParser,
+    engine:10065+) so replay applies the same phase-center correction.  Resolves
+    by the captured receiver antenna against the replay host's antex catalog —
+    portable across hosts, unlike a captured absolute path.  Returns None (with a
+    loud log) when PCV is off, no antenna was captured, or no antex is found, so
+    PCV is never SILENTLY inert (the failure mode Charlie #253 flagged)."""
+    log = logging.getLogger(_ENGINE_LOGGER)
+    if not bool(getattr(args, "pcv", True)):
+        return None                                  # --no-pcv on the live run
+    antenna = getattr(args, "receiver_antenna", None)
+    if not antenna:
+        log.info("pos_replay PCV: no receiver_antenna captured — PCV inactive")
+        return None
+    # A captured antex_path is only usable if it exists on THIS host; otherwise
+    # re-resolve by antenna (the common case: default catalog, no --antex-path).
+    antex_cli = getattr(args, "antex_path", None)
+    if antex_cli and not os.path.exists(antex_cli):
+        antex_cli = None
+    try:
+        from peppar_fix.antex_resolve import resolve_pcv_defaults
+        from antex import ANTEXParser
+        pcv = resolve_pcv_defaults(arp_label=None, antex_path_cli=antex_cli,
+                                   receiver_antenna_cli=antenna, pcv_flag=True)
+        if pcv.enabled and pcv.antex_path:
+            return ANTEXParser(pcv.antex_path)
+        log.info("pos_replay PCV: no antex for %r — PCV inactive in replay (%s)",
+                 antenna, getattr(pcv, "detail", ""))
+    except Exception as exc:               # noqa: BLE001 — never break the build
+        log.warning("pos_replay PCV: antex parser build failed (%s) — "
+                    "PCV inactive in replay", exc)
+    return None
+
+
 def build_filter_thread(driver: ReplayDriver, known_ecef, *, systems=None,
                         args=None, corrections=None):
     """Construct the engine's ``AntPosEstThread``.  By default the filter's
@@ -88,15 +125,59 @@ def build_filter_thread(driver: ReplayDriver, known_ecef, *, systems=None,
     from types import SimpleNamespace
     import peppar_fix_engine as eng
     from ssr_corrections import RealtimeCorrections
+    # The captured per-run filter config (I-191033): the live engine recorded
+    # its AntPosEst-relevant args in the bundle's [filter_config]; build the
+    # replay's args from it so the thread is configured IDENTICALLY (NAV2 anchor,
+    # ZTD tie, solid tide, clock model, …).  An explicit args= still wins (tests
+    # / product-swap callers); otherwise a missing manifest yields spec defaults.
+    fc = read_filter_config(driver.bundle_dir)
     if args is None:
-        args = SimpleNamespace(wl_only=False, ppp_state_log=True)
+        args = SimpleNamespace(**fc, ppp_state_log=True)
     if corrections is None:
         corrections = RealtimeCorrections(driver.stores["beph"],
                                           driver.stores["ssr"])
     ape_sm = eng.AntPosEst(wl_only=bool(getattr(args, "wl_only", False)))
+    # Build the antenna PCV parser so replay applies the SAME phase-center
+    # correction the live engine did (Charlie #253 finding 1).  The thread's
+    # _pcv_enabled requires BOTH receiver_antenna_type AND antex_parser — passing
+    # the antenna without the parser leaves PCV silently inert (the live filter
+    # ran it on).  Re-resolve by antenna against the replay host's antex catalog
+    # (portable: a captured absolute path may not exist here); on any miss, log a
+    # loud skip rather than silently dropping the correction.
+    antex_parser = _build_replay_antex_parser(args)
+    # Replicate the live engine's AntPosEstThread construction (engine:~10718):
+    # pass the same null-constraining config + the NAV2 store the replay driver
+    # already populates from captured NAV2-PVT/NAV-PVT.  Without these the filter
+    # wanders the (pos,ZTD,clk) null and diverges ~8 m from captured-live.
     thread = eng.AntPosEstThread(
         tuple(known_ecef), corrections, threading.Event(), ape_sm,
-        systems=list(systems) if systems else [], args=args)
+        systems=list(systems) if systems else [],
+        nav2_store=driver.stores.get("nav2"),
+        # engine coerces a None ar-elev-mask to 25.0 at parse (engine:12586);
+        # mirror that so replay matches the live AR mask (and never passes None,
+        # which NarrowLaneResolver's `mask > 0` test can't compare).
+        ar_elev_mask_deg=(25.0 if getattr(args, "ar_elev_mask", None) is None
+                          else float(args.ar_elev_mask)),
+        join_test_enabled=bool(getattr(args, "join_test", True)),
+        wl_only=bool(getattr(args, "wl_only", False)),
+        solid_tide=bool(getattr(args, "solid_tide", True)),
+        receiver_antenna_type=getattr(args, "receiver_antenna", None),
+        pcv_enabled=bool(getattr(args, "pcv", True)),
+        clock_model=getattr(args, "clock_model", "random_walk"),
+        rx_tcxo_adev_1s=getattr(args, "rx_tcxo_adev_1s", None),
+        phase_windup_enabled=bool(getattr(args, "phase_windup", False)),
+        gmf_enabled=bool(getattr(args, "gmf", False)),
+        slip_rate_limit_s=float(getattr(args, "slip_rate_limit_s", 0.0)),
+        ztd_tie_sigma=getattr(args, "ztd_tie_sigma", None),
+        nav2_anchor_enabled=bool(getattr(args, "nav2_soft_anchor", True)),
+        nav2_anchor_max_hacc_m=float(getattr(args, "nav2_anchor_max_hacc_m", 3.0)),
+        pin_position=bool(getattr(args, "pin_position", False)),
+        antex_parser=antex_parser,
+        args=args)
+    # Age captured NAV2 opinions against the replayed epoch's recv_mono (the
+    # driver's virtual clock), not the replay host's wall clock — else the
+    # anchor sees every captured fix as stale and never fires.
+    thread._now_mono = lambda: driver.clock.now_mono
     # Seed the clock from the first epoch's PRs (runner bootstrap gap, I-175208):
     # the runner builds a FRESH filter (no bootstrap_result to inherit a
     # converged clock), and initialize() leaves it initialized=True with clock=0

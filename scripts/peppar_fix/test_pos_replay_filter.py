@@ -86,6 +86,99 @@ class TestPppStateCapture(unittest.TestCase):
         self.assertEqual(cap.lines, [])
 
 
+class TestFilterConfigFaithfulness(unittest.TestCase):
+    """I-191033: build_filter_thread must construct the AntPosEstThread with the
+    SAME null-constraining config + NAV2 store the live engine ran, else the
+    replay wanders the (pos,ZTD,clk) null and diverges ~8 m from captured-live."""
+
+    def test_build_thread_wires_nav2_store_anchor_and_virtual_clock(self):
+        rawx = _synthetic_rawx()
+        with tempfile.TemporaryDirectory() as d:
+            _bundle(d)
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True)
+                thread = prf.build_filter_thread(rd, _TRUTH, systems=["gps"])
+        # the driver's NAV2 store is wired into the thread (anchor can fire)
+        self.assertIs(thread._nav2_store, rd.stores["nav2"])
+        self.assertTrue(thread._nav2_anchor_enabled)          # spec default True
+        # NAV2 freshness ages against the virtual clock, not wall time
+        rd.clock.now_mono = 1234.5
+        self.assertEqual(thread._now_mono(), 1234.5)
+
+    def test_captured_filter_config_overrides_defaults(self):
+        # a bundle whose [filter_config] turns the anchor OFF replays with it off
+        rawx = _synthetic_rawx()
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="2026-01-01T00:00:00+00:00",
+                             conventions={"receiver": "f9t", "systems": ["gps"]},
+                             filter_config={"nav2_soft_anchor": False,
+                                            "clock_model": "wno"})
+            b.record("ubx", b"R", recv_mono=1.0)
+            b.close()
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True)
+                thread = prf.build_filter_thread(rd, _TRUTH, systems=["gps"])
+        self.assertFalse(thread._nav2_anchor_enabled)         # captured override
+        self.assertEqual(thread._filt.clock_model, "wno")
+
+    def test_pcv_parser_wired_so_pcv_is_not_silently_inert(self):
+        # Charlie #253 finding 1: passing receiver_antenna WITHOUT antex_parser
+        # left _pcv_enabled False (silent inert).  build_filter_thread must build
+        # the parser so the replay applies the SAME PCV the live filter did.
+        rawx = _synthetic_rawx()
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="t",
+                             conventions={"receiver": "f9t", "systems": ["gps"]},
+                             filter_config={"pcv": True,
+                                            "receiver_antenna": "SFESPK6618H     NONE"})
+            b.record("ubx", b"R", recv_mono=1.0)
+            b.close()
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True)
+                thread = prf.build_filter_thread(rd, _TRUTH, systems=["gps"])
+        self.assertIsNotNone(thread._antex)            # parser wired
+        self.assertTrue(thread._pcv_enabled)           # PCV actually on (not inert)
+
+    def test_no_pcv_capture_leaves_pcv_off(self):
+        rawx = _synthetic_rawx()
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="t",
+                             conventions={"receiver": "f9t", "systems": ["gps"]},
+                             filter_config={"pcv": False,
+                                            "receiver_antenna": "SFESPK6618H     NONE"})
+            b.record("ubx", b"R", recv_mono=1.0)
+            b.close()
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True)
+                thread = prf.build_filter_thread(rd, _TRUTH, systems=["gps"])
+        self.assertFalse(thread._pcv_enabled)          # --no-pcv run → off
+
+    def test_filter_config_roundtrip_drops_none_restores_default(self):
+        from types import SimpleNamespace
+        args = SimpleNamespace(solid_tide=False, clock_model="wno",
+                               ztd_tie_sigma=None, ar_elev_mask=30.0)
+        fc = drv.filter_config_from_args(args)
+        self.assertNotIn("ztd_tie_sigma", fc)     # None dropped (no TOML null)
+        self.assertEqual(fc["solid_tide"], False)
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="t", filter_config=fc)
+            b.close()
+            read = drv.read_filter_config(d)
+        self.assertEqual(read["solid_tide"], False)
+        self.assertEqual(read["clock_model"], "wno")
+        self.assertEqual(read["ar_elev_mask"], 30.0)
+        self.assertIsNone(read["ztd_tie_sigma"])  # restored to spec default None
+        self.assertTrue(read["nav2_soft_anchor"])  # unset key → spec default
+
+
 class TestRunPosReplayDrivesFilter(unittest.TestCase):
     def test_drives_real_process_epoch(self):
         # the loop closer: a real AntPosEstThread is built and its

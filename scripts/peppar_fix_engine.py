@@ -245,9 +245,14 @@ def make_raw_capture_bundle(args, systems, log):
         log.warning("raw-capture: args.receiver is empty — the bundle manifest "
                     "won't name a receiver, so pos_replay can't reconstruct the "
                     "RAWX→obs sig config (this capture will be unreplayable)")
+    # AntPosEst-relevant config so the replay rebuilds the SAME position filter
+    # (I-191033 replayMatchLiveFilterConfig) — without it the replay drops the
+    # live thread's null-constraining config and diverges ~8 m.
+    from peppar_fix.pos_replay_driver import filter_config_from_args
     bundle = RawCaptureBundle(args.raw_capture_dir)
     try:
         bundle.write_manifest(
+            filter_config=filter_config_from_args(args),
             host=socket.gethostname(),
             started_iso=datetime.now(tz=timezone.utc).isoformat(),
             conventions={
@@ -2102,6 +2107,12 @@ class AntPosEstThread(threading.Thread):
         # live trajectory to score against.  None outside capture (incl. replay,
         # which regenerates rather than captures).
         self._raw_bundle = raw_bundle
+        # Monotonic-time source for freshness/age decisions (NAV2 anchor).
+        # Defaults to the wall clock (live); pos_replay overrides it with the
+        # bundle's virtual clock so captured NAV2 opinions age against the
+        # replayed epoch's recv_mono, not the replay host's wall clock — without
+        # this the anchor would see every captured fix as stale (I-191033).
+        self._now_mono = time.monotonic
         # Phase 3 wind-up (Wu 1993): per-SV cumulative wind-up tracker
         # + carrier-phase correction applied before filter.update().
         # Phase 4 GMF (Boehm 2006): hydrostatic + wet mapping functions
@@ -3228,7 +3239,8 @@ class AntPosEstThread(threading.Thread):
         # NAV2 is invisible once filter P has tightened.
         if (self._nav2_anchor_enabled
                 and self._nav2_store is not None):
-            _nav2_op = self._nav2_store.get_opinion(max_age_s=10.0)
+            _nav2_op = self._nav2_store.get_opinion(
+                max_age_s=10.0, now_mono=self._now_mono())
             if (_nav2_op is not None
                     and _nav2_op.get('fix_type') == 3
                     and _nav2_op.get('h_acc_m') is not None
