@@ -16,7 +16,14 @@ if mountpoint -q "$HOME/gt-nfs"; then
   segments=("$HOME"/peppar-fix/data/peppar-fix.log.*.gz)
   if (( ${#segments[@]} )); then
     mkdir -p "$DEST"
-    # move rotated+compressed segments off the tiny local disk to gt
-    rsync -a --remove-source-files "${segments[@]}" "$DEST/"
+    # move rotated+compressed segments off the tiny local disk to gt.
+    # logrotate reuses .1.gz every cycle (--remove-source-files means segments
+    # never accumulate locally to .2/.3/.4), so a flat rsync would overwrite the
+    # previous archived segment each time.  Stamp each with its mtime so the
+    # archive actually accumulates instead of keeping only the latest.
+    for seg in "${segments[@]}"; do
+      stamp=$(date -r "$seg" +%Y%m%dT%H%M%S)
+      rsync -a --remove-source-files "$seg" "$DEST/peppar-fix.log-$stamp.gz"
+    done
   fi
 fi
