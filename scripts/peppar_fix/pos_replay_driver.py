@@ -130,6 +130,11 @@ FILTER_CONFIG_SPEC = (
     ("no_ar", False), ("pin_position", False), ("slip_rate_limit_s", 0.0),
     ("rx_tcxo_adev_1s", None), ("join_test", True), ("receiver_antenna", None),
     ("antex_path", None),
+    # Q_POS_CONVERGED (--q-pos-converged / RTKLIB recipe) is a PPPFilter CLASS
+    # attribute set globally at engine startup, not a _build_ppp_filter arg —
+    # build_filter_thread sets it on the class from this captured value so a
+    # Q-tuned bundle replays with the same converged position stiffness (I-215452).
+    ("q_pos_converged", None),
 )
 
 
