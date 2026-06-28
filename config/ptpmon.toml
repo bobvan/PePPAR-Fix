@@ -26,5 +26,5 @@ ubx_port = "I2C"
 receiver = "f9t-l2-e5b"
 ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
-ssr_ntrip_conf = "ntrip-cnes.conf"
+ssr_ntrip_conf = "ntrip.conf"  # CNES SSRA00CNE0 removed from IGS-IP 2026-06-28 -> BKG (was ntrip-cnes.conf)
 systems = "gps,gal"

@@ -13,7 +13,7 @@ receiver = "f9t-l5"
 ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
 # CNES SSR for PPP-AR (credentials in ntrip-cnes.conf)
-ssr_ntrip_conf = "ntrip-cnes.conf"
+ssr_ntrip_conf = "ntrip.conf"  # CNES SSRA00CNE0 removed from IGS-IP 2026-06-28 -> BKG (was ntrip-cnes.conf)
 
 # BDS B2a-I phase biases are not published by any IGS-IP AC as of
 # 2026-05-09 — see docs/bds-b2a-phase-bias-survey-2026-05-09.md.

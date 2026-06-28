@@ -14,7 +14,7 @@ ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
 # CNES SSR for PPP-AR: GAL fully matched (L1C/L5Q), GPS works via
 # L5I/L5Q shared carrier.  Credentials in ntrip-cnes.conf (not in repo).
-ssr_ntrip_conf = "ntrip-cnes.conf"
+ssr_ntrip_conf = "ntrip.conf"  # CNES SSRA00CNE0 removed from IGS-IP 2026-06-28 -> BKG (was ntrip-cnes.conf)
 # Dual-mount WHU phase-bias capability — disabled by default (I-122350
 # P2, 2026-05-02).  Uncomment the two ssr_bias_* lines below to bring
 # in WHU OSBC00WHU1 alongside CNES SSRA00CNE0.  Both mounts live on
@@ -33,8 +33,8 @@ ssr_ntrip_conf = "ntrip-cnes.conf"
 # 60/hr.  Re-enable here only after Main's P1 per-SV per-signal bias
 # logging (commit 87e5da3 onwards) is in place — bias-value logs are
 # the diagnostic backbone for the bisect in P3+P4 of I-122350-main.
-ssr_bias_mount      = "OSBC00WHU1"
-ssr_bias_ntrip_conf = "ntrip-cnes.conf"
+# [disabled 2026-06-28 CNES-gone, no AR] ssr_bias_mount      = "OSBC00WHU1"
+# [disabled 2026-06-28 CNES-gone, no AR] ssr_bias_ntrip_conf = "ntrip-cnes.conf"
 systems = "gps,gal"
 
 # Operational ARP — engine reads timelab/antennas.json[ufo1] at

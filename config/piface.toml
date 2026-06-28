@@ -16,7 +16,7 @@ receiver = "f9p"
 ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
 # CNES SSR for PPP-AR (credentials in ntrip-cnes.conf)
-ssr_ntrip_conf = "ntrip-cnes.conf"
+ssr_ntrip_conf = "ntrip.conf"  # CNES SSRA00CNE0 removed from IGS-IP 2026-06-28 -> BKG (was ntrip-cnes.conf)
 systems = "gps,gal,bds"
 
 # Operational ARP — engine reads timelab/antennas.json[ufo1] at
