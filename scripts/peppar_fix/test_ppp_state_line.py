@@ -10,7 +10,9 @@ _SCRIPTS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
-from peppar_fix.ppp_state_line import format_ppp_state_line  # noqa: E402
+from peppar_fix.ppp_state_line import (format_ppp_state_line,   # noqa: E402
+                                       format_anchor_line,
+                                       parse_anchor_decisions)
 from peppar_fix import pos_replay_compare as prc            # noqa: E402
 
 
@@ -68,6 +70,38 @@ class TestFormatParseRoundTrip(unittest.TestCase):
         line = format_ppp_state_line(gps, 1, 8, _Arr([1.5, 2.5, 3.5]),
                                      0.2, 0.05, 0.01)
         self.assertIn("ecef=1.5000,2.5000,3.5000", line)
+
+
+class TestAnchorLineRoundTrip(unittest.TestCase):
+    """[NAV2_ANCHOR] format↔parse (I-215452): the captured live anchor decision
+    the replay applies deterministically.  Same producer/consumer-can't-drift
+    discipline as [PPP_STATE]."""
+
+    def test_round_trip_with_vacc(self):
+        gps = datetime(2026, 6, 28, 3, 55, 22, 994000, tzinfo=timezone.utc)
+        line = format_anchor_line(gps, (157469.2061, -4756188.1678, 4232767.857),
+                                  1.234, 2.5)
+        d = parse_anchor_decisions(["2026 INFO " + line])   # prefix tolerated
+        ecef, hacc, vacc = d[gps.isoformat()]
+        self.assertAlmostEqual(ecef[0], 157469.2061, places=4)
+        self.assertAlmostEqual(ecef[2], 4232767.857, places=4)
+        self.assertEqual(hacc, 1.234)
+        self.assertEqual(vacc, 2.5)
+
+    def test_none_vacc(self):
+        gps = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        line = format_anchor_line(gps, (1.0, 2.0, 3.0), 0.5, None)
+        self.assertIn("v_acc=none", line)
+        self.assertIsNone(parse_anchor_decisions([line])[gps.isoformat()][2])
+
+    def test_only_anchor_lines_parsed_fired_epochs_keyed_by_gps(self):
+        g1 = datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc)
+        g2 = datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc)
+        lines = [format_anchor_line(g1, (1, 2, 3), 0.5, None),
+                 "[PPP_STATE] gps=... unrelated",
+                 format_anchor_line(g2, (4, 5, 6), 0.6, 1.1)]
+        d = parse_anchor_decisions(lines)
+        self.assertEqual(set(d), {g1.isoformat(), g2.isoformat()})  # PPP_STATE ignored
 
 
 if __name__ == "__main__":

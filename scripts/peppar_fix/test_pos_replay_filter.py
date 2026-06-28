@@ -242,6 +242,96 @@ class TestSeedStateInheritance(unittest.TestCase):
         self.assertFalse(thread._filt.initialized)
 
 
+class TestNav2AnchorCaptureReplay(unittest.TestCase):
+    """I-215452: the live anchor's per-epoch firing decision is captured to
+    Group-B and applied VERBATIM in replay (deterministic), instead of
+    re-deriving via get_opinion (the freshness/timing mismatch that injected
+    ~600mm in dynamic windows)."""
+
+    def _thread(self, anchor_decisions, nav2_store, raw_bundle):
+        import peppar_fix_engine as eng
+        import time as _t
+        t = eng.AntPosEstThread.__new__(eng.AntPosEstThread)
+        t._nav2_anchor_enabled = True
+        t._nav2_anchor_max_hacc_m = 3.0
+        t._nav2_store = nav2_store
+        t._anchor_decisions = anchor_decisions
+        t._raw_bundle = raw_bundle
+        t._now_mono = _t.monotonic
+        return t
+
+    def _filt(self):
+        calls = []
+        f = SimpleNamespace(apply_nav2_anchor=lambda e, h, v: calls.append((tuple(e), h, v)))
+        return f, calls
+
+    def _gt(self):
+        from datetime import datetime, timezone
+        return datetime(2026, 6, 28, 3, 55, 22, 994000, tzinfo=timezone.utc)
+
+    def test_replay_applies_captured_decision_verbatim(self):
+        gt = self._gt()
+        dec = {gt.isoformat(): ((1.0, 2.0, 3.0), 0.5, 1.1)}
+        t = self._thread(dec, nav2_store=object(), raw_bundle=None)
+        f, calls = self._filt()
+        t._apply_nav2_anchor(gt, f)
+        self.assertEqual(calls, [((1.0, 2.0, 3.0), 0.5, 1.1)])   # verbatim, no get_opinion
+
+    def test_replay_no_decision_for_epoch_means_no_anchor(self):
+        gt = self._gt()
+        t = self._thread({}, nav2_store=object(), raw_bundle=None)  # empty map
+        f, calls = self._filt()
+        t._apply_nav2_anchor(gt, f)
+        self.assertEqual(calls, [])                  # epoch absent → did not fire live
+
+    def test_live_derives_and_captures_decision(self):
+        gt = self._gt()
+        store = SimpleNamespace(get_opinion=lambda **k: {
+            "fix_type": 3, "h_acc_m": 1.2, "v_acc_m": 2.0,
+            "ecef": [10.0, 20.0, 30.0]})
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            t = self._thread(None, nav2_store=store, raw_bundle=b)  # live mode
+            f, calls = self._filt()
+            t._apply_nav2_anchor(gt, f)
+            b.close()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], (10.0, 20.0, 30.0))
+            with open(os.path.join(d, "engine", "anchor_decisions.log")) as fh:
+                line = fh.read().strip()
+        self.assertTrue(line.startswith("[NAV2_ANCHOR]"))
+        self.assertIn("h_acc=1.2000", line)
+
+    def test_build_thread_wires_anchor_decisions_when_present(self):
+        from peppar_fix.ppp_state_line import format_anchor_line
+        rawx = _synthetic_rawx()
+        gt = self._gt()
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="t",
+                             conventions={"receiver": "f9t", "systems": ["gps"]})
+            b.engine_log("anchor_decisions.log",
+                         format_anchor_line(gt, (1.0, 2.0, 3.0), 0.5, None))
+            b.record("ubx", b"R", recv_mono=1.0)
+            b.close()
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True)
+                thread = prf.build_filter_thread(rd, _TRUTH, systems=["gps"])
+        self.assertIsNotNone(thread._anchor_decisions)
+        self.assertIn(gt.isoformat(), thread._anchor_decisions)
+
+    def test_build_thread_none_when_no_anchor_log(self):
+        rawx = _synthetic_rawx()
+        with tempfile.TemporaryDirectory() as d:
+            _bundle(d)                       # no anchor_decisions.log
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True)
+                thread = prf.build_filter_thread(rd, _TRUTH, systems=["gps"])
+        self.assertIsNone(thread._anchor_decisions)   # old bundle → get_opinion path
+
+
 class TestRunPosReplayDrivesFilter(unittest.TestCase):
     def test_drives_real_process_epoch(self):
         # the loop closer: a real AntPosEstThread is built and its
