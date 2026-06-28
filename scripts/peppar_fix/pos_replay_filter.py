@@ -85,7 +85,18 @@ def dump_ppp_filter_state(filt) -> dict:
     ``sv_to_idx``), so restoring these makes the carrier phase immediately usable
     exactly as it was at bootstrap exit.  ``prev_obs`` (slip-detector history) is
     intentionally NOT captured — at most one SV re-floats on the first replayed
-    epoch (negligible vs the multi-metre cold-start it replaces)."""
+    epoch (negligible vs the multi-metre cold-start it replaces).
+
+    KNOWN AR-REPLAY BOUNDARY (Charlie #254): the live AntPos ALSO inherits
+    ``mw_tracker`` from bootstrap (engine:2203), already past ``min_epochs=60`` so
+    WL/NL can fix immediately; the replay's MW tracker is fresh and must
+    re-accumulate ~60 epochs before AR engages.  For FLOAT PPP (no phase-bias
+    source → AR never runs) this is moot — validated identical on two float
+    receivers (F9T, X20P).  For an AR-capable (e.g. CNES) bundle it would make
+    the first ~minute of [PPP_STATE] diverge in the AR transient; closing that
+    means also dumping ``mw_tracker._state`` / ``_sv_state`` (same dump/restore
+    pattern).  So today's snapshot is steady-state-faithful and float-AR-faithful,
+    not AR-transient-faithful — a documented limit, not a silent one."""
     import numpy as np
     return {
         "x": np.asarray(filt.x, dtype=float).tolist(),
