@@ -32,3 +32,37 @@ def format_ppp_state_line(gps_time, n_epochs: int, n_used: int, ecef,
             % (gps_time.isoformat(), n_epochs, n_used,
                float(ecef[0]), float(ecef[1]), float(ecef[2]),
                float(sigma_pos_m), float(ztd_m), float(sigma_ztd_m)))
+
+
+def format_anchor_line(gps_time, ecef, h_acc_m, v_acc_m=None) -> str:
+    """Render one ``[NAV2_ANCHOR]`` line — the live NAV2 soft-anchor's per-epoch
+    FIRING decision (emitted ONLY on the epochs it fired, with the ECEF / h_acc /
+    v_acc it used).  pos_replay reads these back to reproduce the anchor
+    deterministically instead of re-deriving it via ``get_opinion``, whose
+    freshness-timing + amplification mismatch drove the dynamic-window
+    realization divergence (I-215452).  ``gps=`` is the same GPS-time key as
+    ``[PPP_STATE]`` so the replay matches by epoch."""
+    return ("[NAV2_ANCHOR] gps=%s ecef=%.4f,%.4f,%.4f h_acc=%.4f v_acc=%s"
+            % (gps_time.isoformat(), float(ecef[0]), float(ecef[1]),
+               float(ecef[2]), float(h_acc_m),
+               ("%.4f" % float(v_acc_m)) if v_acc_m is not None else "none"))
+
+
+def parse_anchor_decisions(lines) -> dict:
+    """Parse ``[NAV2_ANCHOR]`` lines → ``{gps_iso: (ecef_tuple, h_acc, v_acc|None)}``
+    — the per-epoch fired-anchor decisions the replay applies deterministically.
+    Epochs absent from the map did not fire (only fired epochs are logged)."""
+    import re
+    rx = re.compile(
+        r"\[NAV2_ANCHOR\]\s+gps=(\S+)\s+ecef=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)"
+        r"\s+h_acc=([\d.]+)\s+v_acc=(\S+)")
+    out = {}
+    for ln in lines:
+        m = rx.search(ln)
+        if not m:
+            continue
+        out[m.group(1)] = (
+            (float(m.group(2)), float(m.group(3)), float(m.group(4))),
+            float(m.group(5)),
+            None if m.group(6) == "none" else float(m.group(6)))
+    return out

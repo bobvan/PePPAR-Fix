@@ -47,7 +47,7 @@ import numpy as np
 from solve_pseudorange import C, ecef_to_lla, lla_to_ecef
 from solve_ppp import PPPFilter, FixedPosFilter, ls_init, N_BASE, SIGMA_P_IF, IDX_ZTD as PPP_IDX_ZTD
 from peppar_fix.obs_routing import obs_for_position
-from peppar_fix.ppp_state_line import format_ppp_state_line
+from peppar_fix.ppp_state_line import format_ppp_state_line, format_anchor_line
 from solid_tide import solid_tide_displacement, sun_pos_ecef
 import peer_publisher
 from antex import ANTEXParser, compute_pcv_correction
@@ -2113,6 +2113,12 @@ class AntPosEstThread(threading.Thread):
         # replayed epoch's recv_mono, not the replay host's wall clock — without
         # this the anchor would see every captured fix as stale (I-191033).
         self._now_mono = time.monotonic
+        # pos_replay deterministic NAV2 anchor (I-215452): in replay this is set
+        # to the captured {gps_iso: (ecef, h_acc, v_acc)} fired-anchor decisions
+        # so the anchor reproduces live EXACTLY (no get_opinion re-derivation,
+        # whose freshness/timing mismatch drove the dynamic-window divergence).
+        # None in the live engine → derive-and-capture path.
+        self._anchor_decisions = None
         # Phase 3 wind-up (Wu 1993): per-SV cumulative wind-up tracker
         # + carrier-phase correction applied before filter.update().
         # Phase 4 GMF (Boehm 2006): hydrostatic + wet mapping functions
@@ -2969,6 +2975,47 @@ class AntPosEstThread(threading.Thread):
             # failing (disk full / closed fh) — same rule.
             pass
 
+    def _apply_nav2_anchor(self, gps_time, filt):
+        """NAV2 soft-anchor for this epoch (variance-weighted Kalman update).
+
+        Live: derive the firing decision via ``get_opinion`` and apply it; under
+        a --raw-capture bundle, record the decision to Group-B
+        (engine/anchor_decisions.log, fired epochs only).  Replay
+        (``self._anchor_decisions`` set): apply the captured live decision
+        VERBATIM, so the anchor reproduces live deterministically instead of
+        re-deriving it — the ablation showed get_opinion's freshness-timing +
+        amplification mismatch injects ~600 mm in dynamic windows (I-215452).
+        Epochs absent from the captured map did not fire live → no anchor."""
+        if not (self._nav2_anchor_enabled and self._nav2_store is not None):
+            return
+        if self._anchor_decisions is not None:
+            try:
+                dec = self._anchor_decisions.get(gps_time.isoformat())
+            except (AttributeError, ValueError):
+                dec = None
+            if dec is not None:
+                filt.apply_nav2_anchor(
+                    np.asarray(dec[0], dtype=float), float(dec[1]),
+                    (float(dec[2]) if dec[2] is not None else None))
+            return
+        op = self._nav2_store.get_opinion(
+            max_age_s=10.0, now_mono=self._now_mono())
+        if (op is not None and op.get('fix_type') == 3
+                and op.get('h_acc_m') is not None
+                and op['h_acc_m'] < self._nav2_anchor_max_hacc_m):
+            ecef = np.asarray(op['ecef'], dtype=float)
+            hacc = float(op['h_acc_m'])
+            vacc = (float(op['v_acc_m'])
+                    if op.get('v_acc_m') is not None else None)
+            filt.apply_nav2_anchor(ecef, hacc, vacc)
+            if self._raw_bundle is not None:
+                try:
+                    self._raw_bundle.engine_log(
+                        "anchor_decisions.log",
+                        format_anchor_line(gps_time, ecef, hacc, vacc))
+                except (OSError, AttributeError, ValueError):
+                    pass
+
     def _process_epoch(self, gps_time, observations, obs_counts):
         """Process one dequeued observation epoch (EKF predict/update, slip
         handling, ambiguity mgmt, AR, NAV2/ZTD ties, [PPP_STATE] emit).
@@ -3237,22 +3284,7 @@ class AntPosEstThread(threading.Thread):
         # the misnomer note: this is variance-weighted Kalman, not
         # a truth-pull anchor.  Static offset between filter and
         # NAV2 is invisible once filter P has tightened.
-        if (self._nav2_anchor_enabled
-                and self._nav2_store is not None):
-            _nav2_op = self._nav2_store.get_opinion(
-                max_age_s=10.0, now_mono=self._now_mono())
-            if (_nav2_op is not None
-                    and _nav2_op.get('fix_type') == 3
-                    and _nav2_op.get('h_acc_m') is not None
-                    and _nav2_op['h_acc_m']
-                    < self._nav2_anchor_max_hacc_m):
-                filt.apply_nav2_anchor(
-                    np.asarray(_nav2_op['ecef'], dtype=float),
-                    float(_nav2_op['h_acc_m']),
-                    (float(_nav2_op['v_acc_m'])
-                     if _nav2_op.get('v_acc_m') is not None
-                     else None),
-                )
+        self._apply_nav2_anchor(gps_time, filt)
 
         self._n_epochs += 1
 

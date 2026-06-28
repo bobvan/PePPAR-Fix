@@ -158,6 +158,20 @@ def read_ape_init_state(bundle_dir: str):
         return None
 
 
+def read_anchor_decisions(bundle_dir: str):
+    """The captured live NAV2 fired-anchor decisions (engine/anchor_decisions.log)
+    → ``{gps_iso: (ecef, h_acc, v_acc)}``, or None if the bundle has none (old
+    capture).  The replay applies these verbatim so the anchor reproduces live
+    deterministically instead of re-deriving via get_opinion (I-215452)."""
+    path = os.path.join(bundle_dir, "engine", "anchor_decisions.log")
+    try:
+        from peppar_fix.ppp_state_line import parse_anchor_decisions
+        with open(path) as f:
+            return parse_anchor_decisions(f)
+    except OSError:
+        return None
+
+
 def read_filter_config(bundle_dir: str) -> dict:
     """The captured ``[filter_config]`` table, every key resolved against
     :data:`FILTER_CONFIG_SPEC` defaults (so old bundles with no section, or a

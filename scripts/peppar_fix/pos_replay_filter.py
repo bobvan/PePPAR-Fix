@@ -32,7 +32,8 @@ if _SCRIPTS not in sys.path:
 from peppar_fix.pos_replay_driver import (ReplayDriver,  # noqa: E402
                                           read_manifest_conventions,
                                           read_filter_config,
-                                          read_ape_init_state)
+                                          read_ape_init_state,
+                                          read_anchor_decisions)
 
 _ENGINE_LOGGER = "peppar-fix"
 
@@ -231,6 +232,13 @@ def build_filter_thread(driver: ReplayDriver, known_ecef, *, systems=None,
     # driver's virtual clock), not the replay host's wall clock — else the
     # anchor sees every captured fix as stale and never fires.
     thread._now_mono = lambda: driver.clock.now_mono
+    # Deterministic NAV2 anchor (I-215452): if the capture recorded the live
+    # anchor's per-epoch firing decisions, apply them verbatim in replay instead
+    # of re-deriving via get_opinion — removing the freshness-timing +
+    # amplification mismatch that drove the dynamic-window divergence (the anchor
+    # ablation showed it injects ~600mm in dynamic windows).  Old bundles (no
+    # log) → None → the get_opinion path (current behavior) is preserved.
+    thread._anchor_decisions = read_anchor_decisions(driver.bundle_dir)
     # Seed state (I-204115): if the capture recorded the AntPos initial filter
     # state (the Phase-1 bootstrap result the live AntPos inherited), restore it
     # so replay starts ALREADY CONVERGED — same position/ZTD/clock/float-
