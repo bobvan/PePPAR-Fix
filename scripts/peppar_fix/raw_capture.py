@@ -114,6 +114,20 @@ class RawCaptureBundle:
                 self._engine_files[filename] = fh
             fh.write(b)
 
+    def write_engine_json(self, filename: str, obj) -> None:
+        """Write ``obj`` as JSON to ``engine/<filename>`` (overwrite).
+
+        Group-B one-shot artifact (vs :meth:`engine_log`'s append stream) — e.g.
+        the AntPos initial filter state the replay restores to start converged
+        (I-204115).  Non-fatal on error (a capture-sink hiccup must not take down
+        the run)."""
+        import json
+        try:
+            with open(os.path.join(self.dir, "engine", filename), "w") as f:
+                json.dump(obj, f)
+        except (OSError, TypeError, ValueError):
+            pass
+
     @property
     def counts(self) -> dict:
         return dict(self._counts)

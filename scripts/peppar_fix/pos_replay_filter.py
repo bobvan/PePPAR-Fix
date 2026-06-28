@@ -31,7 +31,8 @@ if _SCRIPTS not in sys.path:
 
 from peppar_fix.pos_replay_driver import (ReplayDriver,  # noqa: E402
                                           read_manifest_conventions,
-                                          read_filter_config)
+                                          read_filter_config,
+                                          read_ape_init_state)
 
 _ENGINE_LOGGER = "peppar-fix"
 
@@ -73,6 +74,47 @@ class PppStateCapture(logging.Handler):
         if self._saved_level is not None:
             logger.setLevel(self._saved_level)
             self._saved_level = None
+
+
+def dump_ppp_filter_state(filt) -> dict:
+    """Serialize a PPPFilter's converged state (I-204115): the live AntPos
+    inherits the Phase-1 bootstrap filter, so a faithful replay must START its
+    steady-state filter from that SAME state, not a cold seed.  Captures the
+    state vector + covariance + the per-SV ambiguity index map + the ISB/ZTD
+    bookkeeping — the float ambiguities live in ``x``/``P`` (indexed by
+    ``sv_to_idx``), so restoring these makes the carrier phase immediately usable
+    exactly as it was at bootstrap exit.  ``prev_obs`` (slip-detector history) is
+    intentionally NOT captured — at most one SV re-floats on the first replayed
+    epoch (negligible vs the multi-metre cold-start it replaces)."""
+    import numpy as np
+    return {
+        "x": np.asarray(filt.x, dtype=float).tolist(),
+        "P": np.asarray(filt.P, dtype=float).tolist(),
+        "sv_to_idx": dict(filt.sv_to_idx),
+        "pinned_isbs": sorted(getattr(filt, "_pinned_isbs", set())),
+        "ztd_sigma_m": float(getattr(filt, "_ztd_sigma_m", 0.2)),
+        "pos_sigma_m_init": float(getattr(filt, "_pos_sigma_m_init", 10.0)),
+        "ztd_window_elapsed": float(getattr(filt, "_ztd_window_elapsed", 0.0)),
+    }
+
+
+def restore_ppp_filter_state(filt, state: dict) -> None:
+    """Restore a :func:`dump_ppp_filter_state` snapshot onto a freshly built
+    PPPFilter — overwriting the cold ``initialize()`` seed with the captured
+    bootstrap-exit state so replay starts converged (initial-P included, Charlie
+    #253 finding 2).  The filter keeps its own ``clock_model``/Q config (already
+    matched from ``[filter_config]``); only the estimated state is replaced."""
+    import numpy as np
+    filt.x = np.asarray(state["x"], dtype=filt.x.dtype if filt.x is not None
+                        else float)
+    filt.P = np.asarray(state["P"], dtype=float)
+    filt.sv_to_idx = dict(state.get("sv_to_idx", {}))
+    filt._pinned_isbs = set(state.get("pinned_isbs", []))
+    filt._ztd_sigma_m = float(state.get("ztd_sigma_m", 0.2))
+    filt._pos_sigma_m_init = float(state.get("pos_sigma_m_init", 10.0))
+    filt._ztd_window_elapsed = float(state.get("ztd_window_elapsed", 0.0))
+    filt.prev_obs = {}                 # slip history not captured — see dump()
+    filt.initialized = True            # clock is in the restored x, no self-seed
 
 
 def _build_replay_antex_parser(args):
@@ -178,13 +220,24 @@ def build_filter_thread(driver: ReplayDriver, known_ecef, *, systems=None,
     # driver's virtual clock), not the replay host's wall clock — else the
     # anchor sees every captured fix as stale and never fires.
     thread._now_mono = lambda: driver.clock.now_mono
-    # Seed the clock from the first epoch's PRs (runner bootstrap gap, I-175208):
-    # the runner builds a FRESH filter (no bootstrap_result to inherit a
-    # converged clock), and initialize() leaves it initialized=True with clock=0
-    # → every IF residual is a ~ms (~100s-km) outlier → all obs rejected →
-    # n_used=0, never converges.  initialized=False lets PPPFilter.update
-    # self-seed the clock (the live engine's "Clock seeded from N PRs").
-    thread._filt.initialized = False
+    # Seed state (I-204115): if the capture recorded the AntPos initial filter
+    # state (the Phase-1 bootstrap result the live AntPos inherited), restore it
+    # so replay starts ALREADY CONVERGED — same position/ZTD/clock/float-
+    # ambiguities and initial P the live filter began with — instead of cold.
+    # This closes the ~1.6 m cold-start null-coordinate residual that remained
+    # after the config fix.  Old bundles (no snapshot) fall back to the clock
+    # self-seed below.
+    init_state = read_ape_init_state(driver.bundle_dir)
+    if init_state is not None:
+        restore_ppp_filter_state(thread._filt, init_state)
+    else:
+        # No captured seed → FRESH filter (runner bootstrap gap, I-175208): the
+        # runner has no bootstrap_result to inherit a converged clock, and
+        # initialize() leaves it initialized=True with clock=0 → every IF
+        # residual is a ~ms (~100s-km) outlier → all obs rejected → n_used=0,
+        # never converges.  initialized=False lets PPPFilter.update self-seed the
+        # clock (the live engine's "Clock seeded from N PRs").
+        thread._filt.initialized = False
     return thread
 
 
