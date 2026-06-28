@@ -10804,6 +10804,21 @@ def run(args):
                 getattr(args, 'nav_sig_gate', False))
             ape_thread._nav_sig_max_age_s = float(
                 getattr(args, 'nav_sig_max_age_s', 2.0))
+            # pos_replay Group-B seed state (I-204115): snapshot the AntPos
+            # filter's INITIAL state — the Phase-1 bootstrap result it inherited
+            # (or its fresh init) — BEFORE start() runs any epoch, so a replay
+            # can restore it and begin already-converged instead of cold (the
+            # ~1.6 m cold-start null-coordinate residual).  Snapshot the filter
+            # under construction; never let it break engine start.
+            if _raw_bundle is not None and ape_thread._filt is not None:
+                try:
+                    from peppar_fix.pos_replay_filter import dump_ppp_filter_state
+                    _raw_bundle.write_engine_json(
+                        "ape_init_state.json",
+                        dump_ppp_filter_state(ape_thread._filt))
+                except Exception as _exc:           # noqa: BLE001
+                    log.warning("raw-capture: AntPos init-state snapshot "
+                                "failed (%s) — replay will cold-start", _exc)
             ape_thread.start()
 
         # Spawn the survey-refresh watcher.  It polls

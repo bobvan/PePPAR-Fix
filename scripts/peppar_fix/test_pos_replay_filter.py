@@ -179,6 +179,69 @@ class TestFilterConfigFaithfulness(unittest.TestCase):
         self.assertTrue(read["nav2_soft_anchor"])  # unset key → spec default
 
 
+class TestSeedStateInheritance(unittest.TestCase):
+    """I-204115: the live AntPos inherits the Phase-1 bootstrap filter, so a
+    faithful replay must restore that captured initial state instead of cold-
+    starting — else it settles at a different (pos,ZTD,clk) null coordinate
+    (~1.6 m stable residual)."""
+
+    def _converged_filter(self):
+        import numpy as np
+        from solve_ppp import PPPFilter
+        f = PPPFilter(clock_model="random_walk")
+        f.initialize(_TRUTH, -680000.0, systems={"gps"})
+        f.sv_to_idx = {"G01": 7}
+        f.x = np.append(f.x, [1.5])        # one float ambiguity
+        f.P = np.pad(f.P, ((0, 1), (0, 1)))
+        return f
+
+    def test_dump_restore_roundtrip_through_json(self):
+        import json, numpy as np
+        from solve_ppp import PPPFilter
+        f = self._converged_filter()
+        st = json.loads(json.dumps(prf.dump_ppp_filter_state(f)))
+        g = PPPFilter(clock_model="random_walk")
+        g.initialize((0, 0, 0), 0.0)
+        prf.restore_ppp_filter_state(g, st)
+        self.assertTrue(np.allclose(g.x, f.x))
+        self.assertEqual(g.x.shape, f.x.shape)     # ambiguity-extended length
+        self.assertTrue(np.allclose(g.P, f.P))
+        self.assertEqual(g.sv_to_idx, {"G01": 7})
+        self.assertTrue(g.initialized)             # clock in x → no self-seed
+
+    def test_build_thread_restores_captured_seed_state(self):
+        import numpy as np
+        rawx = _synthetic_rawx()
+        seed = prf.dump_ppp_filter_state(self._converged_filter())
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="t",
+                             conventions={"receiver": "f9t", "systems": ["gps"]})
+            b.write_engine_json("ape_init_state.json", seed)
+            b.record("ubx", b"R", recv_mono=1.0)
+            b.close()
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True)
+                thread = prf.build_filter_thread(rd, _TRUTH, systems=["gps"])
+        # filter starts from the captured converged state, NOT a cold seed
+        self.assertEqual(len(thread._filt.x), len(seed["x"]))
+        self.assertTrue(np.allclose(thread._filt.x, seed["x"]))
+        self.assertEqual(thread._filt.sv_to_idx, {"G01": 7})
+        self.assertTrue(thread._filt.initialized)
+
+    def test_no_seed_state_falls_back_to_cold_self_seed(self):
+        rawx = _synthetic_rawx()
+        with tempfile.TemporaryDirectory() as d:
+            _bundle(d)                     # no ape_init_state.json
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True)
+                thread = prf.build_filter_thread(rd, _TRUTH, systems=["gps"])
+        # falls back to the I-175208 clock self-seed (initialized=False)
+        self.assertFalse(thread._filt.initialized)
+
+
 class TestRunPosReplayDrivesFilter(unittest.TestCase):
     def test_drives_real_process_epoch(self):
         # the loop closer: a real AntPosEstThread is built and its

@@ -144,6 +144,20 @@ def filter_config_from_args(args) -> dict:
     return out
 
 
+def read_ape_init_state(bundle_dir: str):
+    """The captured AntPos initial filter state (engine/ape_init_state.json), or
+    None if the bundle has none (old capture, or --no-antposest).  The replay
+    restores it so the steady-state filter starts from the same bootstrap-exit
+    state the live AntPos inherited, not a cold seed (I-204115)."""
+    path = os.path.join(bundle_dir, "engine", "ape_init_state.json")
+    try:
+        import json
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 def read_filter_config(bundle_dir: str) -> dict:
     """The captured ``[filter_config]`` table, every key resolved against
     :data:`FILTER_CONFIG_SPEC` defaults (so old bundles with no section, or a
