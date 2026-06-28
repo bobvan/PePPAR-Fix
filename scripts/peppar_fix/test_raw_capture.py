@@ -44,6 +44,38 @@ class TestRoundTrip(unittest.TestCase):
                 self.assertEqual(b.counts, {"ubx": 2, "ssr": 1})
 
 
+class TestEngineLog(unittest.TestCase):
+    """Group-B engine-output sink (manifest §3): captured live [PPP_STATE]."""
+
+    def test_engine_log_appends_lines_under_engine_dir(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with rc.RawCaptureBundle(d) as b:
+                b.engine_log("ppp_state.log", "[ZTD_APRIORI] m=2.3000")
+                b.engine_log("ppp_state.log",
+                             "[PPP_STATE] epoch=1 n=8 ...\n")  # already has \n
+            with open(os.path.join(d, "engine", "ppp_state.log")) as f:
+                lines = f.read().splitlines()
+            self.assertEqual(lines[0], "[ZTD_APRIORI] m=2.3000")
+            self.assertEqual(lines[1], "[PPP_STATE] epoch=1 n=8 ...")
+            # exactly one trailing newline per line (no double-\n on the second)
+            self.assertEqual(len(lines), 2)
+
+    def test_engine_log_separate_from_raw_streams(self):
+        # engine/ output must not land in raw/ (different sink, different role)
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with rc.RawCaptureBundle(d) as b:
+                b.record("ubx", b"raw", 1.0)
+                b.engine_log("ppp_state.log", "[PPP_STATE] epoch=1")
+            self.assertTrue(os.path.exists(
+                os.path.join(d, "engine", "ppp_state.log")))
+            self.assertFalse(os.path.exists(
+                os.path.join(d, "raw", "ppp_state.log")))
+            # raw counts untouched by engine_log
+            self.assertEqual(rc.RawCaptureBundle(d).counts, {})
+
+
 class TestMergeOrder(unittest.TestCase):
     def test_merged_records_in_global_recv_mono_order(self):
         import tempfile
