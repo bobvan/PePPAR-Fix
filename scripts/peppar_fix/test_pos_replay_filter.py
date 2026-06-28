@@ -354,6 +354,17 @@ class TestPreciseCorrections(unittest.TestCase):
 
 
 class TestCorrectionsOverride(unittest.TestCase):
+    def test_build_filter_thread_leaves_clock_unseeded(self):
+        # runner bootstrap gap (I-175208): the fresh filter must be left
+        # initialized=False so PPPFilter.update self-seeds the clock from the
+        # first epoch — else clock=0 → every IF residual is an outlier →
+        # n_used=0, never converges.
+        with tempfile.TemporaryDirectory() as d:
+            _bundle(d, n_rawx=0)
+            rd = drv.ReplayDriver(d, decode_obs=True)
+            thread = prf.build_filter_thread(rd, _TRUTH, systems=["gps"])
+            self.assertFalse(thread._filt.initialized)
+
     def test_build_filter_thread_uses_override(self):
         rawx = _synthetic_rawx()
         sentinel = prf.PreciseCorrections(_StubSP3(), _StubClk())

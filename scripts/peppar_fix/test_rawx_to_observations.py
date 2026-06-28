@@ -56,6 +56,31 @@ class TestRawxToObservations(unittest.TestCase):
         self.assertEqual(n_off, 0)
         self.assertEqual(n_single, 0)
 
+    def test_pure_float_ar_flag_true_so_obs_passes(self):
+        # No phase-bias source (ssr None / no _phase_bias) → pure float, AR
+        # impossible → ar_phase_bias_ok must be True so obs_for_position keeps
+        # the obs (its documented "no-SSR → pass" contract).  Charlie #251 /
+        # I-175208: a blanket False here is what dropped every SV in the runner.
+        rawx = _rawx([0, 0], [0, 3], [1, 1],
+                     [22_000_000.0, 22_000_000.0],
+                     [115_000_000.0, 90_000_000.0])
+        obs, *_ = _run(rawx, ssr=None)
+        self.assertTrue(obs[0]["ar_phase_bias_ok"])
+        from peppar_fix.obs_routing import obs_for_position
+        self.assertEqual(len(obs_for_position(obs)), 1)   # survives the filter
+
+    def test_mixed_source_ar_flag_false_for_missing_sv(self):
+        # WITH a phase-bias source present but no match for THIS SV (mixed) →
+        # ar_phase_bias_ok False (exclude from AR; obs_for_position drops it).
+        from ssr_corrections import SSRState
+        ssr = SSRState()
+        ssr._phase_bias["E99"] = {"L1C": None}    # source present, other SV
+        rawx = _rawx([0, 0], [0, 3], [1, 1],
+                     [22_000_000.0, 22_000_000.0],
+                     [115_000_000.0, 90_000_000.0])
+        obs, *_ = _run(rawx, ssr=ssr)
+        self.assertFalse(obs[0]["ar_phase_bias_ok"])
+
     def test_system_filter_excludes_off_constellation(self):
         rawx = _rawx([0, 0], [0, 3], [1, 1],
                      [22_000_000.0, 22_000_000.0],

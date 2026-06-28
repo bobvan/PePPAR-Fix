@@ -94,9 +94,17 @@ def build_filter_thread(driver: ReplayDriver, known_ecef, *, systems=None,
         corrections = RealtimeCorrections(driver.stores["beph"],
                                           driver.stores["ssr"])
     ape_sm = eng.AntPosEst(wl_only=bool(getattr(args, "wl_only", False)))
-    return eng.AntPosEstThread(
+    thread = eng.AntPosEstThread(
         tuple(known_ecef), corrections, threading.Event(), ape_sm,
         systems=list(systems) if systems else [], args=args)
+    # Seed the clock from the first epoch's PRs (runner bootstrap gap, I-175208):
+    # the runner builds a FRESH filter (no bootstrap_result to inherit a
+    # converged clock), and initialize() leaves it initialized=True with clock=0
+    # → every IF residual is a ~ms (~100s-km) outlier → all obs rejected →
+    # n_used=0, never converges.  initialized=False lets PPPFilter.update
+    # self-seed the clock (the live engine's "Clock seeded from N PRs").
+    thread._filt.initialized = False
+    return thread
 
 
 class PreciseCorrections:

@@ -390,6 +390,10 @@ class ReplayDriver:
         # ~600 s freshness), so sub-second queue latency doesn't move the bias
         # correction.  If a case ever needs processing-time SSR, the bundle's
         # recv_mono lets a replay reconstruct it.
+        # Float-PPP pass-through (no SSR phase biases → AR impossible → obs must
+        # survive obs_for_position) is handled inside rawx_to_observations itself
+        # (Charlie #251), so the LIVE engine and the replay behave identically —
+        # no replay-side override here.
         observations, raw_obs, n_off, n_single = rawx_to_observations(
             rawx, self._systems, self.stores.get("ssr"),
             self._sig_names, self._sig_lookup, self._bds_l1_ref_cycles)

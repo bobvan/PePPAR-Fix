@@ -73,6 +73,21 @@ class TestRawxDecodeBuildsEpochs(unittest.TestCase):
                 rd.run()
             self.assertEqual(rd.epochs, [])
 
+    def test_float_ppp_obs_survive_when_no_phase_biases(self):
+        # Integration (I-175208 / Charlie #251): a phase-bias-free bundle
+        # reconstructs obs that pass obs_for_position — pure-float pass-through
+        # is in rawx_to_observations itself (shared live/replay), so the replay
+        # obs carry ar_phase_bias_ok=True with no replay-side override.
+        rawx = _synthetic_rawx_for_f9t()
+        with tempfile.TemporaryDirectory() as d:
+            _bundle(d)                      # no ssr stream → no phase biases
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True); rd.run()
+            _gt, obs, _c = rd.epochs[0]
+            self.assertTrue(obs)
+            self.assertTrue(all(o["ar_phase_bias_ok"] for o in obs))
+
     def test_decode_obs_requires_receiver(self):
         with tempfile.TemporaryDirectory() as d:
             _bundle(d, receiver=None)           # no receiver in manifest
