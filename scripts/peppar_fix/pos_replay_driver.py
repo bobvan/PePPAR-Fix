@@ -76,19 +76,24 @@ from peppar_fix.raw_capture import merged_records  # noqa: E402
 _BIAS_SKIP_KEYS = ("skip_biases", "skip_code_biases", "skip_phase_biases")
 
 
+def _read_manifest_section(bundle_dir: str, section: str) -> dict:
+    """One ``manifest.toml`` table (or {} if absent/garbled)."""
+    path = os.path.join(bundle_dir, "manifest.toml")
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            return tomllib.load(f).get(section, {})
+    except (OSError, ValueError):
+        return {}           # no/garbled manifest
+
+
 def read_manifest_conventions(bundle_dir: str) -> dict:
     """The bundle's ``manifest.toml`` ``[conventions]`` table (or {} if absent).
 
     The single reader for every per-run config the replay mirrors (bias-skip
     flags, receiver, systems, …) — read wholesale so the next field is a lookup,
     not a new I/O path (Charlie #237)."""
-    path = os.path.join(bundle_dir, "manifest.toml")
-    try:
-        import tomllib
-        with open(path, "rb") as f:
-            return tomllib.load(f).get("conventions", {})
-    except (OSError, ValueError):
-        return {}           # no/garbled manifest
+    return _read_manifest_section(bundle_dir, "conventions")
 
 
 def read_run_config(bundle_dir: str) -> dict:
@@ -98,6 +103,44 @@ def read_run_config(bundle_dir: str) -> dict:
     so replay routing matches the captured run."""
     conv = read_manifest_conventions(bundle_dir)
     return {k: bool(conv.get(k, False)) for k in _BIAS_SKIP_KEYS}
+
+
+# AntPosEstThread-relevant engine config, captured per-run so the replay builds
+# the SAME position filter the live engine ran (I-191033 replayMatchLiveFilter
+# config).  Each entry is (args-attr/manifest-key, engine default).  Omitting
+# these made the replay drop the live thread's null-constraining config (NAV2
+# soft-anchor, ZTD tie, solid tide, clock model, …) → the filter wandered the
+# (pos,ZTD,clk) null and diverged ~8 m from the captured-live trajectory even
+# seeded at truth.  None-valued args are omitted at capture (TOML has no null)
+# and fall back to the default here at read — so a default-None arg round-trips.
+FILTER_CONFIG_SPEC = (
+    ("solid_tide", True), ("pcv", True), ("clock_model", "random_walk"),
+    ("ar_elev_mask", 25.0), ("ztd_tie_sigma", None), ("ztd_tie_interval_s", 60),
+    ("nav2_soft_anchor", True), ("nav2_anchor_max_hacc_m", 3.0),
+    ("phase_windup", False), ("gmf", False), ("wl_only", False),
+    ("no_ar", False), ("pin_position", False), ("slip_rate_limit_s", 0.0),
+    ("rx_tcxo_adev_1s", None), ("join_test", True), ("receiver_antenna", None),
+)
+
+
+def filter_config_from_args(args) -> dict:
+    """Extract the captured-per-run filter config from the live engine ``args``
+    (for the bundle's ``[filter_config]`` section).  None values are dropped —
+    ``read_filter_config`` restores the spec default for any missing key."""
+    out = {}
+    for key, default in FILTER_CONFIG_SPEC:
+        v = getattr(args, key, default)
+        if v is not None:
+            out[key] = v
+    return out
+
+
+def read_filter_config(bundle_dir: str) -> dict:
+    """The captured ``[filter_config]`` table, every key resolved against
+    :data:`FILTER_CONFIG_SPEC` defaults (so old bundles with no section, or a
+    dropped None key, replay with the engine default — never a missing attr)."""
+    fc = _read_manifest_section(bundle_dir, "filter_config")
+    return {key: fc.get(key, default) for key, default in FILTER_CONFIG_SPEC}
 
 
 def replay_sig_config(bundle_dir: str):

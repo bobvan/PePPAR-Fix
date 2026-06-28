@@ -120,11 +120,15 @@ class RawCaptureBundle:
 
     def write_manifest(self, *, host: str, started_iso: str,
                        conventions: dict | None = None,
-                       software: dict | None = None, notes: str = "") -> str:
+                       software: dict | None = None, notes: str = "",
+                       filter_config: dict | None = None) -> str:
         """Write ``manifest.toml`` (provenance + conventions + versions).
 
         Hand-formatted (``tomli_w`` isn't a dependency — same as do_schema);
         round-trips through ``tomllib``.  Returns the manifest path.
+
+        ``filter_config`` (optional) records the engine's AntPosEst-relevant
+        config so the replay rebuilds the SAME position filter (I-191033).
         """
         soft = dict(software or {})
         # Resolve the git rev from the CODE checkout (this module's location),
@@ -144,6 +148,8 @@ class RawCaptureBundle:
             "conventions": dict(conventions or {}),
             "software": soft,
         }
+        if filter_config:
+            sections["filter_config"] = dict(filter_config)
         path = os.path.join(self.dir, "manifest.toml")
         with open(path, "w") as f:
             f.write(f'schema_version = "{SCHEMA_VERSION}"\n')

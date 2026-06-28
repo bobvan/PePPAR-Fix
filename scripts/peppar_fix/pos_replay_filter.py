@@ -30,7 +30,8 @@ if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
 from peppar_fix.pos_replay_driver import (ReplayDriver,  # noqa: E402
-                                          read_manifest_conventions)
+                                          read_manifest_conventions,
+                                          read_filter_config)
 
 _ENGINE_LOGGER = "peppar-fix"
 
@@ -88,15 +89,50 @@ def build_filter_thread(driver: ReplayDriver, known_ecef, *, systems=None,
     from types import SimpleNamespace
     import peppar_fix_engine as eng
     from ssr_corrections import RealtimeCorrections
+    # The captured per-run filter config (I-191033): the live engine recorded
+    # its AntPosEst-relevant args in the bundle's [filter_config]; build the
+    # replay's args from it so the thread is configured IDENTICALLY (NAV2 anchor,
+    # ZTD tie, solid tide, clock model, …).  An explicit args= still wins (tests
+    # / product-swap callers); otherwise a missing manifest yields spec defaults.
+    fc = read_filter_config(driver.bundle_dir)
     if args is None:
-        args = SimpleNamespace(wl_only=False, ppp_state_log=True)
+        args = SimpleNamespace(**fc, ppp_state_log=True)
     if corrections is None:
         corrections = RealtimeCorrections(driver.stores["beph"],
                                           driver.stores["ssr"])
     ape_sm = eng.AntPosEst(wl_only=bool(getattr(args, "wl_only", False)))
+    # Replicate the live engine's AntPosEstThread construction (engine:~10718):
+    # pass the same null-constraining config + the NAV2 store the replay driver
+    # already populates from captured NAV2-PVT/NAV-PVT.  Without these the filter
+    # wanders the (pos,ZTD,clk) null and diverges ~8 m from captured-live.
     thread = eng.AntPosEstThread(
         tuple(known_ecef), corrections, threading.Event(), ape_sm,
-        systems=list(systems) if systems else [], args=args)
+        systems=list(systems) if systems else [],
+        nav2_store=driver.stores.get("nav2"),
+        # engine coerces a None ar-elev-mask to 25.0 at parse (engine:12586);
+        # mirror that so replay matches the live AR mask (and never passes None,
+        # which NarrowLaneResolver's `mask > 0` test can't compare).
+        ar_elev_mask_deg=(25.0 if getattr(args, "ar_elev_mask", None) is None
+                          else float(args.ar_elev_mask)),
+        join_test_enabled=bool(getattr(args, "join_test", True)),
+        wl_only=bool(getattr(args, "wl_only", False)),
+        solid_tide=bool(getattr(args, "solid_tide", True)),
+        receiver_antenna_type=getattr(args, "receiver_antenna", None),
+        pcv_enabled=bool(getattr(args, "pcv", True)),
+        clock_model=getattr(args, "clock_model", "random_walk"),
+        rx_tcxo_adev_1s=getattr(args, "rx_tcxo_adev_1s", None),
+        phase_windup_enabled=bool(getattr(args, "phase_windup", False)),
+        gmf_enabled=bool(getattr(args, "gmf", False)),
+        slip_rate_limit_s=float(getattr(args, "slip_rate_limit_s", 0.0)),
+        ztd_tie_sigma=getattr(args, "ztd_tie_sigma", None),
+        nav2_anchor_enabled=bool(getattr(args, "nav2_soft_anchor", True)),
+        nav2_anchor_max_hacc_m=float(getattr(args, "nav2_anchor_max_hacc_m", 3.0)),
+        pin_position=bool(getattr(args, "pin_position", False)),
+        args=args)
+    # Age captured NAV2 opinions against the replayed epoch's recv_mono (the
+    # driver's virtual clock), not the replay host's wall clock — else the
+    # anchor sees every captured fix as stale and never fires.
+    thread._now_mono = lambda: driver.clock.now_mono
     # Seed the clock from the first epoch's PRs (runner bootstrap gap, I-175208):
     # the runner builds a FRESH filter (no bootstrap_result to inherit a
     # converged clock), and initialize() leaves it initialized=True with clock=0
