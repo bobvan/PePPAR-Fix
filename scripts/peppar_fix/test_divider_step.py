@@ -30,6 +30,7 @@ def _args(**kwargs):
         tadd_hold_s=1.1,
         no_divider_step=False,
         divider_step_threshold_us=5.0,
+        divider_arm_retries=1,
         ticc_port="/dev/ticc5",
         ticc_baud=115200,
         ticc_phc_channel="chA",
@@ -125,6 +126,68 @@ class _Fallbacks(unittest.TestCase):
              patch("peppar_fix_engine._do_tadd_arm") as arm:
             self.assertTrue(_maybe_step_divider_on_phase(_args()))
             arm.assert_called_once()
+
+
+class _ArmVerify(unittest.TestCase):
+    """_do_tadd_arm re-measures phase after the pulse and retries if not locked.
+
+    Catches the MadHat failure mode: the GPIO pulse fires but the divider
+    never GNSS-locks, so the DO PPS sits ~500 ms off and the old code logged
+    "synced" on faith (project_madhat_divider_500ms_offphase).
+    """
+
+    def test_verified_lock_arms_once(self):
+        with patch("peppar_fix.tadd.TADDDivider") as TD, \
+             patch("peppar_fix_engine.time.sleep"), \
+             patch("peppar_fix.timestamper.measure_differential_phase",
+                   return_value=(150.0, 3)):
+            from peppar_fix_engine import _do_tadd_arm
+            _do_tadd_arm(_args(divider_arm_retries=2))
+            self.assertEqual(TD.return_value.arm.call_count, 1)
+            TD.return_value.teardown.assert_called_once()
+
+    def test_persistent_offset_exhausts_retries(self):
+        # 502 ms offset never clears → 1 initial + 2 retries = 3 ARMs.
+        with patch("peppar_fix.tadd.TADDDivider") as TD, \
+             patch("peppar_fix_engine.time.sleep"), \
+             patch("peppar_fix.timestamper.measure_differential_phase",
+                   return_value=(502_000_000.0, 3)):
+            from peppar_fix_engine import _do_tadd_arm
+            _do_tadd_arm(_args(divider_arm_retries=2))
+            self.assertEqual(TD.return_value.arm.call_count, 3)
+
+    def test_locks_on_second_attempt(self):
+        with patch("peppar_fix.tadd.TADDDivider") as TD, \
+             patch("peppar_fix_engine.time.sleep"), \
+             patch("peppar_fix.timestamper.measure_differential_phase",
+                   side_effect=[(502_000_000.0, 3), (120.0, 3)]):
+            from peppar_fix_engine import _do_tadd_arm
+            _do_tadd_arm(_args(divider_arm_retries=3))
+            self.assertEqual(TD.return_value.arm.call_count, 2)
+
+    def test_no_ticc_arms_once_without_verify(self):
+        with patch("peppar_fix.tadd.TADDDivider") as TD, \
+             patch("peppar_fix_engine.time.sleep"), \
+             patch("peppar_fix.timestamper.measure_differential_phase") as meas:
+            from peppar_fix_engine import _do_tadd_arm
+            _do_tadd_arm(_args(ticc_port=None, divider_arm_retries=2))
+            self.assertEqual(TD.return_value.arm.call_count, 1)
+            meas.assert_not_called()  # no TICC → helper returns before measuring
+
+    def test_zero_retries_arms_once(self):
+        with patch("peppar_fix.tadd.TADDDivider") as TD, \
+             patch("peppar_fix_engine.time.sleep"), \
+             patch("peppar_fix.timestamper.measure_differential_phase",
+                   return_value=(502_000_000.0, 3)):
+            from peppar_fix_engine import _do_tadd_arm
+            _do_tadd_arm(_args(divider_arm_retries=0))
+            self.assertEqual(TD.return_value.arm.call_count, 1)
+
+    def test_no_gpio_does_not_construct_divider(self):
+        with patch("peppar_fix.tadd.TADDDivider") as TD:
+            from peppar_fix_engine import _do_tadd_arm
+            _do_tadd_arm(_args(tadd_gpio=None))
+            TD.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -6637,22 +6637,85 @@ def _resolve_qerr_latest_chi(qlc_flag):
     return True if qlc_flag is None else bool(qlc_flag)
 
 
+def _measure_divider_phase_ns(args, n_samples=3, timeout_s=20):
+    """Measure the current DO-vs-ref phase (ns) via a brief TICC differential read.
+
+    Returns ``(median_ns, n)``; ``(None, 0)`` when no TICC port is configured
+    or the read fails / yields no samples.  Shared by the warm-start phase
+    gate (decide whether to ARM) and the post-ARM verification (confirm the
+    ARM actually GNSS-locked the divider).
+    """
+    ticc_port = getattr(args, 'ticc_port', None)
+    if ticc_port is None:
+        return None, 0
+    try:
+        from peppar_fix.timestamper import measure_differential_phase
+        ticc_baud = getattr(args, 'ticc_baud', 115200)
+        do_ch = getattr(args, 'ticc_phc_channel', 'chA')
+        ref_ch = getattr(args, 'ticc_ref_channel', 'chB')
+        return measure_differential_phase(
+            ticc_port, ticc_baud, do_ch, ref_ch,
+            n_samples=n_samples, timeout_s=timeout_s)
+    except Exception as e:
+        log.warning("Divider phase measurement failed (%s)", e)
+        return None, 0
+
+
 def _do_tadd_arm(args):
-    """ARM the TADD divider if configured.  Extracted for reuse."""
+    """ARM the TADD divider if configured, then VERIFY it actually synced.
+
+    The ARM works only if the divider restarts on the next GNSS SYNC PPS
+    edge — which needs GNSS PPS wired to the divider SYNC input AND a divisor
+    matching the input frequency (the TADD-2 Mini is a 10 MHz→1 PPS part).
+    When those don't hold (wrong part, SYNC unwired, or a 5 MHz input into a
+    10 MHz divisor) the GPIO pulse fires but the output never GNSS-locks, and
+    the DO PPS sits at an arbitrary sub-second phase — MadHat's ~500 ms,
+    project_madhat_divider_500ms_offphase.  So instead of logging "synced" on
+    faith, re-measure via TICC after the pulse; retry up to
+    --divider-arm-retries; WARN/ERROR loudly if it never locks.
+    """
     tadd_gpio = getattr(args, 'tadd_gpio', None)
-    if tadd_gpio is not None:
-        from peppar_fix.tadd import TADDDivider
-        tadd_hold = getattr(args, 'tadd_hold_s', 1.1)
-        tadd = TADDDivider(arm_gpio=tadd_gpio, arm_hold_s=tadd_hold)
-        tadd.setup()
-        try:
-            tadd.arm()
-            log.info("TADD ARM complete (GPIO%d) — DO PPS synced to GNSS PPS "
-                     "(phase offset ≤%d ns)", tadd_gpio, tadd.max_phase_offset_ns)
-        finally:
-            tadd.teardown()
-    else:
+    if tadd_gpio is None:
         log.info("No TADD GPIO configured — assuming DO PPS already synced")
+        return
+    from peppar_fix.tadd import TADDDivider
+    tadd_hold = getattr(args, 'tadd_hold_s', 1.1)
+    threshold_ns = getattr(args, 'divider_step_threshold_us', 5.0) * 1000.0
+    retries = max(0, int(getattr(args, 'divider_arm_retries', 1)))
+    tadd = TADDDivider(arm_gpio=tadd_gpio, arm_hold_s=tadd_hold)
+    tadd.setup()
+    try:
+        last_ns = None
+        for attempt in range(retries + 1):
+            tadd.arm()
+            # The divider restarts on the next SYNC PPS edge (~1 s out); let it
+            # emit a couple of cycles before re-measuring.
+            time.sleep(2.0)
+            median_ns, n = _measure_divider_phase_ns(args)
+            if median_ns is None:
+                # No TICC to verify against — keep the prior faith-based
+                # behaviour (can't confirm; trust the spec ≤max_phase_offset).
+                log.info("TADD ARM complete (GPIO%d) — DO PPS assumed synced "
+                         "(no TICC to verify)", tadd_gpio)
+                return
+            last_ns = median_ns
+            if abs(median_ns) <= threshold_ns:
+                log.info("TADD ARM verified (GPIO%d) — DO PPS synced to GNSS "
+                         "PPS: phase %+.0f ns (n=%d)", tadd_gpio, median_ns, n)
+                return
+            log.warning("TADD ARM did NOT sync (GPIO%d): phase still %+.1f µs "
+                        "> %.1f µs after attempt %d/%d",
+                        tadd_gpio, median_ns / 1000.0, threshold_ns / 1000.0,
+                        attempt + 1, retries + 1)
+        log.error("TADD divider FAILED to GNSS-lock after %d ARM attempt(s): "
+                  "DO PPS ~%.1f ms off GNSS PPS.  The GPIO%d pulse fired but the "
+                  "output never locked — check that GNSS PPS feeds the divider "
+                  "SYNC input, the divisor matches the input frequency (TADD-2 "
+                  "Mini = 10 MHz→1 PPS; 5 MHz needs ÷5e6), and the divider part "
+                  "type.  See project_madhat_divider_500ms_offphase.",
+                  retries + 1, (last_ns or 0.0) / 1e6, tadd_gpio)
+    finally:
+        tadd.teardown()
 
 
 def _maybe_step_divider_on_phase(args):
@@ -6681,35 +6744,16 @@ def _maybe_step_divider_on_phase(args):
     # No divider configured — nothing to step.
     if getattr(args, 'tadd_gpio', None) is None:
         return False
-    # TICC port is the only phase-measurement source on TICC-only
-    # (VCOCXO) hosts.  Without it we can't decide; default to ARM
-    # (conservative — small false-positive ARM cost is preferable to
-    # missing a real phase divergence).
-    ticc_port = getattr(args, 'ticc_port', None)
-    if ticc_port is None:
-        log.info("No TICC port — defaulting to ARM (no phase observation "
-                 "available)")
-        _do_tadd_arm(args)
-        return True
 
     threshold_us = getattr(args, 'divider_step_threshold_us', 5.0)
     log.info("Warm-start phase check: measuring DO-vs-ref via TICC...")
-    try:
-        from peppar_fix.timestamper import measure_differential_phase
-        ticc_baud = getattr(args, 'ticc_baud', 115200)
-        do_ch = getattr(args, 'ticc_phc_channel', 'chA')
-        ref_ch = getattr(args, 'ticc_ref_channel', 'chB')
-        median_ns, n = measure_differential_phase(
-            ticc_port, ticc_baud, do_ch, ref_ch,
-            n_samples=3, timeout_s=20)
-    except Exception as e:
-        log.warning("Phase-conditional ARM measurement failed (%s) — "
-                    "defaulting to ARM", e)
-        _do_tadd_arm(args)
-        return True
+    median_ns, n = _measure_divider_phase_ns(args)
 
+    # No phase observation (no TICC, read failed, or no samples): default to
+    # ARM — a small false-positive ARM cost is preferable to missing a real
+    # phase divergence, and _do_tadd_arm now verifies the result itself.
     if median_ns is None:
-        log.warning("TICC produced no phase samples — defaulting to ARM")
+        log.info("No phase observation available — defaulting to ARM")
         _do_tadd_arm(args)
         return True
 
@@ -12232,6 +12276,14 @@ Two-phase operation:
                       help="Disable warm-start's phase-conditional TADD ARM.  "
                            "Use when divider wiring is broken or you want pure "
                            "slewing for diagnostic purposes.")
+    boot.add_argument("--divider-arm-retries", type=int, default=1,
+                      help="After a TADD ARM, re-measure the DO-vs-GNSS phase "
+                           "and retry the ARM up to this many times if it did "
+                           "not lock within --divider-step-threshold-us.  If "
+                           "still off after the retries, log an ERROR (the GPIO "
+                           "pulse fired but the divider never GNSS-locked — wrong "
+                           "input freq/divisor, SYNC unwired, or wrong part).  "
+                           "Default: 1.  Set 0 to ARM + verify once with no retry.")
 
     ticc = ap.add_argument_group("TICC experimental input (optional)")
     ticc.add_argument("--ticc-port", default=None,
