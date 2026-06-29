@@ -65,11 +65,11 @@
   │                                          │
   │  TICC1 chA: TimeHAT PHC PPS OUT (SDP0)  │
   │  TICC1 chB: F9T-BOT PPS                 │
-  │  TICC1 ref: 10 MHz from Geppetto GPSDO  │
+  │  TICC1 ref: 10 MHz from FE-5680A Rb     │
   │                                          │
   │  TICC2 chA: otcBob1 PPS OUT             │
   │  TICC2 chB: (not connected)             │
-  │  TICC2 ref: 10 MHz from Geppetto GPSDO  │
+  │  TICC2 ref: 10 MHz from FE-5680A Rb     │
   │                                          │
   │  eth0: 10.168.60.242                     │
   └──────────────────────────────────────────┘
@@ -154,10 +154,18 @@ NTS is used on Internet sources for MITM protection.
 ### 10 MHz reference chain
 
 ```
-[Geppetto GPSDO] ──10 MHz──→ [SV1AFN Dist Amp] ──10 MHz──→ [TICC #1 ref (PiPuss)]
-     (OCXO)                    (fan-out)       ──10 MHz──→ [TICC #2 ref (PiPuss)]
-                                               ──10 MHz──→ [TICC #3 ref (TimeHat)]
+[FE-5680A Rb] ──10 MHz──→ [SV1AFN Dist Amp] ──10 MHz──→ [TICC #1 ref]
+ (Rb, undisc.)             (fan-out/buffer) ──10 MHz──→ [TICC #2 ref]
+                                            ──10 MHz──→ [TICC #N ref ...]
 ```
+
+**Reference is the Frequency Electronics FE-5680A Rb standard** (10 MHz),
+buffered/fanned out by the SV1AFN distribution amp to every TICC reference
+input.  It replaced the Geppetto Electronics GPSDO (OCXO) on 2026-05-10 after
+storms knocked the Geppetto out on 2026-05-07.  The Rb is undisciplined, so its
+frequency is slightly off 10.0000000 MHz (constant offset, detrends out of any
+chA stability metric), but its short-term TDEV is far better than the OCXO —
+that's what sets the lab TICC measurement floor (now Rb-class, sub-ns).
 
 ### Serial console
 
@@ -171,6 +179,21 @@ NTS is used on Internet sources for MITM protection.
 
 Record topology changes here so the history of what was connected when
 is preserved. Include date, what changed, and why.
+
+### 2026-05-10 — TICC 10 MHz reference switched to FE-5680A Rb standard
+
+- The Geppetto Electronics GPSDO (OCXO) that fed the SV1AFN distribution amp
+  was knocked out by thunderstorms 2026-05-07.  The dist amp briefly ran on its
+  own internal TCXO (which set a ~1 ns @τ=1s lab-wide floor — see
+  `project_geppetto_out_2026_05_07` memory).
+- **2026-05-10**: Bob wired a shelved **Frequency Electronics FE-5680A Rb
+  standard** as the SV1AFN input, replacing the Geppetto.  Rb (FE-5680A model
+  confirmed 2026-06-29) → SV1AFN dist amp (buffers/fans out) → every TICC
+  reference input.  Undisciplined (slightly off 10 MHz, constant offset that
+  detrends out), but far better short-term TDEV than the OCXO → the lab TICC
+  measurement floor is now Rb-class (sub-ns at all reasonable τ).
+- Earlier change-log/gear entries naming "Geppetto GPSDO" as the TICC reference
+  are superseded by this entry.
 
 ### 2026-04-16 — TICC wiring updated, PiPuss in drawer, antenna clarified
 

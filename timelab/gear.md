@@ -276,7 +276,7 @@ specific enumeration order that may not hold after re-plugging.
 | Port | /dev/ticc (udev symlink) |
 | Baud | 115200 |
 | Channels | chA = TimeHAT PHC PPS OUT (SDP0), chB = F9T-BOT PPS |
-| Reference | 10 MHz from SV1AFN distribution amp (fed by Geppetto GPSDO) |
+| Reference | 10 MHz from SV1AFN distribution amp (fed by FE-5680A Rb standard) |
 | Role | SatPulse / PePPAR Fix TDEV measurement |
 | Docs | [TAPR TICC](http://www.tapr.org/ticc.html) |
 
@@ -304,35 +304,47 @@ specific enumeration order that may not hold after re-plugging.
 | Port | /dev/ticc (udev symlink, matched by Arduino serial number) |
 | Baud | 115200 |
 | Channels | chA = TimeHAT PHC PPS OUT (SDP0, SMA1 J4, disciplined), chB = F9T-3RD PPS (EVK SMA, raw GPS) |
-| Reference | 10 MHz from SV1AFN distribution amp (fed by Geppetto GPSDO) |
+| Reference | 10 MHz from SV1AFN distribution amp (fed by FE-5680A Rb standard) |
 | Role | PePPAR Fix M5 TDEV measurement (disciplined PHC vs raw GPS PPS) |
 | Docs | [TAPR TICC](http://www.tapr.org/ticc.html) |
 
 **Reference clock note:** When using TICC for cross-channel time transfer
-(comparing chA vs chB), the OCXO reference cancels — both channels share the
+(comparing chA vs chB), the shared reference cancels — both channels share the
 same timebase, so the measurement reflects only the PPS difference. For
-single-channel absolute measurements, the OCXO's noise floor contributes
-directly to the result and must be accounted for.
+single-channel absolute measurements, the reference's noise floor contributes
+directly to the result and must be accounted for. The reference is now the
+FE-5680A Rb standard (was a Geppetto OCXO GPSDO until 2026-05-07), so that
+single-channel floor is now Rb-class (sub-ns), much lower than the old OCXO floor.
 
 ## Reference Oscillators & Distribution
 
-### Geppetto Electronics GPSDO
+### Frequency Electronics FE-5680A Rb standard — TICC reference (CURRENT)
+
+| Field | Value |
+|-------|-------|
+| Model | Frequency Electronics FE-5680A rubidium frequency standard |
+| Oscillator | Rb |
+| Output | 10 MHz — **not GPS-disciplined**, so not exactly 10.0000000 MHz (small fixed frequency offset) |
+| Role | **Lab TICC reference clock** — feeds the SV1AFN distribution amplifier, which buffers/fans it out to every TICC reference input |
+| Notes | Replaced the Geppetto GPSDO (below) as the lab reference. Free-running/undisciplined, so its absolute frequency is slightly off 10 MHz, but its **short-term TDEV is far better than an OCXO** — which is what sets the TICC measurement floor. A constant frequency offset detrends out of any chA stability metric. Commissioned 2026-05-10 (one of the two shelved Rb units); FE-5680A model confirmed 2026-06-29. |
+
+### Geppetto Electronics GPSDO — OUT OF SERVICE (storm 2026-05-07)
 
 | Field | Value |
 |-------|-------|
 | Model | Geppetto Electronics GPSDO |
 | Oscillator | OCXO |
 | Output | 10 MHz |
-| Role | Lab reference clock — feeds distribution amplifier |
-| Notes | Decent OCXO for a home timelab; adequate for time transfer, noise floor matters for single-channel measurements |
+| Role | FORMER lab reference clock — fed the SV1AFN distribution amp until knocked out by thunderstorms 2026-05-07; replaced by the FE-5680A Rb (above) on 2026-05-10 |
+| Notes | Decent OCXO for a home timelab. Not currently in the reference chain |
 
 ### SV1AFN 10 MHz Distribution Amplifier
 
 | Field | Value |
 |-------|-------|
 | Model | SV1AFN.Com 10 MHz distribution amplifier |
-| Input | 10 MHz from Geppetto GPSDO |
-| Outputs | Multiple 10 MHz (feeds TICC reference inputs) |
+| Input | 10 MHz from FE-5680A Rb standard (was Geppetto GPSDO until 2026-05-07) |
+| Outputs | Multiple 10 MHz (buffers/fans out to TICC reference inputs) |
 | Role | Fan-out lab reference clock to multiple instruments |
 | Docs | [SV1AFN.Com](https://www.sv1afn.com/) |
 
@@ -340,11 +352,11 @@ directly to the result and must be accounted for.
 
 | Field | Value |
 |-------|-------|
-| Quantity | 2 |
-| Status | **Uncommissioned** — not yet set up for lab use |
+| Quantity | 2 (one is the FE-5680A now serving as the TICC reference — see above) |
+| Status | One **commissioned 2026-05-10** as the lab TICC reference (FE-5680A → SV1AFN); the other shelved/spare |
 | Expected ADEV | ~1e-11 at τ=1s (100× better than F9T TCXO) |
-| Potential roles | TICC reference clock (replacing OCXO), independent stability reference, holdover backbone |
-| Notes | Commissioning would improve single-channel TICC measurements and provide an independent stability reference |
+| Potential roles | TICC reference clock (DONE — replaced the Geppetto OCXO), independent stability reference, holdover backbone, second Rb for cross-check |
+| Notes | The active Rb is undisciplined (slightly off 10 MHz) but its short-term stability sets the new, much lower lab TDEV measurement floor |
 
 ## SDR Equipment
 

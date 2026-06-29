@@ -34,7 +34,9 @@ termination jumpers should be verified on each TICC.
 
 ### TICC single-shot resolution
 - TAPR TICC specified: <60 ps single-shot, ~70 ps jitter
-- 10 MHz reference: Geppetto GPSDO via SV1AFN distribution amplifier
+- 10 MHz reference: FE-5680A Rb standard via SV1AFN distribution amplifier
+  (was Geppetto GPSDO OCXO until 2026-05-07; Rb wired in 2026-05-10 — Rb is
+  undisciplined/slightly off 10 MHz but far better short-term TDEV than the OCXO)
 - Both TICC channels share the same reference, so cross-channel measurements
   cancel reference oscillator noise
 
@@ -207,8 +209,15 @@ where all channels need the same signal.
 ### Per-channel TDEV(1s) — reference oscillator wander
 
 Individual channel TDEV(1s) is ~31-35 ns on all three TICCs, dominated by
-the Geppetto GPSDO's short-term phase noise (common to both channels,
+the reference oscillator's short-term phase noise (common to both channels,
 cancels in the differential measurement).
+
+> **STALE — re-measure.** These ~31-35 ns single-channel numbers are from the
+> Geppetto GPSDO OCXO era.  The TICC reference is now the FE-5680A Rb standard
+> (since 2026-05-10), whose short-term TDEV is far lower, so per-channel
+> (single-shot, absolute) TDEV should now be much better — re-run the
+> per-channel survey against the Rb.  Differential (chA−chB) numbers are
+> unaffected (the reference cancels either way).
 
 ### Implications for servo measurements
 
@@ -432,5 +441,5 @@ From overnight Run A data:
 - [ ] Run C1-C5 calibration matrix (see above)
 - [ ] Cable delay calibration (zero-delay reference measurement)
 - [ ] EMI investigation: move TICC #3 away from RPi5, remeasure
-- [ ] Reference chain validation: compare GPSDO 10 MHz at each TICC input
+- [ ] Reference chain validation: compare FE-5680A Rb 10 MHz at each TICC input
 - [ ] Overnight PiPuss TICC #1 run for long-τ comparison with TICC #3

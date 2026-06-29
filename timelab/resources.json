@@ -360,7 +360,7 @@
         "chA": "TimeHAT PHC PPS OUT (SDP0, disciplined)",
         "chB": "F9T-3RD PPS (raw GPS reference)"
       },
-      "reference": "10 MHz from SV1AFN distribution amp (fed by Geppetto GPSDO)",
+      "reference": "10 MHz from SV1AFN distribution amp (fed by FE-5680A Rb standard)",
       "status": "installed"
     },
     "TICC-1": {
@@ -444,7 +444,7 @@
       "from": "SV1AFN distribution amp",
       "to": "TICC-3 ref",
       "cable": "SMA",
-      "signal": "10 MHz (from Geppetto GPSDO)"
+      "signal": "10 MHz (from FE-5680A Rb standard)"
     },
     {
       "from": "F9T-3RD (USB)",
