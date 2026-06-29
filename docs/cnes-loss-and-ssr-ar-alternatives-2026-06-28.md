@@ -1,5 +1,18 @@
 # CNES SSR loss → SSR/HAS AR alternatives (2026-06-28)
 
+> **UPDATE 2026-06-29 — it's a temporary BKG outage, not a move.** CNES replied
+> directly (Thierry, CNES PPP Team): *"BKG IGS-IP caster (products.igs-ip.net) is
+> the right place for CNES real-time SSR streams download. Unfortunately there is
+> for the moment an outage on this flow. CNES PPP Team is doing its best to restore
+> them. Thank you for your patience."* So **`products.igs-ip.net` stays the
+> authoritative source and the CNES streams will return there — prescription is
+> patience**, not migration. The "CNES moved to its own REGINA caster, re-register"
+> reading in §1 below was an over-conclusion (REGINA exists in parallel and does
+> serve SSRA00CNE0 behind a separate login, but it is an *optional interim*, not the
+> fix). Sections below are kept as the contemporaneous investigation; read them
+> through this correction. The SSR analysis-center survey and HAS findings (§2–§5)
+> are unaffected and remain useful contingency.
+
 **Trigger:** the rebuilt MadHat surfaced that CNES `SSRA00CNE0` had vanished from
 the BKG IGS-IP caster (`products.igs-ip.net`), leaving every CNES-configured host
 with 0 orbit/0 clock when wrapper-launched without a `--ssr-mount` override. CNES
