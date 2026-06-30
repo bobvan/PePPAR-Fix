@@ -193,21 +193,35 @@ present by inventory 2026-06-30):
 
 | Peripheral | From | On PiPuss | Notes |
 |---|---|---|---|
-| F9T-20B receiver | PiFace | `/dev/gnss-bot` (USB 1546:01a9) | the F9T PiFace had been running; PiFace now receiver-less |
+| F9T-20B receiver **SEC-UNIQID `2342aa323d`** (uid 262843023907) | PiFace | `/dev/gnss-bot` (USB 1546:01a9) | this unit had been on PiFace (state file 06-29; ultimately ex-MadHat).  PiFace is NOT left receiver-less — it keeps its OTHER F9T-20B **`3b41fabd5b`** (ex-MadHat). |
 | OCXO + AD5693R DAC + PulsePuppy + divider (DO `ocxo-clkpoc3`) | clkPoC3 | i2c-1 `0x4C` | char files moved to PiPuss `state/dos/`; archived `gt/do-char-archive/ocxo-clkpoc3-moved-to-pipuss-20260630/` |
 | TICC #5 | clkPoC3 | `/dev/ticc5` | Arduino serial …406232; udev rule added to `99-timelab.rules` 2026-06-30 |
 | OCXO temperature sensor | (new) | i2c-1 `0x48` | NEW; auto-read by engine `TempSensor(bus_num=1)` → `[TEMP_C]` |
 
 Resulting DO assignments (supersedes the round-1 clkPoC3 row below):
-- **PiPuss** — DO `ocxo-clkpoc3` (OCXO + AD5693R DAC, 1× gain) + F9T-20B + TICC #5 + temp sensor.  CLOCK host.
+- **PiPuss** — DO `ocxo-clkpoc3` (OCXO + AD5693R DAC, 1× gain) + F9T-20B **`2342aa323d`** + TICC #5 + temp sensor.  CLOCK host.
 - **clkPoC3** — DO REMOVED (→ PiPuss); no receiver (X20 pulled earlier).  Now a TICC-only logging host (keeps **TICC #4** = GNSSDO+ / PiFace logger).
-- **PiFace** — F9T moved to PiPuss; being reworked (had been running IsoTemp `isotemp-ocxo131-100-madhat`).
+- **PiFace** — STILL a live clock host: F9T-20B **`3b41fabd5b`** (ex-MadHat) + IsoTemp `isotemp-ocxo131-100-madhat` + TICC #2, running `--no-antposest`.  (Earlier note that PiFace went "receiver-less" was WRONG — corrected here after reading serials 2026-06-30.)
+
+**F9T-20B unit inventory (SEC-UNIQID — the only way to tell EVKs apart; no USB serial).**
+Confirmed by reading `Receiver identity ... id=` log lines + receiver state files 2026-06-30:
+
+| SEC-UNIQID | uid (decimal) | now on | provenance |
+|---|---|---|---|
+| `2342aa323d` | 262843023907 | **PiPuss** | MadHat → PiFace → PiPuss (most recently from PiFace, round 2) |
+| `3b41fabd5b` | 394029318459 | **PiFace** | MadHat → PiFace (came with the IsoTemp board); MadHat still has its `394029318459.json` state file |
+
+(PiFace's prior F9P `5d58b2dad4` was replaced by the ex-MadHat F9T-20B on 2026-06-30.)
+⇒ **PiPuss + PiFace are now the matched F9T-20B + IsoTemp clock pair** the recommissioning aimed for.
 
 `config/pipuss.toml` rewritten from the X20P receiver-only config to the clock-host
-config (X20P config preserved in git history).  **NOT yet brought up** — see the ⚠ verify
-list in that file (gnss-bot↔F9T, /dev/ticc5 after udev reload, divider GPIO, DAC gain
-jumper).  The `ocxo-clkpoc3` do_label is now a host-named misnomer (DO no longer on
-clkPoC3) — logged in `docs/misnomers.md`, rename deferred.
+config (X20P config preserved in git history).  **BROUGHT UP 2026-06-30** and disciplining
+(`--no-antposest`, servo err ~0.46 ns RMS, TICC resid ~50 ps).  Root cause of the initial
+"divider won't lock" was a **missing `gpiod` module** in the venv (silent no-op ARM), not
+wiring — fixed by `pip install gpiod==2.4.2` and now a declared dep (see
+`docs/misnomers.md` / memory `reference_gpiod_required_on_tadd_hosts`).  The `ocxo-clkpoc3`
+do_label is now a host-named misnomer (DO no longer on clkPoC3) — logged in
+`docs/misnomers.md`, rename deferred.
 
 ### 2026-06-30 — DO (disciplined-oscillator) reassignments + board moves
 

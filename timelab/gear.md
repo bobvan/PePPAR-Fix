@@ -183,14 +183,14 @@ against ntp1. NTS is used for MITM protection on Internet sources.
 | EVK model | EVK-F9T-20-00 |
 | Module | u-blox ZED-F9T-20B |
 | Firmware | TIM 2.25 (PROTVER 29.25) |
-| SEC-UNIQID | 394029318459 |
-| Host | clkPoC3 (moved from TimeHat 2026-04-13) |
-| Port | /dev/ttyACM1 |
+| SEC-UNIQID | 394029318459 (decimal) = `3b41fabd5b` (hex, as logged in `Receiver identity id=`) |
+| Host | **PiFace** (live F9T-20B + IsoTemp clock host, 2026-06-30) |
+| Port | PiFace USB CDC-ACM (by-path) |
 | Baud | 460800 |
 | Signals | GPS L1+L5, Galileo E1+E5a, BeiDou B1+B2a |
 | Limitation | **No GLONASS** (-20B hardware variant) |
 | Antenna | Shared with F9T-TOP and F9T-BOT via splitter (same ARP) |
-| Notes | Moved to clkPoC3 2026-04-13. Was on TimeHat 2026-03-16 to 2026-04-13. |
+| Notes | **Now on PiFace** (confirmed by serial 2026-06-30) — it's the "ex-MadHat" F9T that came with the IsoTemp board.  History: TimeHat (03-16) → clkPoC3 (04-13) → MadHat → **PiFace** (06-30).  Replaced PiFace's prior F9P `5d58b2dad4`. |
 
 ### F9T-TOP
 
@@ -214,14 +214,14 @@ against ntp1. NTS is used for MITM protection on Internet sources.
 | EVK model | EVK-F9T-20-00 |
 | Module | u-blox ZED-F9T-20B |
 | Firmware | TIM 2.25 (PROTVER 29.25) |
-| SEC-UNIQID | 262843023907 |
-| Host | MadHat (was PiPuss, renamed 2026-04-13) |
-| Port | /dev/ttyACM0 |
+| SEC-UNIQID | 262843023907 (decimal) = `2342aa323d` (hex, as logged in `Receiver identity id=`) |
+| Host | **PiPuss** (recommissioned F9T-20B + IsoTemp clock host, 2026-06-30) |
+| Port | /dev/gnss-bot |
 | Baud | 460800 |
 | Signals | GPS L1+L5, Galileo E1+E5a, BeiDou B1+B2a |
 | Limitation | **No GLONASS** (-20B hardware variant) |
 | Antenna | Shared with F9T-TOP and F9T-3RD via splitter (same ARP) |
-| Notes | Physically on bottom of the stacked EVK pair |
+| Notes | **Now on PiPuss** (confirmed by serial 2026-06-30) — came most recently from PiFace (round-2 swap), ultimately ex-MadHat.  state file 262843023907.json. |
 
 **USB serial note:** Both F9T EVKs present the same USB VID:PID and serial
 descriptor under `/dev/serial/by-id/`, so udev cannot reliably distinguish them.

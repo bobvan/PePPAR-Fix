@@ -277,7 +277,7 @@
       "description": "u-blox ZED-F9T (EVK-F9T-20-00, ZED-F9T-20B) \u2014 primary GNSS receiver",
       "hw_label": "hw:F9T-3RD",
       "model": "u-blox ZED-F9T-20B",
-      "host": "TimeHat",
+      "host": "PiFace",
       "port": "/dev/gnss-top",
       "baud": 115200,
       "bands": [
@@ -295,7 +295,9 @@
       ],
       "notes": "-20B variant: no GLONASS. Connected via USB.",
       "antenna": "Patch2",
-      "status": "installed"
+      "status": "installed",
+      "secuniqid_hex": "3b41fabd5b",
+      "note": "now on PiFace (live clock host, 2026-06-30); ex-MadHat with IsoTemp board; was clkPoC3/TimeHat"
     },
     "E810-F9T": {
       "description": "Onboard ZED-F9T on E810-XXVDA4T (via ice driver I2C)",
@@ -310,7 +312,7 @@
       "model": "ZED-F9T",
       "evk": "EVK-F9T-10-00",
       "firmware": "TIM 2.20",
-      "host": "PiPuss",
+      "host": "TimeHat",
       "port": "/dev/gnss-top",
       "baud": 115200,
       "antenna": "TBD",
@@ -324,7 +326,9 @@
       "port": "/dev/gnss-bot",
       "baud": 115200,
       "antenna": "Patch3",
-      "splitter": "GUS-2"
+      "splitter": "GUS-2",
+      "secuniqid_hex": "2342aa323d",
+      "note": "now on PiPuss (recommissioned clock host, 2026-06-30); came from PiFace, ultimately ex-MadHat"
     },
     "F10T": {
       "model": "ZED-F10T",
