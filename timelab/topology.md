@@ -184,6 +184,31 @@ that's what sets the lab TICC measurement floor (now Rb-class, sub-ns).
 Record topology changes here so the history of what was connected when
 is preserved. Include date, what changed, and why.
 
+### 2026-06-30 (round 2) — PiPuss recommissioned as a clock host
+
+Pre-London "round 2" peripheral swap.  **PiPuss** returns as a CLOCK host (it had
+been receiver-only ZED-X20P, then mothballed) — F9T-20 + IsoTemp-class OCXO +
+per-clock TICC, mirroring PiFace.  Peripherals consolidated onto it (all verified
+present by inventory 2026-06-30):
+
+| Peripheral | From | On PiPuss | Notes |
+|---|---|---|---|
+| F9T-20B receiver | PiFace | `/dev/gnss-bot` (USB 1546:01a9) | the F9T PiFace had been running; PiFace now receiver-less |
+| OCXO + AD5693R DAC + PulsePuppy + divider (DO `ocxo-clkpoc3`) | clkPoC3 | i2c-1 `0x4C` | char files moved to PiPuss `state/dos/`; archived `gt/do-char-archive/ocxo-clkpoc3-moved-to-pipuss-20260630/` |
+| TICC #5 | clkPoC3 | `/dev/ticc5` | Arduino serial …406232; udev rule added to `99-timelab.rules` 2026-06-30 |
+| OCXO temperature sensor | (new) | i2c-1 `0x48` | NEW; auto-read by engine `TempSensor(bus_num=1)` → `[TEMP_C]` |
+
+Resulting DO assignments (supersedes the round-1 clkPoC3 row below):
+- **PiPuss** — DO `ocxo-clkpoc3` (OCXO + AD5693R DAC, 1× gain) + F9T-20B + TICC #5 + temp sensor.  CLOCK host.
+- **clkPoC3** — DO REMOVED (→ PiPuss); no receiver (X20 pulled earlier).  Now a TICC-only logging host (keeps **TICC #4** = GNSSDO+ / PiFace logger).
+- **PiFace** — F9T moved to PiPuss; being reworked (had been running IsoTemp `isotemp-ocxo131-100-madhat`).
+
+`config/pipuss.toml` rewritten from the X20P receiver-only config to the clock-host
+config (X20P config preserved in git history).  **NOT yet brought up** — see the ⚠ verify
+list in that file (gnss-bot↔F9T, /dev/ticc5 after udev reload, divider GPIO, DAC gain
+jumper).  The `ocxo-clkpoc3` do_label is now a host-named misnomer (DO no longer on
+clkPoC3) — logged in `docs/misnomers.md`, rename deferred.
+
 ### 2026-06-30 — DO (disciplined-oscillator) reassignments + board moves
 
 Corrects long-stale DO attributions in the TICC-wiring tables above (they had

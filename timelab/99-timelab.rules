@@ -16,6 +16,8 @@ SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="2341", ENV{ID_SERIAL_SHORT}=="442363138353
 SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="2341", ENV{ID_SERIAL_SHORT}=="44236313835351B0A091", SYMLINK+="ticc3", MODE="0664", GROUP="dialout"
 # TICC #4
 SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="2341", ENV{ID_SERIAL_SHORT}=="44236313835351906002", SYMLINK+="ticc4", MODE="0664", GROUP="dialout"
+# TICC #5 (added 2026-06-30; moved clkPoC3 → PiPuss in the pre-London swap)
+SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="2341", ENV{ID_SERIAL_SHORT}=="44236313835351406232", SYMLINK+="ticc5", MODE="0664", GROUP="dialout"
 
 # Tell ModemManager and brltty to leave Arduino devices alone.  Both
 # services probe new ttyACM ports at boot/replug by sending arbitrary

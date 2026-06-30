@@ -308,6 +308,25 @@ specific enumeration order that may not hold after re-plugging.
 | Role | PePPAR Fix M5 TDEV measurement (disciplined PHC vs raw GPS PPS) |
 | Docs | [TAPR TICC](http://www.tapr.org/ticc.html) |
 
+### TAPR TICC #5 (PiPuss as of 2026-06-30; was clkPoC3)
+
+| Field | Value |
+|-------|-------|
+| Model | TAPR TICC |
+| Resolution | 60 ps |
+| Host | PiPuss (moved from clkPoC3 2026-06-30, pre-London "round 2" swap) |
+| Port | /dev/ticc5 (udev symlink; Arduino serial 44236313835351406232) |
+| Baud | 115200 |
+| Channels | per-clock TICC for the recommissioned PiPuss clock (DO PPS vs GNSS/ref) — wiring to confirm at bring-up |
+| Reference | 10 MHz from SV1AFN distribution amp (fed by FE-5680A Rb standard) |
+| Role | per-clock servo/measurement for PiPuss's `ocxo-clkpoc3` DO |
+| Docs | [TAPR TICC](http://www.tapr.org/ticc.html) |
+
+> NOTE (2026-06-30): this inventory is behind the lab — it lists no TICC #4
+> (clkPoC3, GNSSDO+/PiFace logger) and the host blocks still carry old
+> PiPuss↔MadHat renames.  `timelab/topology.md` is the authoritative current
+> state (see its 2026-06-30 round-2 change-log entry).
+
 **Reference clock note:** When using TICC for cross-channel time transfer
 (comparing chA vs chB), the shared reference cancels — both channels share the
 same timebase, so the measurement reflects only the PPS difference. For

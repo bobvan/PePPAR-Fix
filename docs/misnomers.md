@@ -636,3 +636,25 @@ an entry under a new dated section.  Don't sort or re-organise;
 chronological accumulation is fine.  When the underlying
 identifier gets renamed, strike through the entry rather than
 deleting (so we keep the audit history visible).
+
+## 2026-06-30
+
+### `ocxo-clkpoc3` (DO uid / do_label) — Misleading
+
+**Where**: `state/dos/ocxo-clkpoc3.*` (do_uid + model fields), referenced by
+`config/pipuss.toml:do_label` and `config/clkpoc3.toml:do_label`.
+**Claim**: The disciplined oscillator lives on host clkPoC3.
+**Actual**: As of 2026-06-30 the OCXO+AD5693R board moved clkPoC3 → PiPuss
+(pre-London round-2 swap).  The uid still names the *former* host, and the
+`model` field is literally `"ocxo-clkpoc3"` (a host name, not an OCXO model).
+**Why it matters**: A reader debugging PiPuss sees a DO named after a different
+host; the `model` field carries no actual part info (cf. the honest
+`isotemp-ocxo131-100-madhat` on PiFace, which names board+origin).  This is
+exactly the host-named-thing-that-moved trap.
+**Proposed**: rename to a board-descriptive, host-neutral uid once the OCXO
+model/serial is confirmed from `timelab/gear.md` (e.g.
+`isotemp-ocxo-<serial>` or similar), updating the 4 `state/dos/` filenames +
+`[identity].do_uid`/`model` + both configs' `do_label` together.
+**Notes**: Deferred — kept as-is during the move to preserve the char→engine
+linkage (renaming mid-swap risks breaking resolution).  Rename deliberately
+when next touching PiPuss's DO state.

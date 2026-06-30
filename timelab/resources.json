@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Time lab hardware inventory. Machine-readable resource list for Mayor scheduling of hardware-dependent work. See docs/hw-labels.md for the hw: bead label convention.",
-  "updated": "2026-03-23",
+  "updated": "2026-06-30",
   "hosts": {
     "TimeHat": {
       "description": "Raspberry Pi 5 with TimeHAT v5 \u2014 primary PePPAR Fix dev platform",
@@ -31,26 +31,30 @@
       "access": "ssh pipuss.local",
       "ip": "10.168.60.242",
       "hardware": "Raspberry Pi 5",
+      "role": "CLOCK host (recommissioned 2026-06-30, mirrors PiFace): F9T-20B + ocxo-clkpoc3 OCXO/DAC + TICC #5",
       "expected_devices": {
         "gnss": [
-          "/dev/gnss-top",
           "/dev/gnss-bot"
         ],
         "ticc": [
-          "/dev/ticc"
+          "/dev/ticc5"
+        ],
+        "i2c": [
+          "i2c-1 0x4C AD5693R DAC",
+          "i2c-1 0x48 OCXO temp sensor (NEW)"
         ],
         "ptp": [
           "/dev/ptp0"
         ]
       },
       "receivers": [
-        "F9T-TOP",
         "F9T-BOT"
       ],
       "ticcs": [
-        "TICC-1"
+        "TICC-5"
       ],
-      "notes": "testAnt data collection, PePPAR Fix observations"
+      "disciplined_oscillator": "ocxo-clkpoc3 (OCXO + AD5693R DAC, ex-clkPoC3; char in state/dos/)",
+      "notes": "X20P removed; F9T-20B ex-PiFace; DO+DAC+PulsePuppy+divider ex-clkPoC3; NOT yet brought up (see config/pipuss.toml verify list)"
     },
     "Onocoy": {
       "access": "ssh onocoy.local",
@@ -64,7 +68,7 @@
       },
       "receivers": [],
       "ticcs": [],
-      "notes": "Mothballed 2026-04-08. Confirmed never had a peppar-fix checkout (find / -iname '*peppar*' returned zero hits during the lab cleanup that day). The F10T (ArduSimple) and PX1125T are physically disconnected; TICC #2 has been moved to host ocxo. The Pi 4 is powered down. Don't ssh — the host may not be reachable."
+      "notes": "Mothballed 2026-04-08. Confirmed never had a peppar-fix checkout (find / -iname '*peppar*' returned zero hits during the lab cleanup that day). The F10T (ArduSimple) and PX1125T are physically disconnected; TICC #2 has been moved to host ocxo. The Pi 4 is powered down. Don't ssh \u2014 the host may not be reachable."
     },
     "otcBob1": {
       "access": "ssh otcBob1",
@@ -117,7 +121,7 @@
         "Adafruit-GPS"
       ],
       "ticcs": [],
-      "notes": "chrony stratum 1, PTP GM domain 20. GPS on /dev/gps0. Reachable ONLY via the PTP LAN (ssh 10.168.13.14) — no trusted-LAN/Tailscale/mDNS interface, so PTP-LAN SSH is the sole option for this host."
+      "notes": "chrony stratum 1, PTP GM domain 20. GPS on /dev/gps0. Reachable ONLY via the PTP LAN (ssh 10.168.13.14) \u2014 no trusted-LAN/Tailscale/mDNS interface, so PTP-LAN SSH is the sole option for this host."
     },
     "ocxo": {
       "description": "DECOMMISSIONED 2026-06-14. The E810-XXVDA4T x86 machine that was host 'ocxo' was recommissioned as host 'ptpmon' (same physical box). 'ocxo' and 'ptpmon' never coexist; do not expect to host 'ocxo' again.",
@@ -136,6 +140,20 @@
       "was": "ocxo",
       "location": "lab rack",
       "status": "active"
+    },
+    "clkPoC3": {
+      "access": "ssh clkPoC3",
+      "hardware": "Raspberry Pi",
+      "role": "TICC-only logging host (2026-06-30): DO moved to PiPuss, X20 receiver pulled earlier; keeps TICC #4 (GNSSDO+ / PiFace logger)",
+      "expected_devices": {
+        "ticc": [
+          "/dev/ticc4"
+        ]
+      },
+      "ticcs": [
+        "TICC-4"
+      ],
+      "notes": "no DO, no receiver, no engine; standing ticc_capture logger only"
     }
   },
   "nics": {
@@ -378,6 +396,17 @@
       "chA": "F10T PPS",
       "chB": "PX1125T PPS",
       "ref": "10 MHz from SV1AFN dist amp"
+    },
+    "TICC-5": {
+      "description": "TAPR TICC #5 \u2014 per-clock TICC for the recommissioned PiPuss clock",
+      "hw_label": "hw:TICC-5",
+      "model": "TAPR TICC",
+      "host": "PiPuss",
+      "port": "/dev/ticc5",
+      "baud": 115200,
+      "serial": "44236313835351406232",
+      "reference": "10 MHz from SV1AFN distribution amp (fed by FE-5680A Rb standard)",
+      "status": "moved clkPoC3 -> PiPuss 2026-06-30 (pre-London round-2 swap); udev rule added to 99-timelab.rules"
     }
   },
   "antennas": {

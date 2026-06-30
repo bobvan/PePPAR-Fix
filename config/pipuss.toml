@@ -1,78 +1,59 @@
 [peppar]
-# PiPuss — u-blox ZED-X20P (Generation 10) on the lab common UFO1
-# antenna via the GUS splitter.  Receiver bring-up 2026-06-08; engine
-# support landed on branch bravo/zed-x20p-support (dayplan zedX20pSupport).
-# See memory reference_zed_x20p_pipuss_bringup for the full bring-up facts.
+# PiPuss — RECOMMISSIONED as a CLOCK host 2026-06-30 (pre-London "round 2"
+# peripheral swap), mirroring PiFace: F9T-20 receiver + IsoTemp-class OCXO
+# disciplined oscillator + per-clock TICC.  Supersedes the prior
+# receiver-only ZED-X20P config (the X20P was pulled; that config lives in
+# git history — restore it when the X20P lands on a host again).
 #
-# Role: receiver characterization / RINEX archival / reference.  There is
-# NO disciplined oscillator and NO TICC on PiPuss — hence no ptp_dev, no
-# do_*/dac_* actuator block, and no ticc_port.  The engine runs its PPP
-# position filter (seeded at the UFO1 survey ARP) and archives RINEX; it
-# does not discipline a clock here.
+# Peripherals moved onto PiPuss 2026-06-30 (verified present by inventory):
+#   - F9T-20B receiver (ex-PiFace; USB 1546:01a9 → /dev/gnss-bot/ttyACM1)
+#   - DO: OCXO + AD5693R DAC + PulsePuppy + divider (ex-clkPoC3); the DAC
+#     answers at i2c-1 0x4C and the DO characterization (do_label below)
+#     travelled with the board — valid because the DAC+OCXO moved as a unit.
+#   - TICC #5 (ex-clkPoC3; Arduino serial 44236313835351406232 → /dev/ticc5
+#     via the udev rule added 2026-06-30 to timelab/99-timelab.rules)
+#   - NEW OCXO temperature sensor at i2c-1 0x48 (auto-read by the engine's
+#     TempSensor(bus_num=1); no config field needed — logged as [TEMP_C]).
 #
-# RECEIVER-COMPARISON / TDCP COLLECTION (X20 vs F9T vs F9P):
-# The receiver-clock short-τ noise floor is measured by TDCP (time-
-# differenced carrier phase) straight off RXM-RAWX — it needs NO DO and
-# NO TICC, so a receiver-only host is the ideal place to run it.  The
-# tdcp_log field below makes the engine emit a per-epoch TDCP CSV.  Launch
-# this host pinned at the surveyed ARP and without a servo:
-#
-#     peppar-fix --no-antposest
-#
-# (--no-antposest pins FixedPosFilter at the ufo1 ARP so the TDCP
-# estimator has a clean fixed known_ecef; no --servo because there is no
-# DO.)  Offline TDEV: integrate c_dt_rx_m to phase (cumsum / c), detrend,
-# allantools.tdev — short-τ is the receiver-clock floor.  Because all lab
-# F9T/F9P/X20 hosts share the same UFO1 RF via the GUS splitter, the
-# comparison is sky/multipath-common — differences are receiver-side.
-# See docs/receiver-comparison-2026-06-01.md for the prior F9P/F10T/F9T
-# round and memory rxtcxo_inherent_vs_thermal_20260524.
+# ⚠ NOT YET BROUGHT UP — verify at first launch: /dev/gnss-bot really is the
+#   F9T (USB-path symlink from the old dual-F9T era), /dev/ticc5 symlink
+#   resolves after the udev reload, the divider GPIO (tadd_gpio) and the
+#   AD5693R gain jumper match this board, and the DAC actually steers.
 
-# The ZED-X20P shares the generic u-blox USB descriptor (VID:PID
-# 1546:01ab, no unique serial number), so /dev/ttyACMx is fragile —
-# enumeration shifts when any USB device is added/removed, and a second
-# u-blox (PiPuss was historically a dual-F9T host) would make by-id
-# ambiguous.  Bind to the physical USB port via /dev/serial/by-path;
-# only breaks if the receiver's USB cable is moved to a different port.
-# See docs/lab-operations.md §12.  Native USB CDC-ACM ignores baud.
-serial = "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:2:1.0"
+# F9T-20B on the "bot" USB path (single u-blox now; X20P removed).
+serial = "/dev/gnss-bot"
 baud = 115200
 ubx_port = "USB"
-
-# ZED-X20P driver (Gen 10, PROTVER 50.10, HPG 2.02).  ensure_receiver_ready
-# auto-detects this from MON-VER MOD=ZED-X20P, so "receiver" here is mostly
-# documentation / a force for the rare diagnostic case.
-receiver = "x20p"
+receiver = "f9t"
 
 ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
+# CNES SSRA00CNE0 removed from IGS-IP 2026-06-28 -> BKG SSRA00BKG0 (float).
+ssr_ntrip_conf = "ntrip.conf"
+systems = "gps,gal,bds"
 
-# GPS+GAL only.  The X20 also tracks BDS (B1C/B2a/B3I) and GAL E6, all
-# verified native-cpMes 2026-06-08, but BDS is held out for the same
-# reason as the L5-tracking F9T hosts: no AC publishes BDS B2a-I phase
-# biases (docs/bds-b2a-phase-bias-survey-2026-05-09.md).  Matches
-# X20PDriver's default IF pairs.
-systems = "gps,gal"
-
-# Operational ARP — engine reads timelab/antennas.json[ufo1] at startup
-# as an in-memory survey-class seed candidate so the PPP filter seeds at
-# survey truth (σ ≈ 9 mm OPUS) instead of NAV2 (~1-2 m biased).  The
-# antennas.json read is in-memory only; only peppar-survey writes
-# state/positions/<uid>.survey.toml.  Single source of truth:
-# timelab/antennas.json.  UFO1 is the current lab antenna (see
-# antennas.json[ufo1]; reference_ufo1_choke1_two_arps).
+# Operational ARP — engine reads timelab/antennas.json[ufo1] as an in-memory
+# survey-class seed (shared lab antenna via the GUS splitter).
 arp_label = "ufo1"
 
-# RINEX archival for offline PRIDE comparison + peppar-survey --pride —
-# the core of PiPuss's reference role.  Path templates {date} (UTC
-# YYYYDDD, triggers UTC-midnight rotation) and {host}.  Decimation to
-# 30 s matches PRIDE/RTKLIB standard input; the engine still consumes
-# RAWX at 1 Hz for its own filter (decimation is writer-side only).
+# Disciplined oscillator — characterization travelled from clkPoC3 with the
+# board (state/dos/ocxo-clkpoc3.*).  NOTE: "ocxo-clkpoc3" is a host-named
+# misnomer now that the DO lives on PiPuss (logged in docs/misnomers.md);
+# kept as-is to preserve the char linkage — rename deliberately later.
+# The MEASURED [steering] in the .toml is authoritative over these dac_*
+# values (measuredSteeringIsAuthoritative, #187); these mirror clkPoC3.
+do_label = "ocxo-clkpoc3"
+do_type = "vcocxo"
+dac_bus = 1
+dac_addr = "0x4C"
+dac_bits = 16
+dac_gain = 1
+dac_ppb_per_code = "0.02309"
+dac_max_ppb = 740.0
+dac_type = "ad5693r"
+tadd_gpio = 16
+
+ticc_port = "/dev/ticc5"
+
 rinex_out = "data/rinex/{host}-{date}.obs"
 rinex_decimate_s = 30.0
-
-# TDCP receiver-clock noise-floor capture (see the role block above).
-# Per-epoch CSV at full 1 Hz rate; {host}/{date} expand once at open.
-# This is the headline metric for the X20-vs-F9T-vs-F9P timing
-# comparison and runs with no DO/servo.
-tdcp_log = "data/tdcp/{host}-{date}.csv"
