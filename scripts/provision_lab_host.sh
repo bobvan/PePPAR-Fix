@@ -11,7 +11,8 @@
 #   - verifies ~/peppar-fix is the SINGLE authoritative git checkout
 #   - creates the venv at ./venv and installs the ENGINE-ONLY stack via
 #     pyproject (`pip install -e '.[timebeat]'` — numpy/scipy/pyubx2/pyserial/
-#     pyrtcm/pyproj + smbus2; never --break-system-packages).  Deliberately
+#     pyrtcm/pyproj + smbus2 (I2C) + gpiod (TADD divider ARM GPIO);
+#     never --break-system-packages).  Deliberately
 #     LEAN: NO analysis libs (matplotlib/allantools/pandas live in the
 #     `[analysis]` extra).  These disk-constrained Timebeat hosts do NO on-host
 #     crunching — pull captures to gt and analyze there.
@@ -83,7 +84,7 @@ fi
 
 # 4. preflight checks (warnings only)
 echo "--- preflight ---"
-venv/bin/python -c "import numpy,scipy,pyubx2,pyrtcm,serial,pyproj,smbus2" 2>/dev/null \
+venv/bin/python -c "import numpy,scipy,pyubx2,pyrtcm,serial,pyproj,smbus2,gpiod" 2>/dev/null \
   && ok "engine imports OK" || warn "engine import failed (rerun provision)"
 
 CFG="config/$(echo "$HOST" | tr '[:upper:]' '[:lower:]').toml"

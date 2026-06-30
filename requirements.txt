@@ -4,8 +4,11 @@ pyubx2>=1.2.55
 pyserial
 pyrtcm>=1.1.0
 
-# Timebeat OTC hardware: Renesas 8A34002 TDC readout
+# Lab-hardware hosts: I2C (Renesas 8A34002 TDC / AD5693R DAC) and GPIO
+# (TADD divider ARM pin).  gpiod is a Linux-only C-extension — without it
+# the divider ARM silently no-ops and the DO PPS never GNSS-locks.
 smbus2
+gpiod; sys_platform == "linux"
 
 # Analysis: TDEV/ADEV plots, servo log analysis
 allantools

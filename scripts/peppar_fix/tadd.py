@@ -29,10 +29,29 @@ def _open_gpio_output(offset, consumer="peppar-tadd"):
     """Open a GPIO line as output, HIGH initial state.
 
     Tries libgpiod v2 then v1, returns a set_value callable and a
-    close callable.  Falls back to mock if gpiod unavailable.
+    close callable.
+
+    Fails LOUD on a real divider host: if GPIO hardware is present
+    (/dev/gpiochip*) but gpiod is missing or no chip accepts the line,
+    raises RuntimeError instead of returning a no-op mock.  A silent
+    no-op ARM is the worst outcome — it looks like the divider runs but
+    never GNSS-locks (cost a red-herring SYNC-cable swap on PiPuss
+    2026-06-30).  The no-op mock survives ONLY on hosts with no GPIO
+    hardware at all (dev box / CI / tests).
     """
+    chips = sorted(glob.glob("/dev/gpiochip*"))
+
     if _GPIOD is None:
-        log.warning("TADD: gpiod not available — ARM pulses will be no-ops")
+        if chips:
+            raise RuntimeError(
+                "TADD ARM requires the 'gpiod' Python module, but it is not "
+                f"installed while GPIO hardware is present ({', '.join(chips)}). "
+                "Without it the divider ARM is a silent no-op and the DO PPS "
+                "never GNSS-locks.  Install it: pip install gpiod  "
+                "(declared in the .[timebeat] extra and requirements.txt)."
+            )
+        log.warning("TADD: gpiod not installed and no GPIO hardware present "
+                    "— ARM is a no-op (non-GPIO host / test).")
         return lambda v: None, lambda: None
 
     # libgpiod v2
@@ -79,7 +98,14 @@ def _open_gpio_output(offset, consumer="peppar-tadd"):
                 chip.close()
             continue
 
-    log.warning("TADD: no gpiochip accepted GPIO%d — ARM pulses will be no-ops", offset)
+    if chips:
+        raise RuntimeError(
+            f"TADD ARM: gpiod is installed but no gpiochip accepted GPIO{offset} "
+            f"(tried {', '.join(chips)}).  Check the arm_gpio number and that the "
+            "line isn't already held by another process."
+        )
+    log.warning("TADD: no GPIO hardware present — ARM is a no-op "
+                "(non-GPIO host / test).")
     return lambda v: None, lambda: None
 
 

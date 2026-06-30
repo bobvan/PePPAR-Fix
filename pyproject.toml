@@ -35,7 +35,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-timebeat = ["smbus2"]
+# Lab-hardware host deps: smbus2 = I2C (ClockMatrix TDC / AD5693R DAC);
+# gpiod = GPIO for the TADD divider ARM pin.  gpiod is a Linux-only
+# C-extension (marker keeps non-Linux dev installs from failing on it).
+timebeat = ["smbus2", "gpiod; sys_platform == 'linux'"]
 analysis = ["allantools", "matplotlib", "pandas"]
 # peppar-mon — status display (scaffold in peppar_mon/).  Textual is the
 # only dep; no numpy/pyubx2/etc.  The monitor reads log files produced by
