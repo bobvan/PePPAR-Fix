@@ -148,8 +148,12 @@ NTS is used on Internet sources for MITM protection.
 
 | Channel | Source | PPS from |
 |---------|--------|----------|
-| chA | DO PPS (OCXO via CTI OSC5A2B02 + TADD-2 divider) | DAC-disciplined |
+| chA | DO PPS (IsoTemp OCXO via AD5693R DAC, 2× mode) | DAC-disciplined |
 | chB | F9T-3RD PPS (EVK SMA) | Patch3 via GUS #2 |
+
+> ⚠️ **TICC↔host and chA-source rows above are STALE after the 2026-06-30
+> rewiring** (TICC #2 is now on PiFace; MadHat's i226 was removed 2026-05-24).
+> See the 2026-06-30 change-log entry for the authoritative current DO assignments.
 
 ### 10 MHz reference chain
 
@@ -179,6 +183,30 @@ that's what sets the lab TICC measurement floor (now Rb-class, sub-ns).
 
 Record topology changes here so the history of what was connected when
 is preserved. Include date, what changed, and why.
+
+### 2026-06-30 — DO (disciplined-oscillator) reassignments + board moves
+
+Corrects long-stale DO attributions in the TICC-wiring tables above (they had
+listed i226 PEROUT for TimeHat/MadHat and "CTI OSC5A2B02" for clkPoC3 — wrong).
+**Authoritative current DO-per-host assignments:**
+
+| Host | Disciplined Oscillator | Actuator | Notes |
+|---|---|---|---|
+| TimeHat | i226 internal TCXO | PHC `adjfine` | i226 PHC still here |
+| clkPoC3 | **IsoTemp OCXO** | AD5693R DAC (2× mode) | NOT the CTI — that was a stale doc error |
+| **PiFace** | **IsoTemp OCXO131-100 (ex-MadHat)** | AD5693R DAC + TADD-2 divider | swapped in 2026-06-30; do_label=`isotemp-ocxo131-100-madhat`; also took TICC #2 (`/dev/ticc2`) + an F9T |
+| MadHat | (DO moved to PiFace; currently DO-less / being reworked) | — | its IsoTemp OCXO131-100 went to PiFace; i226 removed 2026-05-24 |
+| otcBob1 | ClockMatrix OCXO | combo servo (on-chip) | unchanged |
+| ptBoat | ClockMatrix OCXO | — | combo blocked |
+
+- **CTI OSC5A2B02 OCXO + TADD-2 divider** (10 MHz, AD5693R DAC) was **PiFace's**
+  former DO — moved OFF PiFace 2026-06-30, destination TBD. Its characterization is
+  archived at `gt/do-char-archive/ocxo-piface-CTI-OSC5A2B02-TADD2-saved-20260630/`
+  (restore on its next host: place the state/dos files, set that host's
+  `do_label = "ocxo-piface"`).
+- **TICC #2 moved MadHat → PiFace.** The "TICC #2 (MadHat)" / "TICC #3 (clkPoC3)"
+  table headers above and their chA rows need re-verification against the current
+  rewiring before being trusted.
 
 ### 2026-05-10 — TICC 10 MHz reference switched to FE-5680A Rb standard
 
