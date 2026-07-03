@@ -65,6 +65,16 @@ from plot_clock_stability_stack import (  # noqa: E402
 from plot_tch import (  # noqa: E402
     compute_tch, summary_table, _plot_node_curve, _COLORS)
 
+# Reuse the canonical TICC-single-shot ⊕ FE-5680A-Rb measurement floor
+# (the "bathtub") from plot_stability_slide — the SAME floor the campaign
+# deviation plots draw (plot_tracking_companion) — but WITHOUT inheriting
+# that module's top-level rcParams mutation (it sets presentation-sized
+# fonts at import time, which would otherwise leak into every page here).
+import matplotlib as _mpl  # noqa: E402
+_saved_rc = _mpl.rcParams.copy()
+from plot_stability_slide import measurement_floor  # noqa: E402
+_mpl.rcParams.update(_saved_rc)
+
 _TOOLNAME = 'two_clock_report.py'
 _PS_PER_S = 10 ** 12
 _FIGSIZE = (12.8, 7.2)   # 16:9 landscape (12.8 / 7.2 = 1.7778)
@@ -153,6 +163,29 @@ def _finish(pdf: PdfPages, fig) -> None:
     stamp(fig, _TOOLNAME)
     pdf.savefig(fig)
     plt.close(fig)
+
+
+def _add_measurement_floor(ax, kind: str) -> None:
+    """Shade the TICC single-shot (white PM) ⊕ FE-5680A Rb measurement
+    floor — the 'bathtub' — behind the data, matching the campaign
+    deviation plots (tools/plot_tracking_companion).  ``kind`` is
+    'tdev' (ns) or 'adev' (dimensionless).
+
+    Below this curve a device-under-test cannot be distinguished from the
+    measurement chain (TICC 60 ps resolution + FE-5680A reference noise):
+    on the chA-vs-Rb / chB-vs-Rb page this marks where an individual
+    curve is measurement-limited (and why the TCH page is needed to
+    recover stability past it).  Call AFTER the data is plotted and the
+    axis is set log-log, so the shade fills from the data-driven ymin.
+    """
+    ymin, ymax = ax.get_ylim()
+    tau_grid = np.logspace(0, 4, 200)
+    floor = measurement_floor(tau_grid, kind)
+    ax.fill_between(tau_grid, ymin, np.clip(floor, ymin, ymax),
+                    color='0.82', alpha=0.6, zorder=0, lw=0)
+    ax.plot(tau_grid, floor, color='0.5', lw=1.0, zorder=1,
+            label='TICC ⊕ FE-5680A Rb floor')
+    ax.set_ylim(ymin, ymax)
 
 
 # --------------------------------------------------------------------------
@@ -271,23 +304,21 @@ def page_stability(pdf: PdfPages, path: Path, label_a: str, label_b: str,
               marker='o')
     _plot_map(ax_a, _TAUS, adev_b, _COLORS['chB'], '-', f'{label_b} (chB)',
               marker='s')
-    for ax, ylabel, sub, loc in (
-            (ax_t, 'TDEV (ns)', 'TDEV(τ)', 'lower right'),
-            (ax_a, 'ADEV (dimensionless)', 'ADEV(τ)', 'upper right')):
+    for ax, ylabel, sub, loc, kind in (
+            (ax_t, 'TDEV (ns)', 'TDEV(τ)', 'lower right', 'tdev'),
+            (ax_a, 'ADEV (dimensionless)', 'ADEV(τ)', 'upper right', 'adev')):
         ax.set_xscale('log')
         ax.set_yscale('log')
         ax.set_xlabel('τ (s)')
         ax.set_ylabel(ylabel)
         ax.set_title(sub)
         ax.grid(True, which='both', ls=':', alpha=0.4)
+        _add_measurement_floor(ax, kind)   # TICC ⊕ Rb bathtub, behind data
         ax.legend(loc=loc, fontsize=8)
     if ax_t.get_ylim()[0] < 0.35 < ax_t.get_ylim()[1]:
         ax_t.axhline(0.35, color='darkgreen', ls=':', alpha=0.55, lw=1.0)
         ax_t.text(_TAUS[0], 0.36, ' moonshot per-clock budget (350 ps)',
                   fontsize=8, color='darkgreen', va='bottom')
-    ax_t.axhline(0.060, color='red', ls=':', alpha=0.55, lw=1.0)
-    ax_t.text(_TAUS[0], 0.062, ' TICC single-shot resolution (60 ps)',
-              fontsize=8, color='red', va='bottom')
     fig.suptitle(f'{label_a} & {label_b}   ·   individual stability vs '
                  f'{ref_label} reference   (chA n={len(chA)}, chB n={len(chB)})',
                  fontsize=12)
@@ -318,22 +349,21 @@ def page_tch(pdf: PdfPages, path: Path, label_a: str, label_b: str,
             ax_t.axhline(0.35, color='darkgreen', ls=':', alpha=0.55, lw=1.0)
             ax_t.text(taus[0], 0.36, ' moonshot per-clock budget (350 ps)',
                       fontsize=8, color='darkgreen', va='bottom')
-        ax_t.axhline(0.060, color='red', ls=':', alpha=0.55, lw=1.0)
-        ax_t.text(taus[0], 0.062, ' TICC single-shot resolution (60 ps)',
-                  fontsize=8, color='red', va='bottom')
     else:
         for ax in (ax_t, ax_a):
             ax.text(0.5, 0.5, f'insufficient aligned data (n={res.get("n", 0)})',
                     ha='center', va='center', transform=ax.transAxes)
-    for ax, ylabel, sub in ((ax_t, 'TDEV (ns)', 'TDEV(τ) — individual nodes'),
-                            (ax_a, 'ADEV (dimensionless)',
-                             'ADEV(τ) — individual nodes')):
+    for ax, ylabel, sub, kind in (
+            (ax_t, 'TDEV (ns)', 'TDEV(τ) — individual nodes', 'tdev'),
+            (ax_a, 'ADEV (dimensionless)', 'ADEV(τ) — individual nodes', 'adev')):
         ax.set_xscale('log')
         ax.set_yscale('log')
         ax.set_xlabel('τ (s)')
         ax.set_ylabel(ylabel)
         ax.set_title(sub)
         ax.grid(True, which='both', ls=':', alpha=0.4)
+        if len(taus):
+            _add_measurement_floor(ax, kind)   # TICC ⊕ Rb bathtub, behind nodes
         ax.legend(loc='best', fontsize=8)
     est = res.get('estimator', 'closed-form')
     neg = res.get('neg_count', 0)
