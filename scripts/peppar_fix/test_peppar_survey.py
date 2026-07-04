@@ -145,8 +145,8 @@ class BaselineCliTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         kw = rb.call_args.kwargs
         self.assertEqual(kw["mode"], "rtk")
-        self.assertEqual(kw["cors_station"], "dsp1")
-        self.assertIsNone(kw["cors_rinex_path"])
+        self.assertEqual(kw["base_station"], "dsp1")
+        self.assertIsNone(kw["base_rinex_path"])
 
     def test_base_rinex_path_detected(self):
         with tempfile.TemporaryDirectory() as td:
@@ -154,8 +154,8 @@ class BaselineCliTest(unittest.TestCase):
             rc, rb = self._run(["--base", bp])
         self.assertEqual(rc, 0)
         kw = rb.call_args.kwargs
-        self.assertIsNone(kw["cors_station"])
-        self.assertEqual(str(kw["cors_rinex_path"]), bp)
+        self.assertIsNone(kw["base_station"])
+        self.assertEqual(str(kw["base_rinex_path"]), bp)
 
     def test_base_realization_forwarded(self):
         rc, rb = self._run(["--base", "dsp1", "--base-realization", "ETRS89"])

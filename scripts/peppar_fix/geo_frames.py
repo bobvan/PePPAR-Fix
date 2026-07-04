@@ -32,6 +32,7 @@ CANONICAL_REALIZATION = "ITRF2020"
 # Geocentric (ECEF X/Y/Z, metres) CRS EPSG codes per realization.
 #   ITRF2020 geocentric    : 9988
 #   NAD83(2011) geocentric : 6317
+#   ETRS89 geocentric      : 4936  (ensemble; ~cm ambiguous across ETRFxx)
 #
 # NOTE: "WGS84" is deliberately NOT a realization here.  GPS broadcast /
 # NAV2 coordinates are nominally WGS84, but the *generic* WGS84 datum is
@@ -43,14 +44,34 @@ CANONICAL_REALIZATION = "ITRF2020"
 _REALIZATION_EPSG = {
     "ITRF2020": 9988,
     "NAD83(2011)": 6317,
+    "ETRS89": 4936,
 }
 
-# Plate-fixed realizations: their epoch is a *reference convention*
-# (NAD83(2011) coords are always expressed at 2010.0), not the
-# observation time.  The dynamic frames (ITRF2020, WGS84) carry the
-# real observation epoch.  PROJ's time-dependent Helmert wants the
-# observation epoch, which we therefore take from the dynamic side.
-_STATIC_REALIZATIONS = {"NAD83(2011)"}
+# Plate-fixed realizations: their epoch is a *reference convention*, not
+# the observation time.  NAD83(2011) coords are expressed at 2010.0;
+# ETRS89 coords are plate-fixed to stable Eurasia and coincide with ITRF
+# at 1989.0 (EPSG:4936→ITRF2020 grows ~2.5 cm/yr from there — verified
+# ~0.85 m at 2026.5).  A plate-fixed coord is time-invariant, so the
+# dynamic frame (ITRF2020, WGS84) carries the real observation epoch;
+# PROJ's time-dependent Helmert wants that observation epoch, which we
+# therefore always take from the dynamic side (see convert()).
+_STATIC_REALIZATIONS = {"NAD83(2011)", "ETRS89"}
+
+# The reference epoch each static realization's coordinates are conventionally
+# expressed at.  It labels the source Frame honestly; the numerical transform
+# to/from a dynamic frame uses the *observation* (dynamic-side) epoch, so this
+# is not what drives plate-motion propagation — that is obs_epoch in convert().
+_STATIC_REFERENCE_EPOCH = {
+    "NAD83(2011)": 2010.0,
+    "ETRS89": 1989.0,
+}
+
+
+def static_reference_epoch(realization: str, default: float = 2010.0) -> float:
+    """Conventional reference epoch for a plate-fixed realization (the epoch
+    its coordinates are expressed at).  Used to tag a source Frame honestly;
+    the transform itself uses the observation epoch from the dynamic side."""
+    return _STATIC_REFERENCE_EPOCH.get(realization, default)
 
 
 @dataclass(frozen=True)

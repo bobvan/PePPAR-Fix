@@ -528,27 +528,27 @@ def _run_baseline(args) -> int:
         return 2
 
     # --base is a CORS station code or a RINEX path (auto-detect).
-    cors_station = None
-    cors_rinex_path = None
+    base_station = None
+    base_rinex_path = None
     if args.base:
         looks_like_path = ("/" in args.base or "." in args.base
                            or Path(args.base).exists())
         if looks_like_path:
-            cors_rinex_path = Path(args.base)
+            base_rinex_path = Path(args.base)
         else:
-            cors_station = args.base
+            base_station = args.base
 
     work_dir = Path(args.base_work_dir or os.path.join(
         tempfile.gettempdir(), "peppar-survey-baseline"))
     nav_file = (Path(args.base_nav) if args.base_nav
                 else Path(args.rtklib_nav) if args.rtklib_nav else None)
 
-    cors_ntrip = None
+    base_ntrip = None
     if args.base_ntrip_host:
         from peppar_fix.peppar_survey_cors import (
             CorsNtripConfig, DEFAULT_CORS_NTRIP_DURATION_S,
         )
-        cors_ntrip = CorsNtripConfig(
+        base_ntrip = CorsNtripConfig(
             host=args.base_ntrip_host,
             port=args.base_ntrip_port,
             mount=args.base_ntrip_mount,
@@ -562,10 +562,10 @@ def _run_baseline(args) -> int:
         work_dir=work_dir,
         receiver_uid=args.receiver_uid,
         mode="rtk",
-        cors_station=cors_station,
-        cors_rinex_path=cors_rinex_path,
+        base_station=base_station,
+        base_rinex_path=base_rinex_path,
         base_realization=args.base_realization,
-        cors_ntrip=cors_ntrip,
+        base_ntrip=base_ntrip,
         nav_file=nav_file,
         positions_dir=args.positions_dir,
         history_dir=args.history_dir,
