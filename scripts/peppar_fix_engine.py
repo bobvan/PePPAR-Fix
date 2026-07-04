@@ -4434,6 +4434,30 @@ class AntPosEstThread(threading.Thread):
 # ── Phase 2: Steady state ────────────────────────────────────────────── #
 
 
+def _read_survey_converged(survey_path):
+    """Read the ``converged`` flag from a ``.survey.toml`` (I-071400 E3).
+
+    Forward-compatible: ``converged`` lands in ``PositionState.extra`` (the
+    loader keeps unknown keys), so this works today (default False) and fully
+    once peppar-survey writes the field.  Any absence / malformed file / unset
+    field → False.  Returns a plain bool."""
+    if not survey_path:
+        return False
+    try:
+        from peppar_fix.position_state import _load_toml
+        st = _load_toml(survey_path, "survey")
+    except Exception:                       # noqa: BLE001 — never break the loop
+        return False
+    if st is None:
+        return False
+    val = st.extra.get("converged", False)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    return str(val).strip().lower() in ("true", "1", "yes")
+
+
 def _apply_survey_refresh(event, known_ecef, sigma_pin_m, filt):
     """Apply one survey-refresh event drained from the watcher queue.
 
@@ -4495,7 +4519,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                      ar_position=None, ar_pos_lock=None,
                      extint_store=None,
                      pos_sigma_m=None, pos_source=None,
-                     survey_refresh_queue=None, arp_box=None, raw_bundle=None):
+                     survey_refresh_queue=None, arp_box=None, raw_bundle=None,
+                     survey_path=None):
     """Run FixedPosFilter for clock estimation with optional servo.
 
     This is the steady-state phase: position is known, we estimate clock
@@ -4687,6 +4712,21 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     log.info("Position-blend σ_pin initial: %.3f m "
              "(source=%s, --ar-mode=%s)",
              sigma_pin_m, pos_source or "default", args.ar_mode)
+
+    # Survey-provenance lifecycle (I-071400 E3): ACQUIRING (coarse bootstrap
+    # seed) → REFINING (a survey-class σ_r landed, not yet converged) → SURVEYED
+    # (survey converged → hold pin, stop raw-obs logging).  Keyed off the HONEST
+    # σ_r — pos_sigma_m (the seed σ, ~10 m for a --nav2-bootstrap, cm for a
+    # survey pin), NOT sigma_pin_m (which --no-antposest forces to 1 mm as the
+    # rigid pin tightness).  _survey_sigma_r tightens as survey refinements land
+    # (updated in the refresh drain); the state is evaluated at the 60-epoch
+    # confidence tick.  Off-mode (no survey_path) still runs harmlessly.
+    from peppar_fix.survey_lifecycle import SurveyLifecycleMachine, SurveyLifecycle
+    _survey_lifecycle = SurveyLifecycleMachine(
+        trusted_sigma_m=_TRUSTED_POSITION_SIGMA_M)
+    _survey_sigma_r = (float(pos_sigma_m)
+                       if pos_sigma_m is not None and pos_sigma_m > 0
+                       else _TRUSTED_POSITION_SIGMA_M)
 
     # Stage 6 self-healing gate (I-125649): when the blend keeps
     # rejecting updates with the same sustained outlier delta, the
@@ -5470,6 +5510,17 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                             event, known_ecef, sigma_pin_m, filt)
                         if arp_box is not None:
                             arp_box[0] = known_ecef
+                        # Track the HONEST σ_r from the survey that landed (the
+                        # refresh carries the survey's own σ) so the lifecycle
+                        # sees REFINING as σ_r tightens (I-071400 E3).  event is
+                        # (action, SurveyRefresh, Δ); a SLEW that applied gives
+                        # the new survey σ.
+                        try:
+                            _new_sig = float(event[1].new_sigma_m)
+                            if _new_sig > 0:
+                                _survey_sigma_r = _new_sig
+                        except (AttributeError, IndexError, TypeError, ValueError):
+                            pass
                         if exit_code is not None:
                             return exit_code
                 except _queue_mod.Empty:
@@ -6072,6 +6123,23 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                         # may have logged or vetoed, but we already wrote
                         # our decision into ctx.  Future cycles continue
                         # from this state.
+
+                # Survey-provenance lifecycle (I-071400 E3): evaluate
+                # ACQUIRING/REFINING/SURVEYED from the honest σ_r + the survey's
+                # converged flag (read forward-compatibly from .survey.toml).
+                # On first entering SURVEYED, stop raw-obs logging — the pin is
+                # final, no more obs are needed to refine it.  Time-only mode
+                # only: in default (AntPosEst) mode a raw capture is for
+                # pos_replay and must not stop on survey convergence.
+                if getattr(args, 'no_antposest', False):
+                    _survey_converged = _read_survey_converged(survey_path)
+                    _lc_state, _lc_changed = _survey_lifecycle.update(
+                        _survey_sigma_r, _survey_converged)
+                    if (_lc_changed and _lc_state is SurveyLifecycle.SURVEYED
+                            and raw_bundle is not None
+                            and raw_bundle.stop_recording()):
+                        log.info("[SURVEY_LIFECYCLE] SURVEYED — raw-obs logging "
+                                 "stopped (survey converged; holding pin)")
 
                 # Slice 7 — slew/step decision based on the
                 # displacements just logged.  See
@@ -11151,6 +11219,7 @@ def run(args):
             survey_refresh_queue=_survey_refresh_queue,
             arp_box=_arp_box,
             raw_bundle=_raw_bundle,
+            survey_path=_survey_path,
         )
         # run_steady_state returns an int exit code on error
         # (e.g. 5 for catastrophic-reject cascade) or a gate_stats

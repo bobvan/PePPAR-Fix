@@ -69,6 +69,13 @@ class RawCaptureBundle:
         self._lock = threading.Lock()
         self._flush_stop: "threading.Event | None" = None
         self._flusher: "threading.Thread | None" = None
+        # Raw-obs recording gate (I-071400 E3): the SURVEYED lifecycle state
+        # stops raw logging once the survey has converged (no more obs needed to
+        # refine the pin).  Checked per-record so a single flag halts all raw
+        # streams (UBX/RTCM/TICC) at once without touching the reader threads'
+        # captured `raw_bundle` locals.  engine_log/write_engine_json (Group-B)
+        # are NOT gated — this stops raw obs only, per the design.
+        self._recording = True
 
     def _fh(self, stream: str):
         fh = self._files.get(stream)
@@ -80,13 +87,33 @@ class RawCaptureBundle:
         return fh
 
     def record(self, stream: str, payload: bytes, recv_mono: float) -> None:
-        """Append one raw message (``payload``) stamped with ``recv_mono``."""
+        """Append one raw message (``payload``) stamped with ``recv_mono``.
+
+        No-op once :meth:`stop_recording` has been called (SURVEYED)."""
         hdr = _REC_HDR.pack(float(recv_mono), len(payload))
         with self._lock:
+            if not self._recording:
+                return
             fh = self._fh(stream)
             fh.write(hdr)
             fh.write(payload)
             self._counts[stream] = self._counts.get(stream, 0) + 1
+
+    def stop_recording(self) -> bool:
+        """Halt raw-obs recording (idempotent).  Returns True on the call that
+        actually stopped it (so the caller logs the edge once).  Subsequent
+        :meth:`record`/:meth:`record_line` calls become no-ops; Group-B
+        engine_log sinks are unaffected.  The periodic flusher + close() still
+        finalize the already-written .cap files."""
+        with self._lock:
+            if not self._recording:
+                return False
+            self._recording = False
+            return True
+
+    @property
+    def recording(self) -> bool:
+        return self._recording
 
     def record_line(self, stream: str, line, recv_mono: float) -> None:
         """Append a text line (TICC) — stored as bytes with a trailing \\n."""
