@@ -135,6 +135,14 @@ def main(argv: list[str] | None = None) -> int:
              "ITRF2020@epoch so the rover result is native ITRF2020.  "
              "Requires --rinex-glob (rover) + a base, and rnx2rtkp.",
     )
+    backends.add_argument(
+        "--auto", action="store_true",
+        help="Pick the fastest backend that will work for this receiver + "
+             "site (dual-freq + a discoverable nearby base → --baseline), "
+             "falling back to the PRIDE PPP-AR floor otherwise.  Heuristics "
+             "only buy speed — the floor guarantees correctness.  Use "
+             "--plan-only to see the choice without running.",
+    )
     pride = ap.add_argument_group("--pride options")
     pride.add_argument(
         "--rinex-glob", default=None,
@@ -265,6 +273,34 @@ def main(argv: list[str] | None = None) -> int:
              "(5 min).  Must overlap the rover RINEX time range.",
     )
 
+    auto = ap.add_argument_group("--auto options")
+    auto.add_argument(
+        "--plan-only", action="store_true",
+        help="With --auto: print the selected backend + reasoning and exit, "
+             "without fetching a base or running a solve.",
+    )
+    auto.add_argument(
+        "--near", default=None,
+        help="With --auto: 'LAT,LON' (deg) override for region + base "
+             "selection.  Default: the receiver's last-known fix.",
+    )
+    auto.add_argument(
+        "--caster-host", default=None,
+        help="With --auto: NTRIP caster host whose sourcetable is searched "
+             "for a nearby base.  Without it, --auto can't rank a baseline "
+             "and falls back to the PRIDE floor.",
+    )
+    auto.add_argument(
+        "--caster-port", type=int, default=2101,
+        help="With --auto: caster port for sourcetable discovery "
+             "(default 2101).",
+    )
+    auto.add_argument(
+        "--max-km", type=float, default=80.0,
+        help="With --auto: reject bases farther than this from the site "
+             "(default 80 km — a longer baseline erodes the cm advantage).",
+    )
+
     args = ap.parse_args(argv)
 
     logging.basicConfig(
@@ -283,6 +319,8 @@ def main(argv: list[str] | None = None) -> int:
         args.receiver_uid = uid
         log.info("Auto-discovered receiver_uid=%s", uid)
 
+    if args.auto:
+        return _run_auto(args)
     if args.pride:
         return _run_pride(args)
     if args.rtklib:
@@ -291,10 +329,92 @@ def main(argv: list[str] | None = None) -> int:
         return _run_baseline(args)
 
     log.error(
-        "No backend selected.  Pass one of: --pride, --rtklib, "
-        "--baseline.  All three are implemented today."
+        "No backend selected.  Pass one of: --auto, --pride, --rtklib, "
+        "--baseline.  All four are implemented today."
     )
     return 2
+
+
+def _parse_near(near: str | None) -> tuple[float, float] | None:
+    if not near:
+        return None
+    try:
+        lat_s, lon_s = near.split(",")
+        return float(lat_s), float(lon_s)
+    except ValueError:
+        raise SystemExit(f"--near must be 'LAT,LON'; got {near!r}")
+
+
+def _run_auto(args) -> int:
+    """Select the fastest viable backend (baseline > pride floor > rtklib)
+    and either print the plan (--plan-only) or dispatch to it."""
+    from peppar_fix.peppar_survey_auto import plan_auto
+
+    plan = plan_auto(
+        uid=args.receiver_uid,
+        receivers_dir=args.receivers_dir,
+        near=_parse_near(args.near),
+        caster_host=args.caster_host,
+        caster_port=args.caster_port,
+        max_km=args.max_km,
+    )
+
+    log.info("auto: selected %s backend — %s", plan.backend, plan.reason)
+    if args.plan_only:
+        base = plan.base
+        print(f"backend: {plan.backend}")
+        print(f"reason:  {plan.reason}")
+        if base is not None:
+            print(f"base:    {base.station} @ {base.distance_km:.1f} km "
+                  f"({base.base_realization})")
+        return 0
+
+    if plan.backend == "baseline":
+        # Hand the discovered base to the --baseline backend.  A NOAA CORS
+        # station is fetched by _run_baseline itself (by rover date); a
+        # EUREF base is fetched here via S2 so --baseline sees a RINEX path.
+        return _dispatch_baseline_from_plan(args, plan)
+    if plan.backend == "rtklib":
+        return _run_rtklib(args)
+    return _run_pride(args)
+
+
+def _dispatch_baseline_from_plan(args, plan) -> int:
+    """Fetch the planned base RINEX (S2) and run the --baseline backend with
+    the base pre-converted from its regional datum (S1)."""
+    import tempfile
+    from glob import glob
+    from pathlib import Path
+
+    from peppar_fix.peppar_survey_discovery import fetch_base_rinex
+    from peppar_fix.peppar_survey_rtklib import doy_from_obs_name
+
+    if not args.rinex_glob:
+        log.error("--auto baseline requires --rinex-glob (rover)")
+        return 2
+    obs_files = sorted(glob(args.rinex_glob))
+    if not obs_files:
+        log.error("--rinex-glob %r matched no files", args.rinex_glob)
+        return 1
+    yd = doy_from_obs_name(Path(obs_files[0]))
+    if yd is None:
+        log.error("can't derive (year, doy) from rover filename %s "
+                  "to fetch the base", obs_files[0])
+        return 1
+    year, doy = yd
+    work_dir = Path(args.base_work_dir or os.path.join(
+        tempfile.gettempdir(), "peppar-survey-baseline"))
+    work_dir.mkdir(parents=True, exist_ok=True)
+    base_rinex = fetch_base_rinex(plan.base, year, doy, work_dir)
+    if base_rinex is None:
+        log.error("failed to fetch base %s for %d/%03d; "
+                  "falling back to the PRIDE floor", plan.base.station, year, doy)
+        return _run_pride(args)
+    args.base = str(base_rinex)
+    args.base_realization = plan.base_realization
+    log.info("auto: fetched base %s -> %s (%s)", plan.base.station,
+             base_rinex, plan.base_realization)
+    return _run_baseline(args)
 
 
 def _run_pride(args) -> int:
