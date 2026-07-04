@@ -167,5 +167,102 @@ class BaselineCliTest(unittest.TestCase):
         self.assertEqual(self._run([])[0], 2)
 
 
+class AutoCliTest(unittest.TestCase):
+    """--auto dispatch: --plan-only prints without running; a baseline plan
+    fetches the base + runs --baseline; a pride plan runs --pride."""
+
+    def _plan(self, backend, base=None, base_realization=None):
+        from peppar_fix.peppar_survey_auto import BackendPlan
+        return BackendPlan(backend, f"{backend} reason", base=base,
+                           base_realization=base_realization)
+
+    def test_plan_only_prints_and_does_not_run(self):
+        with mock.patch("peppar_survey.plan_auto" if False else
+                        "peppar_fix.peppar_survey_auto.plan_auto",
+                        return_value=self._plan("pride")) as pa, \
+                mock.patch("peppar_survey._run_pride") as rp:
+            rc = peppar_survey.main(["--auto", "--plan-only",
+                                     "--receiver-uid", "U",
+                                     "--receivers-dir", "/nope"])
+        self.assertEqual(rc, 0)
+        pa.assert_called_once()
+        rp.assert_not_called()
+
+    def test_pride_plan_dispatches_to_pride(self):
+        with mock.patch("peppar_fix.peppar_survey_auto.plan_auto",
+                        return_value=self._plan("pride")), \
+                mock.patch("peppar_survey._run_pride",
+                           return_value=0) as rp:
+            rc = peppar_survey.main(["--auto", "--receiver-uid", "U",
+                                     "--receivers-dir", "/nope"])
+        self.assertEqual(rc, 0)
+        rp.assert_called_once()
+
+    def test_baseline_plan_fetches_base_and_runs_baseline(self):
+        from peppar_fix.peppar_survey_auto import BackendPlan
+        from peppar_fix.peppar_survey_discovery import (
+            BaseDescriptor, RegionSource,
+        )
+        region = RegionSource("EUREF", "euref_nrt",
+                              (34.0, 72.0, -12.0, 40.0), "ETRS89")
+        desc = BaseDescriptor("SHOE00GBR0", 8.0, region, "ETRS89")
+        plan = BackendPlan("baseline", "baseline reason", base=desc,
+                           base_realization="ETRS89")
+        with tempfile.TemporaryDirectory() as td:
+            rover = Path(td) / "rover-2026185.obs"
+            rover.write_text("x")
+            base_path = Path(td) / "SHOE.rnx"
+            base_path.write_text("base")
+            captured = {}
+
+            def fake_baseline(args):
+                captured["base"] = args.base
+                captured["realization"] = args.base_realization
+                return 0
+
+            with mock.patch("peppar_fix.peppar_survey_auto.plan_auto",
+                            return_value=plan), \
+                    mock.patch(
+                        "peppar_fix.peppar_survey_discovery.fetch_base_rinex",
+                        return_value=base_path) as fb, \
+                    mock.patch("peppar_survey._run_baseline",
+                               side_effect=fake_baseline):
+                rc = peppar_survey.main(
+                    ["--auto", "--rinex-glob", str(rover),
+                     "--receiver-uid", "U", "--receivers-dir", "/nope"])
+        self.assertEqual(rc, 0)
+        # S2 fetched the base for the rover's date (2026 doy 185)...
+        self.assertEqual(fb.call_args.args[1:3], (2026, 185))
+        # ...and handed --baseline a RINEX path + the region datum.
+        self.assertEqual(captured["base"], str(base_path))
+        self.assertEqual(captured["realization"], "ETRS89")
+
+    def test_baseline_fetch_failure_falls_back_to_pride(self):
+        from peppar_fix.peppar_survey_auto import BackendPlan
+        from peppar_fix.peppar_survey_discovery import (
+            BaseDescriptor, RegionSource,
+        )
+        region = RegionSource("NGS", "ngs_cors", (15.0, 72.0, -170.0, -50.0),
+                              "NAD83(2011)")
+        desc = BaseDescriptor("DSP1", 12.0, region, "NAD83(2011)")
+        plan = BackendPlan("baseline", "r", base=desc,
+                           base_realization="NAD83(2011)")
+        with tempfile.TemporaryDirectory() as td:
+            rover = Path(td) / "rover-2026185.obs"
+            rover.write_text("x")
+            with mock.patch("peppar_fix.peppar_survey_auto.plan_auto",
+                            return_value=plan), \
+                    mock.patch(
+                        "peppar_fix.peppar_survey_discovery.fetch_base_rinex",
+                        return_value=None), \
+                    mock.patch("peppar_survey._run_pride",
+                               return_value=7) as rp:
+                rc = peppar_survey.main(
+                    ["--auto", "--rinex-glob", str(rover),
+                     "--receiver-uid", "U", "--receivers-dir", "/nope"])
+        self.assertEqual(rc, 7)          # PRIDE floor ran
+        rp.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
