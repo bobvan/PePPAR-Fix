@@ -118,6 +118,9 @@ class RefreshAction(enum.Enum):
     NONE = "none"     # no action — first read, or mtime unchanged
     SLEW = "slew"     # Δ < slew_threshold; blend via bayesian_arp_blend
     STEP = "step"     # Δ ≥ slew_threshold OR mount_sn bumped; clean shutdown
+    GLIDE = "glide"   # large Δ on the SAME mount, glide_large_delta on: rate-
+                      # limited position glide instead of a respawn STEP so the
+                      # DO reference never steps (I-071400 E3b)
 
 
 def decide_refresh_action(
@@ -126,6 +129,7 @@ def decide_refresh_action(
     current_arp_ecef: np.ndarray,
     *,
     slew_threshold_m: float = DEFAULT_SLEW_THRESHOLD_M,
+    glide_large_delta: bool = False,
 ) -> tuple[RefreshAction, float]:
     """Decide the action for one survey-refresh event.
 
@@ -176,6 +180,12 @@ def decide_refresh_action(
     delta = _delta_3d(curr.new_ecef, current_arp_ecef)
     if delta < slew_threshold_m:
         return RefreshAction.SLEW, delta
+    # Large Δ on the SAME mount (mount_sn unchanged — checked above): a better
+    # survey of the same antenna, not a physical move.  With glide_large_delta
+    # (--pos-glide) the engine rate-limit-glides the pin there instead of a
+    # service-interrupting respawn STEP; the DO reference never steps (E3b).
+    if glide_large_delta:
+        return RefreshAction.GLIDE, delta
     return RefreshAction.STEP, delta
 
 
@@ -224,6 +234,8 @@ def watch_loop(
     stop_fn: Callable[[], bool] = lambda: False,
     max_iterations: Optional[int] = None,
     load_fn: Callable[[str], Optional[SurveyRefresh]] = load_current_snapshot,
+    on_glide: Optional[Callable[[SurveyRefresh, float], None]] = None,
+    glide_large_delta: bool = False,
 ) -> None:
     """Run the survey-watcher polling loop.
 
@@ -270,8 +282,17 @@ def watch_loop(
             action, delta_3d_m = decide_refresh_action(
                 prev, curr, current_arp_ecef_fn(),
                 slew_threshold_m=slew_threshold_m,
+                glide_large_delta=glide_large_delta,
             )
-            if action is RefreshAction.SLEW:
+            if action is RefreshAction.GLIDE:
+                log.info(
+                    "[SURVEY_REFRESHED] mtime=%s mount_sn=%d Δ=%.3fm "
+                    "σ=%.3fm — GLIDE (large Δ, same mount; rate-limited)",
+                    _fmt_mtime(curr.file_mtime), curr.new_mount_sn,
+                    delta_3d_m, curr.new_sigma_m,
+                )
+                (on_glide or on_step)(curr, delta_3d_m)
+            elif action is RefreshAction.SLEW:
                 log.info(
                     "[SURVEY_REFRESHED] mtime=%s mount_sn=%d Δ=%.3fm "
                     "σ=%.3fm — SLEW (Δ < %.3fm threshold)",
