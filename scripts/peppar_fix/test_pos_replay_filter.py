@@ -254,6 +254,8 @@ class TestNav2AnchorCaptureReplay(unittest.TestCase):
         t = eng.AntPosEstThread.__new__(eng.AntPosEstThread)
         t._nav2_anchor_enabled = True
         t._nav2_anchor_max_hacc_m = 3.0
+        t._nav2_floor_enabled = False   # floor off: _apply_nav2_anchor bails early
+        t._pin_position = False
         t._nav2_store = nav2_store
         t._anchor_decisions = anchor_decisions
         t._raw_bundle = raw_bundle

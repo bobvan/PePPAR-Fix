@@ -26,7 +26,7 @@ _SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from solve_ppp import FixedPosFilter, PPPFilter, IDX_ZTD
+from solve_ppp import FixedPosFilter, PPPFilter, IDX_ZTD, N_BASE
 
 
 class InitialPriorTest(unittest.TestCase):
@@ -364,6 +364,105 @@ class ApplyZtdTieTest(unittest.TestCase):
         f2.apply_ztd_tie(0.05, target_m=0.0)  # tight σ
         # f2 should be pulled closer to 0 than f1.
         self.assertLess(f2.x[f2.IDX_ZTD], f1.x[f1.IDX_ZTD])
+
+
+class Nav2FloorTest(unittest.TestCase):
+    """AntPosEstThread._maybe_apply_nav2_floor — the free-position drift floor
+    (I-215452).  When free-position AntPosEst disagrees with NAV2 beyond the
+    trigger, release the float ambiguities + re-open position P so the NAV2
+    anchor can re-centre (the converged ambiguities otherwise out-confidence it
+    and re-impose the drifted basin).  Off by default; validated in sim on
+    londondrift-20260703 (p95 4.3 m → 1.0 m).
+
+    Exercised via the unbound method on a fake ``self`` carrying the floor
+    config, so no full AntPosEstThread construction is needed."""
+
+    _BASE_ECEF = np.array([157468.4, -4756190.5, 4232770.7])
+
+    def _floor_self(self, enabled=True, pinned=False, trigger_m=1.5):
+        from types import SimpleNamespace
+        from peppar_fix_engine import AntPosEstThread
+        return SimpleNamespace(
+            _nav2_floor_enabled=enabled,
+            _pin_position=pinned,
+            _nav2_floor_trigger_m=trigger_m,
+            _NAV2_FLOOR_AMB_SIGMA_M=AntPosEstThread._NAV2_FLOOR_AMB_SIGMA_M,
+            _NAV2_FLOOR_POS_SIGMA_M=AntPosEstThread._NAV2_FLOOR_POS_SIGMA_M,
+        )
+
+    def _converged_filter_with_ambs(self):
+        """A filter that looks converged: tight (cm) position P and tight
+        (few-cm) float ambiguities — the state that starves the NAV2 anchor."""
+        f = PPPFilter()
+        f.initialize(self._BASE_ECEF, 0.0, pos_sigma_m=10.0)
+        f.add_ambiguity("G01", 1000.0)
+        f.add_ambiguity("G02", 2000.0)
+        for i in range(3):
+            f.P[i, i] = 0.01 ** 2           # cm-tight position
+        for sv in f.sv_to_idx:
+            si = N_BASE + f.sv_to_idx[sv]
+            f.P[si, si] = 0.05 ** 2         # cm-tight float ambiguity
+        return f
+
+    def _call(self, fake_self, f, nav2_ecef):
+        from peppar_fix_engine import AntPosEstThread
+        AntPosEstThread._maybe_apply_nav2_floor(fake_self, f, nav2_ecef)
+
+    def test_releases_ambiguities_and_reopens_pos_on_disagreement(self):
+        """Disagreement > trigger: ambiguity P inflated to amb σ², position
+        axes re-opened to pos σ²."""
+        f = self._converged_filter_with_ambs()
+        up = self._BASE_ECEF / np.linalg.norm(self._BASE_ECEF)
+        f.x[:3] = self._BASE_ECEF + up * 3.0   # 3 m > 1.5 m trigger
+        fs = self._floor_self()
+        self._call(fs, f, self._BASE_ECEF)
+        for sv in f.sv_to_idx:
+            si = N_BASE + f.sv_to_idx[sv]
+            self.assertAlmostEqual(
+                f.P[si, si], fs._NAV2_FLOOR_AMB_SIGMA_M ** 2, places=9,
+                msg="ambiguity not released")
+        for ax in range(3):
+            self.assertAlmostEqual(
+                f.P[ax, ax], fs._NAV2_FLOOR_POS_SIGMA_M ** 2, places=9,
+                msg="position axis not re-opened")
+
+    def test_noop_when_within_trigger(self):
+        """Disagreement ≤ trigger: healthy filter untouched (P unchanged)."""
+        f = self._converged_filter_with_ambs()
+        up = self._BASE_ECEF / np.linalg.norm(self._BASE_ECEF)
+        f.x[:3] = self._BASE_ECEF + up * 0.5   # 0.5 m < 1.5 m trigger
+        P_before = f.P.copy()
+        self._call(self._floor_self(), f, self._BASE_ECEF)
+        np.testing.assert_allclose(f.P, P_before, atol=0.0)
+
+    def test_noop_when_disabled(self):
+        """Flag off: no change even on gross disagreement."""
+        f = self._converged_filter_with_ambs()
+        up = self._BASE_ECEF / np.linalg.norm(self._BASE_ECEF)
+        f.x[:3] = self._BASE_ECEF + up * 10.0
+        P_before = f.P.copy()
+        self._call(self._floor_self(enabled=False), f, self._BASE_ECEF)
+        np.testing.assert_allclose(f.P, P_before, atol=0.0)
+
+    def test_noop_when_pinned(self):
+        """Pinned position: floor never fires (pin owns position)."""
+        f = self._converged_filter_with_ambs()
+        up = self._BASE_ECEF / np.linalg.norm(self._BASE_ECEF)
+        f.x[:3] = self._BASE_ECEF + up * 10.0
+        P_before = f.P.copy()
+        self._call(self._floor_self(pinned=True), f, self._BASE_ECEF)
+        np.testing.assert_allclose(f.P, P_before, atol=0.0)
+
+    def test_only_inflates_never_shrinks_position(self):
+        """A position axis already looser than the floor σ is left alone."""
+        f = self._converged_filter_with_ambs()
+        up = self._BASE_ECEF / np.linalg.norm(self._BASE_ECEF)
+        f.x[:3] = self._BASE_ECEF + up * 3.0
+        fs = self._floor_self()
+        big = (fs._NAV2_FLOOR_POS_SIGMA_M * 5.0) ** 2
+        f.P[0, 0] = big
+        self._call(fs, f, self._BASE_ECEF)
+        self.assertEqual(f.P[0, 0], big, "already-loose axis was shrunk")
 
 
 if __name__ == "__main__":

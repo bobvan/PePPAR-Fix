@@ -147,6 +147,24 @@ class MetarToZtdTest(unittest.TestCase):
 class MetarFetchTest(unittest.TestCase):
     """Test the HTTP fetch path against mocked aviationweather.gov responses."""
 
+    def setUp(self):
+        # Hermetic METAR cache: point XDG_CACHE_HOME at a fresh temp dir so a
+        # cache left by a real engine run (e.g. the ZTD tie's live fetch) can't
+        # make the fetch-failure tests fall back to a cached report instead of
+        # raising.  _cache_dir() reads XDG_CACHE_HOME (metar.py:76).
+        import tempfile
+        self._cache_tmp = tempfile.mkdtemp()
+        self._xdg_saved = os.environ.get("XDG_CACHE_HOME")
+        os.environ["XDG_CACHE_HOME"] = self._cache_tmp
+
+    def tearDown(self):
+        import shutil
+        if self._xdg_saved is None:
+            os.environ.pop("XDG_CACHE_HOME", None)
+        else:
+            os.environ["XDG_CACHE_HOME"] = self._xdg_saved
+        shutil.rmtree(self._cache_tmp, ignore_errors=True)
+
     SAMPLE_RECORD = {
         'icaoId': 'KDPA',
         'reportTime': '2026-05-04T13:00:00.000Z',

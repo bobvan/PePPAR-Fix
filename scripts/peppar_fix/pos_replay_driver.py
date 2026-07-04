@@ -125,6 +125,7 @@ FILTER_CONFIG_SPEC = (
     ("solid_tide", True), ("pcv", True), ("clock_model", "random_walk"),
     ("ar_elev_mask", 25.0), ("ztd_tie_sigma", None), ("ztd_tie_interval_s", 60),
     ("nav2_soft_anchor", True), ("nav2_anchor_max_hacc_m", 3.0),
+    ("nav2_floor", False), ("nav2_floor_trigger_m", 5.0),
     ("phase_windup", False), ("gmf", False), ("wl_only", False),
     ("no_ar", False), ("pin_position", False), ("slip_rate_limit_s", 0.0),
     ("rx_tcxo_adev_1s", None), ("join_test", True), ("receiver_antenna", None),
