@@ -2093,6 +2093,8 @@ class AntPosEstThread(threading.Thread):
                  pos_sigma_m=10.0,
                  nav2_anchor_enabled=True,
                  nav2_anchor_max_hacc_m=3.0,
+                 nav2_floor_enabled=False,
+                 nav2_floor_trigger_m=1.5,
                  pin_position=False,
                  nav_sig_store=None,
                  receiver_uid=None,
@@ -2187,6 +2189,9 @@ class AntPosEstThread(threading.Thread):
         # I-051234 sub-B.
         self._nav2_anchor_enabled = bool(nav2_anchor_enabled)
         self._nav2_anchor_max_hacc_m = float(nav2_anchor_max_hacc_m)
+        # NAV2 free-position floor (I-215452) — see _maybe_apply_nav2_floor.
+        self._nav2_floor_enabled = bool(nav2_floor_enabled)
+        self._nav2_floor_trigger_m = float(nav2_floor_trigger_m)
         # --pin-position with surveyed --known-pos: snapshot the original
         # ECEF here so SECOND_OPINION_POS resets target the pin, not NAV2.
         # See wrongIntBasin-charlie (2026-05-11): NAV2 reset on shared-antenna
@@ -2975,6 +2980,50 @@ class AntPosEstThread(threading.Thread):
             # failing (disk full / closed fh) — same rule.
             pass
 
+    # NAV2 free-position floor tuning (I-215452).  Fixed internals; the operator
+    # knob is the enable flag + trigger threshold.
+    _NAV2_FLOOR_AMB_SIGMA_M = 1.0   # float-ambiguity release σ (m)
+    _NAV2_FLOOR_POS_SIGMA_M = 2.0   # position-axis re-open σ (m)
+
+    def _maybe_apply_nav2_floor(self, filt, nav2_ecef):
+        """Bound free-position AntPosEst drift to ~NAV2 accuracy.
+
+        Absolute position in float PPP is only pseudorange-strong; carrier phase
+        re-floats each SV's float ambiguity to absorb any slow position walk at
+        ~zero residual cost, so without integer AR the absolute position wanders
+        the PR-weak null (London PiFace: ~4 m over 30 min, I-215452).  The NAV2
+        soft-anchor can't correct it: it is a variance-weighted update (K≈P/(P+R)
+        → 0 once P tightens, apply_nav2_anchor's I-051234 note) AND the converged
+        float ambiguities out-confidence it and re-impose the drifted basin on
+        the next update.
+
+        So when the filter disagrees with the independent NAV2 SPP fix by more
+        than the trigger (set above NAV2's own ~1 m bias so a healthy filter is
+        left alone), RELEASE the ambiguities (inflate their covariance) and
+        re-open the position covariance — giving the anchor authority to
+        re-centre position and the ambiguities freedom to re-fit around it.
+        This trades carrier precision for a bounded excursion; it is off by
+        default and meant for free-position hosts WITHOUT AR (no phase biases).
+        Never fires when position is pinned.  Validated in sim on
+        londondrift-20260703: p95 3.8 m → 1.5 m (trigger 1.5 m)."""
+        if not self._nav2_floor_enabled or self._pin_position:
+            return
+        x = getattr(filt, "x", None)
+        if x is None or not getattr(filt, "sv_to_idx", None):
+            return
+        if float(np.linalg.norm(x[:3])) < 1e3:
+            return  # position not meaningfully initialized
+        disagree = float(np.linalg.norm(
+            x[:3] - np.asarray(nav2_ecef, dtype=float)))
+        if disagree <= self._nav2_floor_trigger_m:
+            return
+        for sv in list(filt.sv_to_idx):
+            filt.inflate_ambiguity(sv, sigma_m=self._NAV2_FLOOR_AMB_SIGMA_M)
+        var = self._NAV2_FLOOR_POS_SIGMA_M ** 2
+        for ax in (0, 1, 2):  # ECEF position states (IDX_X/Y/Z)
+            if filt.P[ax, ax] < var:
+                filt.P[ax, ax] = var
+
     def _apply_nav2_anchor(self, gps_time, filt):
         """NAV2 soft-anchor for this epoch (variance-weighted Kalman update).
 
@@ -2994,8 +3043,10 @@ class AntPosEstThread(threading.Thread):
             except (AttributeError, ValueError):
                 dec = None
             if dec is not None:
+                nav2_ecef = np.asarray(dec[0], dtype=float)
+                self._maybe_apply_nav2_floor(filt, nav2_ecef)
                 filt.apply_nav2_anchor(
-                    np.asarray(dec[0], dtype=float), float(dec[1]),
+                    nav2_ecef, float(dec[1]),
                     (float(dec[2]) if dec[2] is not None else None))
             return
         op = self._nav2_store.get_opinion(
@@ -3007,6 +3058,7 @@ class AntPosEstThread(threading.Thread):
             hacc = float(op['h_acc_m'])
             vacc = (float(op['v_acc_m'])
                     if op.get('v_acc_m') is not None else None)
+            self._maybe_apply_nav2_floor(filt, ecef)
             filt.apply_nav2_anchor(ecef, hacc, vacc)
             if self._raw_bundle is not None:
                 try:
@@ -4025,7 +4077,12 @@ class AntPosEstThread(threading.Thread):
                 _tie_int_s = float(getattr(
                     self._args, 'ztd_tie_interval_s', 300))
                 if _tie_int_s > 0:
-                    _now_t = time.monotonic()
+                    # Virtual-clock-paced (I-215452): self._now_mono is
+                    # time.monotonic live but the replay driver's captured
+                    # recv_mono in sim, so the tie fires at the intended
+                    # cadence in a fast replay (wall-clock time.monotonic
+                    # fired it only ONCE over a whole bundle).
+                    _now_t = self._now_mono()
                     if (self._last_ztd_tie_t is None
                             or _now_t - self._last_ztd_tie_t
                             >= _tie_int_s):
@@ -10864,6 +10921,10 @@ def run(args):
                     getattr(args, "nav2_soft_anchor", True)),
                 nav2_anchor_max_hacc_m=float(
                     getattr(args, "nav2_anchor_max_hacc_m", 3.0)),
+                nav2_floor_enabled=bool(
+                    getattr(args, "nav2_floor", False)),
+                nav2_floor_trigger_m=float(
+                    getattr(args, "nav2_floor_trigger_m", 1.5)),
                 pin_position=bool(getattr(args, "pin_position", False)),
                 nav_sig_store=nav_sig_store,
                 receiver_uid=getattr(args, 'receiver_unique_id', None),
@@ -11307,6 +11368,28 @@ Two-phase operation:
                           "reported hAcc exceeds this threshold (NAV2 too "
                           "noisy to trust as a continuous position witness).  "
                           "Default 3 m matches Bravo's SO_POS hAcc gate.")
+    pos.add_argument("--nav2-floor",
+                     action="store_true", default=False,
+                     help="Bound free-position AntPosEst drift to ~NAV2 "
+                          "accuracy.  Without integer AR, float-PPP absolute "
+                          "position is only pseudorange-strong and wanders the "
+                          "PR-weak null (carrier phase re-floats the float "
+                          "ambiguities to absorb the walk); the NAV2 "
+                          "covariance update can't correct it (K→0 once P "
+                          "tightens AND the converged ambiguities out-confidence "
+                          "it — see _maybe_apply_nav2_floor / I-215452).  When "
+                          "the filter disagrees with NAV2 by more than "
+                          "--nav2-floor-trigger-m, this RELEASES the float "
+                          "ambiguities and re-opens the position covariance so "
+                          "the anchor re-centres.  Trades carrier precision for "
+                          "a bounded excursion; for free-position hosts WITHOUT "
+                          "AR (no phase biases).  Never fires when pinned.")
+    pos.add_argument("--nav2-floor-trigger-m", type=float, default=1.5,
+                     help="NAV2-floor disagreement threshold (m).  The floor "
+                          "fires only when |AntPos − NAV2| exceeds this — set "
+                          "above NAV2's own ~1 m SPP bias so a healthy filter "
+                          "is left untouched (default 1.5).  Requires "
+                          "--nav2-floor.")
     pos.add_argument("--init-ztd-from-met",
                      action="store_true", default=False,
                      help="Seed FixedPosFilter ZTD state from latest METAR "
