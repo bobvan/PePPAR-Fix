@@ -1514,6 +1514,15 @@ def _nav2_bootstrap_seed(args, nav2_store, nav_pvt_store, stop_event, ape_sm):
     opinion is typically already in the store; a short poll picks it up
     (no second long cold-start wait).
 
+    Caveat (main review #264): hAcc is a *precision* estimate — it does
+    NOT bound gross accuracy.  The σ_r floor absorbs NAV2's ~1.5-4 m
+    *systematic* bias, not a gross-multipath outlier (tens of m off yet
+    reporting a small hAcc), which the relaxed bar could admit at an
+    understated σ_r.  That is bounded downstream by survey refinement and
+    the 10 m NAV2 gross-move watchdog, and this whole path is opt-in —
+    acceptable for a coarse bootstrap whose error is advertised via σ_t,
+    not for a trusted pin.
+
     Returns (ecef, sigma_m, source) or (None, None, None) when neither
     store yields a fix (e.g. non-timing firmware that NAKs CFG-NAV2).
     """
@@ -10712,6 +10721,10 @@ def run(args):
         known_ecef, pos_sigma_m, pos_source = _nav2_bootstrap_seed(
             args, nav2_store, nav_pvt_store, stop_event, ape_sm)
         if known_ecef is not None:
+            # SIGMA_POS_NS_PER_M = 1/0.30 is the *conservative* σ_r→σ_t
+            # factor (G = 1, worst-case geometry — see its definition in
+            # confidence.py); the advertised σ_t is thus a ceiling, not an
+            # optimistic estimate.  Don't "correct" it downward (main #264).
             from peppar_fix.confidence import SIGMA_POS_NS_PER_M
             log.warning(
                 "[NAV2_BOOTSTRAP] --no-antposest with no survey seed — "
