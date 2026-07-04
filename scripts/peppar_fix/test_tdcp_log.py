@@ -58,30 +58,12 @@ class TdcpLogPlumbingTest(unittest.TestCase):
                       "--tdcp-log alone enables the read-only TDCP estimator")
 
 
-class PiPussConfigCollectsTdcpTest(unittest.TestCase):
-    """PiPuss (no DO) is the TDCP-collection host: its config sets
-    tdcp_log and must NOT configure a DO/servo/TICC."""
-
-    def setUp(self):
-        self.src = _config_src("pipuss.toml")
-        if self.src is None:
-            self.skipTest("config/pipuss.toml not present")
-
-    def test_sets_tdcp_log(self):
-        active = [ln.strip() for ln in self.src.splitlines()
-                  if ln.strip().startswith("tdcp_log")]
-        self.assertTrue(active, "pipuss.toml should set tdcp_log")
-
-    def test_no_do_or_ticc(self):
-        for ln in self.src.splitlines():
-            s = ln.strip()
-            if s.startswith("#"):
-                continue
-            for forbidden in ("ptp_dev", "do_label", "do_type", "dac_",
-                              "ticc_port"):
-                self.assertFalse(
-                    s.startswith(forbidden),
-                    f"pipuss.toml has no DO/TICC but sets {s!r}")
+# NOTE: the former PiPussConfigCollectsTdcpTest (asserting pipuss.toml sets
+# tdcp_log and has no DO/servo/TICC) was retired 2026-07-04: PiPuss was
+# recommissioned from the TDCP-collection host to a full F9T-20B + IsoTemp
+# clock host (do_label=ocxo-clkpoc3, DAC + TICC #5), so its config no longer
+# sets tdcp_log. The config is current; the test encoded the old role. The
+# generic --tdcp-log feature tests above remain the coverage. (I-024907)
 
 
 if __name__ == "__main__":
