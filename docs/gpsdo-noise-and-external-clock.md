@@ -199,7 +199,7 @@ where the DO is the limiter. Typical ceilings (verify per unit/firmware):
   ~5–20 Hz.
 - NetR9 / Septentrio PolaRx / Javad: up to 50–100 Hz raw obs.
 
-### 3d. Bands — the NetRS limitation, and better options
+### 3d. Bands — the L1/L2-era trap, and better options
 
 The catch with the **NetRS**: it is **GPS L1/L2 only** — no GLONASS, no
 Galileo, no BeiDou, **no L5**. That's a poor match for our current stack,
@@ -208,14 +208,28 @@ which is built around F9T **L1 + L5**, **Galileo E1 + E5a**, and BeiDou
 signals. On a NetRS you'd be back to dual-frequency GPS-only PPP: fewer
 satellites, weaker geometry, no L5/Galileo AR, no multi-GNSS robustness.
 
-So the NetRS is an excellent **cheap proof-of-concept for the external-
-clock architecture** — "does clocking the receiver with the DO measurably
-drop our short-τ floor?" — but it's a step *back* in constellation/band
-coverage, and it can't run our multi-GNSS L5 PPP-AR pipeline.
+The **same L1/L2-era limitation** applies to two other used receivers
+worth naming, since they show up cheap:
 
-For a production external-clock timing receiver that keeps our bands, in
-rough order of preference (all support an external 10 MHz input; verify
-current-unit specs before buying used):
+- **NovAtel OEMV-3** (~2006–2011) — GPS L1/L2 **+ GLONASS**, but **no
+  Galileo/BeiDou/L5** (L5 arrived with OEM6/7). A bare OEM *board* needing
+  enclosure + power + interface integration. NovAtel boards do support an
+  **external oscillator input** and PPS out, so it's usable as a
+  GPS+GLONASS external-clock PoC.
+- **Leica GRX1200** — L1/L2 (+ GLONASS on the GG/Pro variants), **no
+  L5/Galileo/BeiDou**. Whether it accepts an external 10 MHz reference is
+  **unconfirmed** — that's a definite feature of the newer Leica GR-series
+  (GR10/25/30/50) and only *maybe* on GRX1200 Pro, so verify the rear panel
+  for a "REF IN"/10 MHz connector before assuming it.
+
+All three — **NetRS, OEMV-3, GRX1200** — are **cheap proof-of-concept
+units only**: fine for "does clocking the receiver with the DO measurably
+drop our short-τ floor?", but a step *back* in constellation/band coverage
+that can't run our multi-GNSS L5 PPP-AR pipeline.
+
+For a **production** external-clock timing receiver that keeps our bands,
+in rough order of preference (all support an external 10 MHz input; verify
+current-unit specs **and firmware options** before buying used):
 
 - **Septentrio PolaRx5 / PolaRx5TR** — full multi-GNSS, all bands, up to
   100 Hz, external 10 MHz in. The **PolaRx5TR is a purpose-built time-&-
@@ -223,9 +237,22 @@ current-unit specs before buying used):
   what we're actually doing. Priciest used, best fit.
 - **Trimble NetR9** — multi-GNSS (GPS/GLO/GAL/BDS/QZSS), L1/L2/L5/E5/B2,
   external 10 MHz in, high rate. Widely available used, strong all-rounder.
+  **Trimble option-lock caveat:** modern-signal tracking (L5 / E5a / B2a)
+  is often a **paid, serial-locked firmware option** — verify the
+  *installed option codes* on the actual unit (Receiver Status → Options),
+  not a "Ti-N unlocked" claim in the listing prose.
 - **Javad (Delta / TRE-3)** — multi-GNSS all bands, external frequency in.
 - **NovAtel OEM7 / PwrPak7** — multi-GNSS all bands; external oscillator
   input on some variants (confirm the specific board).
+
+**One practical gotcha across all these units: I/O is a cabling problem,
+not a licensing one.** PPS output and the external frequency input are
+hardware features — **no dongle/license** — but these receivers use
+multi-pin circular (Lemo/ODU) connectors, so you need the correct
+**breakout cable** to reach 1PPS-out (for cross-host TICC comparison) and
+10 MHz-in (to feed the DO), and used units frequently **don't include**
+them. Budget for sourcing/making the cables, and expect a one-time config
+step (enable PPS, set cable delay) in the receiver UI.
 
 ### 3e. How this would slot into peppar-fix
 
