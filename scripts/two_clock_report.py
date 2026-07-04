@@ -17,7 +17,7 @@ standalone plot_* tools:
 
   * page 1  → plot_xhost_agreement_cdf.load_pairs / cdf_xy
   * page 3  → plot_clock_stability_stack.load_chA_phase / adev_tdev_from_phase
-  * page 4  → plot_tch.compute_tch / summary_table
+  * page 4  → plot_tch.compute_tch
 
 Only page 2 (the phase-difference time series) is drawn here directly —
 it is the one view the standalone tools didn't already emit.
@@ -44,7 +44,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -63,7 +63,7 @@ from plot_xhost_agreement_cdf import load_pairs, cdf_xy  # noqa: E402
 from plot_clock_stability_stack import (  # noqa: E402
     load_chA_phase, adev_tdev_from_phase, _plot_map, _TAUS)
 from plot_tch import (  # noqa: E402
-    compute_tch, summary_table, _plot_node_curve, _COLORS)
+    compute_tch, _plot_node_curve, _COLORS)
 
 # Reuse the canonical TICC-single-shot ⊕ FE-5680A-Rb measurement floor
 # (the "bathtub") from plot_stability_slide — the SAME floor the campaign
@@ -81,7 +81,14 @@ _FIGSIZE = (12.8, 7.2)   # 16:9 landscape (12.8 / 7.2 = 1.7778)
 
 
 def _parse_iso(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace('Z', '+00:00'))
+    """Parse an ISO-8601 UTC timestamp to an offset-AWARE datetime.
+
+    A bare ``2026-07-02T14:47:28`` (which the ``--skip-before/after`` help
+    invites) parses naive; the capture's ``ts_iso`` is offset-aware, so
+    comparing them would raise. Force UTC when no offset is given.
+    """
+    dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
 def _window_csv(src: Path, dst: Path, skip_before: datetime | None,
@@ -112,6 +119,10 @@ def _window_csv(src: Path, dst: Path, skip_before: datetime | None,
                     if cand in cols:
                         ts_idx = cols.index(cand)
                         break
+                if ts_idx is None and (skip_before or skip_after):
+                    print(f'{_TOOLNAME}: WARNING — no ts_iso/host_timestamp '
+                          f'column in {src.name}; skip-before/after NOT '
+                          f'applied (all rows kept).', file=sys.stderr)
                 fout.write(line)
                 header_seen = True
                 continue

@@ -140,3 +140,31 @@ def test_missing_file_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", argv)
     with pytest.raises(SystemExit):
         tcr.main()
+
+
+def test_parse_iso_naive_gets_utc():
+    """A bare (offset-naive) ISO string must parse to an aware UTC datetime,
+    so it can be compared against the capture's offset-aware ts_iso."""
+    import two_clock_report as tcr
+    naive = tcr._parse_iso("2026-07-02T14:47:28")     # no offset
+    aware = tcr._parse_iso("2026-07-02T14:47:28Z")    # explicit Z
+    assert naive.tzinfo is not None and naive.utcoffset().total_seconds() == 0
+    assert aware.tzinfo is not None
+    assert naive == aware
+
+
+def test_main_naive_skip_arg_does_not_crash(tmp_path, monkeypatch):
+    """`--skip-before` with a bare (naive) ISO string — which the help invites —
+    must window cleanly, not raise offset-naive/aware TypeError."""
+    import two_clock_report as tcr
+    csv_path = tmp_path / "cap.csv"
+    _write_two_channel_csv(csv_path, n=900)
+    out_pdf = tmp_path / "cli.pdf"
+    argv = ["two_clock_report.py", "--from-csv", str(csv_path),
+            "--label-a", "A", "--label-b", "B", "--out", str(out_pdf),
+            "--budget-ns", "2.0",
+            "--skip-before", "2026-07-02T00:00:30",   # naive, bare
+            "--skip-after", "2026-07-02T00:12:00"]    # naive, bare
+    monkeypatch.setattr(sys, "argv", argv)
+    assert tcr.main() == 0
+    assert out_pdf.exists() and out_pdf.stat().st_size > 0
