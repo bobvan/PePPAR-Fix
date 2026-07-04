@@ -6053,8 +6053,21 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 # σ-driven authority).
                 if (not args.freerun and servo_ctx is not None
                         and _current_class != "holdover"):
-                    if _current_class != _target_class:
-                        _set_clock_class(servo_ctx, _target_class)
+                    # E2 (I-071400): when --sigma-clock-accuracy is on, derive
+                    # the advertised clockAccuracy byte from σ_total (which folds
+                    # in the position σ_t) instead of the fixed per-class preset;
+                    # None → preset (byte-identical legacy).  Re-announce on a
+                    # class OR accuracy-bucket change (_set_clock_class dedups).
+                    _accuracy = (
+                        _sigma_clock_accuracy_hysteretic(servo_ctx,
+                                                         _total.sigma_ns)
+                        if getattr(args, 'sigma_clock_accuracy', False)
+                        else None)
+                    if (_current_class != _target_class
+                            or servo_ctx.get('pmc_announced_accuracy')
+                            != _accuracy):
+                        _set_clock_class(servo_ctx, _target_class,
+                                         clock_accuracy=_accuracy)
                         # Keep promoter's state in sync — _set_clock_class
                         # may have logged or vetoed, but we already wrote
                         # our decision into ctx.  Future cycles continue
@@ -6259,15 +6272,44 @@ def _open_pmc(args):
         return None
 
 
-def _set_clock_class(ctx, state):
-    """Set ptp4l clockClass if PMC is configured and state has changed."""
+def _set_clock_class(ctx, state, clock_accuracy=None):
+    """Set ptp4l clockClass if PMC is configured and the advertisement changed.
+
+    clock_accuracy: optional σ_total-derived clockAccuracy enum (I-071400 E2).
+    Re-announces when EITHER the class state OR the accuracy bucket changes, so a
+    tightening σ within the same clockClass still updates the advertised byte.
+    """
     pmc = ctx.get('pmc')
     if pmc is None:
         return
-    if ctx.get('pmc_announced') == state:
+    # pmc_announced stays the class STRING (other code reads it as such, e.g.
+    # the promoter re-sync at the call site); track the advertised accuracy
+    # separately so a same-class bucket change still re-announces.
+    if (ctx.get('pmc_announced') == state
+            and ctx.get('pmc_announced_accuracy') == clock_accuracy):
         return
-    if pmc.set_grandmaster_class(state):
+    if pmc.set_grandmaster_class(state, clock_accuracy=clock_accuracy):
         ctx['pmc_announced'] = state
+        ctx['pmc_announced_accuracy'] = clock_accuracy
+
+
+def _sigma_clock_accuracy_hysteretic(ctx, sigma_ns):
+    """σ_total → advertised clockAccuracy enum with asymmetric hysteresis
+    (I-071400 E2): degrade (coarsen) immediately so the advertised bound stays
+    honest when σ worsens, but only upgrade (tighten) when σ fits the finer
+    bucket with a 25 % margin — so a σ wobbling across a bucket boundary doesn't
+    flap the advertised byte.  Keyed off the last advertised accuracy in ctx."""
+    from peppar_fix.pmc import clock_accuracy_for_sigma_ns
+    raw = clock_accuracy_for_sigma_ns(sigma_ns)
+    cur = ctx.get('pmc_announced_accuracy')
+    if cur is None or raw >= cur:
+        return raw                       # first advertisement, or degrade → now
+    try:
+        inflated = float(sigma_ns) * 1.25
+    except (TypeError, ValueError):
+        return raw
+    # Upgrade only if even the inflated σ still fits the finer bucket.
+    return raw if clock_accuracy_for_sigma_ns(inflated) <= raw else cur
 
 
 # Periodic runtime-save cadence + lock gate.  The persisted operating point
@@ -12204,6 +12246,19 @@ Two-phase operation:
                        help="ptp4l UDS path for clockClass management (e.g. /var/run/ptp4l)")
     servo.add_argument("--pmc-domain", type=int, default=0,
                        help="PTP domain number for pmc messages (must match ptp4l config, default: 0)")
+    servo.add_argument("--sigma-clock-accuracy",
+                       action="store_true", default=False,
+                       help="Advertise PTP clockAccuracy quantized from σ_total "
+                            "(which folds in the position σ_t = σ_r·G/c) instead "
+                            "of the fixed per-clock-class preset.  Lets the "
+                            "100 ns / 250 ns buckets emit, so a coarse-position "
+                            "host (e.g. --nav2-bootstrap, σ_t≈33 ns) advertises "
+                            "~100 ns rather than the preset 1 µs, tightening as "
+                            "a survey refines the position.  clockClass "
+                            "(traceability) is unchanged; only the accuracy byte "
+                            "becomes σ-driven, with hysteresis to avoid flap.  "
+                            "Default off is byte-identical (I-071400 E2 / "
+                            "I-060548; docs/time-only-architecture.md).")
     servo.add_argument("--pid-file", default=None,
                        help="Write engine PID here for external test control")
     servo.add_argument("--freerun", action="store_true",
