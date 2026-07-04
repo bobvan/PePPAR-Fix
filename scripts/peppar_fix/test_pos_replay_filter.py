@@ -91,6 +91,45 @@ class TestFilterConfigFaithfulness(unittest.TestCase):
     SAME null-constraining config + NAV2 store the live engine ran, else the
     replay wanders the (pos,ZTD,clk) null and diverges ~8 m from captured-live."""
 
+    def tearDown(self):
+        # Q_POS_CONVERGED is a PPPFilter CLASS attribute build_filter_thread
+        # mutates; restore the engine default so a Q-tuned bundle in one test
+        # can't leak into another (the very leak the always-set guard prevents).
+        from solve_ppp import PPPFilter
+        PPPFilter.Q_POS_CONVERGED = 1e-4
+
+    def _thread_from_filter_config(self, filter_config):
+        """build_filter_thread over a minimal bundle carrying filter_config."""
+        rawx = _synthetic_rawx()
+        with tempfile.TemporaryDirectory() as d:
+            b = RawCaptureBundle(d)
+            b.write_manifest(host="h", started_iso="t",
+                             conventions={"receiver": "f9t", "systems": ["gps"]},
+                             filter_config=filter_config)
+            b.record("ubx", b"R", recv_mono=1.0)
+            b.close()
+            with mock.patch("peppar_fix.rawx_decode.is_rawx", return_value=True), \
+                 mock.patch("peppar_fix.rawx_decode.decode_rawx", return_value=rawx):
+                rd = drv.ReplayDriver(d, decode_obs=True)
+                return prf.build_filter_thread(rd, _TRUTH, systems=["gps"])
+
+    def test_captured_q_pos_converged_lands_on_class_attr(self):
+        """A bundle whose [filter_config] tuned --q-pos-converged replays with the
+        same converged-position stiffness on PPPFilter.Q_POS_CONVERGED (the class
+        attr the engine sets globally; Main review #258)."""
+        from solve_ppp import PPPFilter
+        self._thread_from_filter_config({"q_pos_converged": 1e-9})
+        self.assertEqual(PPPFilter.Q_POS_CONVERGED, 1e-9)
+
+    def test_absent_q_pos_converged_resets_to_default_no_leak(self):
+        """A bundle with no q_pos_converged resets the class attr to 1e-4 — so a
+        prior Q-tuned replay's override can't leak into this one in a shared
+        process (the always-set guard)."""
+        from solve_ppp import PPPFilter
+        PPPFilter.Q_POS_CONVERGED = 1e-9              # simulate a prior replay's leak
+        self._thread_from_filter_config({"clock_model": "wno"})  # no q_pos_converged
+        self.assertEqual(PPPFilter.Q_POS_CONVERGED, 1e-4)
+
     def test_build_thread_wires_nav2_store_anchor_and_virtual_clock(self):
         rawx = _synthetic_rawx()
         with tempfile.TemporaryDirectory() as d:
@@ -208,6 +247,35 @@ class TestSeedStateInheritance(unittest.TestCase):
         self.assertTrue(np.allclose(g.P, f.P))
         self.assertEqual(g.sv_to_idx, {"G01": 7})
         self.assertTrue(g.initialized)             # clock in x → no self-seed
+
+    def test_nondefault_ztd_q_coef_survives_dump_restore(self):
+        """--q-ztd-antpos reaches AntPos via bootstrap inheritance, not the fresh
+        _shim, so the seed snapshot must carry _ztd_q_coef — else a Q-tuned bundle
+        reverts to the 1.29e-3 default ZTD stiffness on replay (I-215452, Main
+        review #258).  The default roundtrip test above uses the default coef, so
+        it can't catch a regression — this pins the NON-default path."""
+        import json
+        from solve_ppp import PPPFilter
+        f = self._converged_filter()
+        f._ztd_q_coef = 1e-4                        # RTKLIB-recipe stiffness
+        st = json.loads(json.dumps(prf.dump_ppp_filter_state(f)))
+        self.assertEqual(st["ztd_q_coef"], 1e-4)   # captured, not defaulted
+        g = PPPFilter(clock_model="random_walk")
+        g.initialize((0, 0, 0), 0.0)               # fresh filter has 1.29e-3
+        prf.restore_ppp_filter_state(g, st)
+        self.assertEqual(g._ztd_q_coef, 1e-4)      # restored, not reverted
+
+    def test_old_snapshot_without_ztd_q_coef_restores_default(self):
+        """A pre-field snapshot (no ztd_q_coef key) restores to the engine's
+        1.29e-3 default, so old bundles replay exactly as before."""
+        from solve_ppp import PPPFilter
+        st = prf.dump_ppp_filter_state(self._converged_filter())
+        del st["ztd_q_coef"]                        # simulate an old snapshot
+        g = PPPFilter(clock_model="random_walk")
+        g.initialize((0, 0, 0), 0.0)
+        g._ztd_q_coef = 42.0                        # prove restore overwrites it
+        prf.restore_ppp_filter_state(g, st)
+        self.assertAlmostEqual(g._ztd_q_coef, 1.29e-3)
 
     def test_build_thread_restores_captured_seed_state(self):
         import numpy as np

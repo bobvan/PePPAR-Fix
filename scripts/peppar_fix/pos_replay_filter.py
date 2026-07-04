@@ -201,6 +201,13 @@ def build_filter_thread(driver: ReplayDriver, known_ecef, *, systems=None,
     # Q-tuned bundle replays with the live converged-position stiffness.  Always
     # set it (default 1e-4 when unset) so a prior replay's override can't leak
     # into this one in a shared process (I-215452).
+    #
+    # KEEP CASES SEQUENTIAL WHILE Q LIVES ON THE CLASS (Charlie review #258):
+    # this is global class state, so it's only safe because the case library
+    # replays bundles one at a time in a shared process (the always-set reset
+    # handles the leak BETWEEN sequential cases).  If replay ever fans out
+    # bundles concurrently in one process, this write would race across cases —
+    # move Q_POS_CONVERGED to a per-filter instance attribute first.
     from solve_ppp import PPPFilter as _PF
     _qpc = getattr(args, "q_pos_converged", None)
     _PF.Q_POS_CONVERGED = float(_qpc) if _qpc is not None else 1e-4
