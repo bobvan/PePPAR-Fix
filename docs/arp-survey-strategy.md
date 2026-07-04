@@ -116,6 +116,26 @@ Note the distinction: **Tier A (post-processed baseline) works on any
 raw-obs receiver** — onboard RTK is only needed for a *real-time* streamed-base
 fix, which timing acquisition doesn't require.
 
+### Real-time onboard RTK — deliberately unused today, a clean future option
+
+`--auto` never uses a receiver's **onboard real-time RTK**, even where present
+(e.g. F9P). For *acquisition* we prefer post-processing (Tier A baseline /
+PRIDE): it's more robust and accurate, works on any raw-obs receiver including
+the timing-only F9T, and needs no RTK firmware — so the acquisition path is
+uniform across the fleet. And the engine is time-only, so it does no real-time
+positioning at all.
+
+A **future** engine could use onboard real-time RTK when a receiver has it —
+for **fast field acquisition** (a cm fix in seconds while the offline survey
+converges toward its final multi-day mean), or as a **live position source for
+a moving platform**. That's a natural extension of the moving/unsurveyed path
+(the one case `AntPosEst` is retained for; see
+[time-only-architecture.md](time-only-architecture.md)) — out of scope for
+fixed-site timing, but a clean add when the use case arrives. The interface
+already fits: a real-time RTK backend would just write the same
+`.survey.toml` (tier `rtk-realtime`) that the engine already polls and slews
+to.
+
 ## Build status
 
 - **Tier C/D (`--pride`)** — built; the lab default. ~5 mm from 24 h + finals.
