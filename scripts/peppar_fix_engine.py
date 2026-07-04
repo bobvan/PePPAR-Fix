@@ -2094,7 +2094,7 @@ class AntPosEstThread(threading.Thread):
                  nav2_anchor_enabled=True,
                  nav2_anchor_max_hacc_m=3.0,
                  nav2_floor_enabled=False,
-                 nav2_floor_trigger_m=1.5,
+                 nav2_floor_trigger_m=5.0,
                  pin_position=False,
                  nav_sig_store=None,
                  receiver_uid=None,
@@ -10924,7 +10924,7 @@ def run(args):
                 nav2_floor_enabled=bool(
                     getattr(args, "nav2_floor", False)),
                 nav2_floor_trigger_m=float(
-                    getattr(args, "nav2_floor_trigger_m", 1.5)),
+                    getattr(args, "nav2_floor_trigger_m", 5.0)),
                 pin_position=bool(getattr(args, "pin_position", False)),
                 nav_sig_store=nav_sig_store,
                 receiver_uid=getattr(args, 'receiver_unique_id', None),
@@ -11198,6 +11198,29 @@ def _check_tdcp_phase_reference(args):
             "drop --servo-input tdcp.")
 
 
+def _check_nav2_floor_needs_anchor(args) -> bool:
+    """nav2FloorNeedsAnchor — warn when --nav2-floor can't take effect.
+
+    The NAV2 free-position floor (--nav2-floor) re-opens the position/ambiguity
+    covariance so the NAV2 soft-anchor can re-centre; it runs INSIDE
+    _apply_nav2_anchor, past that method's ``nav2_anchor_enabled`` gate.  So with
+    --no-nav2-soft-anchor the floor silently never fires.  Warn loudly rather
+    than let an operator believe the floor is active (Charlie review, #261).
+
+    Returns True if it warned (for tests); does not raise — the config is inert,
+    not fatal.
+    """
+    if getattr(args, "nav2_floor", False) and not getattr(
+            args, "nav2_soft_anchor", True):
+        logging.getLogger("peppar-fix").warning(
+            "--nav2-floor has NO EFFECT with --no-nav2-soft-anchor: the floor "
+            "re-opens covariance for the NAV2 anchor to re-centre, but the "
+            "anchor is disabled, so the floor never fires.  Enable the "
+            "soft-anchor (default) or drop --nav2-floor.")
+        return True
+    return False
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Unified peppar-fix: GNSS position bootstrap + clock discipline",
@@ -11383,12 +11406,23 @@ Two-phase operation:
                           "ambiguities and re-opens the position covariance so "
                           "the anchor re-centres.  Trades carrier precision for "
                           "a bounded excursion; for free-position hosts WITHOUT "
-                          "AR (no phase biases).  Never fires when pinned.")
-    pos.add_argument("--nav2-floor-trigger-m", type=float, default=1.5,
+                          "AR (no phase biases).  Never fires when pinned.  "
+                          "REQUIRES the NAV2 soft-anchor (default on): the "
+                          "floor re-opens covariance so the anchor re-centres, "
+                          "so it silently no-ops under --no-nav2-soft-anchor.")
+    pos.add_argument("--nav2-floor-trigger-m", type=float, default=5.0,
                      help="NAV2-floor disagreement threshold (m).  The floor "
-                          "fires only when |AntPos − NAV2| exceeds this — set "
-                          "above NAV2's own ~1 m SPP bias so a healthy filter "
-                          "is left untouched (default 1.5).  Requires "
+                          "fires only when |AntPos − NAV2| exceeds this, and "
+                          "then pulls the filter TOWARD NAV2 — so it MUST exceed "
+                          "this host's NAV2 SPP bias, or a healthy filter "
+                          "false-fires onto the bias.  NAV2 bias is 1.5–4 m and "
+                          "hAcc-blind (a biased fix can report low hAcc), and "
+                          "can exceed that under multipath / sky-view changes.  "
+                          "Default 5.0 clears the documented bias envelope so it "
+                          "won't harm any known host; on a measured good-NAV2 "
+                          "host (e.g. London PiFace, ~1 m vs truth) set it lower "
+                          "(≈1.5) for a tighter bound.  The floor can never bound "
+                          "drift below the host's NAV2 bias.  Requires "
                           "--nav2-floor.")
     pos.add_argument("--init-ztd-from-met",
                      action="store_true", default=False,
@@ -12719,6 +12753,9 @@ Two-phase operation:
     # phaseReferenceRequired: catch TDCP-without-a-phase-reference (a config
     # error) at startup, after host config so host-set flags are caught too.
     _check_tdcp_phase_reference(args)
+
+    # nav2FloorNeedsAnchor: warn if --nav2-floor is on with the anchor off.
+    _check_nav2_floor_needs_anchor(args)
 
     # Apply defaults for args that are None after CLI + host config.
     # These were made nullable so host config can override them.
