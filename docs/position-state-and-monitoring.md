@@ -25,9 +25,10 @@ each receiver is independent, with its own state files keyed by
 
 Specifically:
 
-- **Default invocation `peppar-fix`** reads state files and picks
-  the most-confident known position, falling back to NAV2 when no
-  state exists.  CLI overrides are unusual rather than the norm.
+- **Default invocation `peppar-fix`** reads state files and picks the
+  best-provenance known position (survey-class over `.ppp.toml`; see
+  step 4), falling back to NAV2 when no state exists.  CLI overrides are
+  unusual rather than the norm.
 - **No position file format is mandatory.**  Engine works with
   none, one, two, or three of (`.ppp.toml`, `.survey.toml`, NAV2).
 - **The engine never blocks waiting for survey perfection.**  PPS
@@ -146,11 +147,18 @@ Decision tree on engine startup, in order:
      flag toggles them together.
    - `--ignore-arp-state` is shorthand for both ignore flags.
 
-4. **Pick most-confident.**  Smallest σ wins.  Tie-break (within ~2×)
-   to `.survey.toml` because PPP-filter σ can be optimistic — random
-   walk on position state under-estimates slow-drift uncertainty,
-   while a PRIDE solution is a snapshot with rigorous error
-   propagation.
+4. **Pick by provenance** (I-114628).  Survey-class candidates
+   (`.survey.toml`, `arp_label` → `antennas.json`) **always** beat the
+   engine's own `.ppp.toml`, regardless of reported σ — `.ppp.toml`
+   reports formal *precision* (a covariance), not *accuracy*, and a
+   drifted AntPosEst float can report σ ≈ 24 mm while sitting metres
+   off truth (see `position-drift-investigation-2026-06.md`).  σ only
+   tie-breaks *within* a tier (e.g. `.survey.toml` vs `antennas.json`),
+   never across.  (The old "smallest-σ wins, 2× survey tie-break" let an
+   overconfident `.ppp.toml` shadow an authoritative survey and silently
+   mis-pin the host — found on PiFace, London 2026-07-04.)  In time-only
+   mode (`--no-antposest`) `.ppp.toml` is gated off entirely: there is no
+   runtime position filter to correct its drift.
 
 5. **If no state file has a position** (first cold start on this
    antenna; ignore flags consumed everything), fall back to NAV2

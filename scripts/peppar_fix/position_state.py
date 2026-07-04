@@ -20,11 +20,11 @@ external survey workflow (OPUS-Static, PRIDE PPP-AR, CORS NTRIP RTK)
 survey-class data (from .survey.toml and antennas.json) but never
 writes it; its own position-filter snapshots go to .ppp.toml.
 
-Selection: ``pick_most_confident`` returns the file with the smallest
-``sigma_m``, with a 2x tie-break in favor of survey when both are
-within that factor — survey's error propagation is more rigorous
-than the PPP filter's (which can under-report uncertainty under slow
-position-state random walk).
+Selection: ``pick_seed_by_provenance`` returns the best-PROVENANCE
+candidate — survey-class (.survey.toml, antennas.json) ALWAYS beats the
+engine's own .ppp.toml, regardless of σ, because .ppp.toml reports formal
+PRECISION not ACCURACY (an AntPosEst float can report a tight σ while
+metres off truth).  σ tie-breaks only within a tier (I-114628).
 
 See docs/position-state-and-monitoring.md for the full design.
 """
@@ -48,10 +48,10 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__),
                                           "..", ".."))
 DEFAULT_POSITIONS_DIR = os.path.join(_REPO_ROOT, "state", "positions")
 
-# Tie-break: prefer survey when its sigma is within this multiplicative
-# factor of ppp's sigma.  Survey is "ground truth" with rigorous error
-# propagation; ppp can be optimistic under random-walk position state.
-SURVEY_TIE_BREAK_RATIO = 2.0
+# NOTE: the old SURVEY_TIE_BREAK_RATIO (a 2× σ tie-break of survey over ppp) was
+# removed with I-114628 — seed selection is now PROVENANCE-tiered, so survey
+# always beats ppp regardless of σ; there is no cross-tier σ comparison to tune.
+# See pick_seed_by_provenance.
 
 
 # ── Frame / epoch helpers ─────────────────────────────────────────── #
@@ -1100,7 +1100,7 @@ def seed_from_state_files(
     receivers_dir: Optional[str] = None,
 ) -> Optional[PositionState]:
     """One-shot helper for engine startup.  Considers up to three
-    candidates and returns the most-confident usable one:
+    candidates and returns the best-PROVENANCE usable one:
 
       1. state/positions/<uid>.ppp.toml — engine-written PPP filter
          snapshot from a prior run.
@@ -1112,8 +1112,11 @@ def seed_from_state_files(
          engine never writes a .survey.toml from it.
 
     Candidates are filtered by ``current_mount_sn`` (stale-mount
-    entries discarded) and then ``pick_most_confident`` chooses by
-    smallest sigma_m with a 2x survey tie-break.
+    entries discarded) and then ``pick_seed_by_provenance`` picks the
+    best-provenance candidate (survey-class ALWAYS beats .ppp.toml,
+    regardless of σ), σ tie-breaking only within a tier (I-114628).
+    Pass ``ignore_ppp=True`` in time-only mode (--no-antposest) — there is
+    no runtime position filter to correct a drifted .ppp.toml.
 
     Caller behavior on None: fall back to NAV2 / bootstrap.
 
@@ -1152,35 +1155,41 @@ def seed_from_state_files(
                 arp_label, current_mount_sn,
                 antennas_path=antennas_path, obs_epoch=obs_epoch))
     usable = filter_current_mount(candidates, current_mount_sn)
-    return pick_most_confident(usable)
+    return pick_seed_by_provenance(usable)
 
 
-def pick_most_confident(states: list[PositionState]
-                        ) -> Optional[PositionState]:
-    """Choose the most-confident PositionState from the candidates.
+# Seed provenance tiers (I-114628): a better-provenance candidate ALWAYS wins,
+# regardless of reported σ.  survey-class (external, authoritative) outranks the
+# engine's own .ppp.toml.  σ only tie-breaks WITHIN a tier.
+_SEED_PROVENANCE_TIER = {"survey": 0, "ppp": 1}
+_SEED_UNKNOWN_TIER = 2
 
-    Selection rule:
-      - smallest sigma_m wins
-      - tie-break (within SURVEY_TIE_BREAK_RATIO = 2x) to survey
-        because survey error propagation is more rigorous than the
-        PPP filter's, which can under-report slow-drift uncertainty
 
-    Returns None if the list is empty.  Caller falls back to NAV2.
+def pick_seed_by_provenance(states: list[PositionState]
+                            ) -> Optional[PositionState]:
+    """Choose the seed by PROVENANCE first, σ only as a within-tier tie-break.
+
+    survey-class (``.survey.toml``, ``arp_label`` → ``antennas.json`` — an
+    external, authoritative measurement) ALWAYS beats the engine-written
+    ``.ppp.toml``, regardless of reported σ.  This enforces CLAUDE.md's
+    load-bearing Survey-vs-PPP distinction: ``.ppp.toml`` reports formal
+    PRECISION (a covariance), NOT ACCURACY — an AntPosEst float can report
+    σ = 24 mm while sitting 3 m off truth (docs/position-drift-investigation-
+    2026-06.md).  The old "smallest-σ wins, 2× survey tie-break" let such an
+    overconfident ``.ppp.toml`` shadow an authoritative survey and silently
+    mis-pin the host (I-114628, found on PiFace London 2026-07-04: pinned
+    3.33 m off → ~11 ns clock offset → broke the cross-host PPS-agreement pair).
+
+    σ tie-breaks only WITHIN a tier (e.g. between ``.survey.toml`` and
+    ``antennas.json``, both survey-class), never across tiers.
+
+    Returns None if the list is empty.  Caller falls back to NAV2 / bootstrap.
     """
     if not states:
         return None
-    if len(states) == 1:
-        return states[0]
-    # Find smallest sigma among survey-kind and ppp-kind separately
-    survey = min((s for s in states if s.kind == "survey"),
-                 key=lambda s: s.sigma_m, default=None)
-    ppp = min((s for s in states if s.kind == "ppp"),
-              key=lambda s: s.sigma_m, default=None)
-    if survey is None:
-        return ppp
-    if ppp is None:
-        return survey
-    # Both present — tie-break.
-    if survey.sigma_m <= ppp.sigma_m * SURVEY_TIE_BREAK_RATIO:
-        return survey
-    return ppp
+    best_tier = min(_SEED_PROVENANCE_TIER.get(s.kind, _SEED_UNKNOWN_TIER)
+                    for s in states)
+    in_tier = [s for s in states
+               if _SEED_PROVENANCE_TIER.get(s.kind, _SEED_UNKNOWN_TIER)
+               == best_tier]
+    return min(in_tier, key=lambda s: s.sigma_m)

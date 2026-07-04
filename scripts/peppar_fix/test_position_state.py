@@ -9,7 +9,6 @@ from peppar_fix.position_state import (
     AntPosEstWatchdog,
     PositionState,
     PppStateWriter,
-    SURVEY_TIE_BREAK_RATIO,
     WatchdogActor,
     _format_toml,
     bump_mount_sn,
@@ -23,7 +22,7 @@ from peppar_fix.position_state import (
     load_ppp_state,
     load_survey_state,
     parse_antennas_frame,
-    pick_most_confident,
+    pick_seed_by_provenance,
     save_ppp_state,
     seed_from_state_files,
     utc_now_iso,
@@ -163,58 +162,54 @@ class TestFilterCurrentMount(unittest.TestCase):
         self.assertEqual(out[0].kind, "survey")
 
 
-class TestPickMostConfident(unittest.TestCase):
+class TestPickSeedByProvenance(unittest.TestCase):
+    """Provenance-tiered seed selection (I-114628): survey-class ALWAYS beats
+    .ppp.toml regardless of σ; σ tie-breaks only within a tier."""
 
     def test_empty_returns_none(self):
-        self.assertIsNone(pick_most_confident([]))
+        self.assertIsNone(pick_seed_by_provenance([]))
 
     def test_single_state_returned(self):
         s = _make_state(sigma_m=0.05)
-        self.assertEqual(pick_most_confident([s]), s)
+        self.assertEqual(pick_seed_by_provenance([s]), s)
 
-    def test_smaller_sigma_wins(self):
+    def test_smaller_sigma_wins_within_ppp_tier(self):
         ppp_loose = _make_state(kind="ppp", sigma_m=0.10)
         ppp_tight = _make_state(kind="ppp", sigma_m=0.02)
-        out = pick_most_confident([ppp_loose, ppp_tight])
+        out = pick_seed_by_provenance([ppp_loose, ppp_tight])
         self.assertEqual(out.sigma_m, 0.02)
 
-    def test_survey_wins_when_comparable(self):
-        """Survey ties with PPP when its sigma is within 2x — survey wins."""
+    def test_survey_beats_tighter_ppp(self):
+        """Survey wins even when its σ is looser than the ppp's."""
         ppp = _make_state(kind="ppp", sigma_m=0.020)
-        survey = _make_state(kind="survey", sigma_m=0.025)  # 1.25x
-        out = pick_most_confident([ppp, survey])
+        survey = _make_state(kind="survey", sigma_m=0.025)
+        out = pick_seed_by_provenance([ppp, survey])
         self.assertEqual(out.kind, "survey")
 
-    def test_survey_loses_when_much_looser(self):
-        """Survey > 2x looser than PPP: PPP wins."""
-        ppp = _make_state(kind="ppp", sigma_m=0.020)
-        survey = _make_state(kind="survey", sigma_m=0.10)  # 5x
-        out = pick_most_confident([ppp, survey])
-        self.assertEqual(out.kind, "ppp")
-
-    def test_survey_at_exactly_2x_still_wins(self):
-        """Boundary: sigma_survey == 2 * sigma_ppp — survey wins."""
-        ppp = _make_state(kind="ppp", sigma_m=0.020)
-        survey = _make_state(kind="survey",
-                             sigma_m=ppp.sigma_m * SURVEY_TIE_BREAK_RATIO)
-        out = pick_most_confident([ppp, survey])
+    def test_survey_beats_ppp_even_when_much_looser(self):
+        """THE bug fix (I-114628): a drifted .ppp.toml with a tight formal σ
+        must NOT shadow an authoritative survey.  PiFace scenario: ppp σ=0.024
+        (3.33 m off truth) vs survey σ=0.10 (PRIDE, authoritative) → survey."""
+        ppp = _make_state(kind="ppp", sigma_m=0.024)      # tight but drifted
+        survey = _make_state(kind="survey", sigma_m=0.10)  # 4x looser, truthful
+        out = pick_seed_by_provenance([ppp, survey])
         self.assertEqual(out.kind, "survey")
 
     def test_only_survey_present(self):
         survey = _make_state(kind="survey", sigma_m=0.05)
-        out = pick_most_confident([survey])
-        self.assertEqual(out, survey)
+        self.assertEqual(pick_seed_by_provenance([survey]), survey)
 
     def test_only_ppp_present(self):
+        """No survey candidate → the .ppp.toml is used (warm-start fallback)."""
         ppp = _make_state(kind="ppp", sigma_m=0.05)
-        out = pick_most_confident([ppp])
-        self.assertEqual(out, ppp)
+        self.assertEqual(pick_seed_by_provenance([ppp]), ppp)
 
-    def test_two_surveys_smaller_wins(self):
-        """If somehow two survey states present, smallest wins (not common)."""
+    def test_two_surveys_smaller_sigma_wins(self):
+        """σ DOES tie-break within the survey tier (e.g. .survey.toml vs
+        antennas.json)."""
         a = _make_state(kind="survey", sigma_m=0.08)
         b = _make_state(kind="survey", sigma_m=0.04)
-        out = pick_most_confident([a, b])
+        out = pick_seed_by_provenance([a, b])
         self.assertEqual(out.sigma_m, 0.04)
 
 
@@ -432,10 +427,12 @@ class TestSeedFromStateFiles(unittest.TestCase):
         self.assertGreater(abs(out.ecef_m[0] - 9.0), 0.5)
         self.assertAlmostEqual(out.sigma_m, 0.012)
 
-    def test_antennas_json_loses_to_tighter_ppp(self):
-        """If .ppp.toml has a much tighter sigma than antennas.json,
-        the picker keeps ppp (no 2x survey tie-break can save a 10x
-        worse survey σ)."""
+    def test_antennas_json_survey_beats_tighter_ppp(self):
+        """I-114628: an authoritative antennas.json survey ALWAYS beats the
+        engine's .ppp.toml, even when the .ppp.toml reports a much tighter σ —
+        because that σ is formal precision, not accuracy (a drifted AntPosEst
+        float can look tight while metres off truth).  The old behavior (tighter
+        ppp wins) silently mis-pinned PiFace 3.33 m off truth."""
         import json
         self._write_state("ppp", mount_sn=3, sigma_m=0.001, kind="ppp")
         ants = os.path.join(self.pos_dir, "antennas.json")
@@ -451,7 +448,18 @@ class TestSeedFromStateFiles(unittest.TestCase):
             antennas_path=ants,
             positions_dir=self.pos_dir,
             receivers_dir=self.recv_dir)
-        self.assertEqual(out.kind, "ppp")
+        self.assertEqual(out.kind, "survey")
+
+    def test_ignore_ppp_skips_ppp_candidate(self):
+        """--ignore-ppp (also forced under --no-antposest by the engine) drops
+        the .ppp.toml candidate entirely, so a survey is used even if it were
+        the only other candidate (I-114628 time-only gate)."""
+        self._write_state("ppp", mount_sn=3, sigma_m=0.001, kind="ppp")
+        self._write_state("survey", mount_sn=3, sigma_m=0.10, kind="survey")
+        out = seed_from_state_files(
+            self.uid, ignore_ppp=True,
+            positions_dir=self.pos_dir, receivers_dir=self.recv_dir)
+        self.assertEqual(out.kind, "survey")
 
     def test_ignore_survey_also_blocks_antennas_json(self):
         """--ignore-survey suppresses both .survey.toml AND
