@@ -1,127 +1,171 @@
-# ARP survey strategy — tiered acquisition to the ±10 cm bar
+# Position acquisition — `peppar-survey --auto`
 
-Forward plan coming out of the 2026-06 free-position investigation
-(see [position-drift-investigation-2026-06.md](position-drift-investigation-2026-06.md)).
-Status: **plan / design** — not yet implemented.
+`peppar-survey` owns **position**; the engine
+([time-only-architecture.md](time-only-architecture.md)) owns **time**. This
+doc is the position half: how a deployment gets from a coarse NAV2 fix to a
+surveyed ARP, and how `--auto` picks the fastest safe path to get there.
 
-## Why this is the real work
+The time mission needs the ARP only to **~10 cm** (10 cm ≈ 333 ps, well under
+the few-ns cross-clock budget); cm is a bonus for the moonshot's sub-ns
+cross-host target, not a requirement. The engine is never blocked waiting for
+it — it runs from NAV2 with honest confidence and tightens as the survey lands
+(see the position→time-confidence coupling in the engine doc).
 
-The investigation's load-bearing conclusion: **real-time free position is
-products-limited (~dm) — the filter can't converge it to cm.** So the
-operational design is right: **establish the ARP offline, then pin it**
-(`--no-antposest`); the engine never free-estimates position in the timing
-loop. That makes **`peppar-survey` (ARP acquisition) the load-bearing
-component** for every deployment, fixed or portable.
+## The mental model: a contingency-free floor + graceful degradation
 
-And the bar is forgiving: the time mission needs the ARP only to **~10 cm**
-(10 cm ≈ 333 ps, well under the few-ns cross-clock budget — see
-[[position-accuracy-target-10cm]]). cm is a bonus (helps the moonshot's
-sub-ns cross-host target), not a requirement. **So every deployment needs
-*some* path to a ≤10 cm ARP — and right now several deployments (portable /
-field, no nearby CORS, no patience for PRIDE-final products) have none.**
+The whole problem collapses once you see it as **one optimization axis:
+time-to-fix**, with a guaranteed floor.
 
-## Current state of peppar-survey
+- **The floor** is contingency-free: feed a long session of **dual-frequency**
+  raw observations from any receiver anywhere into **PRIDE** → cm, globally.
+  24 h *float* PPP already converges to ~cm (the long arc averages the float
+  ambiguities down), so the floor needs **no base, no AR, no phase biases** —
+  it sails past the whole SSR-bias saga. Its only requirements are dual-freq +
+  internet + patience (product latency: rapid ~1 day, final ~2 weeks).
+- **Everything above the floor just buys speed** by attacking one of two cost
+  components — *session length* (24 h → minutes) and *product latency*
+  (~1 day → immediate). A nearby base (RTK-in-post) attacks both; PPP-AR
+  attacks latency but needs matching phase biases.
 
-Two real backends; the NTRIP-RTK path is half-there; no self-survey:
+This is what makes the heuristics tractable and testable: a wrong caster
+guess, a missing credential, or a too-long baseline just fails its gate and
+**falls through to the next tier — ultimately the PRIDE floor.** There is
+never a "no path" dead-end. Heuristics are an optimization, not a correctness
+requirement.
 
-| Backend | Accuracy | Needs | Gap |
-|---|---|---|---|
-| `--pride` (PRIDE PPP-AR) | ~5 mm | final/rapid products (hours–days latency), pdp3/Fortran, internet | latency; heavy install |
-| `--rtklib` (rnx2rtkp PPP-static; or RTK-static vs a CORS base) | cm (RTK) / dm (PPP) | rnx2rtkp; CORS base for RTK | CORS-RTK is buried under `--rtklib --cors-ntrip-*`, not a clean backend |
-| `--cors` (NTRIP CORS-RTK) | — | — | **docstring-aspirational only; not implemented** |
-| self-survey | — | — | **does not exist** |
+## The `--auto` cascade
 
-## The plan: a tiered fallback chain (best available wins)
+Ordered by expected time-to-fix; each tier is capability-gated and degrades to
+the floor. `--max-time` shifts the ranking (give it 24 h and it may *prefer*
+PRIDE-final for accuracy; give it "minutes" and it reaches for a baseline).
 
-peppar-survey should pick the **best ARP source available for this
-receiver + site**, falling through to coarser-but-self-contained options:
+| Tier | Backend | Gate | Time-to-fix | Accuracy |
+|---|---|---|---|---|
+| **A** | RTKLIB relative baseline | open base with overlapping signals; base data via **archive** (no creds) or stream-log | **minutes** | ~cm–dm, baseline-dependent (≤~10 km → cm; ~20 cm @ 60 km, London 2026-07-03) |
+| **B** | Real-time PPP-AR (engine live) | SSR stream *with phase biases for the rx's signals* | minutes–hours | cm (fragile) |
+| **C** | PRIDE PPP-AR, **rapid** products | dual-freq + internet | ~1 day | cm |
+| **D (floor)** | PRIDE **float/AR, final** products | dual-freq + internet | ~2 weeks | best cm |
+| **D′** | degraded: single-freq / offline long static-average | always | long | dm–m (a number, at least) |
 
-### Tier 1 — PRIDE PPP-AR (`--pride`) — fixed sites, cm, authoritative
-Already the lab default. ~5 mm from a 24 h capture + final products. Best
-where the host is fixed and can wait hours–days for products. Keep as-is.
+The optimizer's three inputs:
 
-### Tier 2 — NTRIP CORS-RTK (`--cors`) — RTK-capable receivers, cm, FAST  ← *the tidy-up*
-**This is the "NTRIP option for capable receivers" to add/clean up.** For an
-**RTK-capable receiver** (F9P; not the timing-only F9T) within RTK baseline
-of a **CORS reference reachable over NTRIP**, an RTK-static fix gives a
-**cm ARP in minutes** — no product-latency wait, no Fortran. Ideal for
-**portable / field** deployments with cell-NTRIP (e.g. the PiFace roadtrip:
-F9P + a state-DOT/NOAA-RTN CORS mount → instant cm ARP).
+1. **Receiver capabilities** — bands (L1/L2 vs L1/L5), dual-freq?, RTK
+   firmware?, raw-obs? (UBX FWVER / VALGET; see the matrix below).
+2. **NAV2 coarse position** — reverse-geocoded to a region (offline boundary
+   polygons) to pick the region's caster/archive set, and to seed the base
+   search.
+3. **Open-access casters** — a sourcetable search (Haversine-rank the STR
+   records by baseline, filter by signal overlap + open-access; `find_base.py`
+   prototype). NTRIP sourcetables are geolocated directories, so "nearest base"
+   falls right out.
 
-Work:
-- **Promote `--cors` to a first-class backend.** Today RTK-vs-CORS only
-  exists as `--rtklib --cors-station / --cors-ntrip-host/port/mount`. Lift
-  it into a clean `--cors` backend that streams the CORS base over NTRIP +
-  runs RTK-static, and writes the standard `.survey.toml`.
-- **Capability-gate it.** Only offer/auto-select it for RTK-capable
-  receivers (see matrix). For F9T (timing firmware), fall through.
-- **CORS discovery.** Nearest NOAA CORS / state RTN mount by approximate
-  position (NAV2 / coarse fix), with baseline + age sanity gates. Config or
-  auto.
-- **Datum care.** CORS bases are NAD83(2011); convert to the canonical
-  ITRF2020 the engine expects ([[ufo1-choke1-two-arps]] — datum + ARP
-  look-alikes are a known trap).
+`--auto` **emits the chosen cascade before capturing** (`--plan-only`), e.g.
+*"Tier A: SHOE 62 km archive, ~cm in ~1 h; fallback → PRIDE-rapid ~1 day"* —
+inspectable, overridable, side-effect-free to test.
 
-### Tier 3 — our own PPP self-survey to ~10 cm (NEW) — last resort, self-contained
-**"Our own 10 cm PPP survey if no other options exist."** When there's no
-PRIDE products *and* no usable CORS (remote field, no RTN coverage), fall
-back to **our own engine**: run the **RTKLIB recipe in static mode and
-average over a long window**.
+```
+peppar-survey --auto [--max-time 30m|--overnight] [--offline] [--plan-only] <uid>
+```
 
-This is *exactly* what the recipe enables. The recipe
-([[converging-config-found-20260605]]) bounds the free position **around
-truth with an unbiased mean** (F9P: mean +45 mm over 6.6 h) — it just has
-±0.26 m *scatter*. A **static time-average over a multi-hour window**
-collapses that scatter toward the (unbiased) mean → a **≤10 cm ARP from the
-receiver alone**, using only the real-time SSR (or even broadcast) it
-already has. Config: `--clock-model wno --q-ztd-antpos 1e-4
---q-pos-converged 1e-9 --no-ar` (default tie), static, averaged.
+## Why this is testable
 
-Work (this is the (b) free-position work, repurposed for the self-survey —
-*not* for real-time free position):
-1. **Honest σ first.** The recipe is ~10× overconfident; the self-survey's
-   convergence/quality gate is only trustworthy once σ tracks actual error.
-   This is the prerequisite.
-2. **Static-mean accumulator + quality gate.** Accumulate the static
-   position over the window; declare done when the running mean is stable to
-   ≤10 cm with honest σ (n_obs, σ_3d, stability/innovation checks) — spanning
-   ≥1 active window so the average isn't a calm-window fluke.
-3. **Write `.survey.toml`** like the other backends (same contract; only a
-   peppar-survey-class backend writes survey-class state — the engine reads,
-   never writes it).
+The scary matrix (L1/L2 vs L1/L5 × US/EU/Asia × find-caster × creds ×
+RTK-or-not) reduces to three pieces, none needing live GNSS:
+
+1. **Capability predicates** — pure functions (`is_dual_freq`, `bands`,
+   `rtk_firmware`, `base_signal_overlap`), unit-tested with fixtures.
+2. **A ranking function** — `{caps, region, ranked bases, internet?, budget}`
+   → ordered backends, unit-tested with mocked inputs.
+3. **A region→source data *table*** — `US→NGS CORS`, `EU→EUREF`,
+   `global→IGS`, plus the caster list. Wrong/missing entries fall through.
+   Tested as data; trivial to extend.
+
+Each backend is tested in isolation; the floor guarantees correctness
+regardless of heuristic quality. You test the floor hard, each backend once,
+and the selector as decision logic.
+
+## Progressive refinement (the engine's feed)
+
+`--auto` consumes the engine's raw-obs logs (locally, or pulled to gt/ptpmon
+and crunched there — the offload pattern) and writes **progressively-refined**
+estimates to `state/positions/<uid>.survey.toml` as each tier completes
+(schema + atomic-write contract in the engine doc). Over the first ~month at a
+new APC it averages **rapid then final** products into the authoritative sub-cm
+mean (how `ufo1` was nailed). When the multi-day final mean stops moving within
+its σ it writes `converged = true` — the engine's cue to stop logging.
+
+**Datum care is a hard requirement, and the fix differs for a base vs a
+result.** A base held at the wrong datum drags the rover with it: holding a
+EUREF (**ETRS89**) base at its published coord put the rover **0.87 m** off in
+the 2026-07-03 London offline-baseline run until transformed (ETRS89 is
+plate-fixed to 1989 → ~0.9 m of accumulated plate motion by 2026). But how you
+get to ITRF2020 splits by source:
+
+- **Bases** are published *only* in a regional datum (EUREF ETRS89, NGS CORS
+  NAD83), so there's no choice: convert the base coord to **ITRF2020 at the
+  observation epoch** via `pyproj` (e.g. ETRS89 `EPSG:4936` → ITRF2020
+  `EPSG:9988`) before differencing.
+- **Results** use the backend's **native ITRF2020 output** (OPUS emits a direct
+  ITRF2020 column; PRIDE solves in ITRF) — **never** a `pyproj` round-trip of
+  the backend's regional output. A `pyproj` NAD83↔ITRF2020 round-trip
+  reintroduces ~cm of realization noise: the stored `ufo1` ITRF2020 value was
+  found **~20 mm off** on 2026-07-03 for exactly this reason and was refreshed
+  from OPUS's direct ITRF column (see `project_opus_pipeline_disabled_20260703`).
+
+Net: what the engine reads is always ITRF2020@epoch — **pyproj for bases,
+native for results.** See
+[coordinate-reference-frames.md](coordinate-reference-frames.md).
 
 ## Receiver-capability matrix (drives tier selection)
 
-| Receiver | RTK-capable (Tier 2)? | Notes |
-|---|---|---|
-| ZED-F9P | **Yes** | full RTK; the portable/field workhorse |
-| ZED-F9T (timing) | RTK firmware varies | timing-focused; prefer Tier 1/3 unless RTK confirmed |
-| NEO-F10T / others | per-unit | confirm before offering Tier 2 |
+| Receiver | Bands | RTK-capable (Tier A/B real-time)? | Notes |
+|---|---|---|---|
+| ZED-F9P | L1/L2 | **Yes** | full RTK; portable/field workhorse. *Post-processed* baseline (Tier A) needs no onboard RTK — raw obs suffice |
+| ZED-F9T (timing) | L1/L2 or L1/L5 | firmware varies | timing-focused; raw obs → Tier A (post-baseline) or C/D regardless of RTK firmware |
+| ZED-X20P | L1/L5 | per-unit | confirm before offering real-time RTK |
+| NEO-F10T / others | per-unit | per-unit | confirm before offering Tier A/B real-time |
 
-(Confirm actual RTK support per unit before wiring auto-select.)
+Note the distinction: **Tier A (post-processed baseline) works on any
+raw-obs receiver** — onboard RTK is only needed for a *real-time* streamed-base
+fix, which timing acquisition doesn't require.
 
-## Selection logic
+### Real-time onboard RTK — deliberately unused today, a clean future option
 
-```
-ARP needed (≤10 cm)
- ├─ fixed site + can wait + products available → Tier 1 (PRIDE, cm)
- ├─ RTK-capable rx + CORS reachable over NTRIP  → Tier 2 (CORS-RTK, cm, fast)
- └─ else (no products, no CORS)                 → Tier 3 (self-PPP static-avg, ≤10 cm)
-```
+`--auto` never uses a receiver's **onboard real-time RTK**, even where present
+(e.g. F9P). For *acquisition* we prefer post-processing (Tier A baseline /
+PRIDE): it's more robust and accurate, works on any raw-obs receiver including
+the timing-only F9T, and needs no RTK firmware — so the acquisition path is
+uniform across the fleet. And the engine is time-only, so it does no real-time
+positioning at all.
 
-All three write the same `.survey.toml`; the engine pins it via
-`--no-antposest`. The chain guarantees **every** deployment — including
-portable ones with neither products nor CORS — has a path to a ≤10 cm ARP.
+A **future** engine could use onboard real-time RTK when a receiver has it —
+for **fast field acquisition** (a cm fix in seconds while the offline survey
+converges toward its final multi-day mean), or as a **live position source for
+a moving platform**. That's a natural extension of the moving/unsurveyed path
+(the one case `AntPosEst` is retained for; see
+[time-only-architecture.md](time-only-architecture.md)) — out of scope for
+fixed-site timing, but a clean add when the use case arrives. The interface
+already fits: a real-time RTK backend would just write the same
+`.survey.toml` (tier `rtk-realtime`) that the engine already polls and slews
+to.
 
-## Open questions / next steps
+## Build status
 
-- Tier 2: confirm per-receiver RTK capability; pick the CORS/RTN source(s)
-  + credentials; baseline limit; NAD83→ITRF2020 conversion path.
-- Tier 3: the honest-σ fix (prerequisite); the static-mean quality-gate
-  thresholds; how long a window reliably hits ≤10 cm (the recipe residual
-  is products-limited, so the answer depends on capture length × correction
-  grade — characterize it).
-- peppar-survey ergonomics: auto-select the tier vs explicit flag; keep the
-  install lean (Tier 2/3 shouldn't require the PRIDE Fortran stack).
-- Cross-ref: pickyEaterSSR (I-210733) — making non-CNES ACs digest would
-  also widen Tier 3's correction options.
+- **Tier C/D (`--pride`)** — built; the lab default. ~5 mm from 24 h + finals.
+- **Tier A (RTKLIB relative baseline)** — proven end-to-end 2026-07-03
+  (London: F9T raw + open EUREF archive base → 20 cm at 62 km float; cm at a
+  short baseline). Not yet a clean `peppar-survey` backend — currently a manual
+  `f9p_rawx_log → convbin → hatanaka → rnx2rtkp` pipeline. Promoting it (with
+  the caster/archive discovery + datum transform) is the near-term work.
+- **`--auto` selector + caster discovery + `--plan-only`** — designed here,
+  not built.
+- **Tier D′ self-survey** (static-averaged own solution when no products *and*
+  no base) — designed; needs the honest-σ + static-mean quality-gate first.
+
+## Related
+
+- [time-only-architecture.md](time-only-architecture.md) — the time half: how
+  the engine bootstraps from NAV2, consumes these estimates, and slews.
+- [peppar-survey-install.md](peppar-survey-install.md) — install / backends.
+- pickyEaterSSR (I-210733) — non-CNES AC digestion would widen Tier B/C
+  correction options.
