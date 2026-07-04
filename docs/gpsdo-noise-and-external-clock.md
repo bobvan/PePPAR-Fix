@@ -254,7 +254,52 @@ multi-pin circular (Lemo/ODU) connectors, so you need the correct
 them. Budget for sourcing/making the cables, and expect a one-time config
 step (enable PPS, set cable delay) in the receiver UI.
 
-### 3e. How this would slot into peppar-fix
+### 3e. Getting the raw data out — interfaces & formats
+
+Not F9T-over-USB — the trade is friendly USB enumeration for
+**network-native streaming + a proprietary binary format**. Different, not
+necessarily harder.
+
+**Hardware.** The packaged reference receivers (NetRS, NetR9, PolaRx,
+GRX1200) are **Ethernet-first**: raw data streams over a TCP socket,
+config is a web UI, and most can act as an NTRIP server directly — once
+set up that's *cleaner* than USB (the engine just reads a socket). All
+also carry **RS-232 serial** (high baud, often Lemo/DB9); on the bare
+**OEMV-3 board** a serial UART is the *primary* interface (wire to pins —
+the least convenient). USB, where present (NetR9/PolaRx5), is usually
+**USB-serial (CDC)** or thumb-drive host, not plug-and-play enumeration.
+Most also log to **CF/internal memory** for post-processing.
+
+**Format.** Each vendor speaks its own binary raw format, so you need a
+decoder:
+
+| Vendor | Native raw obs (+ PVT/clock) |
+|---|---|
+| Trimble (NetRS / NetR9) | **RT17 / RT27**; GSOF for PVT/clock |
+| NovAtel (OEMV-3 / OEM7) | **OEM binary** (`RANGEB`/`RANGECMPB`, `RAWEPHEMB`) |
+| Septentrio (PolaRx) | **SBF** (very well documented) |
+| Leica (GRX1200) | Leica proprietary (LB2 — poorly documented; use RTCM) |
+
+**The bridge that fits our stack.** The engine already parses RTCM
+(pyrtcm, for the SSR streams), so two clean paths, best first:
+
+1. **Configure the receiver to stream RTCM 3 MSM (MSM4/MSM7) over TCP** —
+   the standard multi-GNSS raw code+phase+Doppler+CNR format, the
+   cross-vendor lingua franca, landing on plumbing we already have. Least
+   new code.
+2. **Put RTKLIB in front as a universal translator** — `str2str` reads the
+   native binary (RT27 / SBF / OEM / …) off TCP or serial and re-emits RTCM
+   or RINEX; `convbin` does the same for files. Handles every vendor above.
+
+For the external-clock experiment, either the raw obs (our PPP computes
+`dt`) or the receiver's own clock-bias output (Trimble GSOF / NovAtel
+`CLOCKMODEL` / Septentrio SBF) delivers `dt_DO` directly. Integration cost
+= network/serial setup + a format bridge (prefer RTCM-MSM, else RTKLIB
+`str2str`) + mapping their obs into our observation model — a mature
+ecosystem, closer to "wire it up and configure a stream" than "write a
+driver from scratch."
+
+### 3f. How this would slot into peppar-fix
 
 The engine already estimates `dt_rx` from carrier phase. In the
 external-clock architecture, `dt_rx` simply *becomes* the DO's clock bias
