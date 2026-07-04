@@ -128,5 +128,60 @@ class GlideStepTest(unittest.TestCase):
         np.testing.assert_allclose(new, p)
 
 
+class _FakeFilt:
+    def __init__(self):
+        self.pos = None
+
+
+class GlideStepApplyTest(unittest.TestCase):
+    """The dt-scaled glide wiring (Charlie #1 + Main dt-scaling, #272): steps
+    rate·dt, clamps dt, writes filt.pos + arp_box, clears target on arrival."""
+
+    def setUp(self):
+        self.filt = _FakeFilt()
+        self.arp = [np.array([0.0, 0.0, 0.0])]
+        self.tgt = np.array([100.0, 0.0, 0.0])   # far target (won't reach)
+        self.rate = 0.9                          # m/s
+
+    def _apply(self, known, dt_s):
+        return eng._glide_step_apply(known, self.tgt, self.rate, dt_s,
+                                     self.filt, self.arp)
+
+    def test_dt_scales_the_step_and_writes_pin(self):
+        new, tgt = self._apply(np.array([0.0, 0.0, 0.0]), dt_s=1.0)
+        np.testing.assert_allclose(new, [0.9, 0.0, 0.0])       # rate·1 s
+        np.testing.assert_allclose(self.filt.pos, new)          # filt.pos written
+        np.testing.assert_allclose(self.arp[0], new)            # arp_box written
+        self.assertIsNotNone(tgt)                               # still gliding
+
+    def test_sub_second_dt_scales_down(self):
+        new, _ = self._apply(np.array([0.0, 0.0, 0.0]), dt_s=0.1)
+        np.testing.assert_allclose(new, [0.09, 0.0, 0.0])       # rate·0.1 s
+
+    def test_large_dt_is_clamped(self):
+        # A stall (dt=100 s) must NOT jump the pin — clamp to max_dt_s=2 s.
+        new, _ = self._apply(np.array([0.0, 0.0, 0.0]), dt_s=100.0)
+        np.testing.assert_allclose(new, [1.8, 0.0, 0.0])        # rate·2 s cap
+
+    def test_negative_dt_no_move(self):
+        new, _ = self._apply(np.array([5.0, 0.0, 0.0]), dt_s=-3.0)
+        np.testing.assert_allclose(new, [5.0, 0.0, 0.0])        # clamped to 0
+
+    def test_reaches_and_clears_target(self):
+        # Close to a near target: one step snaps exactly and clears (None).
+        near = np.array([0.0, 0.0, 0.0])
+        self.tgt = np.array([0.5, 0.0, 0.0])     # 0.5 m < rate·1 s = 0.9 m
+        new, tgt = eng._glide_step_apply(near, self.tgt, self.rate, 1.0,
+                                         self.filt, self.arp)
+        np.testing.assert_allclose(new, [0.5, 0.0, 0.0])        # exact, no overshoot
+        self.assertIsNone(tgt)                                  # target cleared
+        np.testing.assert_allclose(self.filt.pos, [0.5, 0.0, 0.0])
+
+    def test_none_arp_box_tolerated(self):
+        new, _ = eng._glide_step_apply(np.array([0.0, 0.0, 0.0]), self.tgt,
+                                       self.rate, 1.0, self.filt, None)
+        np.testing.assert_allclose(self.filt.pos, new)          # no arp_box crash
+
+
 if __name__ == "__main__":
     unittest.main()

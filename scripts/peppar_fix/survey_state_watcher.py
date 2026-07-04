@@ -147,9 +147,11 @@ def decide_refresh_action(
         (action, delta_3d_m):
           - NONE if first read (prev is None) OR mtime unchanged.
           - STEP if mount_sn bumped (operator action, always restart
-            regardless of delta).
+            regardless of delta) — checked before the GLIDE branch.
           - SLEW if Δ_3d < slew_threshold_m.
-          - STEP if Δ_3d ≥ slew_threshold_m.
+          - GLIDE if Δ_3d ≥ slew_threshold_m AND glide_large_delta (a large
+            refinement of the SAME mount — rate-limited pin glide, no respawn).
+          - STEP if Δ_3d ≥ slew_threshold_m and glide_large_delta is False.
 
         delta_3d_m is the |new_ecef − current_arp_ecef| in meters; 0.0
         when the action is NONE.

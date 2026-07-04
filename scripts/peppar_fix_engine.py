@@ -4473,6 +4473,28 @@ def _glide_step(current_ecef, target_ecef, step_m):
     return cur + vec * (step_m / rem), False
 
 
+def _glide_step_apply(known_ecef, target, rate_m_per_s, dt_s, filt, arp_box,
+                      *, max_dt_s=2.0):
+    """Advance a position glide one tick and apply it (I-071400 E3b).
+
+    Steps ``known_ecef`` toward ``target`` by ``rate_m_per_s · dt`` metres —
+    **dt-scaled** so the induced clock-reference rate is time-based, not
+    per-epoch (robust if the epoch cadence ever leaves ~1 Hz; main review #272).
+    ``dt`` is clamped to ``max_dt_s`` so a stalled/bursty loop can't move the pin
+    (hence step the clock) in one jump.  Writes ``filt.pos`` and ``arp_box[0]``
+    so FixedPosFilter derives the clock from the glided pin.
+
+    Returns ``(new_known_ecef, new_target)`` where ``new_target`` is None once
+    the glide has arrived (so the caller clears its glide state).  The one place
+    the glide wiring lives, so it's unit-testable against a fake filt/arp_box."""
+    step_m = float(rate_m_per_s) * min(max(float(dt_s), 0.0), float(max_dt_s))
+    new_ecef, reached = _glide_step(known_ecef, target, max(step_m, 0.0))
+    filt.pos = np.asarray(new_ecef, dtype=float)
+    if arp_box is not None:
+        arp_box[0] = new_ecef
+    return new_ecef, (None if reached else target)
+
+
 def _apply_survey_refresh(event, known_ecef, sigma_pin_m, filt):
     """Apply one survey-refresh event drained from the watcher queue.
 
@@ -4755,7 +4777,10 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     from peppar_fix.confidence import SIGMA_POS_NS_PER_M as _SIG_NS_PER_M
     _pos_glide_target = None                 # ndarray ECEF while gliding, else None
     _pos_glide_max_ns_per_s = float(getattr(args, 'pos_glide_max_ns_per_s', 0.003))
-    _pos_glide_step_m = max(1e-6, _pos_glide_max_ns_per_s / _SIG_NS_PER_M)
+    # Metres/second the pin may move so the induced clock rate stays under the
+    # ns/s budget (conservative G=1 via SIGMA_POS_NS_PER_M).  dt-scaled per tick.
+    _pos_glide_rate_m_per_s = max(1e-9, _pos_glide_max_ns_per_s / _SIG_NS_PER_M)
+    _glide_last_mono = None                  # time.monotonic() of the last step
 
     # Stage 6 self-healing gate (I-125649): when the blend keeps
     # rejecting updates with the same sustained outlier delta, the
@@ -5548,9 +5573,10 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                                 pass
                             log.info(
                                 "[POS_GLIDE] target set: Δ=%.3fm σ=%.3fm "
-                                "rate≤%.3gns/s (~%.4gmm/epoch)",
+                                "rate≤%.3gns/s (~%.4gmm/s)",
                                 float(event[2]), event[1].new_sigma_m,
-                                _pos_glide_max_ns_per_s, _pos_glide_step_m * 1e3)
+                                _pos_glide_max_ns_per_s,
+                                _pos_glide_rate_m_per_s * 1e3)
                             continue
                         (known_ecef, sigma_pin_m,
                          exit_code) = _apply_survey_refresh(
@@ -5574,19 +5600,21 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     pass
 
             # E3b position-glide stepper: each epoch move the pinned ARP toward
-            # the glide target by at most _pos_glide_step_m (the per-epoch
-            # clock-rate budget).  FixedPosFilter derives the clock from filt.pos,
-            # so this glides the reference at ≤ --pos-glide-max-ns-per-s and the
+            # the glide target by rate·dt (the dt-scaled clock-rate budget).
+            # FixedPosFilter derives the clock from filt.pos, so this glides the
+            # reference at ≤ --pos-glide-max-ns-per-s and the
             # servo follows — the DO never steps.  Snap + clear on arrival.
             if _pos_glide_target is not None:
-                known_ecef, _glide_reached = _glide_step(
-                    known_ecef, _pos_glide_target, _pos_glide_step_m)
-                if _glide_reached:
-                    _pos_glide_target = None
+                _now_mono = time.monotonic()
+                _glide_dt = (_now_mono - _glide_last_mono
+                             if _glide_last_mono is not None else 1.0)
+                _glide_last_mono = _now_mono
+                known_ecef, _pos_glide_target = _glide_step_apply(
+                    known_ecef, _pos_glide_target, _pos_glide_rate_m_per_s,
+                    _glide_dt, filt, arp_box)
+                if _pos_glide_target is None:
+                    _glide_last_mono = None
                     log.info("[POS_GLIDE] target reached — pin settled")
-                filt.pos = np.asarray(known_ecef, dtype=float)
-                if arp_box is not None:
-                    arp_box[0] = known_ecef
 
             # Blend a refined position estimate into FixedPosFilter's ARP.
             #
