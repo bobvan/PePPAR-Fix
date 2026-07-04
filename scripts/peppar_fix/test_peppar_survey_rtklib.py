@@ -374,7 +374,7 @@ class ProcessOneObsTest(unittest.TestCase):
                 rnx2rtkp_runner=self._make_runner_returning_pos([]),
             )
         self.assertIsNone(sol)
-        self.assertIn("--cors-station", last.error)
+        self.assertIn("--base", last.error)
 
     def test_rtk_with_cors_station_calls_fetcher(self):
         called = {}
@@ -482,8 +482,8 @@ class ProcessOneObsTest(unittest.TestCase):
         self.assertIn("live NTRIP capture failed", last.error)
         self.assertIn("peer.lab:2102/PEPPAR", last.error)
 
-    def test_rtk_error_message_lists_all_three_sources(self):
-        """Without any cors source, the error mentions all three."""
+    def test_rtk_error_message_names_base_sources(self):
+        """Without any base source, the error names the --baseline base flags."""
         with TemporaryDirectory() as td:
             tdp = Path(td)
             obs = tdp / "host-2026140.obs"
@@ -493,9 +493,8 @@ class ProcessOneObsTest(unittest.TestCase):
                 rnx2rtkp_runner=self._make_runner_returning_pos([]),
             )
         self.assertIsNone(sol)
-        self.assertIn("--cors-station", last.error)
-        self.assertIn("--cors-rinex-path", last.error)
-        self.assertIn("--cors-ntrip", last.error)
+        self.assertIn("--base", last.error)
+        self.assertIn("--base-ntrip-host", last.error)
 
     def test_no_quality_epochs_returns_none_solution(self):
         with TemporaryDirectory() as td:
@@ -673,6 +672,48 @@ class BaselineDatumTest(unittest.TestCase):
                 (157470.222, -4756189.544, 4232767.952),
                 2026 + (140 - 0.5) / 365.25)
             self.assertIn(f"ant2-pos1          ={itrf[0]:.4f}", cfg)
+
+    def test_rtk_refuses_when_base_cannot_be_pinned(self):
+        """None-path guard (main #265): if the base APPROX POSITION is
+        unreadable (or the rover is undated) we can't pre-convert the base, so
+        REFUSE — never fall back to a regional-datum result mis-stamped
+        ITRF2020.  Must not even invoke rnx2rtkp."""
+        ran = {"called": False}
+
+        def fake_run(cmd, cwd, **kw):  # pragma: no cover - must not fire
+            ran["called"] = True
+            class _R: returncode = 0; stdout = ""; stderr = ""
+            return _R()
+
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            rover = tdp / "rover-2026140.obs"; rover.write_text("stub")
+            base_no_approx = tdp / "base-2026140.obs"
+            base_no_approx.write_text("     3.04  OBS\n            "
+                                      "END OF HEADER\n")
+            with mock.patch(
+                    "peppar_fix.peppar_survey_rtklib.subprocess.run", fake_run):
+                result = invoke_rnx2rtkp(
+                    rover, tdp / "work", "rtk", base_obs=base_no_approx,
+                    rnx2rtkp_bin="/tmp/fake")
+        self.assertEqual(result.returncode, -1)
+        self.assertIsNone(result.pos_path)
+        self.assertIn("cannot pin base in ITRF2020", result.error)
+        self.assertFalse(ran["called"])  # refused before running rnx2rtkp
+
+    def test_rtk_refuses_when_rover_undated(self):
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            rover = tdp / "rover-nodate.obs"; rover.write_text("stub")
+            base = tdp / "base-2026140.obs"
+            base.write_text("     3.04  OBS\n   157470.2220 -4756189.5440  "
+                            "4232767.9520                  APPROX POSITION XYZ\n"
+                            "            END OF HEADER\n")
+            result = invoke_rnx2rtkp(
+                rover, tdp / "work", "rtk", base_obs=base,
+                rnx2rtkp_bin="/tmp/fake")
+        self.assertEqual(result.returncode, -1)
+        self.assertIn("rover observation date", result.error)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ bead body).
 
 CORS source default: NOAA CORS publishes daily RINEX 3 obs files at
 geodesy.noaa.gov/corsdata.  No auth, ~1-day latency.  Operator
-picks the station via --cors-station.
+picks the base via --baseline --base.
 
 Two modes:
   - PPP-static (no base): rnx2rtkp -p 7 -m S -k <ppp.conf> rover.obs nav
@@ -423,7 +423,10 @@ def base_ecef_to_itrf2020(
     ITRF2020, so the survey's ITRF2020 frame stamp is correct-by-construction
     (never a pyproj round-trip of a result, which carries ~cm realization noise).
     """
-    static_epoch = 2010.0  # NAD83(2011) and ETRS89 are both referenced to 2010.0
+    # NAD83(2011) is referenced to 2010.0.  TODO(S2): EUREF ETRS89 realizations
+    # vary (ETRF2000/2014/...) and may not be 2010.0 — S2's fetchers should
+    # supply the base's actual reference epoch rather than assume this.
+    static_epoch = 2010.0
     src = GeoPoint(tuple(base_ecef), Frame(base_realization, static_epoch))
     out = convert(src, Frame(CANONICAL_REALIZATION, obs_epoch))
     return (float(out.ecef[0]), float(out.ecef[1]), float(out.ecef[2]))
@@ -508,18 +511,24 @@ def invoke_rnx2rtkp(
     if mode == "rtk" and base_obs is not None:
         base_ecef = read_rinex_approx_ecef(base_obs)
         yd = doy_from_obs_name(obs_file)
-        if base_ecef is not None and yd is not None:
-            obs_epoch = yd[0] + (yd[1] - 0.5) / 365.25
-            base_ecef_itrf = base_ecef_to_itrf2020(
-                base_ecef, obs_epoch, base_realization)
-            log.info("Base %s: %s@2010.0 -> ITRF2020@%.4f pinned "
-                     "(%.3f, %.3f, %.3f)", base_obs.name, base_realization,
-                     obs_epoch, *base_ecef_itrf)
-        else:
-            log.warning("Base %s: no APPROX POSITION or undated rover — "
-                        "cannot pre-convert; rnx2rtkp will anchor to the base "
-                        "header's regional datum (result frame may be wrong)",
-                        base_obs.name)
+        if base_ecef is None or yd is None:
+            # REFUSE rather than fall back to anchoring on the base header's
+            # regional datum — that result would be mis-stamped ITRF2020 (the
+            # exact ~1.7m latent trap S1 exists to close).  Main review #265.
+            missing = ("base APPROX POSITION" if base_ecef is None
+                       else "rover observation date")
+            return RtklibRunResult(
+                obs_file=obs_file, mode=mode, returncode=-1, pos_path=None,
+                error=(f"cannot pin base in ITRF2020 ({missing} unavailable); "
+                       "refusing rather than emit a regional-datum result "
+                       "mis-stamped ITRF2020 (I-071401 datum guard)"),
+            )
+        obs_epoch = yd[0] + (yd[1] - 0.5) / 365.25
+        base_ecef_itrf = base_ecef_to_itrf2020(
+            base_ecef, obs_epoch, base_realization)
+        log.info("Base %s: %s@2010.0 -> ITRF2020@%.4f pinned "
+                 "(%.3f, %.3f, %.3f)", base_obs.name, base_realization,
+                 obs_epoch, *base_ecef_itrf)
     config_path = write_config(work_dir, mode, base_ecef_itrf)
     pos_path = work_dir / (obs_file.stem + ".pos")
     cmd = [rnx2rtkp_bin, "-k", config_path.name, "-o", pos_path.name,
@@ -729,8 +738,8 @@ def process_one_obs(
         else:
             return None, RtklibRunResult(
                 obs_file=obs_file, mode=mode, returncode=-1, pos_path=None,
-                error="rtk mode requires --cors-station, "
-                      "--cors-rinex-path, or --cors-ntrip-*",
+                error="--baseline requires a base: --base "
+                      "(CORS station or RINEX path) or --base-ntrip-host",
             )
 
     result = rnx2rtkp_runner(
