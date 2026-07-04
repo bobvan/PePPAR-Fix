@@ -1,0 +1,203 @@
+"""Tests for peppar-survey base discovery (S2 of I-071401).
+
+All network I/O is injected, so ranking + region-selection are deterministic.
+"""
+from __future__ import annotations
+
+import gzip
+import os
+import sys
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+_SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from peppar_fix.peppar_survey_discovery import (
+    BaseDescriptor, Mount, RegionSource, discover_base, fetch_base_rinex,
+    fetch_euref_nrt_rinex, haversine_km, parse_sourcetable, rank_by_distance,
+    source_for_position,
+)
+
+
+def _str_record(mount, lat, lon, *, nmea="0", soln="0", fmt="RTCM 3.2",
+                nav="GPS+GLO", country="USA"):
+    # STR;mount;id;fmt;fmt-details;carrier;nav;network;country;lat;lon;nmea;soln;...
+    f = ["STR", mount, mount, fmt, "1004", "2", nav, "NET", country,
+         f"{lat}", f"{lon}", nmea, soln, "", "", "", "", "", ""]
+    return ";".join(f)
+
+
+class HaversineTest(unittest.TestCase):
+    def test_known_distance(self):
+        # London -> Paris ~ 344 km
+        d = haversine_km(51.5074, -0.1278, 48.8566, 2.3522)
+        self.assertAlmostEqual(d, 344, delta=5)
+
+    def test_zero_distance(self):
+        self.assertAlmostEqual(haversine_km(40, -90, 40, -90), 0.0, places=6)
+
+
+class ParseSourcetableTest(unittest.TestCase):
+    def test_parses_str_records(self):
+        text = ("CAS;caster;...\n"
+                + _str_record("NEAR", 41.85, -88.10) + "\n"
+                + _str_record("FAR", 51.5, -0.06) + "\n"
+                "NET;net;...\nENDSOURCETABLE\n")
+        mounts = parse_sourcetable(text)
+        self.assertEqual([m.mount for m in mounts], ["NEAR", "FAR"])
+        self.assertEqual(mounts[0].lat, 41.85)
+
+    def test_skips_malformed_and_null_island(self):
+        text = ("STR;short;only;three\n"          # too few fields
+                + _str_record("ZEROS", 0.0, 0.0) + "\n"     # null island
+                + _str_record("BADLAT", 999.0, 10.0) + "\n"  # out of range
+                + _str_record("OK", 41.85, -88.10) + "\n")
+        self.assertEqual([m.mount for m in parse_sourcetable(text)], ["OK"])
+
+    def test_vrs_flag(self):
+        text = (_str_record("VRSNET", 41.85, -88.10, soln="1") + "\n"
+                + _str_record("FIXED", 41.86, -88.11, soln="0") + "\n")
+        by = {m.mount: m for m in parse_sourcetable(text)}
+        self.assertTrue(by["VRSNET"].vrs)
+        self.assertFalse(by["FIXED"].vrs)
+
+
+class RankByDistanceTest(unittest.TestCase):
+    def _mounts(self):
+        return [
+            Mount("A", "RTCM", "GPS", "USA", 41.90, -88.10, False),   # ~5 km
+            Mount("B", "RTCM", "GPS", "USA", 42.20, -88.10, False),   # ~40 km
+            Mount("FARAWAY", "RTCM", "GPS", "USA", 45.0, -88.10, False),  # ~350 km
+            Mount("VRS", "RTCM", "GPS", "USA", 41.85, -88.10, True),   # ~0 km, VRS
+        ]
+
+    def test_nearest_first_within_max_km(self):
+        ranked = rank_by_distance(self._mounts(), 41.85, -88.10, max_km=80)
+        self.assertEqual([m.mount for _d, m in ranked], ["A", "B"])
+        self.assertLess(ranked[0][0], ranked[1][0])
+
+    def test_excludes_vrs_by_default(self):
+        ranked = rank_by_distance(self._mounts(), 41.85, -88.10, max_km=80)
+        self.assertNotIn("VRS", [m.mount for _d, m in ranked])
+
+    def test_max_km_filters(self):
+        ranked = rank_by_distance(self._mounts(), 41.85, -88.10, max_km=10)
+        self.assertEqual([m.mount for _d, m in ranked], ["A"])
+
+
+class SourceForPositionTest(unittest.TestCase):
+    def test_chicago_is_ngs_cors_nad83(self):
+        src = source_for_position(41.85, -88.10)
+        self.assertEqual(src.kind, "ngs_cors")
+        self.assertEqual(src.base_realization, "NAD83(2011)")
+
+    def test_london_is_euref_etrs89(self):
+        src = source_for_position(51.4946, -0.0613)
+        self.assertEqual(src.kind, "euref_nrt")
+        self.assertEqual(src.base_realization, "ETRS89")
+
+    def test_mid_ocean_returns_none(self):
+        self.assertIsNone(source_for_position(0.0, -30.0))
+
+
+class EurefFetchTest(unittest.TestCase):
+    def test_url_and_gunzip(self):
+        captured = {}
+
+        def fake_fetcher(url, dest):
+            captured["url"] = url
+            with gzip.open(dest, "wb") as f:
+                f.write(b"RINEX EUREF nrt content")
+
+        with TemporaryDirectory() as td:
+            out = fetch_euref_nrt_rinex(
+                "PTBB", 2026, 163, 10, Path(td), fetcher=fake_fetcher)
+            self.assertIsNotNone(out)
+            self.assertEqual(out.read_bytes(), b"RINEX EUREF nrt content")
+        # DDD/HH path + station + .26o naming
+        self.assertIn("/nrt/163/10/ptbb16310.26o.gz", captured["url"])
+
+    def test_fetch_failure_returns_none(self):
+        def boom(url, dest):
+            raise OSError("404")
+        with TemporaryDirectory() as td:
+            self.assertIsNone(fetch_euref_nrt_rinex(
+                "PTBB", 2026, 163, 10, Path(td), fetcher=boom))
+
+
+class DiscoverBaseTest(unittest.TestCase):
+    def test_picks_nearest_fixed_base_with_region_datum(self):
+        table = (_str_record("VRSNET", 41.851, -88.101, soln="1") + "\n"
+                 + _str_record("CLOSE", 41.90, -88.10) + "\n"
+                 + _str_record("FAR", 42.5, -88.10) + "\n")
+        desc = discover_base(
+            41.85, -88.10, caster_host="caster.example", caster_port=2101,
+            sourcetable_fetcher=lambda h, p: table)
+        self.assertIsInstance(desc, BaseDescriptor)
+        self.assertEqual(desc.station, "CLOSE")          # nearest non-VRS
+        self.assertEqual(desc.base_realization, "NAD83(2011)")  # region datum
+
+    def test_no_region_returns_none(self):
+        self.assertIsNone(discover_base(
+            0.0, -30.0, caster_host="c", sourcetable_fetcher=lambda h, p: ""))
+
+    def test_no_caster_returns_none(self):
+        self.assertIsNone(discover_base(41.85, -88.10))
+
+    def test_unreachable_caster_returns_none(self):
+        def boom(h, p):
+            raise OSError("refused")
+        self.assertIsNone(discover_base(
+            41.85, -88.10, caster_host="c", sourcetable_fetcher=boom))
+
+    def test_nothing_in_range_returns_none(self):
+        table = _str_record("FAR", 45.0, -88.10) + "\n"  # ~350 km
+        self.assertIsNone(discover_base(
+            41.85, -88.10, caster_host="c", max_km=80,
+            sourcetable_fetcher=lambda h, p: table))
+
+
+class FetchBaseRinexTest(unittest.TestCase):
+    """The glue that feeds S1 a base: dispatch to the source's archive fetcher."""
+
+    def _desc(self, kind, realization):
+        src = RegionSource("R", kind, (0, 90, -180, 180), realization)
+        return BaseDescriptor("STAT", 12.3, src, realization)
+
+    def test_ngs_cors_dispatch(self):
+        calls = {}
+
+        def cors(station, year, doy, work_dir):
+            calls["cors"] = (station, year, doy)
+            return Path("/tmp/base.obs")
+
+        def euref(*a, **k):  # must not fire
+            calls["euref"] = True
+            return None
+
+        out = fetch_base_rinex(
+            self._desc("ngs_cors", "NAD83(2011)"), 2026, 163, Path("/tmp"),
+            cors_fetcher=cors, euref_fetcher=euref)
+        self.assertEqual(str(out), "/tmp/base.obs")
+        self.assertEqual(calls["cors"], ("STAT", 2026, 163))
+        self.assertNotIn("euref", calls)
+
+    def test_euref_dispatch_passes_hour(self):
+        calls = {}
+
+        def euref(station, year, doy, hour, work_dir):
+            calls["euref"] = (station, year, doy, hour)
+            return Path("/tmp/e.obs")
+
+        out = fetch_base_rinex(
+            self._desc("euref_nrt", "ETRS89"), 2026, 163, Path("/tmp"),
+            hour=10, cors_fetcher=lambda *a: None, euref_fetcher=euref)
+        self.assertEqual(str(out), "/tmp/e.obs")
+        self.assertEqual(calls["euref"], ("STAT", 2026, 163, 10))
+
+
+if __name__ == "__main__":
+    unittest.main()
