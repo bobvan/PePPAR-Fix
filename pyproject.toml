@@ -45,7 +45,12 @@ analysis = ["allantools", "matplotlib", "pandas"]
 # the engine and is explicitly forbidden from importing peppar_fix — see
 # peppar_mon/tests/test_boundary.py for the enforcement.
 mon = ["textual>=0.50"]
-dev = ["pytest", "pyflakes", "peppar-fix[analysis,timebeat,mon]"]
+# peppar-survey base-discovery deps.  hatanaka de-compresses the RINEX-3
+# Hatanaka (.crx.gz) obs the EUREF nrt archive serves for --baseline; a
+# plain gunzip leaves a .crx rnx2rtkp can't read.  (PRIDE/RTKLIB binaries
+# are built separately by scripts/install_peppar_survey.sh, not pip.)
+survey = ["hatanaka>=2.8"]
+dev = ["pytest", "pyflakes", "peppar-fix[analysis,timebeat,mon,survey]"]
 
 # Entry points — these become CLI commands after `pip install`.
 # Not yet functional: requires the import refactor (all bare imports
