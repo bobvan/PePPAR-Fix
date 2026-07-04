@@ -142,6 +142,18 @@ def test_missing_file_errors(tmp_path, monkeypatch):
         tcr.main()
 
 
+def test_tau_reach_scales_with_capture_and_adev_exceeds_tdev(tmp_path):
+    """τ reach is data-driven: a longer capture reaches larger τ, and the
+    ADEV panel (N/4 cap) reaches at least as far as TDEV (N/10 cap)."""
+    import two_clock_report as tcr
+    short = tmp_path / "s.csv"; _write_two_channel_csv(short, n=1200)
+    long = tmp_path / "l.csv"; _write_two_channel_csv(long, n=6000)
+    s = tcr.build_report(short, tmp_path / "s.pdf", "A", "B", budget_ns=2.0)
+    ln = tcr.build_report(long, tmp_path / "l.pdf", "A", "B", budget_ns=2.0)
+    assert max(ln["stability"]["A"]["adev"]) > max(s["stability"]["A"]["adev"])
+    assert max(ln["stability"]["A"]["adev"]) >= max(ln["stability"]["A"]["tdev"])
+
+
 def test_parse_iso_naive_gets_utc():
     """A bare (offset-naive) ISO string must parse to an aware UTC datetime,
     so it can be compared against the capture's offset-aware ts_iso."""

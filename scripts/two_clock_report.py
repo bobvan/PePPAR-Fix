@@ -60,10 +60,8 @@ sys.path.insert(0, str(_SCRIPT_DIR.parent / 'tools'))
 from analysis_provenance import (stamp, provenance_line,  # noqa: E402
                                  skip_comment_lines)
 from plot_xhost_agreement_cdf import load_pairs, cdf_xy  # noqa: E402
-from plot_clock_stability_stack import (  # noqa: E402
-    load_chA_phase, adev_tdev_from_phase, _plot_map, _TAUS)
-from plot_tch import (  # noqa: E402
-    compute_tch, _plot_node_curve, _COLORS)
+from plot_clock_stability_stack import load_chA_phase  # noqa: E402
+from plot_tch import compute_tch, _COLORS  # noqa: E402
 
 # Reuse the canonical TICC-single-shot ⊕ FE-5680A-Rb measurement floor
 # (the "bathtub") from plot_stability_slide — the SAME floor the campaign
@@ -72,12 +70,20 @@ from plot_tch import (  # noqa: E402
 # fonts at import time, which would otherwise leak into every page here).
 import matplotlib as _mpl  # noqa: E402
 _saved_rc = _mpl.rcParams.copy()
-from plot_stability_slide import measurement_floor  # noqa: E402
+from plot_stability_slide import measurement_floor, dev_with_err  # noqa: E402
 _mpl.rcParams.update(_saved_rc)
 
 _TOOLNAME = 'two_clock_report.py'
 _PS_PER_S = 10 ** 12
 _FIGSIZE = (12.8, 7.2)   # 16:9 landscape (12.8 / 7.2 = 1.7778)
+
+# τ reach is data-length-limited: a point at τ rests on ~N/τ independent
+# intervals. We cap each panel's τ grid at a data-driven τ_max = N / K so
+# every plotted point has ≥ K independent intervals, and shade a ±1σ
+# confidence band that widens as that count falls. ADEV reaches further
+# than TDEV because TDEV = τ·MDEV/√3 rises ∝τ^(3/2) and runs off-scale.
+_ADEV_MIN_INTERVALS = 4    # ADEV τ_max = N/4  (classic T/4 cap)
+_TDEV_MIN_INTERVALS = 10   # TDEV stops sooner — it runs off-scale at long τ
 
 
 def _parse_iso(s: str) -> datetime:
@@ -176,7 +182,45 @@ def _finish(pdf: PdfPages, fig) -> None:
     plt.close(fig)
 
 
-def _add_measurement_floor(ax, kind: str) -> None:
+def _tau_grid(n_samples: int, min_intervals: int) -> np.ndarray:
+    """Log-spaced τ (1-2-5 per decade) up to a data-driven τ_max =
+    n_samples / min_intervals, so every point has ≥ min_intervals
+    independent intervals. Auto-extends for longer captures."""
+    tau_max = n_samples / float(max(1, min_intervals))
+    out, d = [], 1
+    while d <= tau_max:
+        for m in (1, 2, 5):
+            v = float(m * d)
+            if 1.0 <= v <= tau_max:
+                out.append(v)
+        d *= 10
+    return np.array(out if out else [1.0])
+
+
+def _conf_rel(taus: np.ndarray, n_samples: int) -> np.ndarray:
+    """Relative 1σ on a deviation from finite independent intervals:
+    EDF ≈ N/τ, so rel ≈ 1/√(2·EDF) = √(τ/2N). Grows toward long τ — the
+    honest "few samples here" signal."""
+    return np.sqrt(np.asarray(taus, float) / (2.0 * max(n_samples, 1)))
+
+
+def _plot_dev_band(ax, taus, dev, n_samples, color, label, marker) -> None:
+    """Plot a deviation curve with a shaded ±1σ (EDF≈N/τ) confidence band,
+    skipping NaN/≤0 points (log-safe)."""
+    taus = np.asarray(taus, float)
+    dev = np.asarray(dev, float)
+    good = np.isfinite(dev) & (dev > 0) & np.isfinite(taus)
+    if not np.any(good):
+        return
+    t, d = taus[good], dev[good]
+    rel = np.clip(_conf_rel(t, n_samples), 0.0, 0.95)
+    ax.fill_between(t, d * (1.0 - rel), d * (1.0 + rel),
+                    color=color, alpha=0.18, lw=0, zorder=2)
+    ax.plot(t, d, color=color, ls='-', lw=2.0, marker=marker, ms=4,
+            label=label, zorder=3)
+
+
+def _add_measurement_floor(ax, kind: str, tau_max: float = 1e4) -> None:
     """Shade the TICC single-shot (white PM) ⊕ FE-5680A Rb measurement
     floor — the 'bathtub' — behind the data, matching the campaign
     deviation plots (tools/plot_tracking_companion).  ``kind`` is
@@ -190,7 +234,7 @@ def _add_measurement_floor(ax, kind: str) -> None:
     axis is set log-log, so the shade fills from the data-driven ymin.
     """
     ymin, ymax = ax.get_ylim()
-    tau_grid = np.logspace(0, 4, 200)
+    tau_grid = np.logspace(0, np.log10(max(tau_max, 10.0)), 200)
     floor = measurement_floor(tau_grid, kind)
     ax.fill_between(tau_grid, ymin, np.clip(floor, ymin, ymax),
                     color='0.82', alpha=0.6, zorder=0, lw=0)
@@ -303,40 +347,46 @@ def page_stability(pdf: PdfPages, path: Path, label_a: str, label_b: str,
                    ref_label: str) -> dict:
     chA = load_chA_phase(path, None, channel='chA')     # chA vs Rb, detrended
     chB = load_chA_phase(path, None, channel='chB')     # chB vs Rb, detrended
-    adev_a, tdev_a = adev_tdev_from_phase(chA)
-    adev_b, tdev_b = adev_tdev_from_phase(chB)
+    n = max(len(chA), len(chB))
+    grid_a = _tau_grid(n, _ADEV_MIN_INTERVALS)          # ADEV reach (further)
+    grid_t = _tau_grid(n, _TDEV_MIN_INTERVALS)          # TDEV reach (shorter)
+    tmax_a = float(grid_a[-1]) if len(grid_a) else 1e4
+    tmax_t = float(grid_t[-1]) if len(grid_t) else 1e4
 
     fig, (ax_t, ax_a) = plt.subplots(1, 2, figsize=_FIGSIZE)
-    _plot_map(ax_t, _TAUS, tdev_a, _COLORS['chA'], '-', f'{label_a} (chA)',
-              marker='o')
-    _plot_map(ax_t, _TAUS, tdev_b, _COLORS['chB'], '-', f'{label_b} (chB)',
-              marker='s')
-    _plot_map(ax_a, _TAUS, adev_a, _COLORS['chA'], '-', f'{label_a} (chA)',
-              marker='o')
-    _plot_map(ax_a, _TAUS, adev_b, _COLORS['chB'], '-', f'{label_b} (chB)',
-              marker='s')
-    for ax, ylabel, sub, loc, kind in (
-            (ax_t, 'TDEV (ns)', 'TDEV(τ)', 'lower right', 'tdev'),
-            (ax_a, 'ADEV (dimensionless)', 'ADEV(τ)', 'upper right', 'adev')):
+    ret: dict = {}
+    for phase, color, lab, mk, key in (
+            (chA, _COLORS['chA'], f'{label_a} (chA)', 'o', label_a),
+            (chB, _COLORS['chB'], f'{label_b} (chB)', 's', label_b)):
+        ta, da, _ = dev_with_err(phase, 'adev', grid_a)
+        tt, dt, _ = dev_with_err(phase, 'tdev', grid_t)
+        _plot_dev_band(ax_a, ta, da, len(phase), color, lab, mk)
+        _plot_dev_band(ax_t, tt, dt, len(phase), color, lab, mk)
+        ret[key] = {'tdev': {float(x): float(y) for x, y in zip(tt, dt)},
+                    'adev': {float(x): float(y) for x, y in zip(ta, da)}}
+
+    for ax, ylabel, sub, loc, kind, tmax in (
+            (ax_t, 'TDEV (ns)', 'TDEV(τ)', 'lower right', 'tdev', tmax_t),
+            (ax_a, 'ADEV (dimensionless)', 'ADEV(τ)', 'upper right', 'adev', tmax_a)):
         ax.set_xscale('log')
         ax.set_yscale('log')
         ax.set_xlabel('τ (s)')
         ax.set_ylabel(ylabel)
         ax.set_title(sub)
         ax.grid(True, which='both', ls=':', alpha=0.4)
-        _add_measurement_floor(ax, kind)   # TICC ⊕ Rb bathtub, behind data
+        _add_measurement_floor(ax, kind, tmax)   # TICC ⊕ Rb bathtub, behind data
         ax.legend(loc=loc, fontsize=8)
     if ax_t.get_ylim()[0] < 0.35 < ax_t.get_ylim()[1]:
         ax_t.axhline(0.35, color='darkgreen', ls=':', alpha=0.55, lw=1.0)
-        ax_t.text(_TAUS[0], 0.36, ' moonshot per-clock budget (350 ps)',
+        ax_t.text(1.0, 0.36, ' moonshot per-clock budget (350 ps)',
                   fontsize=8, color='darkgreen', va='bottom')
     fig.suptitle(f'{label_a} & {label_b}   ·   individual stability vs '
-                 f'{ref_label} reference   (chA n={len(chA)}, chB n={len(chB)})',
-                 fontsize=12)
+                 f'{ref_label} reference   (n={n}; shaded ±1σ, EDF≈N/τ; '
+                 f'ADEV to N/{_ADEV_MIN_INTERVALS}, TDEV to N/{_TDEV_MIN_INTERVALS})',
+                 fontsize=11)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     _finish(pdf, fig)
-    return {label_a: {'tdev': tdev_a, 'adev': adev_a},
-            label_b: {'tdev': tdev_b, 'adev': adev_b}}
+    return ret
 
 
 # --------------------------------------------------------------------------
@@ -344,29 +394,40 @@ def page_stability(pdf: PdfPages, path: Path, label_a: str, label_b: str,
 # --------------------------------------------------------------------------
 def page_tch(pdf: PdfPages, path: Path, label_a: str, label_b: str,
              ref_label: str, groslambert: bool) -> dict:
-    res = compute_tch(path, None, groslambert)
+    # Wide candidate grid; compute_tch keeps only feasible τ (3τ < N).
+    res = compute_tch(path, None, groslambert, taus=_tau_grid(10 ** 7, 1))
     fig, (ax_t, ax_a) = plt.subplots(1, 2, figsize=_FIGSIZE)
-    taus = res.get('taus', np.array([]))
+    taus = np.asarray(res.get('taus', np.array([])), float)
+    n = res.get('n', 0)
+    tmax_a = n / float(_ADEV_MIN_INTERVALS) if n else 1e4
+    tmax_t = n / float(_TDEV_MIN_INTERVALS) if n else 1e4
     if len(taus):
         tdev, adev = res['tdev_ns'], res['adev']
         node_label = {'chA': f'{label_a} (chA)', 'chB': f'{label_b} (chB)',
                       'Rb': f'{ref_label} (reference)'}
         markers = {'chA': 'o', 'chB': 's', 'Rb': '^'}
-        for ax, ymap in ((ax_t, tdev), (ax_a, adev)):
-            for key in ('chA', 'chB', 'Rb'):
-                _plot_node_curve(ax, taus, ymap.get(key, np.array([])),
-                                 _COLORS[key], node_label[key], markers[key])
+        ma, mt = taus <= tmax_a, taus <= tmax_t     # ADEV reaches further
+        for key in ('chA', 'chB', 'Rb'):
+            av = np.asarray(adev.get(key, np.array([])), float)
+            td = np.asarray(tdev.get(key, np.array([])), float)
+            if len(av) == len(taus):
+                _plot_dev_band(ax_a, taus[ma], av[ma], n, _COLORS[key],
+                               node_label[key], markers[key])
+            if len(td) == len(taus):
+                _plot_dev_band(ax_t, taus[mt], td[mt], n, _COLORS[key],
+                               node_label[key], markers[key])
         if ax_t.get_ylim()[0] < 0.35 < ax_t.get_ylim()[1]:
             ax_t.axhline(0.35, color='darkgreen', ls=':', alpha=0.55, lw=1.0)
-            ax_t.text(taus[0], 0.36, ' moonshot per-clock budget (350 ps)',
+            ax_t.text(1.0, 0.36, ' moonshot per-clock budget (350 ps)',
                       fontsize=8, color='darkgreen', va='bottom')
     else:
         for ax in (ax_t, ax_a):
-            ax.text(0.5, 0.5, f'insufficient aligned data (n={res.get("n", 0)})',
+            ax.text(0.5, 0.5, f'insufficient aligned data (n={n})',
                     ha='center', va='center', transform=ax.transAxes)
-    for ax, ylabel, sub, kind in (
-            (ax_t, 'TDEV (ns)', 'TDEV(τ) — individual nodes', 'tdev'),
-            (ax_a, 'ADEV (dimensionless)', 'ADEV(τ) — individual nodes', 'adev')):
+    for ax, ylabel, sub, kind, tmax in (
+            (ax_t, 'TDEV (ns)', 'TDEV(τ) — individual nodes', 'tdev', tmax_t),
+            (ax_a, 'ADEV (dimensionless)', 'ADEV(τ) — individual nodes', 'adev',
+             tmax_a)):
         ax.set_xscale('log')
         ax.set_yscale('log')
         ax.set_xlabel('τ (s)')
@@ -374,12 +435,13 @@ def page_tch(pdf: PdfPages, path: Path, label_a: str, label_b: str,
         ax.set_title(sub)
         ax.grid(True, which='both', ls=':', alpha=0.4)
         if len(taus):
-            _add_measurement_floor(ax, kind)   # TICC ⊕ Rb bathtub, behind nodes
+            _add_measurement_floor(ax, kind, tmax)   # TICC ⊕ Rb bathtub
         ax.legend(loc='best', fontsize=8)
     est = res.get('estimator', 'closed-form')
     neg = res.get('neg_count', 0)
     fig.suptitle(f'Three-cornered hat: {label_a} / {label_b} / {ref_label}   '
-                 f'({est}; {neg} neg-var τ guarded→NaN)', fontsize=12)
+                 f'({est}; {neg} neg-var τ→NaN; shaded ±1σ, EDF≈N/τ)',
+                 fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     _finish(pdf, fig)
     return res
