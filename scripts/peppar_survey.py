@@ -119,12 +119,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     backends.add_argument(
         "--rtklib", action="store_true",
-        help="Use RTKLIB rnx2rtkp over captured RINEX (PPP-static "
-             "by default).  Practical alternative to --pride for "
-             "F9T L1+L5 hardware where WUM phase biases don't cover "
-             "GPS L5.  Add --cors-station for RTK-static against a "
-             "NOAA CORS base.  Requires rnx2rtkp on PATH or via "
+        help="Use RTKLIB rnx2rtkp PPP-static over captured RINEX "
+             "(absolute, no base).  Practical alternative to --pride "
+             "for F9T L1+L5 hardware where WUM phase biases don't cover "
+             "GPS L5.  For a relative baseline against a CORS/peer base, "
+             "use --baseline.  Requires rnx2rtkp on PATH or via "
              "PEPPAR_RNX2RTKP_BIN.",
+    )
+    backends.add_argument(
+        "--baseline", action="store_true",
+        help="RTKLIB RTK-static RELATIVE baseline against a base station "
+             "(NOAA CORS via --base, or a peer caster via "
+             "--base-ntrip-host).  cm-class where --rtklib/--pride are "
+             "dm/latency-bound.  The base is pre-converted to "
+             "ITRF2020@epoch so the rover result is native ITRF2020.  "
+             "Requires --rinex-glob (rover) + a base, and rnx2rtkp.",
     )
     pride = ap.add_argument_group("--pride options")
     pride.add_argument(
@@ -202,51 +211,58 @@ def main(argv: list[str] | None = None) -> int:
              "inside).  Default: $TMPDIR/peppar-survey-rtklib/.",
     )
     rtklib.add_argument(
-        "--cors-station", default=None,
-        help="NOAA CORS station code (4-char, e.g. 'dsp1').  When set "
-             "with --rtklib, runs RTK-static against the station's "
-             "daily RINEX 3 base file fetched from "
-             "geodesy.noaa.gov/corsdata.  Omit for PPP-static mode "
-             "(no base, no fetch).",
-    )
-    rtklib.add_argument(
-        "--cors-rinex-path", default=None,
-        help="Explicit path to a CORS base RINEX file (skip the NOAA "
-             "fetch).  Useful when an internal base / pre-fetched "
-             "file is available or when the operator wants to point "
-             "at a non-NOAA source.",
-    )
-    rtklib.add_argument(
         "--rtklib-nav", default=None,
         help="Path to a broadcast-nav RINEX file (.<yy>p) to pass to "
              "rnx2rtkp.  If unset, rnx2rtkp tries to find one in "
-             "work_dir.",
+             "work_dir.  Shared with --baseline.",
     )
-    rtklib.add_argument(
-        "--cors-ntrip-host", default=None,
-        help="Hostname or IP of a peer peppar-fix's NTRIP caster "
-             "(scripts/ntrip_caster.py).  When set with --rtklib, "
-             "streams RTCM 3.3 MSM4 + 1005 from the peer for "
-             "--cors-ntrip-duration seconds and uses the converted "
-             "RINEX as the RTK base.  Mutually exclusive with "
-             "--cors-station and --cors-rinex-path.  Requires str2str "
-             "+ convbin alongside rnx2rtkp.",
+
+    baseline = ap.add_argument_group("--baseline options")
+    baseline.add_argument(
+        "--base", default=None,
+        help="Base station for the relative baseline: either a 4-char "
+             "NOAA CORS station code (e.g. 'dsp1', fetched from "
+             "geodesy.noaa.gov/corsdata) OR a path to a base RINEX file "
+             "(auto-detected: a value with '/' or '.' or an existing "
+             "file is treated as a path, else a station code).  Its "
+             "APPROX POSITION is pre-converted to ITRF2020@epoch.",
     )
-    rtklib.add_argument(
-        "--cors-ntrip-port", type=int, default=2102,
-        help="Peer caster port.  Default 2102 (matches "
-             "scripts/ntrip_caster.py).",
+    baseline.add_argument(
+        "--base-realization", default="NAD83(2011)",
+        help="The base's regional datum realization for the ITRF2020 "
+             "pre-conversion.  Default 'NAD83(2011)' (NOAA CORS); use "
+             "'ETRS89' for EUREF bases.",
     )
-    rtklib.add_argument(
-        "--cors-ntrip-mount", default="PEPPAR",
-        help="Peer caster mountpoint.  Default 'PEPPAR' (matches "
-             "scripts/ntrip_caster.py's MOUNTPOINT constant).",
+    baseline.add_argument(
+        "--base-work-dir", default=None,
+        help="Scratch directory for the baseline run.  Default: "
+             "$TMPDIR/peppar-survey-baseline/.",
     )
-    rtklib.add_argument(
-        "--cors-ntrip-duration", type=int, default=None,
+    baseline.add_argument(
+        "--base-nav", default=None,
+        help="Broadcast-nav RINEX for the baseline rnx2rtkp run "
+             "(falls back to --rtklib-nav, then work_dir discovery).",
+    )
+    baseline.add_argument(
+        "--base-ntrip-host", default=None,
+        help="Hostname/IP of a peer peppar-fix's NTRIP caster "
+             "(scripts/ntrip_caster.py).  Streams RTCM 3.3 MSM4 + 1005 "
+             "for --base-ntrip-duration seconds and uses the converted "
+             "RINEX as the base.  Mutually exclusive with --base.  "
+             "Requires str2str + convbin alongside rnx2rtkp.",
+    )
+    baseline.add_argument(
+        "--base-ntrip-port", type=int, default=2102,
+        help="Peer caster port.  Default 2102 (scripts/ntrip_caster.py).",
+    )
+    baseline.add_argument(
+        "--base-ntrip-mount", default="PEPPAR",
+        help="Peer caster mountpoint.  Default 'PEPPAR'.",
+    )
+    baseline.add_argument(
+        "--base-ntrip-duration", type=int, default=None,
         help="Seconds of RTCM to capture from the peer.  Default 300 "
-             "(5 min).  Must overlap the rover RINEX time range or "
-             "rnx2rtkp will have no co-temporal epochs to solve.",
+             "(5 min).  Must overlap the rover RINEX time range.",
     )
 
     args = ap.parse_args(argv)
@@ -271,10 +287,12 @@ def main(argv: list[str] | None = None) -> int:
         return _run_pride(args)
     if args.rtklib:
         return _run_rtklib(args)
+    if args.baseline:
+        return _run_baseline(args)
 
     log.error(
         "No backend selected.  Pass one of: --pride, --rtklib, "
-        "--opus, --cors.  --pride and --rtklib are implemented today."
+        "--baseline.  All three are implemented today."
     )
     return 2
 
@@ -321,7 +339,10 @@ def _run_pride(args) -> int:
 
 
 def _run_rtklib(args) -> int:
-    """Dispatch to the RTKLIB rnx2rtkp backend."""
+    """Dispatch to the RTKLIB rnx2rtkp backend, PPP-static (absolute, no base).
+
+    The relative-baseline (RTK vs a base) path lives in --baseline / _run_baseline.
+    """
     import tempfile
     from glob import glob
     from pathlib import Path
@@ -340,34 +361,79 @@ def _run_rtklib(args) -> int:
     work_dir = Path(args.rtklib_work_dir or os.path.join(
         tempfile.gettempdir(), "peppar-survey-rtklib"))
 
-    # Exactly one of (--cors-station, --cors-rinex-path, --cors-ntrip-host)
-    # may be set.  More than one is ambiguous; none → PPP-static mode.
-    cors_sources = [
-        ("--cors-station", args.cors_station),
-        ("--cors-rinex-path", args.cors_rinex_path),
-        ("--cors-ntrip-host", args.cors_ntrip_host),
-    ]
-    selected = [name for name, val in cors_sources if val]
-    if len(selected) > 1:
-        log.error("--rtklib accepts at most one of %s — got %s",
-                  ", ".join(n for n, _ in cors_sources),
-                  ", ".join(selected))
+    return run_rtklib_backend(
+        obs_files=obs_files,
+        work_dir=work_dir,
+        receiver_uid=args.receiver_uid,
+        mode="ppp",
+        nav_file=Path(args.rtklib_nav) if args.rtklib_nav else None,
+        positions_dir=args.positions_dir,
+        history_dir=args.history_dir,
+        mount_sn=args.mount_sn,
+        n_days=args.n_days,
+        max_sig0_m=(args.max_sig0_m if args.max_sig0_m is not None
+                    else DEFAULT_MAX_SIG0_M),
+        min_n_obs=(args.min_n_obs if args.min_n_obs is not None
+                   else DEFAULT_MIN_N_OBS),
+        dry_run=args.dry_run,
+    )
+
+
+def _run_baseline(args) -> int:
+    """Dispatch to the RTKLIB rnx2rtkp backend, RTK-static relative baseline.
+
+    Base source is exactly one of: --base (CORS station code or RINEX path) or
+    --base-ntrip-host (peer caster).  The base is pre-converted to
+    ITRF2020@epoch so the rover result is native ITRF2020 (I-071401).
+    """
+    import tempfile
+    from glob import glob
+    from pathlib import Path
+
+    from peppar_fix.arp_history import DEFAULT_MAX_SIG0_M, DEFAULT_MIN_N_OBS
+    from peppar_fix.peppar_survey_rtklib import run_rtklib_backend
+
+    if not args.rinex_glob:
+        log.error("--baseline requires --rinex-glob (the ROVER obs, "
+                  "e.g. 'data/rinex/MadHat-*.obs')")
         return 2
-    use_rtk = bool(selected)
-    mode = "rtk" if use_rtk else "ppp"
-    nav_file = Path(args.rtklib_nav) if args.rtklib_nav else None
+    obs_files = [Path(p) for p in sorted(glob(args.rinex_glob))]
+    if not obs_files:
+        log.error("--rinex-glob %r matched no files", args.rinex_glob)
+        return 1
+
+    if bool(args.base) == bool(args.base_ntrip_host):
+        log.error("--baseline requires exactly one base source: --base "
+                  "(CORS station or RINEX path) OR --base-ntrip-host")
+        return 2
+
+    # --base is a CORS station code or a RINEX path (auto-detect).
+    cors_station = None
+    cors_rinex_path = None
+    if args.base:
+        looks_like_path = ("/" in args.base or "." in args.base
+                           or Path(args.base).exists())
+        if looks_like_path:
+            cors_rinex_path = Path(args.base)
+        else:
+            cors_station = args.base
+
+    work_dir = Path(args.base_work_dir or os.path.join(
+        tempfile.gettempdir(), "peppar-survey-baseline"))
+    nav_file = (Path(args.base_nav) if args.base_nav
+                else Path(args.rtklib_nav) if args.rtklib_nav else None)
 
     cors_ntrip = None
-    if args.cors_ntrip_host:
+    if args.base_ntrip_host:
         from peppar_fix.peppar_survey_cors import (
             CorsNtripConfig, DEFAULT_CORS_NTRIP_DURATION_S,
         )
         cors_ntrip = CorsNtripConfig(
-            host=args.cors_ntrip_host,
-            port=args.cors_ntrip_port,
-            mount=args.cors_ntrip_mount,
-            duration_s=(args.cors_ntrip_duration
-                        if args.cors_ntrip_duration is not None
+            host=args.base_ntrip_host,
+            port=args.base_ntrip_port,
+            mount=args.base_ntrip_mount,
+            duration_s=(args.base_ntrip_duration
+                        if args.base_ntrip_duration is not None
                         else DEFAULT_CORS_NTRIP_DURATION_S),
         )
 
@@ -375,10 +441,10 @@ def _run_rtklib(args) -> int:
         obs_files=obs_files,
         work_dir=work_dir,
         receiver_uid=args.receiver_uid,
-        mode=mode,
-        cors_station=args.cors_station,
-        cors_rinex_path=(Path(args.cors_rinex_path)
-                         if args.cors_rinex_path else None),
+        mode="rtk",
+        cors_station=cors_station,
+        cors_rinex_path=cors_rinex_path,
+        base_realization=args.base_realization,
         cors_ntrip=cors_ntrip,
         nav_file=nav_file,
         positions_dir=args.positions_dir,
