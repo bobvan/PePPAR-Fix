@@ -50,6 +50,38 @@ ACCURACY_250NS = 0x22
 ACCURACY_1US = 0x23
 ACCURACY_UNKNOWN = 0xFE
 
+# σ_total → clockAccuracy quantization ladder (I-071400 E2 / I-060548).
+# (upper-bound ns, enum) in ascending order.  A σ_total (which folds in the
+# position σ_t = σ_r·SIGMA_POS_NS_PER_M via confidence.py) maps to the SMALLEST
+# bucket whose bound ≥ σ_total — a conservative ceiling, matching the "advertise
+# the honest worst case" framing used for clockClass.  Without this the
+# advertised clockAccuracy is a fixed per-clock-class constant, so the 100 ns /
+# 250 ns buckets never emit and e.g. a ~33 ns NAV2-bootstrap σ_t jumps straight
+# to the 1 µs bucket.
+_ACCURACY_LADDER = (
+    (25.0, ACCURACY_25NS),
+    (100.0, ACCURACY_100NS),
+    (250.0, ACCURACY_250NS),
+    (1000.0, ACCURACY_1US),
+)
+
+
+def clock_accuracy_for_sigma_ns(sigma_ns) -> int:
+    """Quantize a σ_total (ns) to the smallest clockAccuracy enum whose bound
+    covers it; ACCURACY_UNKNOWN above the ladder (>1 µs) or for None/NaN/≤0."""
+    if sigma_ns is None:
+        return ACCURACY_UNKNOWN
+    try:
+        s = float(sigma_ns)
+    except (TypeError, ValueError):
+        return ACCURACY_UNKNOWN
+    if not (s > 0) or s != s:  # ≤0 or NaN — no honest bound
+        return ACCURACY_UNKNOWN
+    for bound_ns, enum in _ACCURACY_LADDER:
+        if s <= bound_ns:
+            return enum
+    return ACCURACY_UNKNOWN
+
 # IEEE 1588 timeSource enumeration (selected values)
 TIME_SOURCE_GPS = 0x20
 TIME_SOURCE_PTP = 0x40
@@ -233,10 +265,19 @@ class PmcClient:
         """Send SET GRANDMASTER_SETTINGS_NP with pre-built *data*."""
         return self._send(ACTION_SET, MID_GRANDMASTER_SETTINGS_NP, data)
 
-    def set_grandmaster_class(self, state: str) -> bool:
+    def set_grandmaster_class(self, state: str,
+                              clock_accuracy: int = None) -> bool:
         """Set clockClass by named state.
 
         States: 'locked' (6), 'initialized' (52), 'holdover' (7), 'freerun' (248).
+
+        clock_accuracy: optional IEEE-1588 clockAccuracy enum override
+        (I-071400 E2).  When given, the preset's fixed accuracy byte is
+        replaced with this σ_total-derived value (clockClass — the
+        traceability state — is unchanged), so the advertised accuracy
+        reflects the actual time confidence instead of a per-class constant.
+        When None, the preset's accuracy is used (byte-identical legacy).
+
         Returns True if the message was sent successfully.
         """
         presets = {
@@ -248,7 +289,17 @@ class PmcClient:
         builder = presets.get(state)
         if builder is None:
             raise ValueError(f"Unknown GM state {state!r}, expected one of {list(presets)}")
-        ok = self.set_grandmaster_settings(builder())
+        settings = builder()
+        if clock_accuracy is not None:
+            # grandmaster_settings_np is packed ">BBHhBB" (clock_class,
+            # clock_accuracy, ...): patch byte 1 in place, leaving clockClass
+            # and every other field exactly as the preset built them.
+            settings = settings[:1] + bytes((clock_accuracy & 0xFF,)) + settings[2:]
+        ok = self.set_grandmaster_settings(settings)
         if ok:
-            log.info("pmc: SET clockClass → %s", state)
+            if clock_accuracy is not None:
+                log.info("pmc: SET clockClass → %s (accuracy=0x%02x)",
+                         state, clock_accuracy & 0xFF)
+            else:
+                log.info("pmc: SET clockClass → %s", state)
         return ok
