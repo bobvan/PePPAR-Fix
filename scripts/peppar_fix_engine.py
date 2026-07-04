@@ -4458,6 +4458,43 @@ def _read_survey_converged(survey_path):
     return str(val).strip().lower() in ("true", "1", "yes")
 
 
+def _glide_step(current_ecef, target_ecef, step_m):
+    """One rate-limited position-glide step (I-071400 E3b).
+
+    Returns ``(new_ecef ndarray, reached: bool)``: move ``current`` toward
+    ``target`` by at most ``step_m`` metres; snap to ``target`` (reached=True)
+    once within ``step_m``.  Pure — the per-epoch stepper in run_steady_state
+    calls this so the glide geometry is unit-testable."""
+    cur = np.asarray(current_ecef, dtype=float)
+    vec = np.asarray(target_ecef, dtype=float) - cur
+    rem = float(np.linalg.norm(vec))
+    if rem <= step_m or rem == 0.0:
+        return np.asarray(target_ecef, dtype=float), True
+    return cur + vec * (step_m / rem), False
+
+
+def _glide_step_apply(known_ecef, target, rate_m_per_s, dt_s, filt, arp_box,
+                      *, max_dt_s=2.0):
+    """Advance a position glide one tick and apply it (I-071400 E3b).
+
+    Steps ``known_ecef`` toward ``target`` by ``rate_m_per_s · dt`` metres —
+    **dt-scaled** so the induced clock-reference rate is time-based, not
+    per-epoch (robust if the epoch cadence ever leaves ~1 Hz; main review #272).
+    ``dt`` is clamped to ``max_dt_s`` so a stalled/bursty loop can't move the pin
+    (hence step the clock) in one jump.  Writes ``filt.pos`` and ``arp_box[0]``
+    so FixedPosFilter derives the clock from the glided pin.
+
+    Returns ``(new_known_ecef, new_target)`` where ``new_target`` is None once
+    the glide has arrived (so the caller clears its glide state).  The one place
+    the glide wiring lives, so it's unit-testable against a fake filt/arp_box."""
+    step_m = float(rate_m_per_s) * min(max(float(dt_s), 0.0), float(max_dt_s))
+    new_ecef, reached = _glide_step(known_ecef, target, max(step_m, 0.0))
+    filt.pos = np.asarray(new_ecef, dtype=float)
+    if arp_box is not None:
+        arp_box[0] = new_ecef
+    return new_ecef, (None if reached else target)
+
+
 def _apply_survey_refresh(event, known_ecef, sigma_pin_m, filt):
     """Apply one survey-refresh event drained from the watcher queue.
 
@@ -4727,6 +4764,23 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     _survey_sigma_r = (float(pos_sigma_m)
                        if pos_sigma_m is not None and pos_sigma_m > 0
                        else _TRUSTED_POSITION_SIGMA_M)
+
+    # Position glide (I-071400 E3b): a large survey upgrade on the same mount is
+    # applied as a rate-limited glide of the pinned ARP toward the new estimate,
+    # instead of a respawn STEP.  Because FixedPosFilter derives the clock from
+    # the pin, moving the pin slowly glides the clock reference by G·Δr/c per
+    # epoch (a few ps) — the servo follows within bandwidth and the DO never
+    # steps.  The per-epoch step is bounded so the induced clock-reference rate
+    # ≤ --pos-glide-max-ns-per-s, using the CONSERVATIVE G=1 factor
+    # (SIGMA_POS_NS_PER_M) so the true rate is always under budget.  Epochs are
+    # ~1 Hz, so 1 step ≈ 1 s of budget.
+    from peppar_fix.confidence import SIGMA_POS_NS_PER_M as _SIG_NS_PER_M
+    _pos_glide_target = None                 # ndarray ECEF while gliding, else None
+    _pos_glide_max_ns_per_s = float(getattr(args, 'pos_glide_max_ns_per_s', 0.003))
+    # Metres/second the pin may move so the induced clock rate stays under the
+    # ns/s budget (conservative G=1 via SIGMA_POS_NS_PER_M).  dt-scaled per tick.
+    _pos_glide_rate_m_per_s = max(1e-9, _pos_glide_max_ns_per_s / _SIG_NS_PER_M)
+    _glide_last_mono = None                  # time.monotonic() of the last step
 
     # Stage 6 self-healing gate (I-125649): when the blend keeps
     # rejecting updates with the same sustained outlier delta, the
@@ -5505,6 +5559,25 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 try:
                     while True:
                         event = survey_refresh_queue.get_nowait()
+                        # E3b: a GLIDE event sets/updates the glide target; the
+                        # pin is NOT moved here (the per-epoch stepper below
+                        # rate-limits it).  No respawn — the DO glides, not steps.
+                        if event[0] == "glide":
+                            _pos_glide_target = np.asarray(
+                                event[1].new_ecef, dtype=float)
+                            try:
+                                _ns = float(event[1].new_sigma_m)
+                                if _ns > 0:
+                                    _survey_sigma_r = _ns
+                            except (AttributeError, TypeError, ValueError):
+                                pass
+                            log.info(
+                                "[POS_GLIDE] target set: Δ=%.3fm σ=%.3fm "
+                                "rate≤%.3gns/s (~%.4gmm/s)",
+                                float(event[2]), event[1].new_sigma_m,
+                                _pos_glide_max_ns_per_s,
+                                _pos_glide_rate_m_per_s * 1e3)
+                            continue
                         (known_ecef, sigma_pin_m,
                          exit_code) = _apply_survey_refresh(
                             event, known_ecef, sigma_pin_m, filt)
@@ -5525,6 +5598,23 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                             return exit_code
                 except _queue_mod.Empty:
                     pass
+
+            # E3b position-glide stepper: each epoch move the pinned ARP toward
+            # the glide target by rate·dt (the dt-scaled clock-rate budget).
+            # FixedPosFilter derives the clock from filt.pos, so this glides the
+            # reference at ≤ --pos-glide-max-ns-per-s and the
+            # servo follows — the DO never steps.  Snap + clear on arrival.
+            if _pos_glide_target is not None:
+                _now_mono = time.monotonic()
+                _glide_dt = (_now_mono - _glide_last_mono
+                             if _glide_last_mono is not None else 1.0)
+                _glide_last_mono = _now_mono
+                known_ecef, _pos_glide_target = _glide_step_apply(
+                    known_ecef, _pos_glide_target, _pos_glide_rate_m_per_s,
+                    _glide_dt, filt, arp_box)
+                if _pos_glide_target is None:
+                    _glide_last_mono = None
+                    log.info("[POS_GLIDE] target reached — pin settled")
 
             # Blend a refined position estimate into FixedPosFilter's ARP.
             #
@@ -11174,11 +11264,19 @@ def run(args):
             _survey_refresh_queue.put(("slew", _refresh, _delta))
         def _on_survey_step(_refresh, _delta):
             _survey_refresh_queue.put(("step", _refresh, _delta))
+        def _on_survey_glide(_refresh, _delta):
+            _survey_refresh_queue.put(("glide", _refresh, _delta))
+        # --pos-glide (I-071400 E3b): a large survey upgrade on the SAME mount
+        # becomes a rate-limited GLIDE instead of a respawn STEP.  Default off →
+        # large Δ still STEPs (byte-identical).  mount_sn bumps always STEP.
+        _pos_glide_on = bool(getattr(args, 'pos_glide', False))
         _survey_watcher_thread = threading.Thread(
             target=_sw.watch_loop,
             args=(_survey_path, lambda: _arp_box[0],
                   _on_survey_slew, _on_survey_step),
-            kwargs=dict(stop_fn=stop_event.is_set),
+            kwargs=dict(stop_fn=stop_event.is_set,
+                        on_glide=_on_survey_glide,
+                        glide_large_delta=_pos_glide_on),
             daemon=True,
             name="survey-watcher",
         )
@@ -11586,6 +11684,28 @@ Two-phase operation:
                           "1.5-4 m systematic receiver bias means the true "
                           "position uncertainty is ~10 m, so σ_r is floored to "
                           "this and the advertised σ_t stays honest.")
+    pos.add_argument("--pos-glide",
+                     action="store_true", default=False,
+                     help="Apply a large survey upgrade on the SAME antenna "
+                          "(e.g. a --nav2-bootstrap ~10 m seed → a cm survey "
+                          "pin) as a rate-limited GLIDE of the pinned position "
+                          "instead of a respawn STEP.  FixedPosFilter derives "
+                          "the clock from the pin, so gliding the pin glides the "
+                          "clock reference by G·Δr/c per epoch (a few ps) and "
+                          "the servo follows within bandwidth — the DO never "
+                          "steps and PPS OUT never jumps.  A physical antenna "
+                          "move (mount_sn bump) still STEPs (respawn → re-"
+                          "ACQUIRE).  Default off = byte-identical (large Δ "
+                          "STEPs).  Companion to --nav2-bootstrap; "
+                          "docs/time-only-architecture.md (I-071400 E3b).")
+    pos.add_argument("--pos-glide-max-ns-per-s", type=float, default=0.003,
+                     help="Position-glide clock-reference rate budget (ns/s, "
+                          "default 0.003 = 3 ps/s).  The per-epoch pin step is "
+                          "bounded so the induced clock rate stays under this, "
+                          "using the conservative G=1 factor so the true rate is "
+                          "always below budget.  A 10 m→cm upgrade at 3 ps/s "
+                          "glides over ~hours; raise it to glide faster within "
+                          "the two-clock excursion budget.")
     pos.add_argument("--no-nav2-soft-anchor",
                      dest="nav2_soft_anchor",
                      action="store_false", default=True,
