@@ -41,6 +41,11 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from plot_clock_stability_stack import load_chA_phase  # noqa: E402
+# Spec measurement-floor model factored into a shared helper so the
+# stability-floor overlay can draw the SAME a-priori floor (math unchanged).
+from measurement_floor_model import (measurement_floor,  # noqa: E402,F401
+                                     TICC_FLOOR_PS, RB_ADEV_1S,
+                                     RB_FLICKER_FLOOR)
 import allantools  # noqa: E402
 
 plt.rcParams.update({
@@ -52,9 +57,9 @@ plt.rcParams.update({
 TRACE_COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7"]  # Okabe-Ito
 GNSS_PPS_COLOR = "#555555"
 IDEAL_COLOR = "#9467bd"
-TICC_FLOOR_PS = 60.0          # TAPR TICC single-shot resolution
-RB_ADEV_1S = 1.4e-11          # FE-5680A short-term ADEV: 1.4e-11·τ^-1/2
-RB_FLICKER_FLOOR = 1e-12      # Rb flicker floor (long τ)
+# TICC_FLOOR_PS / RB_ADEV_1S / RB_FLICKER_FLOOR / measurement_floor are
+# imported from measurement_floor_model (re-exported above) — single source
+# of truth shared with the stability-floor overlay.
 
 
 def make_taus(n: int, mode: str):
@@ -75,17 +80,6 @@ def dev_with_err(phase_ns, kind, taus):
         dev, err = dev * 1e9, err * 1e9     # s → ns
     keep = np.isfinite(dev) & (dev > 0)
     return t[keep], dev[keep], err[keep]
-
-
-def measurement_floor(tau, kind):
-    """TICC single-shot (white PM) ⊕ FE-5680A Rb, in quadrature."""
-    rb_adev = np.maximum(RB_ADEV_1S * tau ** -0.5, RB_FLICKER_FLOOR)
-    if kind == 'adev':
-        ticc = (np.sqrt(3) * TICC_FLOOR_PS * 1e-12) * tau ** -1.0   # white PM
-        return np.sqrt(ticc ** 2 + rb_adev ** 2)
-    ticc = (TICC_FLOOR_PS * 1e-12) * tau ** -0.5                    # white PM, s
-    rb_tdev = tau * rb_adev / np.sqrt(3)                            # white FM, s
-    return np.sqrt(ticc ** 2 + rb_tdev ** 2) * 1e9                  # → ns
 
 
 def at_tau(taus, vals, x):

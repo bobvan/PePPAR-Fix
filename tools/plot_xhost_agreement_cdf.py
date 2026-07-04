@@ -254,8 +254,13 @@ def render_cdf(curves: list[tuple[str, callable]], output: Path,
         p95 = float(np.percentile(abs_r, 95))
         p99 = float(np.percentile(abs_r, 99))
         if not rows_printed:
-            print(f'{"label":<40s} {"n":>7s} {"p50":>10s} {"p95":>10s} '
-                  f'{"p99":>10s} {"max":>10s}', file=sys.stderr)
+            # Column headers carry units explicitly: the p50/p95/p99/max
+            # columns are PICOSECONDS (the verdict line elsewhere is in ns).
+            # An operator once read these ps columns as ns — the (ps) tags
+            # make the units unambiguous on the page.
+            print(f'{"label":<40s} {"n":>7s} {"p50 (ps)":>10s} '
+                  f'{"p95 (ps)":>10s} {"p99 (ps)":>10s} {"max (ps)":>10s}',
+                  file=sys.stderr)
             print('-' * 92, file=sys.stderr)
             rows_printed = True
         print(f'{label:<40s} {n:>7d} {p50:>10.1f} {p95:>10.1f} '
