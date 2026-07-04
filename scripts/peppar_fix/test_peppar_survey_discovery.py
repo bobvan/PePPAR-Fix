@@ -4,12 +4,12 @@ All network I/O is injected, so ranking + region-selection are deterministic.
 """
 from __future__ import annotations
 
-import gzip
 import os
 import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 _SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SCRIPTS_DIR not in sys.path:
@@ -104,28 +104,66 @@ class SourceForPositionTest(unittest.TestCase):
 
 
 class EurefFetchTest(unittest.TestCase):
-    def test_url_and_gunzip(self):
+    # EUREF nrt serves RINEX-3 long-named Hatanaka obs; the R/S source char
+    # varies per station, so the fetcher lists the hour dir and matches.
+    _LISTING = (
+        '<a href="OTHR00XXX_R_20261631000_01H_30S_MO.crx.gz">o</a>\n'
+        '<a href="SHOE00GBR_S_20261631000_01H_30S_MO.crx.gz">o</a>\n'
+        '<a href="SHOE00GBR_S_20261631000_01H_30S_MN.rnx.gz">nav</a>\n')
+
+    def test_matches_rinex3_longname_and_de_hatanakas(self):
         captured = {}
+
+        def fake_lister(url):
+            captured["dir"] = url
+            return self._LISTING
 
         def fake_fetcher(url, dest):
             captured["url"] = url
-            with gzip.open(dest, "wb") as f:
-                f.write(b"RINEX EUREF nrt content")
+            Path(dest).write_bytes(b"fake crx.gz bytes")
 
-        with TemporaryDirectory() as td:
+        # A plain gunzip would leave a .crx rnx2rtkp can't read; assert the
+        # hatanaka de-compress step runs and its .rnx output is returned.
+        def fake_dehat(p):
+            captured["dehat_in"] = p
+            out = Path(p).with_name(Path(p).name.replace(".crx.gz", ".rnx"))
+            out.write_bytes(b"RINEX3 obs")
+            return str(out)
+
+        with TemporaryDirectory() as td, \
+                mock.patch("hatanaka.decompress_on_disk", side_effect=fake_dehat):
             out = fetch_euref_nrt_rinex(
-                "PTBB", 2026, 163, 10, Path(td), fetcher=fake_fetcher)
+                "SHOE00GBR0", 2026, 163, 10, Path(td),
+                lister=fake_lister, fetcher=fake_fetcher)
             self.assertIsNotNone(out)
-            self.assertEqual(out.read_bytes(), b"RINEX EUREF nrt content")
-        # DDD/HH path + station + .26o naming
-        self.assertIn("/nrt/163/10/ptbb16310.26o.gz", captured["url"])
+            self.assertTrue(str(out).endswith(".rnx"))
+            self.assertEqual(out.read_bytes(), b"RINEX3 obs")
+            self.assertTrue(captured["dir"].endswith("/nrt/163/10/"))
+            # Matched the _S_ source char (varies) via the 9-char monument.
+            self.assertIn("SHOE00GBR_S_20261631000_01H_30S_MO.crx.gz",
+                          captured["url"])
+            self.assertIn(".crx.gz", captured["dehat_in"])
+
+    def test_no_matching_file_returns_none(self):
+        with TemporaryDirectory() as td:
+            self.assertIsNone(fetch_euref_nrt_rinex(
+                "SHOE00GBR0", 2026, 999, 10, Path(td),
+                lister=lambda u: self._LISTING, fetcher=lambda u, d: None))
 
     def test_fetch_failure_returns_none(self):
         def boom(url, dest):
             raise OSError("404")
         with TemporaryDirectory() as td:
             self.assertIsNone(fetch_euref_nrt_rinex(
-                "PTBB", 2026, 163, 10, Path(td), fetcher=boom))
+                "SHOE00GBR0", 2026, 163, 10, Path(td),
+                lister=lambda u: self._LISTING, fetcher=boom))
+
+    def test_dir_list_failure_returns_none(self):
+        def boom(url):
+            raise OSError("archive down")
+        with TemporaryDirectory() as td:
+            self.assertIsNone(fetch_euref_nrt_rinex(
+                "SHOE00GBR0", 2026, 163, 10, Path(td), lister=boom))
 
 
 class DiscoverBaseTest(unittest.TestCase):

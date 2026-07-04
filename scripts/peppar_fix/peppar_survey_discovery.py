@@ -138,10 +138,18 @@ def rank_by_distance(
 
 # ── region -> source table + archive fetchers ──────────────────────── #
 
-# EUREF near-real-time hourly RINEX archive (URL structure mapped 2026-07-03).
-DEFAULT_EUREF_NRT_URL_TMPL = (
-    "https://igs.bkg.bund.de/root_ftp/EUREF/nrt/{doy:03d}/{hour:02d}/"
-    "{station_lc}{doy:03d}{hour:02d}.{yy:02d}o.gz")
+# EUREF near-real-time hourly RINEX archive (dir structure mapped 2026-07-03).
+# It serves RINEX-3 long-named, HATANAKA-compressed obs, e.g.
+#   AAER00FRA_R_20261851200_01H_30S_MO.crx.gz
+# The data-source char (R = from receiver stream / S = from RINEX) varies per
+# station, so we LIST the hour dir and match rather than hardcode it (main #268).
+DEFAULT_EUREF_NRT_DIR_TMPL = (
+    "https://igs.bkg.bund.de/root_ftp/EUREF/nrt/{doy:03d}/{hour:02d}/")
+
+
+def _http_listing(url: str, timeout: int = 25) -> str:
+    with urllib.request.urlopen(url, timeout=timeout) as r:  # noqa: S310
+        return r.read().decode("latin-1", "replace")
 
 
 def fetch_euref_nrt_rinex(
@@ -151,37 +159,51 @@ def fetch_euref_nrt_rinex(
     hour: int,
     work_dir: Path,
     *,
-    url_template: str = DEFAULT_EUREF_NRT_URL_TMPL,
+    dir_template: str = DEFAULT_EUREF_NRT_DIR_TMPL,
+    lister: Callable[[str], str] = _http_listing,
     fetcher: Callable = urllib.request.urlretrieve,
 ) -> Path | None:
-    """Download a EUREF nrt hourly RINEX obs file to work_dir (gunzipped), or
-    None on failure.  Mirrors fetch_cors_rinex's shape (cache + gunzip)."""
-    import gzip
-    import shutil
+    """Fetch + de-Hatanaka a EUREF nrt hourly RINEX-3 obs → an rnx2rtkp-readable
+    ``.rnx`` path, or None on failure.
 
+    ``station`` is the mount / 9+char monument (STR mount ``SHOE00GBR0`` →
+    monument ``SHOE00GBR``).  Lists ``nrt/{doy}/{hour}/`` and matches
+    ``{MONUMENT9}_[RS]_{YYYY}{DDD}{HH}00_01H_30S_MO.crx.gz``, then decompresses
+    the ``.crx.gz`` (gzip + Hatanaka in one) via the ``hatanaka`` package —
+    a plain gunzip would leave a ``.crx`` rnx2rtkp can't read (main #268).
+    """
+    import re as _re
+
+    monument = station.upper()[:9]
+    dir_url = dir_template.format(doy=doy, hour=hour)
+    try:
+        listing = lister(dir_url)
+    except Exception as e:  # noqa: BLE001 - unreachable archive is non-fatal
+        log.warning("EUREF nrt dir list failed (%s): %s", dir_url, e)
+        return None
+    pat = _re.compile(
+        rf"{_re.escape(monument)}_[RS]_{year:04d}{doy:03d}{hour:02d}00"
+        r"_01H_30S_MO\.crx\.gz")
+    m = pat.search(listing)
+    if not m:
+        log.info("EUREF nrt: no %s obs in %s", monument, dir_url)
+        return None
+    fname = m.group(0)
     work_dir.mkdir(parents=True, exist_ok=True)
-    yy = year % 100
-    station_lc = station.lower()[:4]
-    local_name = f"{station_lc}{doy:03d}{hour:02d}.{yy:02d}o"
-    local_path = work_dir / local_name
-    if local_path.exists():
-        return local_path
-    url = url_template.format(
-        doy=doy, hour=hour, yy=yy, station_lc=station_lc)
-    gz_path = work_dir / (local_name + ".gz")
+    gz_path = work_dir / fname
     try:
-        fetcher(url, str(gz_path))
+        fetcher(dir_url + fname, str(gz_path))
     except Exception as e:  # noqa: BLE001 - network/HTTP errors are non-fatal
-        log.warning("EUREF nrt fetch failed (%s): %s", url, e)
+        log.warning("EUREF nrt fetch failed (%s): %s", fname, e)
         return None
     try:
-        with gzip.open(gz_path, "rb") as gz, open(local_path, "wb") as out:
-            shutil.copyfileobj(gz, out)
-    except OSError as e:
-        log.warning("EUREF nrt gunzip failed: %s", e)
+        from hatanaka import decompress_on_disk
+        rnx_path = decompress_on_disk(str(gz_path))
+    except Exception as e:  # noqa: BLE001 - missing pkg / bad file is non-fatal
+        log.warning("EUREF nrt de-Hatanaka failed (needs the 'hatanaka' pip "
+                    "package): %s", e)
         return None
-    gz_path.unlink()
-    return local_path
+    return Path(rnx_path)
 
 
 @dataclass(frozen=True)
