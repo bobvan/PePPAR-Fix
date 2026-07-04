@@ -36,7 +36,9 @@ longer corrupts the clock loop; it only widens the time confidence (below).
 
 `AntPosEst` is retained only for the cases timing doesn't have: **moving
 platforms and unsurveyed real-time positioning**. It is never load-bearing for
-a fixed-site time deployment.
+a fixed-site time deployment. In those retained cases the `--nav2-floor` (#261)
+bounds its free-position drift to ~NAV2 accuracy — the same "NAV2 as honest
+coarse position" lever this architecture leans on at bootstrap.
 
 ## The core coupling: position error → time confidence
 
@@ -51,7 +53,7 @@ absorbs the common-mode part, so the induced time-confidence term is
 | Position state (σ_r) | → time-confidence term σ_t |
 |---|---|
 | NAV2 bootstrap (~10 m) | **~15–30 ns** |
-| RTK-baseline / PPP-rapid (~cm) | ~0.1–0.2 ns |
+| RTK-baseline / PPP-rapid (~cm–dm) | ~0.02–0.2 ns |
 | PRIDE-final multi-day mean (~mm–cm) | tens of ps (negligible) |
 
 Two properties make this the right coupling:
@@ -115,7 +117,7 @@ converged = false            # true → engine may stop logging
 
 On a better estimate the engine **slews** the pinned position `r_old → r_new`.
 That move shifts the clock reference by up to `G·|Δr|/c` — a NAV2→cm upgrade is
-~10 m → a **~20–30 ns** step. Applied raw the PPS OUT would jump, so the slew
+~10 m → a **~15–30 ns** step. Applied raw the PPS OUT would jump, so the slew
 is **rate-limited to the excursion budget** (spread over minutes–hours at ≤ a
 few ps/s), reusing the existing **glide-slope** machinery
 ([phc-bootstrap.md](phc-bootstrap.md)). The DO glides to the corrected

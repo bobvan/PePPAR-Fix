@@ -41,7 +41,7 @@ PRIDE-final for accuracy; give it "minutes" and it reaches for a baseline).
 
 | Tier | Backend | Gate | Time-to-fix | Accuracy |
 |---|---|---|---|---|
-| **A** | RTKLIB relative baseline | open base ≤ ~30–50 km with overlapping signals; base data via **archive** (no creds) or stream-log | **minutes** | cm |
+| **A** | RTKLIB relative baseline | open base with overlapping signals; base data via **archive** (no creds) or stream-log | **minutes** | ~cm–dm, baseline-dependent (≤~10 km → cm; ~20 cm @ 60 km, London 2026-07-03) |
 | **B** | Real-time PPP-AR (engine live) | SSR stream *with phase biases for the rx's signals* | minutes–hours | cm (fragile) |
 | **C** | PRIDE PPP-AR, **rapid** products | dual-freq + internet | ~1 day | cm |
 | **D (floor)** | PRIDE **float/AR, final** products | dual-freq + internet | ~2 weeks | best cm |
@@ -94,13 +94,26 @@ new APC it averages **rapid then final** products into the authoritative sub-cm
 mean (how `ufo1` was nailed). When the multi-day final mean stops moving within
 its σ it writes `converged = true` — the engine's cue to stop logging.
 
-**Datum care is a hard requirement, in one place.** Archive base coordinates
-carry regional datums — **EUREF = ETRS89, NGS CORS = NAD83** — that differ from
-the canonical **ITRF2020** by up to ~1 m of accumulated plate motion (an
-ETRS89 base cost 0.87 m in the 2026-07-03 London run until transformed). Every
-backend converts its base/result to **ITRF2020 at the observation epoch**
-(`pyproj`, e.g. ETRS89 `EPSG:4936` → ITRF2020 `EPSG:9988`) before it hits disk,
-so what the engine reads is always ITRF2020@epoch. See
+**Datum care is a hard requirement, and the fix differs for a base vs a
+result.** A base held at the wrong datum drags the rover with it: holding a
+EUREF (**ETRS89**) base at its published coord put the rover **0.87 m** off in
+the 2026-07-03 London offline-baseline run until transformed (ETRS89 is
+plate-fixed to 1989 → ~0.9 m of accumulated plate motion by 2026). But how you
+get to ITRF2020 splits by source:
+
+- **Bases** are published *only* in a regional datum (EUREF ETRS89, NGS CORS
+  NAD83), so there's no choice: convert the base coord to **ITRF2020 at the
+  observation epoch** via `pyproj` (e.g. ETRS89 `EPSG:4936` → ITRF2020
+  `EPSG:9988`) before differencing.
+- **Results** use the backend's **native ITRF2020 output** (OPUS emits a direct
+  ITRF2020 column; PRIDE solves in ITRF) — **never** a `pyproj` round-trip of
+  the backend's regional output. A `pyproj` NAD83↔ITRF2020 round-trip
+  reintroduces ~cm of realization noise: the stored `ufo1` ITRF2020 value was
+  found **~20 mm off** on 2026-07-03 for exactly this reason and was refreshed
+  from OPUS's direct ITRF column (see `project_opus_pipeline_disabled_20260703`).
+
+Net: what the engine reads is always ITRF2020@epoch — **pyproj for bases,
+native for results.** See
 [coordinate-reference-frames.md](coordinate-reference-frames.md).
 
 ## Receiver-capability matrix (drives tier selection)
