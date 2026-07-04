@@ -107,6 +107,12 @@ def dump_ppp_filter_state(filt) -> dict:
         "ztd_sigma_m": float(getattr(filt, "_ztd_sigma_m", 0.2)),
         "pos_sigma_m_init": float(getattr(filt, "_pos_sigma_m_init", 10.0)),
         "ztd_window_elapsed": float(getattr(filt, "_ztd_window_elapsed", 0.0)),
+        # ZTD process-noise coef (--q-ztd-antpos / RTKLIB recipe).  Reaches the
+        # live AntPos filter via bootstrap inheritance, NOT the fresh _shim, so
+        # capturing the filter's actual attribute is the faithful way to carry it
+        # into replay (else the replay reverts to the 1.29e-3 default and a
+        # Q-tuned bundle replays with the WRONG ZTD stiffness — I-215452).
+        "ztd_q_coef": float(getattr(filt, "_ztd_q_coef", 1.29e-3)),
     }
 
 
@@ -125,6 +131,9 @@ def restore_ppp_filter_state(filt, state: dict) -> None:
     filt._ztd_sigma_m = float(state.get("ztd_sigma_m", 0.2))
     filt._pos_sigma_m_init = float(state.get("pos_sigma_m_init", 10.0))
     filt._ztd_window_elapsed = float(state.get("ztd_window_elapsed", 0.0))
+    # ZTD process-noise coef — default to the engine's 1.29e-3 for old snapshots
+    # that predate this field, so they restore exactly as before.
+    filt._ztd_q_coef = float(state.get("ztd_q_coef", 1.29e-3))
     filt.prev_obs = {}                 # slip history not captured — see dump()
     filt.initialized = True            # clock is in the restored x, no self-seed
 
@@ -187,6 +196,21 @@ def build_filter_thread(driver: ReplayDriver, known_ecef, *, systems=None,
     fc = read_filter_config(driver.bundle_dir)
     if args is None:
         args = SimpleNamespace(**fc, ppp_state_log=True)
+    # Q_POS_CONVERGED is a PPPFilter CLASS attribute the engine sets globally at
+    # startup (engine:12624); mirror that here from the captured config so a
+    # Q-tuned bundle replays with the live converged-position stiffness.  Always
+    # set it (default 1e-4 when unset) so a prior replay's override can't leak
+    # into this one in a shared process (I-215452).
+    #
+    # KEEP CASES SEQUENTIAL WHILE Q LIVES ON THE CLASS (Charlie review #258):
+    # this is global class state, so it's only safe because the case library
+    # replays bundles one at a time in a shared process (the always-set reset
+    # handles the leak BETWEEN sequential cases).  If replay ever fans out
+    # bundles concurrently in one process, this write would race across cases —
+    # move Q_POS_CONVERGED to a per-filter instance attribute first.
+    from solve_ppp import PPPFilter as _PF
+    _qpc = getattr(args, "q_pos_converged", None)
+    _PF.Q_POS_CONVERGED = float(_qpc) if _qpc is not None else 1e-4
     if corrections is None:
         corrections = RealtimeCorrections(driver.stores["beph"],
                                           driver.stores["ssr"])
