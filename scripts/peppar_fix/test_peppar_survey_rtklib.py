@@ -22,9 +22,10 @@ if _SCRIPTS_DIR not in sys.path:
 from peppar_fix.peppar_survey_rtklib import (
     RtklibPosEpoch, RtklibRunResult, RtklibSolution,
     _datetime_to_mjd,
-    aggregate_solution, doy_from_obs_name, fetch_cors_rinex,
-    invoke_rnx2rtkp, parse_pos, process_one_obs,
-    rtklib_to_pride_solution, run_rtklib_backend, write_config,
+    aggregate_solution, base_ecef_to_itrf2020, doy_from_obs_name,
+    fetch_cors_rinex, invoke_rnx2rtkp, parse_pos, process_one_obs,
+    read_rinex_approx_ecef, rtklib_to_pride_solution,
+    run_rtklib_backend, write_config,
 )
 
 
@@ -583,6 +584,95 @@ class DatetimeToMjdTest(unittest.TestCase):
         self.assertEqual(
             _datetime_to_mjd(datetime(2026, 5, 20, tzinfo=timezone.utc)),
             61180.0)
+
+
+# ── Baseline datum handling (I-071401 / ufo1 lesson) ───────────────── #
+
+
+class BaselineDatumTest(unittest.TestCase):
+    """The --baseline backend must pin the base in ITRF2020 before rnx2rtkp so
+    the rover result is native ITRF2020 — NOT silently anchor to the base
+    RINEX's regional-datum APPROX POSITION (the latent ~1.7 m mis-tag)."""
+
+    # A Chicago-area NGS-CORS-style marker in NAD83(2011)@2010.0 (~ufo1 mount).
+    _NAD83_BASE = (157470.222, -4756189.544, 4232767.952)
+
+    def test_read_rinex_approx_ecef(self):
+        with TemporaryDirectory() as td:
+            p = Path(td) / "base.obs"
+            p.write_text(
+                "     3.04           OBSERVATION DATA    M\n"
+                "   157470.2220 -4756189.5440  4232767.9520"
+                "                  APPROX POSITION XYZ\n"
+                "                                        "
+                "            END OF HEADER\n")
+            self.assertEqual(read_rinex_approx_ecef(p), self._NAD83_BASE)
+
+    def test_read_rinex_approx_absent_returns_none(self):
+        with TemporaryDirectory() as td:
+            p = Path(td) / "base.obs"
+            p.write_text("     3.04  OBS\n            END OF HEADER\n")
+            self.assertIsNone(read_rinex_approx_ecef(p))
+
+    def test_base_ecef_to_itrf2020_is_nonidentity_datum_shift(self):
+        # NAD83(2011)@2010 -> ITRF2020@epoch must move the coord by the ~1.7 m
+        # datum offset (a no-op here would be the mis-tag bug).
+        out = base_ecef_to_itrf2020(self._NAD83_BASE, 2026.4)
+        d3 = sum((a - b) ** 2 for a, b in zip(out, self._NAD83_BASE)) ** 0.5
+        self.assertGreater(d3, 0.5)          # real datum transform happened
+        self.assertLess(d3, 3.0)             # ...and it's the ~1.7 m offset, not garbage
+        # deterministic + epoch-sensitive (plate motion)
+        self.assertEqual(out, base_ecef_to_itrf2020(self._NAD83_BASE, 2026.4))
+        self.assertNotEqual(out, base_ecef_to_itrf2020(self._NAD83_BASE, 2020.0))
+
+    def test_write_config_injects_ant2_pos_for_baseline(self):
+        with TemporaryDirectory() as td:
+            itrf = (157469.2017, -4756188.1927, 4232767.8802)
+            cfg = write_config(Path(td), "rtk", base_ecef_itrf=itrf).read_text()
+            self.assertIn("ant2-postype       =xyz", cfg)
+            self.assertIn("ant2-pos1          =157469.2017", cfg)
+            self.assertIn("ant2-pos3          =4232767.8802", cfg)
+
+    def test_write_config_no_ant2_pos_without_base(self):
+        with TemporaryDirectory() as td:
+            self.assertNotIn("ant2-pos",
+                             write_config(Path(td), "rtk").read_text())
+            self.assertNotIn("ant2-pos",
+                             write_config(Path(td), "ppp").read_text())
+
+    def test_rtk_invoke_pins_base_in_itrf2020_not_nad83(self):
+        """The mis-tag regression: rtk-mode invoke reads the NAD83 base APPROX,
+        converts to ITRF2020, and the config's ant2-pos is the ITRF2020 coord
+        (NOT the base's NAD83 header value)."""
+        def fake_run(cmd, cwd, **kw):
+            pos_path = Path(cwd) / Path(cmd[cmd.index("-o") + 1]).name
+            _write_pos_file(pos_path, [
+                (2026, 5, 20, 14, 0, 0.0, 40.0, -90.0, 200.0, 6, 12)])
+            class _R: returncode = 0; stdout = ""; stderr = ""
+            return _R()
+
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            rover = tdp / "rover-2026140.obs"; rover.write_text("stub")
+            base = tdp / "base-2026140.obs"
+            base.write_text(
+                "     3.04  OBS\n   157470.2220 -4756189.5440  4232767.9520"
+                "                  APPROX POSITION XYZ\n            "
+                "END OF HEADER\n")
+            with mock.patch(
+                    "peppar_fix.peppar_survey_rtklib.subprocess.run", fake_run):
+                result = invoke_rnx2rtkp(
+                    rover, tdp / "work", "rtk", base_obs=base,
+                    rnx2rtkp_bin="/tmp/fake")
+            self.assertEqual(result.returncode, 0)
+            cfg = (tdp / "work" / "rnx2rtkp-rtk.conf").read_text()
+            self.assertIn("ant2-postype       =xyz", cfg)
+            # ant2-pos1 must be the ITRF2020 X, NOT the NAD83 header X.
+            self.assertNotIn("ant2-pos1          =157470.2220", cfg)
+            itrf = base_ecef_to_itrf2020(
+                (157470.222, -4756189.544, 4232767.952),
+                2026 + (140 - 0.5) / 365.25)
+            self.assertIn(f"ant2-pos1          ={itrf[0]:.4f}", cfg)
 
 
 if __name__ == "__main__":

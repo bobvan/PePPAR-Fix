@@ -14,6 +14,8 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 # Make scripts/peppar_survey.py importable when run via the venv.
 _REPO = os.path.abspath(os.path.join(
@@ -120,6 +122,49 @@ class TestMainNoBackendError(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(empty)
+
+
+class BaselineCliTest(unittest.TestCase):
+    """--baseline base source: --base auto-detects station-code vs RINEX path;
+    exactly one of --base / --base-ntrip-host is required (I-071401)."""
+
+    def _run(self, base_args):
+        with tempfile.TemporaryDirectory() as td:
+            obs = Path(td) / "rover-2026140.obs"
+            obs.write_text("x")
+            with mock.patch(
+                    "peppar_fix.peppar_survey_rtklib.run_rtklib_backend",
+                    return_value=0) as rb:
+                rc = peppar_survey.main(
+                    ["--baseline", "--rinex-glob", str(obs),
+                     "--receiver-uid", "U"] + base_args)
+            return rc, rb
+
+    def test_base_station_code_detected(self):
+        rc, rb = self._run(["--base", "dsp1"])
+        self.assertEqual(rc, 0)
+        kw = rb.call_args.kwargs
+        self.assertEqual(kw["mode"], "rtk")
+        self.assertEqual(kw["cors_station"], "dsp1")
+        self.assertIsNone(kw["cors_rinex_path"])
+
+    def test_base_rinex_path_detected(self):
+        with tempfile.TemporaryDirectory() as td:
+            bp = str(Path(td) / "base.obs")
+            rc, rb = self._run(["--base", bp])
+        self.assertEqual(rc, 0)
+        kw = rb.call_args.kwargs
+        self.assertIsNone(kw["cors_station"])
+        self.assertEqual(str(kw["cors_rinex_path"]), bp)
+
+    def test_base_realization_forwarded(self):
+        rc, rb = self._run(["--base", "dsp1", "--base-realization", "ETRS89"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(rb.call_args.kwargs["base_realization"], "ETRS89")
+
+    def test_requires_exactly_one_base_source(self):
+        self.assertEqual(self._run(["--base", "d", "--base-ntrip-host", "h"])[0], 2)
+        self.assertEqual(self._run([])[0], 2)
 
 
 if __name__ == "__main__":

@@ -46,7 +46,7 @@ from peppar_fix.arp_history import (
     DEFAULT_MAX_SIG0_M, DEFAULT_MIN_N_OBS, DEFAULT_N_DAYS, RunningArp,
     append_solution, apply_quality_filter, running_mean,
 )
-from peppar_fix.geo_frames import CANONICAL_REALIZATION, Frame
+from peppar_fix.geo_frames import CANONICAL_REALIZATION, Frame, GeoPoint, convert
 from peppar_fix.position_state import (
     DEFAULT_POSITIONS_DIR, PositionState,
     decimal_year_from_mjd, save_survey_state, utc_now_iso,
@@ -387,13 +387,73 @@ out-degform        =deg
 """
 
 
-def write_config(work_dir: Path, mode: str) -> Path:
+def read_rinex_approx_ecef(path: Path) -> tuple[float, float, float] | None:
+    """The APPROX POSITION XYZ (ECEF metres) from a RINEX obs header, or None.
+
+    For an NGS CORS / EUREF base this is the station's *published* marker
+    coordinate in its regional datum (NAD83(2011) / ETRS89) — the coordinate
+    the baseline is anchored to.  Read so we can pre-convert it to ITRF2020
+    (see :func:`base_ecef_to_itrf2020`) before it reaches rnx2rtkp.
+    """
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if "APPROX POSITION XYZ" in line:
+                    parts = line.split()
+                    return (float(parts[0]), float(parts[1]), float(parts[2]))
+                if "END OF HEADER" in line:
+                    return None
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def base_ecef_to_itrf2020(
+    base_ecef: tuple[float, float, float],
+    obs_epoch: float,
+    base_realization: str = "NAD83(2011)",
+) -> tuple[float, float, float]:
+    """Convert a base-station ECEF from its regional datum to ITRF2020@obs_epoch.
+
+    This is the load-bearing datum step for the baseline backend (I-071401 /
+    the 2026-07-03 ufo1 lesson): the base carries a regional datum (NGS CORS =
+    NAD83(2011)@2010.0, EUREF = ETRS89@2010.0) that differs from ITRF2020 by up
+    to ~1 m of accumulated plate motion.  Pre-converting the BASE — not
+    round-tripping the RESULT — means the rover solution comes out NATIVE
+    ITRF2020, so the survey's ITRF2020 frame stamp is correct-by-construction
+    (never a pyproj round-trip of a result, which carries ~cm realization noise).
+    """
+    static_epoch = 2010.0  # NAD83(2011) and ETRS89 are both referenced to 2010.0
+    src = GeoPoint(tuple(base_ecef), Frame(base_realization, static_epoch))
+    out = convert(src, Frame(CANONICAL_REALIZATION, obs_epoch))
+    return (float(out.ecef[0]), float(out.ecef[1]), float(out.ecef[2]))
+
+
+def write_config(
+    work_dir: Path,
+    mode: str,
+    base_ecef_itrf: tuple[float, float, float] | None = None,
+) -> Path:
     """Materialize the rnx2rtkp config file for the given mode.
+
+    ``base_ecef_itrf`` (rtk mode only): the base station's ECEF **already in
+    ITRF2020** — pins ``ant2-pos`` explicitly so rnx2rtkp anchors the baseline
+    to the ITRF2020 base (making the rover result native ITRF2020) instead of
+    silently using the base RINEX header's regional-datum APPROX POSITION.
 
     Returns the path to the written config file.
     """
     config_text = {"ppp": _PPP_STATIC_CONFIG,
                    "rtk": _RTK_STATIC_CONFIG}[mode]
+    if base_ecef_itrf is not None:
+        x, y, z = base_ecef_itrf
+        config_text += (
+            "# Base pinned in ITRF2020 (pre-converted from its regional datum)\n"
+            "ant2-postype       =xyz\n"
+            f"ant2-pos1          ={x:.4f}\n"
+            f"ant2-pos2          ={y:.4f}\n"
+            f"ant2-pos3          ={z:.4f}\n"
+        )
     path = work_dir / f"rnx2rtkp-{mode}.conf"
     with open(path, "w") as f:
         f.write(config_text)
@@ -409,6 +469,7 @@ def invoke_rnx2rtkp(
     mode: str,
     *,
     base_obs: Path | None = None,
+    base_realization: str = "NAD83(2011)",
     nav_file: Path | None = None,
     rnx2rtkp_bin: str = DEFAULT_RNX2RTKP,
     timeout_s: int = DEFAULT_RNX2RTKP_TIMEOUT_S,
@@ -439,7 +500,27 @@ def invoke_rnx2rtkp(
     if obs_local.resolve() != obs_file.resolve():
         shutil.copy2(obs_file, obs_local)
 
-    config_path = write_config(work_dir, mode)
+    # Datum: pin the base in ITRF2020 so the rover result is native ITRF2020
+    # (I-071401 / ufo1 lesson).  The base RINEX header's APPROX POSITION is in
+    # its regional datum (NAD83(2011)/ETRS89); pre-convert it rather than let
+    # rnx2rtkp anchor to the regional coordinate and mis-frame the result.
+    base_ecef_itrf = None
+    if mode == "rtk" and base_obs is not None:
+        base_ecef = read_rinex_approx_ecef(base_obs)
+        yd = doy_from_obs_name(obs_file)
+        if base_ecef is not None and yd is not None:
+            obs_epoch = yd[0] + (yd[1] - 0.5) / 365.25
+            base_ecef_itrf = base_ecef_to_itrf2020(
+                base_ecef, obs_epoch, base_realization)
+            log.info("Base %s: %s@2010.0 -> ITRF2020@%.4f pinned "
+                     "(%.3f, %.3f, %.3f)", base_obs.name, base_realization,
+                     obs_epoch, *base_ecef_itrf)
+        else:
+            log.warning("Base %s: no APPROX POSITION or undated rover — "
+                        "cannot pre-convert; rnx2rtkp will anchor to the base "
+                        "header's regional datum (result frame may be wrong)",
+                        base_obs.name)
+    config_path = write_config(work_dir, mode, base_ecef_itrf)
     pos_path = work_dir / (obs_file.stem + ".pos")
     cmd = [rnx2rtkp_bin, "-k", config_path.name, "-o", pos_path.name,
            obs_local.name]
@@ -585,6 +666,7 @@ def process_one_obs(
     mode: str = "ppp",
     cors_station: str | None = None,
     cors_rinex_path: Path | None = None,
+    base_realization: str = "NAD83(2011)",
     cors_ntrip=None,  # peppar_survey_cors.CorsNtripConfig | None
     nav_file: Path | None = None,
     rnx2rtkp_bin: str = DEFAULT_RNX2RTKP,
@@ -653,7 +735,8 @@ def process_one_obs(
 
     result = rnx2rtkp_runner(
         obs_file, work_dir, mode,
-        base_obs=base_obs, nav_file=nav_file,
+        base_obs=base_obs, base_realization=base_realization,
+        nav_file=nav_file,
         rnx2rtkp_bin=rnx2rtkp_bin, timeout_s=timeout_s,
     )
     last_result = result
@@ -731,6 +814,7 @@ def run_rtklib_backend(
     mode: str = "ppp",
     cors_station: str | None = None,
     cors_rinex_path: Path | None = None,
+    base_realization: str = "NAD83(2011)",
     nav_file: Path | None = None,
     positions_dir: str | None = None,
     history_dir: str | None = None,
@@ -775,7 +859,7 @@ def run_rtklib_backend(
                 f"peppar-survey --rtklib --cors-ntrip "
                 f"{cors_ntrip.host}:{cors_ntrip.port}/{cors_ntrip.mount}")
         elif mode == "rtk" and cors_station:
-            source_label = f"peppar-survey --rtklib --cors-station {cors_station}"
+            source_label = f"peppar-survey --baseline --base {cors_station}"
         else:
             source_label = "peppar-survey --rtklib"
 
@@ -789,6 +873,7 @@ def run_rtklib_backend(
             mode=mode,
             cors_station=cors_station,
             cors_rinex_path=cors_rinex_path,
+            base_realization=base_realization,
             cors_ntrip=cors_ntrip,
             nav_file=nav_file,
             rnx2rtkp_bin=rnx2rtkp_bin,
