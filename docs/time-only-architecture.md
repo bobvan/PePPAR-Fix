@@ -1,201 +1,187 @@
-# Time-only architecture — `--no-antposest`
+# Time-only engine architecture — decoupled position via peppar-survey
 
-## Summary
+The engine owns **time**; [`peppar-survey`](arp-survey-strategy.md) owns
+**position**. They are two separate processes that meet at one file on disk.
+The engine never free-estimates position in the timing loop — it pins a
+position, disciplines the clock, and tracks how much its *time* confidence is
+limited by how well that position is known. As `peppar-survey` refines the
+position offline, the engine gently slews to it and tightens its time
+confidence.
 
-`--no-antposest` is an opt-in engine flag that **skips the position
-filter entirely** and delegates the antenna reference point (ARP) to
-[`peppar-survey`](peppar-survey-install.md).  The engine still does its
-time-transfer job at full precision; it just doesn't try to refine the
-position online.
+This is not an opt-in mode; for a **timing** deployment it is the
+architecture. The `--no-antposest` flag is how you select it today.
 
-In time-only mode:
+## Why the engine doesn't solve position
 
-| Component | Status |
-|---|---|
-| `FixedPosFilter` (time-side, mode=pinned) | **Active** — estimates `dt_rx + ZTD` at the pinned position, drives PHC |
-| Phase-1 PPPFilter bootstrap | **Refused** — engine exits 1 if no seed available |
-| `AntPosEstThread` (position filter + AR machinery) | **Not spawned** |
-| `AntPosEstWatchdog` (running-mean ARP refinement) | Inert (no `ape_thread` → no updates) |
-| Position blend (`--position-blend-source`) | Forced to `none`; `--pin-position` forced on |
-| NAV2 store + watchdog (gross-move detector at 10 m) | **Active** |
-| RINEX writer | **Active** — captures observations for offline re-survey |
-| `peppar-survey` (OPUS / PRIDE / RTKLIB / CORS) | **Load-bearing** for ARP acquisition |
-
-## Why
-
-`peppar-fix`'s mission is time transfer.  The position filter
-(`PPPFilter`, AR machinery, anchoring state machine) was always a means
-to an end: get an accurate enough ARP so `FixedPosFilter` can compute
-`dt_rx + ZTD` correctly.  If `peppar-survey` delivers a survey-class
-pin offline (OPUS-Static σ ≈ 12 mm, PRIDE-PPP-AR sub-cm, RTKLIB via
-`surveyRtklibBackend-main`), the runtime position filter is just
-surface area for known bugs:
+The position filter (`PPPFilter`, ambiguity-resolution machinery, anchoring
+state machine) was always a means to an end: get an accurate-enough ARP so the
+time-side `FixedPosFilter` can compute `dt_rx + ZTD` correctly. Real-time,
+forward-only, no-base PPP-AR is the *hardest* variant of position solving —
+it is products- and phase-bias-limited (~dm), needs per-host tuning, and can
+fail to converge. Offline tools already won this fight (PRIDE-PPP-AR absolute;
+RTKLIB relative-baseline against a reference station), using full-arc
+smoothing and better products. So the runtime position filter is just surface
+area for known bugs:
 
 - biased-equilibrium traps (day0422 + day0519 confirmed)
-- false-fix lock-in (`--ar-mode full` pathology, observed 2026-05-20)
-- ZTD/clock/ambiguity coupling under disturbance (10-round bisect)
-- ~30 % of engine complexity that doesn't serve time output
+- false-fix lock-in (`--ar-mode full` pathology, 2026-05-20)
+- ZTD/clock/ambiguity coupling under disturbance
+- the (pos, ZTD, clk) null wander (position-drift-investigation-2026-06)
+- ~30 % of engine complexity that never serves time output
 
-The time-side `FixedPosFilter` has been silently correct throughout
-every bias-hunt round — `pos_sigma` stays at 0.005 m on the seed,
-`dt_rx + ZTD` outputs are unaffected by AntPosEst's drift.
+`FixedPosFilter` has been silently correct throughout every bias-hunt round.
+**Let peppar-survey own position; let the engine own time** — and, crucially,
+because integer resolution is a survey concern, a *wrong* pinned position no
+longer corrupts the clock loop; it only widens the time confidence (below).
 
-This mode is the architectural conclusion: **let `peppar-survey` own
-position, let the engine own time.**
+`AntPosEst` is retained only for the cases timing doesn't have: **moving
+platforms and unsurveyed real-time positioning**. It is never load-bearing for
+a fixed-site time deployment.
 
-## What it costs
+## The core coupling: position error → time confidence
 
-1. **No sub-cm runtime ARP refinement.**  You get whatever
-   `peppar-survey` produced — typically ~12 mm from OPUS-Static.  You
-   can't tighten that during the engine run.  Honestly, you couldn't
-   tighten OPUS-Static σ = 12 mm with float PPP anyway (the historic
-   AntPosEst running mean was meter-class on our lab), so this isn't a
-   regression in practice.
+A pinned position wrong by **δr** makes each satellite's computed range wrong
+by `δρ_i = −ê_i·δr` (ê_i = line-of-sight unit vector). The clock estimate
+absorbs the common-mode part, so the induced time-confidence term is
 
-2. **NAV2 10 m threshold for ARP-move detection.**  Sub-meter antenna
-   shifts (mast wobble, ground heave) won't trigger.  NAV2's
-   1.5–4 m systematic bias on our receivers means anything tighter
-   than 10 m generates false positives anyway, so this is the natural
-   limit.
-
-3. **No cm-class real-time position output.**  For applications where
-   `peppar-fix` would be a positioning node (moving platform, real-time
-   surveying), this mode is the wrong choice.  Out of scope.
-
-## Startup dependency change
-
-Time-only mode reframes `peppar-survey` from "nice diagnostic" to
-**load-bearing infrastructure**.  Fresh deployment becomes:
-
-1. Install `peppar-fix`
-2. Install `peppar-survey` (`scripts/install_peppar_survey.sh`)
-3. Run a survey to produce `state/positions/<uid>.survey.toml` (or
-   provide `arp_label` pointing at `timelab/antennas.json`)
-4. Start the engine with `--no-antposest`
-
-The default (without `--no-antposest`) still works as before: NAV2
-seed → Phase-1 bootstrap → AntPosEst → running-mean refinement.  Time-
-only mode is explicit opt-in.
-
-## Seed sources accepted
-
-The engine refuses to bootstrap in time-only mode and instead exits
-with code 1 if none of these is available:
-
-| Source | Priority | Typical use |
-|---|---|---|
-| `--known-pos` operator CLI | 1 | one-off runs |
-| `state/positions/<uid>.survey.toml` | 2 (σ < trust threshold) | normal lab path — written by `peppar-survey` |
-| `state/positions/<uid>.ppp.toml` | 2 (σ ≤ trust threshold) | from prior engine convergence (now unused by default in time-only mode) |
-| `timelab/antennas.json[arp_label]` | 2 | lab-shared antenna database |
-
-The same trust + mount_sn gates as the default mode apply.  If the
-selected seed has σ > the trust threshold (`_TRUSTED_POSITION_SIGMA_M`
-in `peppar_fix_engine.py`), the engine logs and falls through to the
-LS-validation path — which is also refused under `--no-antposest`.
-
-## Operational example
-
-A representative lab host wanting time-only behavior:
-
-```bash
-# 1. One-time survey (offline)
-./scripts/peppar-survey --pride --receiver <uid> \
-    --rinex-dir data/rinex --output state/positions/<uid>.survey.toml
-
-# 2. Run the engine, time-only
-./scripts/peppar-fix --no-antposest \
-    --systems gps,gal --nav-sig-gate \
-    --servo /dev/ptp_i226 --pps-pin 1 \
-    --log-out data/engine.log
+```
+σ_t(position) ≈ G · σ_r / c        G ≈ 0.3–0.7 (sky/geometry factor)
 ```
 
-The engine reads the `.survey.toml` at startup, pins the position,
-spins up `FixedPosFilter` + NAV2 watchdog + RINEX writer, and starts
-PHC discipline.  No AntPosEst messages appear in the log.  No NL_DIAG
-events.  No FALSE_FIX / IF_STEP / ANCHORING transitions.
+| Position state (σ_r) | → time-confidence term σ_t |
+|---|---|
+| NAV2 bootstrap (~10 m) | **~15–30 ns** |
+| RTK-baseline / PPP-rapid (~cm) | ~0.1–0.2 ns |
+| PRIDE-final multi-day mean (~mm–cm) | tens of ps (negligible) |
+
+Two properties make this the right coupling:
+
+1. **Short-term stability is untouched by position error.** A fixed wrong
+   position is quasi-static: as the geometry rotates it projects into the
+   clock as a slow (diurnal) wander plus a DC bias. It limits **absolute
+   accuracy and long-τ**, not TDEV(1 s). The DO's short-term stability is good
+   from the first minute; only absolute time tightens as the survey converges.
+2. **The engine is never blocked and never per-host-tuned.** It always emits
+   time with an *honest* confidence that starts coarse (tens of ns on NAV2)
+   and tightens automatically as σ_r shrinks. No convergence gate, no knob —
+   σ_t just tracks σ_r.
+
+σ_t is a real output: it drives the advertised **PTP `clockAccuracy` /
+`clockClass`** ([ptp4l-supervision.md](ptp4l-supervision.md)) — coarse while
+NAV2-bootstrapped, upgrading as the survey refines. A downstream consumer sees
+the truth without reading any survey file.
+
+## Startup: bootstrap from NAV2, never refuse
+
+The engine starts from the NAV2 single-point fix (honest σ_r ≈ 10 m, absorbing
+NAV2's 1.5–4 m receiver bias) and begins disciplining immediately. It does not
+block on a survey. A better seed, when present at startup, is used directly:
+
+| Seed source | σ_r | Use |
+|---|---|---|
+| `--known-pos` operator CLI | operator-stated | one-off runs |
+| `state/positions/<uid>.survey.toml` | from the file's covariance | normal path — written by `peppar-survey` |
+| `timelab/antennas.json[arp_label]` | ~12 mm | lab-shared antenna database |
+| **NAV2 single-point** | ~10 m | **always-available bootstrap** — the engine starts here when nothing better exists |
+
+> Build status: today the engine *refuses* (exit 1) under `--no-antposest`
+> without a trusted seed. The target architecture starts from NAV2 with honest
+> confidence so a fresh deployment is never blocked on a survey — it produces
+> coarse-but-honest time from second one and tightens as the survey lands.
+
+The engine writes **no** position state of its own — not `.survey.toml`
+(survey-class, peppar-survey only) and not `.ppp.toml` (there is no position
+filter to produce it). This keeps the survey/PPP write-ownership boundary
+clean by construction.
+
+## The refinement loop: poll, slew, re-confidence
+
+The engine logs raw observations (`RXM-RAWX`/`SFRBX`) — the feed
+`peppar-survey --auto` consumes — and watches `state/positions/<uid>.survey.toml`
+for a *strictly better* estimate (lower `quality` σ / higher tier). The disk
+contract:
+
+```toml
+# state/positions/<uid>.survey.toml — written atomically (temp + rename)
+ecef_m  = [X, Y, Z]
+cov_m2  = [...]              # feeds σ_r → σ_t
+frame   = "ITRF2020@2026.50" # always ITRF2020@epoch; datum transform done in the backend
+tier    = "pride-final"      # nav2 | rtk-baseline | ppp-rapid | pride-final
+quality = 0.008              # 1σ 3D (m) — the monotonic "is this better?" scalar
+session = { start = ..., span_s = ..., n_days = 12 }
+product = "COD0MGXFIN wk2422"
+converged = false            # true → engine may stop logging
+```
+
+On a better estimate the engine **slews** the pinned position `r_old → r_new`.
+That move shifts the clock reference by up to `G·|Δr|/c` — a NAV2→cm upgrade is
+~10 m → a **~20–30 ns** step. Applied raw the PPS OUT would jump, so the slew
+is **rate-limited to the excursion budget** (spread over minutes–hours at ≤ a
+few ps/s), reusing the existing **glide-slope** machinery
+([phc-bootstrap.md](phc-bootstrap.md)). The DO glides to the corrected
+reference; it never steps. Then σ_r → σ_t → clockClass update.
+
+## Lifecycle
+
+```
+ACQUIRING  pos = NAV2,  σ_r ≈ 10 m,  σ_t ≈ tens-of-ns,  raw-log ON
+   │  strictly-better estimate on disk
+   ▼
+REFINING   slew to each better tier,  σ_r ↓,  σ_t ↓,  clockClass ↑,  raw-log ON
+   │  survey converged = true  (final multi-day mean stable)
+   ▼
+SURVEYED   pin final APC,  σ_t at floor,  raw-log OFF     ── steady state
+   │  NAV2 watchdog: gross move (> 10 m)
+   └────────────────────────────────────► ACQUIRING
+```
+
+`peppar-survey` typically runs for the **first ~month** at a new APC —
+averaging rapid, then final, products into the authoritative sub-cm mean (the
+OPUS multi-day pattern). When the final mean stops moving within its σ it flags
+`converged = true`; the engine stops logging raw obs and holds the pin. The
+`_check_nav2` watchdog (10 m gross-move detector) stays armed and re-triggers
+the cycle on a real antenna move — matching NAV2's honest resolution (tighter
+than 10 m is false-positive territory given its 1.5–4 m bias).
 
 ## What's unchanged
 
-- PHC bootstrap / DO characterization / servo loop
-- Clock state machine (`DOFreqEst`)
-- Servo glide-slope, dead-zone, gain scheduling
-- Watchdog actor (NAV2-driven slew/step at 10 m)
-- TICC / EXTTS / qErr correlation
-- RINEX writer (PR #42 fixes still in effect)
-- Wrapper-respawn on exit 5
+PHC bootstrap / DO characterization / servo loop; `DOFreqEst` clock state
+machine; servo glide-slope, dead-zone, gain scheduling; TICC / EXTTS / qErr
+correlation; RINEX writer; wrapper-respawn on exit 5.
 
-## Recommendation
+## Validation
 
-**For time-mission deployments where peppar-survey provides the ARP
-seed, `--no-antposest` is the recommended operational mode.**  Lab
-validation 2026-05-20 (PiFace canary, 1 h post-restart) measured:
+Lab-validated 2026-05-20 (PiFace canary, 1 h post-restart) that disabling the
+position filter leaves the clock output unaffected — the empirical basis for
+the whole split:
 
-| τ | Canary (`--no-antposest`) | Baseline (default) | Ratio |
+| τ | Time-only (`--no-antposest`) | Default (AntPosEst) | Ratio |
 |---|---|---|---|
 | 1 s | 0.55 ns | 0.47 ns | 1.17× |
 | 10 s | 1.97 ns | 1.83 ns | 1.08× |
-| 100 s | 2.79 ns | 1.56 ns | 1.79× (high variance; few independent samples) |
+| 100 s | 2.79 ns | 1.56 ns | 1.79× (few independent samples) |
 | 1000 s | **0.73 ns** | **0.72 ns** | **1.01× (1 ps match)** |
 
-Same host, same hardware, same `arp_label = ufo1` survey seed —
-only the engine mode changed.  At τ = 1000 s (the most dispositive
-measurement), canary and baseline match within 1 ps.  At τ ≤ 10 s
-the difference is within measurement noise of the comparison.  The
-clock side is empirically unaffected by the position filter being
-disabled — exactly as the architecture predicts (FixedPosFilter
-runs at the pinned ARP independently of AntPosEst output).
+Same host/hardware/seed; only the engine mode changed. At τ = 1000 s (most
+dispositive) the two match within 1 ps — the clock side is empirically
+independent of the position filter, exactly as the architecture predicts.
 
-Switching to `--no-antposest` is the right choice when:
-- The host has a fresh `.survey.toml` or trustworthy `arp_label`
-- The deployment goal is **time output**, not real-time position
-- The operator can tolerate the 10 m NAV2 watchdog threshold for
-  gross-move detection (sub-meter wobble won't trigger)
+`tests/test_no_antposest.py` covers flag parse/defaults, the forced
+`pin_position` / `position_blend_source=none`, and `--help` advertising.
 
-## Validation plan
-
-The unit tests in `tests/test_no_antposest.py` cover:
-
-1. Flag parses and defaults to False
-2. When set, derived defaults force `pin_position = True` and
-   `position_blend_source = 'none'`
-3. Pre-bootstrap gate refuses to proceed without a seed
-4. Engine `--help` advertises the flag (catches accidental rename /
-   removal)
-
-Lab validation completed 2026-05-20:
-
-- PiFace canary on `--no-antposest` for 1 h.  No `AntPosEst*`
-  messages in log; `FixedPosFilter` emits `[FIXEDPOS_ZTD]` /
-  `[FIXEDPOS_RESID]` normally.  TICC chA TDEV per the table above.
-- Pre-bootstrap gate verified by removing the seed and observing
-  the engine exit 1 with the expected error message.
-- All 4 lab hosts (TimeHat / MadHat / PiFace / clkPoC3) switched
-  to `--no-antposest` 2026-05-20 ~12:55 CDT for broader coverage.
-
-Still owed:
-- Synthetic ARP move (move seed in `.survey.toml` by 15 m, restart):
-  confirm `WatchdogActor` trips on NAV2 disagreement.
-
-## Open follow-ons
-
-- `WatchdogActor`'s slew/step paths consult `ape_thread` for the
-  refined ARP target.  In time-only mode, slew/step is effectively
-  disabled (only step at 10 m via NAV2 disagreement remains).  This
-  is documented behavior, not a bug — but if a future deployment
-  wants sub-meter ARP-move tracking without AntPosEst, a separate
-  pathway would need to be designed.
-- `peppar-mon` may need a tweak to handle missing AntPosEst data
-  cleanly.  Today it logs a zombie-SV warning when `n=` is missing;
-  in time-only mode no `[AntPosEst N]` lines are emitted so that
-  warning may fire spuriously.  TBD whether this needs adjustment or
-  if peppar-mon's existing graceful handling already covers it.
+**Still owed** (target-architecture work, in build-priority order):
+1. NAV2 bootstrap + honest σ_r (replace refuse-on-no-seed).
+2. σ_t = G·σ_r/c confidence term → PTP clockAccuracy output.
+3. Poll `.survey.toml` + rate-limited glide-slope slew on a better estimate.
+4. `converged` handshake → stop raw-logging.
+5. Synthetic ARP move (shift seed 15 m, restart) → confirm the watchdog trips.
 
 ## Related
 
-- Dayplan: `timeOnlyArchitecture-main`
-- Bias hunt that motivated this: `docs/position-bias-hunt-2026-05-20.md`
-- WL-only foundation (parallel architectural simplification on the AR
-  side): `docs/wl-only-foundation.md`
-- The companion `surveyRtklibBackend-main` extends `peppar-survey`
-  with a CORS / RTK backend, broadening the seed-source menu.
+- [arp-survey-strategy.md](arp-survey-strategy.md) — the position half: how
+  `peppar-survey --auto` produces the progressively-refined estimates this
+  engine consumes.
+- [ptp4l-supervision.md](ptp4l-supervision.md) — how σ_t maps to advertised
+  clock class/accuracy.
+- [phc-bootstrap.md](phc-bootstrap.md) — the glide-slope the position slew
+  reuses.
