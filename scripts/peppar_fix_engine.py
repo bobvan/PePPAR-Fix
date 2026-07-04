@@ -1469,16 +1469,23 @@ def wait_for_nav2_seed(nav2_store, stop_event, timeout_s=60.0,
     return None
 
 
-def _apply_position_seed(seed, source_label, args, ape_sm):
+def _apply_position_seed(seed, source_label, args, ape_sm, sigma_floor_m=None):
     """Common handling for a NAV2 / NAV-PVT position seed.
 
-    Returns (known_ecef, pos_sigma_m, pos_source).  Applies the optional
-    --nav2-seed-sigma-floor-m honest-σ floor and transitions AntPosEst
-    to VERIFYING.  Shared by the NAV2 and NAV-PVT seed paths so they
-    stay in lockstep.
+    Returns (known_ecef, pos_sigma_m, pos_source).  Applies an honest-σ
+    floor and transitions AntPosEst to VERIFYING.  Shared by the NAV2 and
+    NAV-PVT seed paths so they stay in lockstep.
+
+    sigma_floor_m: explicit honest-σ floor (m).  When None, uses
+    --nav2-seed-sigma-floor-m (default 0 → σ = raw hAcc).  The
+    --no-antposest NAV2 bootstrap passes an explicit floor (~10 m) so σ_r
+    absorbs NAV2's 1.5-4 m *systematic* bias regardless of the
+    precision-only reported hAcc — the advertised σ_t must be honest, not
+    over-confident (I-071400 E1).
     """
     ecef, h_acc, n_sv = seed
-    floor = getattr(args, 'nav2_seed_sigma_floor_m', 0.0)
+    floor = (float(sigma_floor_m) if sigma_floor_m is not None
+             else getattr(args, 'nav2_seed_sigma_floor_m', 0.0))
     if floor and h_acc < floor:
         log.info("%s seed σ inflated: hAcc=%.2fm < floor=%.2fm",
                  source_label, h_acc, floor)
@@ -1490,6 +1497,39 @@ def _apply_position_seed(seed, source_label, args, ape_sm):
     ape_sm.transition(AntPosEstState.VERIFYING,
                       f"{source_label} seed @ σ={sigma:.2f}m")
     return ecef, sigma, source
+
+
+def _nav2_bootstrap_seed(args, nav2_store, nav_pvt_store, stop_event, ape_sm):
+    """`--no-antposest` NAV2 single-point bootstrap (I-071400 E1).
+
+    The time-only architecture never blocks on a survey: when no trusted
+    seed exists, start from the NAV2 (or NAV-PVT) single-point fix with an
+    HONEST σ_r (floored via --nav2-bootstrap-sigma-floor-m to absorb NAV2's
+    1.5-4 m receiver bias) so the engine produces coarse-but-honest time
+    from second one — σ_t ≈ σ_r/c ≈ tens of ns absolute, short-term
+    stability unaffected — and tightens when a survey lands.
+
+    Uses a *relaxed* hAcc bar (--nav2-bootstrap-hacc-max-m): the strict
+    cold-start seed chain already tried --seed-hacc-max-m, so a fresh
+    opinion is typically already in the store; a short poll picks it up
+    (no second long cold-start wait).
+
+    Returns (ecef, sigma_m, source) or (None, None, None) when neither
+    store yields a fix (e.g. non-timing firmware that NAKs CFG-NAV2).
+    """
+    bs_hacc = float(getattr(args, 'nav2_bootstrap_hacc_max_m', 30.0))
+    bs_floor = float(getattr(args, 'nav2_bootstrap_sigma_floor_m', 10.0))
+    for store, timeout_s, label in (
+            (nav2_store, 10.0, "NAV2-bootstrap"),
+            (nav_pvt_store, 5.0, "NAV-PVT-bootstrap")):
+        if store is None:
+            continue
+        seed = wait_for_nav2_seed(store, stop_event, timeout_s=timeout_s,
+                                  hacc_max_m=bs_hacc, source_label=label)
+        if seed is not None:
+            return _apply_position_seed(seed, label, args, ape_sm,
+                                        sigma_floor_m=bs_floor)
+    return None, None, None
 
 
 def _build_ppp_filter(args):
@@ -10660,6 +10700,27 @@ def run(args):
         if seed is not None:
             known_ecef, pos_sigma_m, pos_source = _apply_position_seed(
                 seed, "NAV-PVT", args, ape_sm)
+    # 3c. NAV2 single-point bootstrap for --no-antposest (I-071400 E1).
+    #     Rather than refuse when no survey-class seed exists, start from a
+    #     coarse NAV2 fix with an honest σ_r (see _nav2_bootstrap_seed).
+    #     Opt-in via --nav2-bootstrap; without it the no-seed case still
+    #     refuses (the gate below).  This is the target-default behavior,
+    #     landed gated for validation first.
+    if (known_ecef is None
+            and getattr(args, 'no_antposest', False)
+            and getattr(args, 'nav2_bootstrap', False)):
+        known_ecef, pos_sigma_m, pos_source = _nav2_bootstrap_seed(
+            args, nav2_store, nav_pvt_store, stop_event, ape_sm)
+        if known_ecef is not None:
+            from peppar_fix.confidence import SIGMA_POS_NS_PER_M
+            log.warning(
+                "[NAV2_BOOTSTRAP] --no-antposest with no survey seed — "
+                "bootstrapping from %s.  Time is COARSE-but-honest: "
+                "σ_r=%.1fm → σ_t≈%.0fns absolute; short-term stability is "
+                "unaffected.  Advertised clock accuracy tightens when a "
+                "survey lands.", pos_source, pos_sigma_m,
+                pos_sigma_m * SIGMA_POS_NS_PER_M)
+
     if known_ecef is not None:
         # --seed-pos-offset: apply (E,N,U) displacement in meters to
         # whatever known_ecef was loaded.  Used for seed-error
@@ -10709,8 +10770,12 @@ def run(args):
                 log.error(
                     "--no-antposest requires a seed but none was found.  "
                     "Provide --known-pos, set arp_label in the host config "
-                    "with a matching timelab/antennas.json entry, or run "
-                    "peppar-survey to produce state/positions/<uid>.survey.toml.")
+                    "with a matching timelab/antennas.json entry, run "
+                    "peppar-survey to produce state/positions/<uid>.survey.toml, "
+                    "or pass --nav2-bootstrap to start from a coarse NAV2 fix "
+                    "with honest σ_t%s.",
+                    " (NAV2 unavailable — no fix)"
+                    if getattr(args, 'nav2_bootstrap', False) else "")
                 return 1
             # Phase 1: Bootstrap
             result = run_bootstrap(args, obs_queue, corrections, stop_event,
@@ -11372,6 +11437,31 @@ Two-phase operation:
                           "initial covariance is honest — and refines "
                           "from there, instead of stalling the seed "
                           "cascade and dropping to LS-init.")
+    pos.add_argument("--nav2-bootstrap",
+                     action="store_true", default=False,
+                     help="Under --no-antposest, bootstrap from the NAV2 "
+                          "single-point fix instead of refusing when no "
+                          "survey-class seed exists.  The time-only "
+                          "architecture never blocks on a survey: the engine "
+                          "starts from a coarse NAV2 position with an HONEST "
+                          "σ_r (floored via --nav2-bootstrap-sigma-floor-m to "
+                          "absorb NAV2's 1.5-4 m bias) and produces coarse-but-"
+                          "honest time — σ_t≈σ_r/c≈tens of ns absolute, "
+                          "short-term stability unaffected — that tightens "
+                          "when a survey lands.  No effect without "
+                          "--no-antposest (docs/time-only-architecture.md).")
+    pos.add_argument("--nav2-bootstrap-hacc-max-m", type=float, default=30.0,
+                     help="Relaxed NAV2 hAcc bar (m) for the --nav2-bootstrap "
+                          "seed (default 30).  Looser than --seed-hacc-max-m "
+                          "(the strict cold-start gate) because a bootstrap "
+                          "position only needs to be coarse — its error is "
+                          "advertised honestly via σ_t, not hidden.")
+    pos.add_argument("--nav2-bootstrap-sigma-floor-m", type=float, default=10.0,
+                     help="Honest σ_r floor (m) for the --nav2-bootstrap seed "
+                          "(default 10).  NAV2 hAcc is precision-only; the "
+                          "1.5-4 m systematic receiver bias means the true "
+                          "position uncertainty is ~10 m, so σ_r is floored to "
+                          "this and the advertised σ_t stays honest.")
     pos.add_argument("--no-nav2-soft-anchor",
                      dest="nav2_soft_anchor",
                      action="store_false", default=True,
