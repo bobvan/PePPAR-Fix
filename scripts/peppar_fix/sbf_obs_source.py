@@ -1,0 +1,111 @@
+"""Engine obs-source seam for Septentrio SBF (I-030423 — geodetic bridge).
+
+Turns a stream of SBF blocks (from a Septentrio receiver's IP-server TCP port,
+e.g. the mosaic-T) into the engine's ``(gps_time, observations)`` obs_queue
+items — the same contract ``serial_reader`` fills from UBX-RXM-RAWX and
+``msm_obs_source`` fills from RTCM MSM.  So the engine can position/discipline
+from a Septentrio receiver's raw obs with NO change to the PPP/ZTD/AR/clock
+pipeline.
+
+SBF is simpler than RTCM MSM here: each **MeasEpoch** block is one complete
+epoch and carries **WNc (week) + TOW** directly, so there is no multi-message
+epoch assembly and no wall-clock week derivation — ``sbf_gps_time`` maps
+WNc+TOW straight to a GPS-time datetime.
+
+Uses ``pysbf2`` for framing; the obs decode lives in ``sbf_obs``.  GPS/GAL/BDS
+(CDMA); GLONASS FDMA is a follow-on.  Broadcast ephemeris is fed by the
+separate ``--eph-mount`` NTRIP thread (as with the MSM path).
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta, timezone
+
+from peppar_fix.rtcm_msm_obs import default_sig_lookup
+from peppar_fix.sbf_obs import meas_epoch_to_raw_obs
+
+log = logging.getLogger("peppar-fix.sbf_source")
+
+_GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
+_WEEK_S = 604800.0
+
+
+def sbf_gps_time(tow_ms, wnc):
+    """SBF MeasEpoch TOW (ms) + WNc (full GPS week) → GPS-time datetime.
+    SBF carries the week, so unlike the MSM path this needs no wall clock."""
+    return _GPS_EPOCH + timedelta(seconds=int(wnc) * _WEEK_S + int(tow_ms) / 1000.0)
+
+
+def sbf_obs_reader(messages, obs_queue, stop_event, sig_lookup, *,
+                   systems=None, ssr=None, now_fn=None, mono_fn=None):
+    """Reader loop: consume pysbf2-parsed SBF ``messages`` (an iterator, e.g.
+    ``SBFReader`` over a socket), decode each MeasEpoch into IF observations via
+    the SHARED former, and push ``ObservationEvent``\\ s onto ``obs_queue`` —
+    the serial_reader contract.  Returns the count of epochs queued; stops when
+    ``stop_event`` is set or the stream ends.  ``now_fn``/``mono_fn`` are
+    injectable receipt clocks for deterministic tests.
+    """
+    import time as _time
+
+    from peppar_fix.event_time import ObservationEvent
+    from realtime_ppp import raw_obs_to_if_observations
+    now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+    mono_fn = mono_fn or _time.monotonic
+    n_epochs = 0
+    for _raw, parsed in messages:
+        if stop_event is not None and stop_event.is_set():
+            break
+        if parsed is None or getattr(parsed, "identity", "") != "MeasEpoch":
+            continue
+        raw_obs = meas_epoch_to_raw_obs(parsed, sig_lookup)
+        obs, _r, _no, _ns = raw_obs_to_if_observations(raw_obs, systems, ssr)
+        if obs:
+            obs_queue.put(ObservationEvent(
+                gps_time=sbf_gps_time(parsed.TOW, parsed.WNc),
+                observations=obs,
+                recv_mono=mono_fn(),
+                recv_utc=now_fn()))
+            n_epochs += 1
+    return n_epochs
+
+
+def _parse_hostport(spec, default_port=28784):
+    host, _sep, port = str(spec).partition(":")
+    return host, int(port) if port else default_port
+
+
+def run_sbf_tcp_source(args, obs_queue, stop_event, *, ssr=None,
+                       systems=None, sig_lookup=None):
+    """Engine obs-source thread target: read SBF from a receiver's IP-server TCP
+    port (``args.obs_sbf_tcp`` as ``host:port``) and fill ``obs_queue`` with
+    ObservationEvents — in place of ``serial_reader``.  Broadcast ephemeris is
+    fed by the separate ``--eph-mount`` thread.  Blocks until ``stop_event`` or
+    the stream ends.
+    """
+    import socket
+
+    from pysbf2 import SBFReader
+    host, port = _parse_hostport(args.obs_sbf_tcp)
+    if systems is None:
+        systems = (set(args.systems.split(",")) if getattr(args, "systems", None)
+                   else {"gps"})
+    if sig_lookup is None:
+        sig_lookup = default_sig_lookup(systems,
+                                        gps_l2=getattr(args, "msm_l2_sig", "GPS-L2W"))
+    sock = None
+    try:
+        sock = socket.create_connection((host, port), timeout=15)
+        stream = sock.makefile("rb")
+        log.info("SBF obs source: %s:%d", host, port)
+        n = sbf_obs_reader(SBFReader(stream, quitonerror=0),
+                           obs_queue, stop_event, sig_lookup,
+                           systems=systems, ssr=ssr)
+        log.info("SBF obs source ended (%d epochs queued)", n)
+    except Exception as e:                    # noqa: BLE001 - thread must log, not crash
+        log.error("SBF obs source failed: %s", e)
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:                 # noqa: BLE001
+                pass

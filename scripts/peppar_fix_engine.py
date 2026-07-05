@@ -1577,6 +1577,26 @@ def _build_ppp_filter(args):
     return PPPFilter(**kwargs)
 
 
+# ── External (non-serial) obs sources ──────────────────────────────────── #
+
+def _is_msm_source(args):
+    """True when the engine ingests RTCM MSM obs from an NTRIP mount."""
+    return bool(getattr(args, 'obs_ntrip_mount', None))
+
+
+def _is_sbf_source(args):
+    """True when the engine ingests Septentrio SBF obs from a TCP endpoint."""
+    return bool(getattr(args, 'obs_sbf_tcp', None))
+
+
+def _has_ext_obs_source(args):
+    """True when obs come from an external source (RTCM MSM or SBF) rather than
+    a serial UBX receiver.  Such sources never feed NAV2, so the NAV2 seed
+    waits (both here and in ``run``) must be skipped for all of them — see
+    #283 (MSM) and delta's #288 review (the SBF miss this helper prevents)."""
+    return _is_msm_source(args) or _is_sbf_source(args)
+
+
 # ── Phase 1: Bootstrap ─────────────────────────────────────────────────── #
 
 def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
@@ -1728,12 +1748,13 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
                     # LS-init.  Per Bob's directive 2026-04-30 +
                     # cold_boot_smoke run-1 finding (LS-init Phase-1
                     # converged at horiz-good + 2 km altitude error).
-                    # An RTCM MSM obs source (CORS/geodetic) never feeds NAV2,
-                    # so waiting for it is a pure dead-wait — go straight to
-                    # LS-init (validated on MadHat/ALIC: cold LS-init Phase-1
-                    # converged 2.66 m).  I-030423 fast-follow (bravo #281).
+                    # An external obs source (RTCM MSM CORS/geodetic, or
+                    # Septentrio SBF) never feeds NAV2, so waiting for it is a
+                    # pure dead-wait — go straight to LS-init (validated on
+                    # MadHat/ALIC: cold LS-init Phase-1 converged 2.66 m).
+                    # I-030423 fast-follow (bravo #281; SBF added per delta #288).
                     timeout_s = (
-                        0.0 if getattr(args, 'obs_ntrip_mount', None)
+                        0.0 if _has_ext_obs_source(args)
                         else float(getattr(args, 'nav2_seed_timeout_s', 30.0)))
                     if timeout_s > 0:
                         if nav2_wait_started is None:
@@ -10400,10 +10421,15 @@ def run(args):
     stop_event = threading.Event()
     gate_stats = None
     exit_code = 0
-    # RTCM MSM obs source (I-030423): observations come from an NTRIP MSM mount
-    # instead of a serial UBX receiver.  Skips serial-device detection + the
-    # UBX diagnostic-message config, and swaps serial_reader for the MSM reader.
-    _msm_source = bool(getattr(args, 'obs_ntrip_mount', None))
+    # External obs sources (I-030423): observations come from an NTRIP RTCM MSM
+    # mount (--obs-ntrip-mount) or a Septentrio SBF TCP stream (--obs-sbf-tcp)
+    # instead of a serial UBX receiver.  Either skips serial-device detection +
+    # the UBX diagnostic-message config and the NAV2/NAV-PVT seed waits (a
+    # CORS/geodetic source never feeds them), and swaps serial_reader for the
+    # matching reader.
+    _msm_source = _is_msm_source(args)
+    _sbf_source = _is_sbf_source(args)
+    _ext_obs_source = _has_ext_obs_source(args)
     # Verify receiver config on open (defensive: re-applies if needed).
     # This opens/closes the serial port to check for dual-freq observations,
     # reconfigures if single-freq, then releases the port for serial_reader.
@@ -10430,12 +10456,12 @@ def run(args):
     # If --receiver was explicitly set, force that driver (skip auto-detect).
     # args.receiver is None when unset (default applied later in main()).
     forced = get_driver(args.receiver) if args.receiver is not None else None
-    if _msm_source:
+    if _ext_obs_source:
         # No serial receiver to detect — pick a driver for its default signal
-        # config only; the MSM adapter builds its own sig_lookup.
+        # config only; the MSM/SBF adapter builds its own sig_lookup.
         driver, receiver_identity = get_driver(args.receiver), None
-        log.info("MSM obs source (%s) — skipping serial receiver detection",
-                 args.obs_ntrip_mount)
+        log.info("External obs source (%s) — skipping serial receiver detection",
+                 args.obs_ntrip_mount or args.obs_sbf_tcp)
     else:
         driver, receiver_identity = ensure_receiver_ready(
             args.serial, args.baud, port_type=port_type,
@@ -10703,8 +10729,8 @@ def run(args):
     # the existing pattern.  Receiver-side enabling is also handled
     # by configure_messages(), but that only runs on first-time
     # config; this burst guarantees enablement on every restart.
-    if _msm_source:
-        log.debug("MSM obs source — skipping the NAV2/UBX diagnostic config burst")
+    if _ext_obs_source:
+        log.debug("External obs source — skipping the NAV2/UBX diagnostic config burst")
     else:
         try:
             from peppar_fix.receiver import send_cfg
@@ -10819,6 +10845,25 @@ def run(args):
         t_serial.start()
         log.info(f"MSM obs source: {args.ntrip_caster}:{args.ntrip_port}/"
                  f"{args.obs_ntrip_mount} (L1CA+{args.msm_l2_sig})")
+    elif _sbf_source:
+        # Septentrio SBF obs source: fill obs_queue from a receiver's IP-server
+        # TCP stream instead of a serial UBX receiver.  beph/ssr come from the
+        # start_ntrip_threads eph/ssr threads (pair with --eph-mount).
+        if not args.eph_mount:
+            log.warning(
+                "--obs-sbf-tcp without --eph-mount: broadcast ephemeris must "
+                "come from somewhere or position/clock cannot solve.  Pair "
+                "with --eph-mount (e.g. BCEP00BKG0).")
+        from peppar_fix.sbf_obs_source import run_sbf_tcp_source
+        t_serial = threading.Thread(
+            target=run_sbf_tcp_source,
+            args=(args, obs_queue, stop_event),
+            kwargs={'ssr': ssr, 'systems': systems},
+            daemon=True,
+        )
+        t_serial.start()
+        log.info(f"SBF obs source: {args.obs_sbf_tcp} "
+                 f"(systems={args.systems})")
     else:
         t_serial = threading.Thread(
             target=serial_reader,
@@ -10971,7 +11016,7 @@ def run(args):
     # An RTCM MSM obs source (CORS/geodetic) has no u-blox NAV2/NAV-PVT plane,
     # so these seed stores are never fed — skip their waits and let Phase-1
     # LS-init bootstrap directly from the MSM obs (I-030423 fast-follow).
-    if known_ecef is None and nav2_store is not None and not _msm_source:
+    if known_ecef is None and nav2_store is not None and not _ext_obs_source:
         seed = wait_for_nav2_seed(nav2_store, stop_event,
                                   timeout_s=60.0, hacc_max_m=_seed_hacc_max,
                                   source_label="NAV2")
@@ -10982,7 +11027,7 @@ def run(args):
     #     and fix-quality, so it seeds receivers that have no NAV2
     #     (non-timing u-blox firmware) or whose NAV2 isn't emitting.
     #     Shorter timeout: NAV-PVT is available within seconds if at all.
-    if known_ecef is None and nav_pvt_store is not None and not _msm_source:
+    if known_ecef is None and nav_pvt_store is not None and not _ext_obs_source:
         seed = wait_for_nav2_seed(nav_pvt_store, stop_event,
                                   timeout_s=20.0, hacc_max_m=_seed_hacc_max,
                                   source_label="NAV-PVT")
@@ -10998,7 +11043,7 @@ def run(args):
     if (known_ecef is None
             and getattr(args, 'no_antposest', False)
             and getattr(args, 'nav2_bootstrap', False)
-            and not _msm_source):
+            and not _ext_obs_source):
         # An MSM/CORS source never feeds NAV2/NAV-PVT, so --nav2-bootstrap can
         # only dead-wait ~15s then return None (with no LS-init fallback on this
         # --no-antposest path — the RECOMMENDED mode).  Skip it and fall through
@@ -12271,6 +12316,14 @@ Two-phase operation:
                        help="Which L2/L5 signal to pair with L1 C/A for the "
                             "iono-free combination on the MSM obs stream "
                             "(default GPS-L2W = geodetic/CORS L2 Z-tracking).")
+    ntrip.add_argument("--obs-sbf-tcp", default=None, metavar="HOST:PORT",
+                       help="Septentrio SBF observation source: a receiver's "
+                            "IP-server TCP endpoint (e.g. a mosaic-T at "
+                            "10.101.101.153:28784).  When set, the engine "
+                            "ingests SBF MeasEpoch observations from this TCP "
+                            "stream IN PLACE OF a serial UBX receiver — no "
+                            "--serial device is opened.  Pair with --eph-mount "
+                            "for broadcast ephemeris (I-030423).  GPS/GAL/BDS.")
     ntrip.add_argument("--ssr-mount", help="SSR corrections mountpoint")
     ntrip.add_argument("--ssr-records-file", default=None,
                        help="Ingest SSR corrections from an external records "
