@@ -218,5 +218,52 @@ class TestClockClassPromoter(unittest.TestCase):
         self.assertEqual(p.current_class, "freerun")
 
 
+class TestReConfidenceOnRefinement(unittest.TestCase):
+    """Advertised clockAccuracy is driven by the LIVE σ_r, so it TIGHTENS as a
+    survey refines (I-071400; origin: charlie's #272 review nit #2 — the live
+    _survey_sigma_r was feeding only the lifecycle, not the advertised σ_t).
+
+    The regression this guards: feeding the STATIC bootstrap σ (the pre-fix
+    behavior) would leave the advertisement stuck at the coarse value forever —
+    E2's "tightens as the survey refines" would silently never happen.
+    """
+
+    def _accuracy_for_sigma_r(self, sigma_r_m, dt_rx_sigma_ns=5.0):
+        """The engine chain σ_r → σ_t → σ_total → clockAccuracy enum, with a
+        locked-servo freq leg."""
+        from peppar_fix.pmc import clock_accuracy_for_sigma_ns
+        phase = compute_phase_confidence(seed_sigma_m=sigma_r_m)
+        freq = compute_frequency_confidence(dt_rx_sigma_ns=dt_rx_sigma_ns,
+                                            scheduler_settled=True)
+        total = compute_total_confidence(phase, freq)
+        return clock_accuracy_for_sigma_ns(total.sigma_ns)
+
+    def test_clockaccuracy_tightens_100ns_to_25ns_on_refine(self):
+        from peppar_fix.pmc import ACCURACY_25NS, ACCURACY_100NS
+        # NAV2-bootstrap σ_r ≈ 10 m → σ_t ≈ 33 ns → 100 ns bucket
+        self.assertEqual(self._accuracy_for_sigma_r(10.0), ACCURACY_100NS)
+        # after gliding to a cm survey pin → σ_t ≈ 0.03 ns → freq-limited
+        # (5 ns) → 25 ns bucket.  This is the tightening the fix delivers.
+        self.assertEqual(self._accuracy_for_sigma_r(0.01), ACCURACY_25NS)
+
+    def test_static_sigma_r_stays_coarse(self):
+        """If the SAME (bootstrap) σ_r is fed both times — the pre-fix
+        static-seed behavior — the advertisement never tightens (100 ns both).
+        The fix feeds the live σ_r instead, so a refine drops it to 25 ns."""
+        from peppar_fix.pmc import ACCURACY_100NS
+        self.assertEqual(self._accuracy_for_sigma_r(10.0), ACCURACY_100NS)
+        self.assertEqual(self._accuracy_for_sigma_r(10.0), ACCURACY_100NS)
+
+    def test_phase_sigma_scales_with_seed_sigma(self):
+        # The load-bearing link: phase σ_t is σ_r · SIGMA_POS_NS_PER_M, so a
+        # tighter live σ_r directly tightens the advertised confidence.
+        self.assertAlmostEqual(
+            compute_phase_confidence(seed_sigma_m=10.0).sigma_ns,
+            10.0 * SIGMA_POS_NS_PER_M)
+        self.assertAlmostEqual(
+            compute_phase_confidence(seed_sigma_m=0.01).sigma_ns,
+            0.01 * SIGMA_POS_NS_PER_M)
+
+
 if __name__ == "__main__":
     unittest.main()
