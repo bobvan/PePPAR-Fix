@@ -94,8 +94,13 @@ mount `ALIC00AUS0` = Alice Springs IGS, the account already has obs access):
 gave the station ARP (−4052052.74, 4212835.99, −2545104.59) m** = ALIC's
 published IGS position. Each AUSCORS mount carries **1074/1077 (GPS MSM) +
 1006 (ARP) + 1019 (GPS eph)** on one stream — obs, truth, and ephemeris
-together, so the LS-solve-and-compare needs no extra source. Remaining spike
-increment: wire 1019 eph → `ls_init` → residual vs the 1006 ARP.
+together, so the LS-solve-and-compare needs no extra source.
+
+**Full loop closed 2026-07-05** — the spike decodes MSM (MSM4/5 *and* MSM7
+extended fields), ingests 1019 eph, forms iono-free pseudoranges, and runs
+`ls_init`. Against ALIC (5 dual-freq GPS SVs): LS fix landed **3.04 m** from
+ALIC's published IGS ARP (E +0.19, N +1.06, U +2.84 m) — textbook code-only
+single-point accuracy, confirming the MSM ingest + obs assembly are correct.
 
 ## Build order
 
