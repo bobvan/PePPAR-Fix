@@ -99,12 +99,16 @@ the F9T PPS":
   per second, quantized to ~8 ns (125 MHz divider), plus sawtooth.
   Averaging it recovers long-τ GPS stability but is **floored by that ~ns
   measurement noise** at the handoff, and forces a slow loop.
-- peppar-fix instead servos on **carrier phase (TD-CP), ~5–10 ps per
-  epoch** — the *same* receiver clock, seen through a window ~100–300×
-  cleaner. Removing the PPS quantization floor lets the crossover move
-  far inward, so GPS stability is transferred faithfully down into
-  **mid-τ (seconds to hundreds of seconds)** — exactly the band a PPS loop
-  can't reach, and exactly where the two-clock excursion budget lives.
+- peppar-fix instead servos on the receiver's **carrier phase** — the
+  *same* receiver clock, through a window ~100–300× cleaner than the PPS.
+  The headline **~5–10 ps/epoch** figure is *time-differenced* carrier
+  phase (TD-CP), which is a clean **frequency** observable; the absolute
+  clock *phase* (`dt_rx` from PPP) is noisier per epoch because it's
+  correlated with position/ZTD/ambiguities. Either way, removing the PPS
+  quantization floor lets the crossover move far inward, so GPS stability
+  is transferred faithfully down into **mid-τ (seconds to hundreds of
+  seconds)** — exactly the band a PPS loop can't reach, and where the
+  two-clock excursion budget lives.
 
 So the "cleaner receiver → better GPSDO" intuition is right *if* you read
 "cleaner" as "use the receiver's carrier phase instead of its PPS." That
@@ -127,6 +131,13 @@ Some geodetic/timing receivers accept an **external frequency reference**
 Bob has a **Trimble NetRS** on order; the NetR9, Septentrio PolaRx, Javad,
 and some NovAtel boards do the same.
 
+**⚠ Load-bearing assumption to verify: the NetRS external 10 MHz input.**
+An external frequency input is a definite NetR5/NetR9 feature, but is
+*unconfirmed* on the 2003-era NetRS — check the rear panel for a `REF IN` /
+10 MHz connector before relying on it. This is the single most load-bearing
+assumption in this section: without it the NetRS is just an L1/L2 receiver,
+not an external-clock PoC at all (the entire §3f-step-1 path rests on it).
+
 ### 3a. What it changes — eliminating the rx TCXO
 
 Feed the **DO's own 10 MHz** into the receiver and something fundamental
@@ -143,7 +154,7 @@ This collapses peppar-fix's two-oscillator problem into one:
 | | rx on its own TCXO (today) | rx clocked by the DO |
 |---|---|---|
 | Servo observable | `(DO − rx_TCXO)` via TICC/EXTINT **plus** `(rx_TCXO − GPS)` via PPP dt_rx — combine, both carry rx TCXO noise | `(DO − GPS)` **directly** via PPP dt_rx (= dt of the DO) |
-| Noise floor at short τ | rx TCXO (contributor #2) | GNSS measurement noise only (thermal/atmo/multipath) |
+| Noise floor at short τ | rx TCXO (contributor #2) | GNSS measurement noise — thermal/atmo/multipath **and corrections/SSR** (§1b #1 & #3), which also survive clocking-by-DO |
 | Extra hardware | TICC + a DO-PPS↔rx-PPS comparison to remove rx clock | none — the receiver *is* the GPS-vs-DO phase meter |
 
 The receiver becomes a transparent **"GPS-minus-DO phase comparator."**
@@ -204,9 +215,12 @@ where the DO is the limiter. Typical ceilings (verify per unit/firmware):
 The catch with the **NetRS**: it is **GPS L1/L2 only** — no GLONASS, no
 Galileo, no BeiDou, **no L5**. That's a poor match for our current stack,
 which is built around F9T **L1 + L5**, **Galileo E1 + E5a**, and BeiDou
-**B1I + B2a-I**, with SSR corrections and PPP-AR keyed to those modern
-signals. On a NetRS you'd be back to dual-frequency GPS-only PPP: fewer
-satellites, weaker geometry, no L5/Galileo AR, no multi-GNSS robustness.
+**B1I + B2a-I**, with SSR corrections and **GPS + Galileo E1/E5a PPP-AR**
+plus BeiDou *tracking* (BeiDou is not AR'd — no SSR AC publishes B2a-I phase
+biases, so BDS is dropped from the default `--systems gps,gal`; see
+`docs/bds-b2a-phase-bias-survey-2026-05-09.md`). On a NetRS you'd be back to
+dual-frequency GPS-only PPP: fewer satellites, weaker geometry, no
+L5/Galileo AR, no multi-GNSS robustness.
 
 The **same L1/L2-era limitation** applies to two other used receivers
 worth naming, since they show up cheap:
@@ -304,7 +318,10 @@ driver from scratch."
 The engine already estimates `dt_rx` from carrier phase. In the
 external-clock architecture, `dt_rx` simply *becomes* the DO's clock bias
 vs GPS — the servo arm we most want, delivered directly by the receiver
-with the rx TCXO removed from the path. The natural experiment:
+with the rx TCXO removed from the path. (Note this is the absolute clock
+*phase*, so it carries `dt_rx`'s per-epoch precision — not the tighter
+TD-CP *frequency* figure from §2; the win is deleting the rx TCXO, not
+changing which observable's noise applies.) The natural experiment:
 
 1. Prove the concept cheaply on the NetRS (GPS L1/L2), OCXO DO feeding its
    external 10 MHz, and measure the short-τ floor of `dt_DO` vs our
