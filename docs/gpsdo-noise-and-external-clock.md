@@ -249,6 +249,14 @@ current-unit specs **and firmware options** before buying used):
   100 Hz, external 10 MHz in. The **PolaRx5TR is a purpose-built time-&-
   frequency-transfer receiver** used in UTC(k) labs — the closest match to
   what we're actually doing. Priciest used, best fit.
+- **Septentrio mosaic-T** — the *module-scale* Septentrio timing engine
+  (same lineage as the PolaRx). Multi-frequency multi-GNSS (GPS L1/L2/L5,
+  Galileo E1/E5a/E5b, BeiDou B1/B2a, GLONASS; verify the exact band set),
+  native **SBF + RTCM 3 MSM** output, USB/UART/**Ethernet**, up to ~100 Hz,
+  and an **external 10 MHz input**. Cheaper and far smaller than a PolaRx5TR
+  while keeping our whole L5/E5a/B2a AR stack — a strong external-clock
+  receiver candidate. **We already have one in the lab** — it's the GNSS
+  engine inside the SparkFun/SparkPNT GNSSDO+ (see §3g).
 - **Trimble NetR9** — multi-GNSS (GPS/GLO/GAL/BDS/QZSS), L1/L2/L5/E5/B2,
   external 10 MHz in, high rate. Widely available used, strong all-rounder.
   **Trimble option-lock caveat:** modern-signal tracking (L5 / E5a / B2a)
@@ -333,6 +341,51 @@ changing which observable's noise applies.) The natural experiment:
 That is the cleanest path we have to the moonshot's "as good as the best
 of (DO floor, rx TCXO floor) at every τ" — because it deletes the rx TCXO
 floor from the problem entirely.
+
+### 3g. The SparkFun/SparkPNT GNSSDO+ as a whole target platform
+
+The GNSSDO+ we already use as the lab reference is *the entire external-clock
+architecture in one commercial box*, and — with two changes — could become a
+self-contained **peppar-fix node**:
+
+- **DO:** a good **Rakon STP3593LF / ROX5242T1N OCXO** (10 MHz,
+  ~1.5×10⁻¹² typ ADEV, −130 dBc/Hz — Rb-grade at short τ; specs +
+  SparkPNT datasheet in `docs/pulsepuppy-ocxo-buying-guide.md`).
+- **Receiver:** a **Septentrio mosaic-T** (§3d), multi-GNSS L5/E5a,
+  RTCM-MSM-capable.
+- **Already external-clocked:** the OCXO feeds the mosaic-T's external
+  reference (`docs/do-characterization-architecture.md` flags this
+  topology — currently treated as an out-of-scope black box), so the
+  receiver's obs are already `(satellite − OCXO)`, rx-TCXO-free.
+- **Steering today:** the shipped **ESP32 firmware** disciplines the OCXO
+  from an error signal the mosaic-T produces — by default a multi-
+  constellation **float PPP** solution, optionally refined by **AtomiChron**
+  (Fugro's subscription *single-AC* correction service, which tightens
+  accuracy but ties the timescale to Fugro's). Our PPS label
+  "GNSSDO+AtomiChron" denotes this hardware running *with* that correction.
+  (The OCXO is quartz, Rb-*class* — distinct from the lab's actual Rb
+  standard, the FE-5680A, which is a separate 10 MHz reference / TICC clock.)
+
+The two changes that make it a peppar-fix target:
+
+1. **Feed the mosaic-T's raw obs (RTCM 3 MSM) into peppar-fix** — the ingest
+   pipeline (`docs/rtcm-msm-obs-ingest.md`) already consumes exactly this.
+2. **Replace/augment the ESP32 firmware so peppar-fix supplies the
+   steering** — instead of the stock closed-loop discipline, the ESP32
+   accepts an external frequency/DAC command from peppar-fix (which computes
+   it from the mosaic-T obs), or peppar-fix drives the OCXO's EFC DAC
+   directly. This also **swaps the correction source**: the stock loop runs
+   Fugro's float-PPP/AtomiChron (their timescale, a subscription); peppar-fix
+   would run its own **PPP-AR** against our SSR streams — ambiguity-resolved,
+   carrier-phase-timing discipline, on our GPS/ITRF timescale, no
+   subscription. That's a real reason to do it, not just re-plumbing.
+
+The result is the moonshot architecture in a cheap off-the-shelf enclosure:
+a multi-GNSS L5 receiver clocked by a good OCXO (rx TCXO deleted), disciplined
+by our servo from carrier-phase obs. **Gating unknowns** (→ dayplan): (a) does
+the enclosure expose the mosaic-T data/config port (Ethernet/UART) and let us
+enable RTCM output; (b) is the ESP32 firmware replaceable/augmentable, and
+what's the OCXO's EFC/steering interface (DAC vs the ESP32's control path).
 
 ---
 
