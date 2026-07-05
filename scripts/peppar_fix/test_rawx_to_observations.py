@@ -146,8 +146,8 @@ class TestGfDiagPersistsAcrossEpochs(unittest.TestCase):
 
     def setUp(self):
         # isolate from any state left by serial_reader / other tests
-        if hasattr(r.rawx_to_observations, "_gf_diag"):
-            del r.rawx_to_observations._gf_diag
+        if hasattr(r.raw_obs_to_if_observations, "_gf_diag"):
+            del r.raw_obs_to_if_observations._gf_diag
 
     def _epoch(self):
         return _rawx([0, 0], [0, 3], [1, 1],
@@ -156,13 +156,13 @@ class TestGfDiagPersistsAcrossEpochs(unittest.TestCase):
 
     def test_state_persists_and_reaches_epoch2(self):
         _run(self._epoch())                 # call 1 → epoch1 recorded
-        diag = r.rawx_to_observations._gf_diag
+        diag = r.raw_obs_to_if_observations._gf_diag
         slot = diag[("gps", "G01")]
         self.assertIsNotNone(slot["epoch1"])
         self.assertIsNone(slot["epoch2"])   # not yet
 
         _run(self._epoch())                 # call 2 → epoch2 reached (persisted)
-        slot = r.rawx_to_observations._gf_diag[("gps", "G01")]
+        slot = r.raw_obs_to_if_observations._gf_diag[("gps", "G01")]
         self.assertIsNotNone(slot["epoch2"])  # would be None if dict reset
 
 

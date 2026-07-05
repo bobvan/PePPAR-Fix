@@ -238,6 +238,7 @@ SIG_TO_RINEX = {
     'GPS-L1CA': ('C1C', 'L1C'),   # Code, Phase
     'GPS-L2CL': ('C2L', 'L2L'),
     'GPS-L2CM': ('C2S', 'L2S'),
+    'GPS-L2W':  ('C2W', 'L2W'),   # L2 Z-tracking (geodetic/CORS, RTCM ingest)
     'GPS-L5Q':  ('C5Q', 'L5Q'),
     'GAL-E1C':  ('C1C', 'L1C'),
     'GAL-E5bQ': ('C7Q', 'L7Q'),

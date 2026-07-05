@@ -158,6 +158,10 @@ SIG_WAVELENGTH = {
     'GPS-L1CA': C / F_L1,
     'GPS-L2CL': C / F_L2,
     'GPS-L2CM': C / F_L2,
+    # L2 Z-tracking (P(Y) codeless).  u-blox never emits this, but it is the
+    # L2 signal geodetic receivers (Leica/Trimble/Septentrio) and most CORS
+    # MSM streams carry — the RTCM-ingest bridge needs it (I-030423).
+    'GPS-L2W': C / F_L2,
     'GPS-L5I': C / F_L5,
     'GPS-L5Q': C / F_L5,
     'GAL-E1C': C / F_L1,
@@ -178,6 +182,9 @@ SIG_WAVELENGTH = {
 
 IF_PAIR_PARAMS = {
     ('GPS-L1CA', 'GPS-L2CL'): ('G', ALPHA_L1_L2, ALPHA_L2),
+    # Geodetic/CORS L1 C/A + L2 Z-tracking — same L2 carrier as L2CL, so the
+    # IF coefficients are identical; only the code/RINEX label differs (I-030423).
+    ('GPS-L1CA', 'GPS-L2W'): ('G', ALPHA_L1_L2, ALPHA_L2),
     ('GPS-L1CA', 'GPS-L5Q'): ('G', ALPHA_L1, ALPHA_L5),
     ('GAL-E1C', 'GAL-E5bQ'): ('E', ALPHA_E1, ALPHA_E5B),
     ('GAL-E1C', 'GAL-E5aQ'): ('E', ALPHA_L1, ALPHA_L5),
@@ -1231,6 +1238,22 @@ def rawx_to_observations(rawx, systems, ssr, sig_names, sig_lookup,
             'sig_name': sig_name,
         }
 
+    return raw_obs_to_if_observations(raw_obs, systems, ssr)
+
+
+def raw_obs_to_if_observations(raw_obs, systems, ssr):
+    """Form IF (iono-free) observations from a per-SV ``raw_obs[sv][role]``
+    dict — the source-agnostic half of the obs pipeline.
+
+    Factored out of :func:`rawx_to_observations` so the RTCM MSM path
+    (``rtcm_msm_obs``) and the UBX-RXM-RAWX path emit BYTE-IDENTICAL obs
+    structures from the same code — the format-parity invariant (I-030423):
+    once obs are in this dict, GF/MW/IF, cycle-slip, the PPP filter, AR and
+    clock estimation are all source-agnostic.  ``raw_obs[sv][role]`` carries
+    the IF alphas (``alpha_f1``/``alpha_f2``) and ``sig_name`` per band, so
+    this needs no sig_lookup; the SSR bias caches + the GF-DIAG two-epoch
+    cache persist on ``ssr`` / this function across epochs (same as live).
+    """
     # Form IF observations
     observations = []
     # Counters for the [OBS_COUNTS] emit downstream
@@ -1507,9 +1530,9 @@ def rawx_to_observations(rawx, systems, ssr, sig_names, sig_lookup,
         # so we can see whether the 60–190 m per-epoch GF on
         # BDS is a unit/wavelength bug or a receiver-side
         # measurement quirk.  One-shot per (sys, sv) pair.
-        if not hasattr(rawx_to_observations, '_gf_diag'):
-            rawx_to_observations._gf_diag = {}
-        diag = rawx_to_observations._gf_diag
+        if not hasattr(raw_obs_to_if_observations, '_gf_diag'):
+            raw_obs_to_if_observations._gf_diag = {}
+        diag = raw_obs_to_if_observations._gf_diag
         key = (sys_name, sv)
         if key not in diag:
             diag[key] = {'epoch1': None, 'epoch2': None}
