@@ -102,12 +102,15 @@ loop self-consistent — but it means the sim validates the loop
 measurement model itself**: if that model were wrong, plant and filter
 would be wrong together and the loop would still close.  Hardware and
 the recorded captures remain the truth for measurement-model
-correctness.  Likewise, `run_two_clock` is **not yet faithful** (it
-reseeds clock B with A's RNG, sharing the *whole* noise realization
-including DO noise, and desyncs once the two arm configs draw different
-numbers of randoms per epoch) — do **not** trust its |Δ| for the 1 ns
-cross-host bound until next-increment #3 feeds one shared rx/GNSS
-realization to both plants with independent per-DO noise streams.
+correctness.  `run_two_clock` **is now faithful** (2026-07-05, I-084500):
+two fully INDEPENDENT sims with independent seeds, per
+`two-site-sync-budget.md` §2 (on a shared antenna the rx TCXO, DO
+free-running noise, and loop noise are all independent — only sky-side
+terms cancel, and the sim injects no sky-side term).  σ²_Δ ≈ σ²_clock,A +
+σ²_clock,B.  Use `two_clock_excursion_stats` for the settled p50/p95/max —
+the p95 is the moonshot acceptance metric.  (The old `share_gnss` reseed —
+which shared the DO noise and desynced — is removed; passing it warns.)
+See [mid-tau-hump-servo-sim-2026-07-05.md](mid-tau-hump-servo-sim-2026-07-05.md).
 
 ## Findings the sim already surfaces
 

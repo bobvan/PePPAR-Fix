@@ -828,26 +828,78 @@ def preset(name: str, **overrides) -> SimConfig:
 # Two-clock differential — cross-host PPS-OUT agreement (1 ns bound).
 # ────────────────────────────────────────────────────────────────────
 def run_two_clock(cfg_a: SimConfig, cfg_b: SimConfig,
-                  share_gnss: bool = True):
-    """Run two sims toward the CLAUDE.md cross-host excursion bound
-    (|Δ| ≤ 1 ns shared antenna); return (res_a, res_b, diff_ns).
+                  share_gnss=None, *, seed_a: Optional[int] = None,
+                  seed_b: Optional[int] = None):
+    """Faithful shared-antenna two-clock differential; return
+    (res_a, res_b, diff_ns) where diff = φ_do,A − φ_do,B (the chA−chA
+    PPS-OUT excursion the acceptance test measures on a shared TICC).
 
-    NOT YET FAITHFUL (v1) — do not trust the |Δ| numbers for the 1 ns
-    bound.  share_gnss=True reseeds B with A's seed, which shares the
-    WHOLE noise realization (DO noise included, not just GNSS) and
-    desyncs the moment the two arm configs draw a different number of
-    randoms per epoch.  Next-increment #3 replaces this with ONE shared
-    rx/GNSS realization fed to both plants plus INDEPENDENT per-DO noise
-    streams; until then this is a smoke test of the two-clock plumbing,
-    not a cross-host bound measurement (see docs "Scope").
+    Faithfulness (docs/two-site-sync-budget.md §2).  On a shared antenna
+    the receiver clock (rx TCXO), DO free-running noise, and disciplining-
+    loop noise are ALL in the *independent* column — only sky-side terms
+    (orbit/clock, iono, tropo, multipath) cancel.  The sim's ``phi_rx``
+    *is* the per-host rx TCXO and the sim injects no sky-side term, so the
+    faithful shared-antenna model is two FULLY INDEPENDENT sims and
+
+        σ²_Δ(τ) ≈ σ²_clock,A(τ) + σ²_clock,B(τ)          (= 2σ²_clock)
+
+    matching the budget's §2 shared-antenna formula.  There is nothing to
+    share (the common-mode sky term is modelled as zero-in-both, which is
+    equivalent to identical-and-cancelling), so this harness carries no
+    correlated stream and none of the v1 desync hazard.
+
+    Independence is enforced by seeding the two plants from *different*
+    RNG seeds: ``seed_a`` (default ``cfg_a.seed``) and ``seed_b`` (default
+    ``cfg_b.seed``, bumped by a fixed offset when it collides with
+    ``seed_a`` so two clocks built from the same ``preset()`` — which pins
+    ``seed=0`` — are still independent rather than bit-identical).
+
+    ``share_gnss`` is DEPRECATED and ignored.  The v1 behaviour it named
+    (reseed B with A's whole RNG) was never faithful: it shared the DO
+    noise too, collapsing the differential toward zero, and desynced the
+    instant the two arm configs drew a different number of randoms per
+    epoch.  A non-None value raises a warning so old callers surface.
     """
-    sim_a = ClosedLoopSim(cfg_a)
-    sim_b = ClosedLoopSim(cfg_b)
-    if share_gnss:
-        sim_b.rng = np.random.default_rng(cfg_a.seed)
-        sim_b.truth.f_rx = sim_a.truth.f_rx
-    res_a = sim_a.run()
-    res_b = sim_b.run()
+    if share_gnss is not None:
+        import warnings
+        warnings.warn(
+            "run_two_clock(share_gnss=...) is deprecated and ignored; the "
+            "harness is now faithful (independent per-host realizations per "
+            "two-site-sync-budget.md §2). Remove the argument.",
+            DeprecationWarning, stacklevel=2)
+    sa = cfg_a.seed if seed_a is None else seed_a
+    sb = cfg_b.seed if seed_b is None else seed_b
+    if sb == sa:
+        sb = sa + 10_007      # keep the two plants independent by default
+    cfg_a.seed = sa
+    cfg_b.seed = sb
+    res_a = ClosedLoopSim(cfg_a).run()
+    res_b = ClosedLoopSim(cfg_b).run()
     n = min(len(res_a.t_s), len(res_b.t_s))
     diff = res_a.phi_do_true_ns[:n] - res_b.phi_do_true_ns[:n]
     return res_a, res_b, diff
+
+
+def two_clock_excursion_stats(diff_ns, t_s, skip_s: float = 300.0) -> dict:
+    """Excursion statistics for the two-clock differential — the moonshot
+    acceptance metric (docs/two-site-sync-budget.md §4.4: p95 ≤ 1 ns
+    shared antenna).
+
+    ``diff_ns`` is φ_do,A − φ_do,B; ``t_s`` its epoch axis.  Grades on the
+    SETTLED, reset-free portion (t ≥ skip_s) exactly as the lab A/B does —
+    the acquisition transient is not part of the bound.  Returns p50/p95/
+    max of |Δ| and the RMS, all in ns, plus the sample count.
+    """
+    d = np.asarray(diff_ns, dtype=float)
+    t = np.asarray(t_s, dtype=float)[: len(d)]
+    m = t >= skip_s
+    if not m.any():
+        return dict(p50=float("nan"), p95=float("nan"), max=float("nan"),
+                    rms=float("nan"), n=0)
+    a = np.abs(d[m])
+    return dict(
+        p50=float(np.percentile(a, 50)),
+        p95=float(np.percentile(a, 95)),
+        max=float(np.max(a)),
+        rms=float(np.sqrt(np.mean(d[m] ** 2))),
+        n=int(m.sum()))

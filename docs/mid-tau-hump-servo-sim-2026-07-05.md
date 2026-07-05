@@ -34,15 +34,38 @@ investigation on `servo_sim`** — the go/no-go rig — before any lab A/B.
    instead of coasting through them: hump 394→329 ps, rise 3.5×→2.7×, τ=1 s
    preserved, excursion 2.7→2.0 ns. Best combo: **softgate + Q[3,3]=0.003 →
    300 ps @64 s, rise 2.8×, τ=1 s 108 ps, excursion 1.84 ns.**
-5. **The optimal lever is host-dependent, and TDEV and the acceptance
-   metric (excursion) can move in opposite directions.** On piface-v1
-   (OCXO gate active at 0.54 ns; huge −135 ppb DO drift carried by EXTINT):
-   softgate does *nothing* (the internal soft-gate never engages behind the
-   OCXO gate), and stiffer Q[3,3] *lowers TDEV but blows the excursion up
-   to 21 ns* (4× worse) — a sluggish freq state lets phase run away between
-   sparse TICC-admits. clkpoc3's hump = TICC sawtooth-injection;
-   piface's = EXTINT-resolution-limited under drift. Different root causes,
-   different levers.
+5. **Grade on the two-clock p95 excursion, not TDEV or single-clock
+   max.** With the now-faithful `run_two_clock` (§ below), the acceptance
+   metric (both clocks get the lever; p95 over 6 independent pairs,
+   settled) says:
+
+   | lever (both clocks) | clkpoc3 p95 | piface-v1 p95 |
+   |---|---|---|
+   | baseline | 1.81 ns | 3.53 ns |
+   | softgate | 1.56 ns (−14%) | 3.53 ns (inert) |
+   | **softgate + Q[3,3]=0.003** | **1.45 ns (−20%)** | **3.23 ns (−9%)** |
+   | Q[3,3]=0.003 only | 1.67 ns (−8%) | 3.23 ns (−8%) |
+   | coast 8 s (dayplan lever #2) | 5.14 ns (**+184%**) | 8.40 ns (**+138%**) |
+
+   `softgate + Q[3,3]=0.003` is the best lever on **both** hosts; coast is
+   catastrophic on both. On piface softgate alone is inert (its OCXO gate
+   at 0.54 ns is the active gate, so the internal soft-gate never engages)
+   and the Q[3,3] term does the work. **Metric caveat:** an earlier pass
+   reported stiffer Q[3,3] "blowing piface excursion to 21 ns" — that was
+   *single-clock absolute* `max_excursion` (heavy-tailed, dominated by rare
+   pull-in spikes), the wrong metric. The differential p95 *improves* and
+   even the differential max (5.51 vs 5.77 ns) does not blow up. Stiffer Q
+   can raise a high-drift host's *absolute* holdover excursion while
+   improving the *differential* — grade the shared-antenna target on the
+   differential.
+
+6. **No lever reaches PASS (≤1 ns) alone.** The sim baseline is already
+   1.8–3.5 ns p95; the best lever buys 10–20%, not the 2–3.5× needed. This
+   matches `two-site-sync-budget.md` §3.2.1/§4.2: σ_servo_residual is ~7×
+   over budget and needs *architecture* (soft-gate + slow innovation-mean
+   integrator + per-host bias calibration), not tuning alone. The mid-τ
+   levers are a real but partial improvement to be *stacked on* the §8.1
+   gate-architecture work, not a substitute for it.
 
 ## Method
 
@@ -76,17 +99,29 @@ R-inflation, Q) trade τ=1 s against mid-τ but don't remove the structured
 mid-τ residual; `soft_ticc_gate` helps *because* it is selective
 (per-epoch χ²-weighted), not uniform.
 
-## Open prerequisite — make `run_two_clock` faithful
+## Faithful `run_two_clock` (LANDED this arc)
 
-The acceptance metric is the **two-clock CDF p95 excursion**, and finding 5
-shows single-clock TDEV is not a sufficient proxy. `run_two_clock` is
-explicitly v1/non-faithful (`share_gnss=True` reseeds B with A's *entire*
-noise realization, DO included, and desyncs when arm configs draw a
-different number of randoms). **Next build step:** one shared rx/GNSS
-realization fed to both plants + independent per-DO noise streams (the
-increment its own docstring specs), then re-grade every lever against p95
-excursion, not just TDEV. Only then does a lab A/B have a defensible
-go/no-go gate.
+The acceptance metric is the **two-clock p95 excursion**, and findings 5–6
+show single-clock TDEV / max are not sufficient proxies. `run_two_clock`
+was v1/non-faithful (`share_gnss=True` reseeded B with A's *entire*
+realization, DO noise included → collapsed the differential toward zero,
+and desynced when arm configs drew a different number of randoms).
+
+The docstring's proposed "ONE shared rx/GNSS realization + independent
+per-DO noise" is itself **contradicted by `two-site-sync-budget.md` §2**:
+on a shared antenna the rx TCXO, DO free-running noise, *and* disciplining-
+loop noise are all in the *independent* column — only sky-side terms
+(orbit/clock, iono, tropo, multipath) cancel, and the sim injects no
+sky-side term (`phi_rx` *is* the per-host rx TCXO). So the faithful
+shared-antenna model is **two fully independent sims with independent
+seeds**, giving σ²_Δ ≈ σ²_clock,A + σ²_clock,B (= the budget's 2σ²_clock).
+There is no correlated stream, so the whole v1 desync class is gone.
+
+Landed: independent-seed `run_two_clock` + `two_clock_excursion_stats`
+(settled p50/p95/max/rms) + tests (independence, √2 scaling, deprecation
+warning). CLI `scripts/servo_sim.py --two-clock A B` now prints the real
+verdict — two clkpoc3 clocks p95 = 1.88 ns FAIL, same order + FAIL as the
+lab §4.4 result. This is the go/no-go gate the lab A/B needs.
 
 ## Recommendation
 

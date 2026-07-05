@@ -36,7 +36,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from peppar_fix.servo_sim import (  # noqa: E402
-    ClosedLoopSim, SimConfig, preset, run_two_clock, _DEFAULT_TAUS)
+    ClosedLoopSim, SimConfig, preset, run_two_clock,
+    two_clock_excursion_stats, _DEFAULT_TAUS)
 
 _SUMMARY_TAUS = (1, 4, 16, 64, 128, 256, 1024)
 
@@ -155,22 +156,18 @@ def _do_two_clock(args) -> list:
     name_a, name_b = args.two_clock
     cfg_a = preset(name_a, duration_s=args.duration)
     cfg_b = preset(name_b, duration_s=args.duration)
-    res_a, res_b, diff = run_two_clock(cfg_a, cfg_b, share_gnss=not args.independent_gnss)
-    skip = int(300 / cfg_a.dt_s)
-    d = diff[skip:]
-    p95 = float(np.percentile(np.abs(d), 95))
+    res_a, res_b, diff = run_two_clock(cfg_a, cfg_b)
+    st = two_clock_excursion_stats(diff, res_a.t_s, skip_s=300.0)
     print(f"=== two-clock differential: {name_a} vs {name_b} "
-          f"({'shared' if not args.independent_gnss else 'independent'} GNSS) ===")
+          f"(shared antenna — independent per-host realizations) ===")
     print(f"  {name_a}: {'LOCKED' if res_a.locked() else 'NOT-LOCKED'}  "
           f"TDEV(1s)={res_a.tdev_1s()*1e3:.0f}ps")
     print(f"  {name_b}: {'LOCKED' if res_b.locked() else 'NOT-LOCKED'}  "
           f"TDEV(1s)={res_b.tdev_1s()*1e3:.0f}ps")
-    print(f"  |Δ| (post-300s):  max={np.max(np.abs(d)):.2f}ns  "
-          f"95%={p95:.2f}ns  RMS={np.sqrt(np.mean(d**2)):.2f}ns")
+    print(f"  |Δ| (settled, post-300s):  p50={st['p50']:.2f}ns  "
+          f"p95={st['p95']:.2f}ns  max={st['max']:.2f}ns  RMS={st['rms']:.2f}ns")
     print(f"  CLAUDE.md shared-antenna bound: |Δ|≤1ns @95%  →  "
-          f"{'PASS' if p95 <= 1.0 else 'FAIL'}")
-    print("  NOTE: run_two_clock is NOT yet faithful (v1 shares the whole "
-          "RNG) — this |Δ| is a plumbing smoke test, not the bound (see docs).")
+          f"{'PASS' if st['p95'] <= 1.0 else 'FAIL'}")
     return [res_a, res_b]
 
 
@@ -207,9 +204,8 @@ def main(argv=None) -> int:
     ap.add_argument("--sweep", metavar="field=v1,v2,...",
                     help="sweep one SimConfig field over comma-separated values")
     ap.add_argument("--two-clock", nargs=2, metavar=("PRESET_A", "PRESET_B"),
-                    help="cross-host differential of two presets sharing one GNSS")
-    ap.add_argument("--independent-gnss", action="store_true",
-                    help="two-clock: separate-antenna (independent GNSS realizations)")
+                    help="shared-antenna cross-host |Δ| of two presets "
+                         "(faithful: independent per-host realizations)")
     ap.add_argument("--faithfulness", action="store_true",
                     help="reproduce the dayplan faithfulness bar and print verdicts")
     ap.add_argument("--out", help="write per-epoch CSV log")
