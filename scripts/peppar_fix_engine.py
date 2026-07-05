@@ -4495,6 +4495,30 @@ def _glide_step_apply(known_ecef, target, rate_m_per_s, dt_s, filt, arp_box,
     return new_ecef, (None if reached else target)
 
 
+def _survey_refresh_sigma_r(event, current_sigma_r):
+    """The live honest σ_r after a survey-refresh event (I-071400; delta #277
+    review): the survey's own σ (``event[1].new_sigma_m``) when positive, else
+    ``current_sigma_r`` unchanged.
+
+    Pure, so its mapping LOGIC is unit-tested
+    (test_pos_glide.TestSurveyRefreshSigmaR).  Both drain sites (SLEW and GLIDE)
+    go through here so they can't drift apart.
+
+    Coverage honesty (delta #279): this guards the mapping, NOT its USE.  A
+    revert that stops the drain calling it — or that reverts the confidence FEED
+    (``seed_sigma_m=_survey_sigma_r`` → ``pos_sigma_m``) — still passes the unit
+    tests.  Closing that seam needs an engine-level integration test (drive
+    refresh events through run_steady_state, assert the advertised clockAccuracy
+    tightens) — the one genuinely-open guard, deferred on the monolithic-
+    function obstacle (tracked follow-up).
+    """
+    try:
+        new_sig = float(event[1].new_sigma_m)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return current_sigma_r
+    return new_sig if new_sig > 0 else current_sigma_r
+
+
 def _apply_survey_refresh(event, known_ecef, sigma_pin_m, filt):
     """Apply one survey-refresh event drained from the watcher queue.
 
@@ -5569,12 +5593,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                         if event[0] == "glide":
                             _pos_glide_target = np.asarray(
                                 event[1].new_ecef, dtype=float)
-                            try:
-                                _ns = float(event[1].new_sigma_m)
-                                if _ns > 0:
-                                    _survey_sigma_r = _ns
-                            except (AttributeError, TypeError, ValueError):
-                                pass
+                            _survey_sigma_r = _survey_refresh_sigma_r(
+                                event, _survey_sigma_r)
                             log.info(
                                 "[POS_GLIDE] target set: Δ=%.3fm σ=%.3fm "
                                 "rate≤%.3gns/s (~%.4gmm/s)",
@@ -5587,17 +5607,11 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                             event, known_ecef, sigma_pin_m, filt)
                         if arp_box is not None:
                             arp_box[0] = known_ecef
-                        # Track the HONEST σ_r from the survey that landed (the
-                        # refresh carries the survey's own σ) so the lifecycle
-                        # sees REFINING as σ_r tightens (I-071400 E3).  event is
-                        # (action, SurveyRefresh, Δ); a SLEW that applied gives
-                        # the new survey σ.
-                        try:
-                            _new_sig = float(event[1].new_sigma_m)
-                            if _new_sig > 0:
-                                _survey_sigma_r = _new_sig
-                        except (AttributeError, IndexError, TypeError, ValueError):
-                            pass
+                        # Track the HONEST σ_r from the survey that landed so the
+                        # lifecycle sees REFINING and confidence tightens σ_t as
+                        # σ_r drops (I-071400).  Shared pure helper (delta #277).
+                        _survey_sigma_r = _survey_refresh_sigma_r(
+                            event, _survey_sigma_r)
                         if exit_code is not None:
                             return exit_code
                 except _queue_mod.Empty:

@@ -219,14 +219,13 @@ class TestClockClassPromoter(unittest.TestCase):
 
 
 class TestReConfidenceOnRefinement(unittest.TestCase):
-    """Advertised clockAccuracy is driven by the LIVE σ_r, so it TIGHTENS as a
-    survey refines (I-071400; origin: charlie's #272 review nit #2 — the live
-    _survey_sigma_r was feeding only the lifecycle, not the advertised σ_t).
-
-    The regression this guards: feeding the STATIC bootstrap σ (the pre-fix
-    behavior) would leave the advertisement stuck at the coarse value forever —
-    E2's "tightens as the survey refines" would silently never happen.
-    """
+    """The confidence MATH: a tighter σ_r yields a tighter advertised
+    clockAccuracy (I-071400; origin: charlie's #272 review nit #2).  This half
+    proves that IF the live σ_r reaches confidence, the advertisement tightens
+    100 ns → 25 ns.  The other half — that the engine actually FEEDS the live
+    σ_r (and the drain updates it) — is the WIRING, guarded by
+    ``test_pos_glide.TestSurveyRefreshSigmaR`` (delta #277 review correctly noted
+    these math tests don't cover the wiring that was the real bug)."""
 
     def _accuracy_for_sigma_r(self, sigma_r_m, dt_rx_sigma_ns=5.0):
         """The engine chain σ_r → σ_t → σ_total → clockAccuracy enum, with a
@@ -245,14 +244,6 @@ class TestReConfidenceOnRefinement(unittest.TestCase):
         # after gliding to a cm survey pin → σ_t ≈ 0.03 ns → freq-limited
         # (5 ns) → 25 ns bucket.  This is the tightening the fix delivers.
         self.assertEqual(self._accuracy_for_sigma_r(0.01), ACCURACY_25NS)
-
-    def test_static_sigma_r_stays_coarse(self):
-        """If the SAME (bootstrap) σ_r is fed both times — the pre-fix
-        static-seed behavior — the advertisement never tightens (100 ns both).
-        The fix feeds the live σ_r instead, so a refine drops it to 25 ns."""
-        from peppar_fix.pmc import ACCURACY_100NS
-        self.assertEqual(self._accuracy_for_sigma_r(10.0), ACCURACY_100NS)
-        self.assertEqual(self._accuracy_for_sigma_r(10.0), ACCURACY_100NS)
 
     def test_phase_sigma_scales_with_seed_sigma(self):
         # The load-bearing link: phase σ_t is σ_r · SIGMA_POS_NS_PER_M, so a

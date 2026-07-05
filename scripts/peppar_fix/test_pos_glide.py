@@ -183,5 +183,43 @@ class GlideStepApplyTest(unittest.TestCase):
         np.testing.assert_allclose(self.filt.pos, new)          # no arp_box crash
 
 
+class TestSurveyRefreshSigmaR(unittest.TestCase):
+    """The drain's (event → new σ_r) MAPPING that feeds confidence
+    (`_survey_refresh_sigma_r`, I-071400).  Guards the mapping LOGIC — the
+    tighten/coarsen/keep/edge cases.  Coverage honesty (delta #279): this does
+    NOT guard the mapping's USE (the drain calling it) or the confidence FEED
+    itself; those close only with an engine-level integration test through
+    run_steady_state (tracked follow-up)."""
+
+    def _event(self, action, sigma):
+        return (action, _refresh(ANCHOR + [1, 0, 0], sigma=sigma), 1.0)
+
+    def test_positive_survey_sigma_replaces_current(self):
+        # A refined survey (cm σ) tightens the live σ_r from the bootstrap 10 m.
+        self.assertAlmostEqual(
+            eng._survey_refresh_sigma_r(self._event("slew", 0.02), 10.0), 0.02)
+        # Same mapping on a GLIDE event (both drain sites share this helper).
+        self.assertAlmostEqual(
+            eng._survey_refresh_sigma_r(self._event("glide", 0.05), 10.0), 0.05)
+
+    def test_can_also_coarsen(self):
+        # Bidirectional: a later coarser survey coarsens the advertised σ_r —
+        # more honest, matches delta's observation.
+        self.assertAlmostEqual(
+            eng._survey_refresh_sigma_r(self._event("slew", 0.30), 0.02), 0.30)
+
+    def test_nonpositive_sigma_keeps_current(self):
+        for bad in (0.0, -1.0):
+            self.assertEqual(
+                eng._survey_refresh_sigma_r(self._event("slew", bad), 7.0), 7.0)
+
+    def test_malformed_event_keeps_current(self):
+        # Missing/short/None event → unchanged, never raises.
+        self.assertEqual(eng._survey_refresh_sigma_r(("slew",), 7.0), 7.0)
+        self.assertEqual(
+            eng._survey_refresh_sigma_r(("slew", object(), 1.0), 7.0), 7.0)
+        self.assertIsNone(eng._survey_refresh_sigma_r(("slew",), None))
+
+
 if __name__ == "__main__":
     unittest.main()
