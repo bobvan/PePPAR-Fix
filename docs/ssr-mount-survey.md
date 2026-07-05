@@ -182,6 +182,55 @@ section in `docs/l5i-l5q-phase-bias-empirical.md` (if the topic
 is closely related) or as a sibling `docs/<signal>-phase-bias-
 empirical.md` doc (if the story is its own thing).
 
+## Signal-matching: the obs and the AC phase biases must agree per frequency (2026-07-05)
+
+The load-bearing rule for PPP-AR, made concrete during the RTCM MSM ingest
+work (I-030423): **an SV enters ambiguity resolution only if the SSR AC
+publishes a phase bias for the *exact* RINEX signal each frequency of the
+obs uses.**  In the engine this is the `ar_phase_bias_ok` gate — a per-SV
+`[PB_APPLIED] f1=…→L1C val=MISS` means the AC has no phase bias for that
+signal, so the SV is float-only.  Both `f1` and `f2` of the IF pair must
+match, or no AR for that SV.
+
+**What the obs give us (universal): GPS L1 is C/A, not P(Y).**  Every RTCM
+obs source we can reach streams GPS **`L1CA` + `L2W` + `L2S`(L2C) + `L5Q`** —
+rich on L2/L5, but L1 is **C/A (`L1C`) only, never `L1W`**.  Confirmed
+2026-07-05 by decoding the ALIC IGS MSM (via the GA caster) and every mount
+on the two local casters:
+- **ISTHA** `50.149.86.86:12054` (10 mounts: ALSIP/ROCKFORD/NAPERVILLE/…),
+  RTCM 3.1 MSM5, GPS+GLO+GAL(+BDS).
+- **DuPage** `50.149.86.86:12055` (6 mounts: WHEATON/ELMHURST/…), RTCM 3.
+  (creds `VANVALZAH:8888`; DuPage mounts were quiet/text-only in a short probe.)
+
+So the obs side is fixed at `L1CA`; the AC side must therefore publish an
+**`L1C`** phase bias (an `L1W`-only AC cannot AR our obs).
+
+**What the ACs publish (probed 2026-07-05 on `products.igs-ip.net:2101`,
+IGS-IP creds; reachable from a London host / PiPuss — IPv6-only-blocked from
+gt).  GPS phase-bias signals per mount:**
+
+| Mount | GPS phase-bias signals | Matches `L1CA+L2W` obs? |
+|---|---|---|
+| **`SSRA01CAS0`** (CAS) | `L1C + L2W + L5Q` | **YES** — the working AR stream |
+| **`OSBC00WHU1`** (WHU-OSB) | `L1C + L2W + L5Q` | **YES** (OSB is bias-only; pair with orbit/clock) |
+| `SSRA00NRC0` (NRCan) | `L1W + L2W` | NO — `L1W` misses our `L1CA` |
+| `SSRA00GFZ0`/`SSRA00SHA0`/`SSRA00GMV0` | *(none)* | no phase biases at all |
+| `SSRA00CNE0` (CNES) | *(historically `L1C`-class)* | **DOWN** — 404, absent from the sourcetable since the 2026-06-28 BKG outage |
+| `SSRA00BKG0` (BKG combined) | *(0 phase biases)* | float-PPP only |
+
+**Working recipe with CNES down: single-AC CAS.**  Obs `L1CA+L2W` (ALIC or
+any local caster) + **all** SSR (orbit+clock+code-bias+phase-bias) from
+`SSRA01CAS0` (single-AC per the `ac-datum-mixing.md` rule) → `[PB_APPLIED]`
+matches both frequencies → **wide-lane AR resolves** (observed WL 7/9 fixed,
+strength 37 on PiPuss/ALIC).  **Narrow-lane still needs a second
+constellation:** GPS-only + SSR hits the near-singular `(rx_clk, ZTD,
+common-ambiguity)` mode (formal σ 0.19 m but 1.8 m biased + drifting, NL
+0 fixed) — so cm PPP-AR is blocked on **multi-GNSS (`gps,gal`)**, i.e. the
+GAL MSM decode (ingest step 4), NOT on correction availability.  See also
+`docs/bds-b2a-phase-bias-survey-2026-05-09.md` (the BDS analog of this
+per-signal availability probe) and `docs/ac-datum-mixing.md` (why single-AC
+for AR).
+
 ## Sources
 - Banville et al. 2023 (data + pilot bias handling): <https://link.springer.com/article/10.1007/s10291-023-01448-y>
 - Wang et al. 2022 (GNSS OSB all-frequency PPP-AR): <https://link.springer.com/article/10.1007/s00190-022-01602-3>
