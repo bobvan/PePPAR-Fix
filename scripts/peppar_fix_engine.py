@@ -10858,14 +10858,23 @@ def run(args):
     #     from it — the "survey" word is reserved for actual
     #     peppar-survey-class output)
     #
-    # Most-confident wins (smallest σ), with a 2x tie-break to
-    # survey-class entries.  mount_sn mismatch → stale → filtered
-    # out.  See docs/position-state-and-monitoring.md.
+    # Best-PROVENANCE wins (I-114628): survey-class (.survey.toml,
+    # arp_label→antennas.json) ALWAYS beats the engine's own .ppp.toml,
+    # regardless of σ — .ppp.toml reports formal precision, not accuracy, so a
+    # drifted AntPosEst float (tight σ, metres off truth) must NOT shadow an
+    # authoritative survey.  σ tie-breaks only within a tier.  mount_sn mismatch
+    # → stale → filtered out.  See docs/position-state-and-monitoring.md.
+    #
+    # Time-only mode (--no-antposest) also gates .ppp.toml OFF: there is no
+    # runtime position filter to correct a drifted .ppp.toml, so the engine's
+    # own stale opinion is pure risk (honors the doc's "unused in time-only").
     if known_ecef is None and not args.ignore_arp_state:
         from peppar_fix.position_state import seed_from_state_files
+        _ignore_ppp = (bool(args.ignore_ppp)
+                       or bool(getattr(args, 'no_antposest', False)))
         picked = seed_from_state_files(
             uid,
-            ignore_ppp=args.ignore_ppp,
+            ignore_ppp=_ignore_ppp,
             ignore_survey=args.ignore_survey,
             arp_label=getattr(args, 'arp_label', None),
             antennas_path=getattr(args, 'antennas_json', None),
