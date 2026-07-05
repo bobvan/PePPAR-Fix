@@ -29,6 +29,9 @@ dependencies = [
     "pyubx2>=1.2.57",
     "pyserial",
     "pyrtcm>=1.1.0",
+    # pysbf2: Septentrio SBF framing + block parsing for the SBF obs adapter
+    # (scripts/peppar_fix/sbf_obs.py — the geodetic raw-obs bridge, I-030423).
+    "pysbf2>=1.0",
     # geo_frames: NAD83(2011)<->ITRF2020 datum/epoch conversion.
     # Needs the bundled PROJ >= 9.0 for ITRF2020 (pyproj 3.6+ ships it).
     "pyproj>=3.6",
