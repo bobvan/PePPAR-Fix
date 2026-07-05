@@ -4761,9 +4761,13 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     from peppar_fix.survey_lifecycle import SurveyLifecycleMachine, SurveyLifecycle
     _survey_lifecycle = SurveyLifecycleMachine(
         trusted_sigma_m=_TRUSTED_POSITION_SIGMA_M)
-    _survey_sigma_r = (float(pos_sigma_m)
-                       if pos_sigma_m is not None and pos_sigma_m > 0
-                       else _TRUSTED_POSITION_SIGMA_M)
+    # The live honest σ_r of the current pin: starts at the seed σ and TIGHTENS
+    # as survey refinements land (updated in the refresh drain).  Preserves
+    # pos_sigma_m EXACTLY (None → None, 0.0 for --known-pos → 0.0) so the
+    # confidence feed below is byte-identical until a survey actually refines —
+    # the lifecycle treats all of None/0/≥trust as ACQUIRING either way, so this
+    # doesn't change E3a's labelling.
+    _survey_sigma_r = (float(pos_sigma_m) if pos_sigma_m is not None else None)
 
     # Position glide (I-071400 E3b): a large survey upgrade on the same mount is
     # applied as a rate-limited glide of the pinned ARP toward the new estimate,
@@ -6125,9 +6129,19 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                                 f"{_antpos_state['sigma_3d_m']:.3f}m)")
 
                 # Phase / freq / total confidence — slice 9.
+                # Re-confidence on refinement (I-071400; origin: charlie's #272
+                # review nit #2 flagged that _survey_sigma_r feeds only the
+                # lifecycle, NOT advertised σ_t).  Feed the LIVE σ_r — which
+                # tightens as survey refinements/glides land — instead of the
+                # STATIC seed pos_sigma_m, so clockAccuracy actually tightens
+                # (e.g. a --nav2-bootstrap host advertises ~100 ns and drops to
+                # ~25 ns once it glides to a cm survey pin).  Byte-identical
+                # until a survey refines (_survey_sigma_r == pos_sigma_m at
+                # start); without this the tightening half of E2's promise is
+                # dead — the host stays stuck at the coarse bootstrap value.
                 _phase = compute_phase_confidence(
                     antpos_state=_antpos_state,
-                    seed_sigma_m=pos_sigma_m,
+                    seed_sigma_m=_survey_sigma_r,
                     nav2_h_acc_m=_nav2_h_acc,
                 )
                 _scheduler = (servo_ctx.get('scheduler')
