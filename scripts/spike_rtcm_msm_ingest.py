@@ -108,6 +108,16 @@ def main() -> int:
     ap.add_argument('--password', default=os.environ.get('NTRIP_PASS'))
     ap.add_argument('--duration', type=float, default=300.0)
     ap.add_argument('--published', help='published ECEF "x,y,z" m to grade against')
+    # Separate broadcast-ephemeris stream (BCEP), for obs casters that carry
+    # no 1019 (RTK base casters, and the eventual Leica receiver): obs from the
+    # primary mount, eph from a global nav mount. Same pattern as the engine's
+    # --eph-mount.
+    ap.add_argument('--eph-caster', help='NTRIP caster for broadcast eph (default: same as --caster)')
+    ap.add_argument('--eph-port', type=int, default=443)
+    ap.add_argument('--eph-mount', help='broadcast-eph mount, e.g. BCEP00BKG0')
+    ap.add_argument('--eph-user', default=os.environ.get('EPH_USER'))
+    ap.add_argument('--eph-password', default=os.environ.get('EPH_PASS'))
+    ap.add_argument('--eph-tls', action='store_true')
     args = ap.parse_args()
 
     from ntrip_client import NtripStream
@@ -126,6 +136,33 @@ def main() -> int:
         ecef_to_lla = None
 
     eph = BroadcastEphemeris()
+
+    # Optional second stream feeding broadcast eph (BCEP) concurrently.
+    import threading
+    stop_ev = threading.Event()
+    if args.eph_mount:
+        def _eph_feeder():
+            try:
+                es = NtripStream(args.eph_caster or args.caster, args.eph_port,
+                                 args.eph_mount, user=args.eph_user,
+                                 password=args.eph_password,
+                                 tls=args.eph_tls or args.eph_port == 443)
+                es.connect()
+                print(f'# eph feed: {args.eph_caster or args.caster}:'
+                      f'{args.eph_port}/{args.eph_mount}')
+                for m in es.messages():
+                    if stop_ev.is_set():
+                        break
+                    if str(getattr(m, 'identity', '')) in (
+                            '1019', '1042', '1045', '1046'):
+                        try:
+                            eph.update_from_rtcm(m)
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f'# eph feeder error: {e}')
+        threading.Thread(target=_eph_feeder, daemon=True).start()
+
     t0 = time.monotonic()
     epochs = 0
     seen_sv = set()
@@ -167,6 +204,7 @@ def main() -> int:
             if time.monotonic() - t0 > args.duration or (solvable >= 5 and epochs > 3):
                 break
     finally:
+        stop_ev.set()
         stream.close()
 
     print(f'# {epochs} MSM epochs, {len(seen_sv)} GPS SVs: {sorted(seen_sv)}')

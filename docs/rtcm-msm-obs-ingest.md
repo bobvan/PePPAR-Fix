@@ -98,9 +98,20 @@ together, so the LS-solve-and-compare needs no extra source.
 
 **Full loop closed 2026-07-05** — the spike decodes MSM (MSM4/5 *and* MSM7
 extended fields), ingests 1019 eph, forms iono-free pseudoranges, and runs
-`ls_init`. Against ALIC (5 dual-freq GPS SVs): LS fix landed **3.04 m** from
-ALIC's published IGS ARP (E +0.19, N +1.06, U +2.84 m) — textbook code-only
-single-point accuracy, confirming the MSM ingest + obs assembly are correct.
+`ls_init`. Two stations, two configs:
+
+- **ALIC** (remote IGS, obs+eph on one stream): LS fix **3.04 m** from the
+  published IGS ARP (E +0.19, N +1.06, U +2.84) — textbook code-only SPP.
+- **NAPERVILLE** (local Wheaton CORS on the ISTHA Leica caster, run from gt):
+  the base caster carries **no 1019**, so the spike's **`--eph-mount`
+  two-stream mode** fed eph from **BCEP00BKG0** (full constellation, 97 SVs)
+  while obs came from NAPERVILLE. LS fix **12.14 m 3D** — but only **~2.3 m
+  horizontal** (E −0.39, N +2.25); the ~12 m is vertical (code-only SPP with
+  no troposphere model + a likely NAD83↔ITRF datum offset on the caster's
+  published ARP). Good horizontal ⇒ the decode is correct.
+
+The two-stream `--eph-mount` mode is **the pattern the real Leica GRX1200
+ingest needs** — receiver gives obs, eph comes from a BCEP nav stream.
 
 ## Build order
 
