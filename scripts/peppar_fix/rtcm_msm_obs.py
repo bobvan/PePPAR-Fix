@@ -94,6 +94,11 @@ def decode_msm_obs(msg):
     polarity the engine's ``half_cyc`` gate wants: keep only unambiguous phase).
     """
     num = int(getattr(msg, "DF002"))
+    # Only MSM4-7 carry full pseudorange + phase-range (the fields we assemble).
+    # MSM1/2/3 (num%10 in 1-3) are compact/partial with a different field
+    # layout — reject rather than misdecode them as MSM4 (bravo #281).
+    if (num % 10) not in (4, 5, 6, 7):
+        return None
     disp = _CONSTELL.get(num // 10)
     if disp is None:
         return None

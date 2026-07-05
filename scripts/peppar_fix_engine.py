@@ -1728,8 +1728,13 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
                     # LS-init.  Per Bob's directive 2026-04-30 +
                     # cold_boot_smoke run-1 finding (LS-init Phase-1
                     # converged at horiz-good + 2 km altitude error).
-                    timeout_s = float(getattr(
-                        args, 'nav2_seed_timeout_s', 30.0))
+                    # An RTCM MSM obs source (CORS/geodetic) never feeds NAV2,
+                    # so waiting for it is a pure dead-wait — go straight to
+                    # LS-init (validated on MadHat/ALIC: cold LS-init Phase-1
+                    # converged 2.66 m).  I-030423 fast-follow (bravo #281).
+                    timeout_s = (
+                        0.0 if getattr(args, 'obs_ntrip_mount', None)
+                        else float(getattr(args, 'nav2_seed_timeout_s', 30.0)))
                     if timeout_s > 0:
                         if nav2_wait_started is None:
                             nav2_wait_started = time.time()
@@ -10798,6 +10803,12 @@ def run(args):
         # RTCM MSM obs source: fill obs_queue from the NTRIP MSM mount instead
         # of a serial UBX receiver.  beph/ssr are already fed by the
         # start_ntrip_threads eph/ssr threads (pair with --eph-mount).
+        if not args.eph_mount:
+            log.warning(
+                "--obs-ntrip-mount without --eph-mount: broadcast ephemeris "
+                "must come from somewhere or position/clock cannot solve.  "
+                "Pair with --eph-mount (e.g. BCEP00BKG0) unless the obs mount "
+                "itself carries 1019/1042/1045/1046.")
         from peppar_fix.msm_obs_source import run_msm_ntrip_source
         t_serial = threading.Thread(
             target=run_msm_ntrip_source,
@@ -10957,7 +10968,10 @@ def run(args):
     #    in _apply_position_seed.  wait_for_nav2_seed gives up fast if
     #    NAV2-PVT isn't emitted at all (non-timing firmware NAKs CFG-NAV2).
     _seed_hacc_max = getattr(args, 'seed_hacc_max_m', 5.0)
-    if known_ecef is None and nav2_store is not None:
+    # An RTCM MSM obs source (CORS/geodetic) has no u-blox NAV2/NAV-PVT plane,
+    # so these seed stores are never fed — skip their waits and let Phase-1
+    # LS-init bootstrap directly from the MSM obs (I-030423 fast-follow).
+    if known_ecef is None and nav2_store is not None and not _msm_source:
         seed = wait_for_nav2_seed(nav2_store, stop_event,
                                   timeout_s=60.0, hacc_max_m=_seed_hacc_max,
                                   source_label="NAV2")
@@ -10968,7 +10982,7 @@ def run(args):
     #     and fix-quality, so it seeds receivers that have no NAV2
     #     (non-timing u-blox firmware) or whose NAV2 isn't emitting.
     #     Shorter timeout: NAV-PVT is available within seconds if at all.
-    if known_ecef is None and nav_pvt_store is not None:
+    if known_ecef is None and nav_pvt_store is not None and not _msm_source:
         seed = wait_for_nav2_seed(nav_pvt_store, stop_event,
                                   timeout_s=20.0, hacc_max_m=_seed_hacc_max,
                                   source_label="NAV-PVT")
