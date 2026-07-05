@@ -160,30 +160,38 @@ RANGE_MS = C_LIGHT / 1000.0  # meters per millisecond of light travel time
 
 # Signal IDs for MSM (RTCM 10403.3 Table 3.5-91 GPS, 3.5-96 GAL, 3.5-104 BDS)
 # Map our signal names to RTCM MSM signal IDs
+# MSM signal IDs are the DF395 bit positions per RTCM 10403.3 (GPS Table
+# 3.5-91, Galileo 3.5-96, BeiDou 3.5-104) — the same numbering pyrtcm decodes
+# with and scripts/peppar_fix/rtcm_msm_obs.py maps back from.  The prior values
+# were non-standard (GPS-L2CL→9=2P, GAL-E5aI→12=6Z, BDS-B2I→8=6I, …), so the
+# caster emitted MSM a standards-compliant consumer mis-labels (I-042609).
 MSM_SIGNAL_ID = {
-    # GPS signals
-    'GPS-L1CA': 2,   # 1C
-    'GPS-L2CL': 9,   # 2L
-    'GPS-L2CM': 8,   # 2S (close enough)
-    'GPS-L5I': 14,   # 5I
-    'GPS-L5Q': 15,   # 5Q
-    # Galileo signals
-    'GAL-E1C': 2,    # 1C
-    'GAL-E1B': 1,    # 1B (actually mapped to signal ID 1 in RTCM table)
-    'GAL-E5aI': 12,  # 5I
-    'GAL-E5aQ': 13,  # 5Q
-    'GAL-E5bI': 7,   # 7I
-    'GAL-E5bQ': 8,   # 7Q
-    # BDS signals
-    'BDS-B1I': 2,    # 2I
-    'BDS-B1C': 4,    # 1D (approximation)
-    'BDS-B2aI': 14,  # 5I (B2a maps to signal slot 14)
-    'BDS-B2I': 8,    # 7I
+    # GPS (Table 3.5-91)
+    'GPS-L1CA': 2,    # 1C
+    'GPS-L2W':  10,   # 2W  L2 Z-tracking (geodetic L2, RTCM-ingest bridge)
+    'GPS-L2CM': 15,   # 2S
+    'GPS-L2CL': 16,   # 2L
+    'GPS-L5I':  22,   # 5I
+    'GPS-L5Q':  23,   # 5Q
+    # Galileo (Table 3.5-96): E5a is the 5-band (5I/5Q=22/23); E5b is the
+    # 7-band (7I/7Q=14/15).  8I/8Q (18/19) is E5-AltBOC, a different signal.
+    'GAL-E1C':  2,    # 1C
+    'GAL-E1B':  4,    # 1B
+    'GAL-E5bI': 14,   # 7I
+    'GAL-E5bQ': 15,   # 7Q
+    'GAL-E5aI': 22,   # 5I
+    'GAL-E5aQ': 23,   # 5Q
+    # BeiDou (Table 3.5-104)
+    'BDS-B1I':  2,    # 2I
+    'BDS-B1C':  30,   # 1D  (B1C data)
+    'BDS-B2I':  14,   # 7I
+    'BDS-B2aI': 22,   # 5D  (B2a data)
 }
 
 # Signal frequencies in Hz (for carrier phase wavelength)
 SIGNAL_FREQ = {
     'GPS-L1CA': 1575.42e6, 'GPS-L2CL': 1227.60e6, 'GPS-L2CM': 1227.60e6,
+    'GPS-L2W': 1227.60e6,
     'GPS-L5I': 1176.45e6, 'GPS-L5Q': 1176.45e6,
     'GAL-E1C': 1575.42e6, 'GAL-E1B': 1575.42e6,
     'GAL-E5aI': 1176.45e6, 'GAL-E5aQ': 1176.45e6,
