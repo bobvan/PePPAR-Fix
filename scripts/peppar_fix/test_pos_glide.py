@@ -184,11 +184,12 @@ class GlideStepApplyTest(unittest.TestCase):
 
 
 class TestSurveyRefreshSigmaR(unittest.TestCase):
-    """The tighten-on-refine WIRING (delta #277 review): `_survey_refresh_sigma_r`
-    is the drain's (event → new σ_r) mapping that feeds confidence.  A regression
-    here — or dropping the drain update — silently kills 'clockAccuracy tightens
-    as the survey refines' (the confidence-math tests in test_confidence.py can't
-    catch that; this can)."""
+    """The drain's (event → new σ_r) MAPPING that feeds confidence
+    (`_survey_refresh_sigma_r`, I-071400).  Guards the mapping LOGIC — the
+    tighten/coarsen/keep/edge cases.  Coverage honesty (delta #279): this does
+    NOT guard the mapping's USE (the drain calling it) or the confidence FEED
+    itself; those close only with an engine-level integration test through
+    run_steady_state (tracked follow-up)."""
 
     def _event(self, action, sigma):
         return (action, _refresh(ANCHOR + [1, 0, 0], sigma=sigma), 1.0)

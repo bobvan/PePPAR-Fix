@@ -4500,11 +4500,17 @@ def _survey_refresh_sigma_r(event, current_sigma_r):
     review): the survey's own σ (``event[1].new_sigma_m``) when positive, else
     ``current_sigma_r`` unchanged.
 
-    Pure, so the tighten-on-refine WIRING is unit-testable — this is the σ_r the
-    confidence path reads (re-confidence fix), so it's the piece a regression
-    would break (reverting the confidence feed to the static ``pos_sigma_m``, or
-    dropping this drain update, silently kills 'tightens as the survey refines').
-    Both drain sites (SLEW and GLIDE) go through here so they can't drift apart.
+    Pure, so its mapping LOGIC is unit-tested
+    (test_pos_glide.TestSurveyRefreshSigmaR).  Both drain sites (SLEW and GLIDE)
+    go through here so they can't drift apart.
+
+    Coverage honesty (delta #279): this guards the mapping, NOT its USE.  A
+    revert that stops the drain calling it — or that reverts the confidence FEED
+    (``seed_sigma_m=_survey_sigma_r`` → ``pos_sigma_m``) — still passes the unit
+    tests.  Closing that seam needs an engine-level integration test (drive
+    refresh events through run_steady_state, assert the advertised clockAccuracy
+    tightens) — the one genuinely-open guard, deferred on the monolithic-
+    function obstacle (tracked follow-up).
     """
     try:
         new_sig = float(event[1].new_sigma_m)
