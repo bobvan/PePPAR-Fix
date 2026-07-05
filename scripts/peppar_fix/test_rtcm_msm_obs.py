@@ -126,6 +126,18 @@ class DecodeMsmTest(unittest.TestCase):
         self.assertIsNone(m.decode_msm_obs(_msm(1097, [5], [2], [73.0],
                           [{"pr_fine": 0.0004}])))   # 109x = Galileo, not in scope
 
+    def test_msm1_2_3_rejected(self):
+        # MSM1/2/3 (num%10 in 1-3) have a compact/different field layout — must
+        # be rejected, not misdecoded as MSM4 (bravo #281).
+        for num in (1071, 1072, 1073):
+            self.assertIsNone(
+                m.decode_msm_obs(_msm(num, [5], [2], [73.0],
+                                      [{"pr_fine": 0.0004}])),
+                f"MSM{num % 10} should be rejected")
+        # MSM4 (num%10==4) is still accepted
+        self.assertIsNotNone(m.decode_msm_obs(_msm(1074, [5], [2], [73.0],
+                             [{"pr_fine": 0.0004, "ph_fine": 0.0004}])))
+
     def test_unmapped_signal_dropped(self):
         # sig id 3 (1P) has no engine sig_name → not emitted
         msg = _msm(1077, [5], [2, 3], [73.0],
