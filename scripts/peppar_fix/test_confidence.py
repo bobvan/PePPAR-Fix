@@ -256,5 +256,38 @@ class TestReConfidenceOnRefinement(unittest.TestCase):
             0.01 * SIGMA_POS_NS_PER_M)
 
 
+class TestKnownPosZeroSigmaFreqLimited(unittest.TestCase):
+    """--known-pos σ=0 (operator-asserted exact position) → zero phase leg, so
+    the advertised clockAccuracy is freq-limited (the best case), NOT UNKNOWN
+    (I-044524; delta #277 review — the most-certain position must not advertise
+    the least-certain time)."""
+
+    def test_zero_seed_sigma_is_zero_phase_from_seed(self):
+        p = compute_phase_confidence(seed_sigma_m=0.0)
+        self.assertEqual(p.sigma_ns, 0.0)
+        self.assertEqual(p.source, "seed")        # not skipped to nav2/unknown
+
+    def test_zero_seed_sigma_advertises_freq_floor_not_unknown(self):
+        from peppar_fix.pmc import (clock_accuracy_for_sigma_ns,
+                                    ACCURACY_25NS, ACCURACY_UNKNOWN)
+        phase = compute_phase_confidence(seed_sigma_m=0.0)        # exact pin
+        freq = compute_frequency_confidence(dt_rx_sigma_ns=5.0,   # locked servo
+                                            scheduler_settled=True)
+        total = compute_total_confidence(phase, freq)
+        self.assertAlmostEqual(total.sigma_ns, 5.0)              # freq alone
+        acc = clock_accuracy_for_sigma_ns(total.sigma_ns)
+        self.assertEqual(acc, ACCURACY_25NS)                     # the floor
+        self.assertNotEqual(acc, ACCURACY_UNKNOWN)               # not UNKNOWN
+
+    def test_negative_seed_sigma_still_skipped(self):
+        # Only 0 is "perfectly known"; a negative σ is invalid → fall through.
+        p = compute_phase_confidence(seed_sigma_m=-1.0, nav2_h_acc_m=2.0)
+        self.assertEqual(p.source, "nav2_hAcc")
+
+    def test_none_seed_sigma_unchanged(self):
+        p = compute_phase_confidence(seed_sigma_m=None, nav2_h_acc_m=2.0)
+        self.assertEqual(p.source, "nav2_hAcc")
+
+
 if __name__ == "__main__":
     unittest.main()
