@@ -134,31 +134,104 @@ class ExtObsSourcePredicateTest(unittest.TestCase):
         self.assertFalse(self.eng._has_ext_obs_source(a))
 
 
+def _args():
+    return SimpleNamespace(obs_sbf_tcp="10.101.101.153:28784",
+                           systems="gps,gal", msm_l2_sig="GPS-L2W")
+
+
+def _fake_sock():
+    s = mock.Mock()
+    s.makefile.return_value = io.BytesIO(_fixture_bytes())
+    return s
+
+
 class RunSbfTcpSourceTest(unittest.TestCase):
     def test_reads_from_mocked_socket(self):
-        # a fake socket whose makefile() serves the real fixture bytes;
-        # the real SBFReader parses them end-to-end.
-        fake_sock = mock.Mock()
-        fake_sock.makefile.return_value = io.BytesIO(_fixture_bytes())
-        args = SimpleNamespace(obs_sbf_tcp="10.101.101.153:28784",
-                               systems="gps,gal", msm_l2_sig="GPS-L2W")
+        # a fake socket whose makefile() serves the real fixture bytes; the real
+        # SBFReader parses them end-to-end.  stop_event is set on the 2nd connect
+        # so the reconnect supervisor exits after one full session.
+        stop = threading.Event()
+        calls = []
+
+        def fake_conn(addr, timeout=None):
+            calls.append(addr)
+            if len(calls) >= 2:
+                stop.set()
+            return _fake_sock()
+
         q = queue.Queue()
         with mock.patch.object(socket, "create_connection",
-                               return_value=fake_sock) as cc:
-            src.run_sbf_tcp_source(args, q, threading.Event(), ssr=None)
-        cc.assert_called_once()
-        self.assertEqual(cc.call_args.args[0], ("10.101.101.153", 28784))
+                               side_effect=fake_conn) as cc:
+            src.run_sbf_tcp_source(_args(), q, stop, ssr=None,
+                                   reconnect_delay=0.01)
+        self.assertEqual(cc.call_args_list[0].args[0], ("10.101.101.153", 28784))
         # the fixture holds ≥1 MeasEpoch → ≥1 queued event
         self.assertGreaterEqual(q.qsize(), 1)
-        fake_sock.close.assert_called_once()
 
-    def test_connect_failure_is_logged_not_raised(self):
-        args = SimpleNamespace(obs_sbf_tcp="10.0.0.1:1", systems="gps",
-                               msm_l2_sig="GPS-L2W")
+    def test_reconnects_after_stream_end(self):
+        # the reader returns on stream EOF; the supervisor must reconnect and
+        # keep queuing.  Stop once 2 sessions have each produced an event, so we
+        # prove events flow ACROSS a reconnect boundary.
+        stop = threading.Event()
+        q = queue.Queue()
+        calls = []
+
+        def fake_conn(addr, timeout=None):
+            calls.append(addr)
+            if q.qsize() >= 2:            # 2 productive sessions already
+                stop.set()
+            return _fake_sock()
+
         with mock.patch.object(socket, "create_connection",
-                               side_effect=OSError("refused")):
-            # must not raise — a thread target logs and returns
-            src.run_sbf_tcp_source(args, queue.Queue(), threading.Event())
+                               side_effect=fake_conn):
+            src.run_sbf_tcp_source(_args(), q, stop, reconnect_delay=0.01)
+        self.assertGreaterEqual(len(calls), 3)   # ≥2 reconnects
+        self.assertEqual(q.qsize(), 2)           # 1 event per session, 2 sessions
+
+    def test_connect_failure_retries_then_stops(self):
+        # transient connect failures must NOT kill the feed — retry with backoff,
+        # honoring stop_event (here set on the 3rd attempt) for prompt shutdown.
+        stop = threading.Event()
+        attempts = []
+
+        def fail_conn(addr, timeout=None):
+            attempts.append(addr)
+            if len(attempts) >= 3:
+                stop.set()
+            raise OSError("connection refused")
+
+        q = queue.Queue()
+        with mock.patch.object(socket, "create_connection",
+                               side_effect=fail_conn):
+            # must not raise — a thread target logs and retries, then stops
+            src.run_sbf_tcp_source(_args(), q, stop, reconnect_delay=0.01)
+        self.assertGreaterEqual(len(attempts), 3)
+        self.assertTrue(q.empty())
+
+    def test_already_stopped_never_connects(self):
+        # prompt shutdown: a stop_event set before entry means no connect at all.
+        stop = threading.Event()
+        stop.set()
+        with mock.patch.object(socket, "create_connection") as cc:
+            src.run_sbf_tcp_source(_args(), queue.Queue(), stop)
+        cc.assert_not_called()
+
+    def test_backoff_wait_is_interruptible(self):
+        # a stop_event that fires DURING the post-failure backoff wait must break
+        # the loop, not sleep out the full delay.
+        stop = threading.Event()
+
+        def fail_conn(addr, timeout=None):
+            raise OSError("refused")
+
+        q = queue.Queue()
+        with mock.patch.object(socket, "create_connection",
+                               side_effect=fail_conn):
+            with mock.patch.object(stop, "wait", return_value=True) as w:
+                src.run_sbf_tcp_source(_args(), q, stop, reconnect_delay=30.0)
+        # wait() returned True (stopped) → loop broke after a single attempt,
+        # without sleeping the 30 s delay.
+        w.assert_called_once()
 
 
 if __name__ == "__main__":
