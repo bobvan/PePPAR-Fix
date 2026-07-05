@@ -43,9 +43,27 @@ _GPS_MSM_SIG = {
     23: ("GPS-L5Q",  1176.45e6),   # 5Q
 }
 
-# Dispatch by the MSM message-number base (num // 10): 1074/1077 → GPS.
-# GAL (109x)/BDS (112x) tables are a deliberate follow-on alongside GLONASS.
-_CONSTELL = {107: ("G", _GPS_MSM_SIG)}
+# Galileo MSM signal IDs (RTCM 10403.3 Table 3.5-96 / pyrtcm GALILEO_SIG_MAP).
+# E5a is the 5-band (5I/5Q = 22/23); E5b is the 7-band (7I/7Q = 14/15) — 8I/8Q
+# (18/19) is E5-AltBOC, a different signal.  Galileo is CDMA, so it drops into
+# the same obs model as GPS with no FDMA detour (I-030423 step 4).
+_GAL_MSM_SIG = {
+    2:  ("GAL-E1C",  1575.42e6),   # 1C  E1 C
+    4:  ("GAL-E1B",  1575.42e6),   # 1B  E1 B
+    14: ("GAL-E5bI", 1207.14e6),   # 7I  E5b I
+    15: ("GAL-E5bQ", 1207.14e6),   # 7Q  E5b Q
+    22: ("GAL-E5aI", 1176.45e6),   # 5I  E5a I
+    23: ("GAL-E5aQ", 1176.45e6),   # 5Q  E5a Q
+}
+
+# Dispatch by the MSM message-number base (num // 10): 1074/1077 → GPS,
+# 1094/1097 → Galileo.  Value = (SV prefix, signal table, epoch-time DF) —
+# the epoch field differs per constellation (pyrtcm rtcmtypes_core MSM map:
+# GPS DF004, GAL DF248, BDS DF427).  BDS/GLONASS remain a follow-on.
+_CONSTELL = {
+    107: ("G", _GPS_MSM_SIG, "DF004"),
+    109: ("E", _GAL_MSM_SIG, "DF248"),
+}
 
 
 def _bits(mask: int, width: int) -> list[int]:
@@ -102,13 +120,13 @@ def decode_msm_obs(msg):
     disp = _CONSTELL.get(num // 10)
     if disp is None:
         return None
-    prefix, sigtab = disp
+    prefix, sigtab, epoch_df = disp
     extended = (num % 10) in (6, 7)                 # MSM6/7 use DF405/406/407/408
     sats = _bits(int(msg.DF394), 64)                # PRNs present, in order
     sigs = _bits(int(msg.DF395), 32)                # MSM signal ids present
     nsat, nsig = len(sats), len(sigs)
     cellmask = int(msg.DF396)                       # nsat×nsig bits, sat-major
-    tow_ms = int(getattr(msg, "DF004", 0))          # GPS epoch time (ms)
+    tow_ms = int(getattr(msg, epoch_df, 0))         # per-constellation epoch (ms)
     cells = []
     cell = 0                                        # 1-based counter over SET cells
     for si in range(nsat):
@@ -212,8 +230,26 @@ def default_gps_sig_lookup(l2_sig="GPS-L2W"):
     an L1/L5 stream.  Built via the engine's own ``build_sig_lookup`` so the
     roles/alphas match the RXM path exactly.
     """
+    return default_sig_lookup(("gps",), gps_l2=l2_sig)
+
+
+def default_sig_lookup(systems=("gps",), gps_l2="GPS-L2W", gal_f2="GAL-E5aQ"):
+    """A multi-GNSS IF sig_lookup for RTCM MSM obs (I-030423 step 4).
+
+    Builds one IF pair per requested constellation — GPS ``L1CA``+``gps_l2``
+    (default L2 Z-tracking) and Galileo ``E1C``+``gal_f2`` (default E5a) — via
+    the engine's own ``build_sig_lookup``, so roles/alphas match the RXM path.
+    A second constellation (``systems`` incl. ``'gal'``) is what breaks the
+    GPS-only near-singular clock/ZTD/ambiguity mode and unblocks narrow-lane AR.
+    """
     from realtime_ppp import build_sig_lookup
-    driver = SimpleNamespace(
-        name=f"rtcm-gps-{l2_sig}",
-        if_pairs=[("GPS", "GPS-L1CA", l2_sig, "G")])
+    pairs = []
+    if "gps" in systems:
+        pairs.append(("GPS", "GPS-L1CA", gps_l2, "G"))
+    if "gal" in systems:
+        pairs.append(("GAL", "GAL-E1C", gal_f2, "E"))
+    if not pairs:
+        pairs.append(("GPS", "GPS-L1CA", gps_l2, "G"))
+    driver = SimpleNamespace(name="rtcm-" + "+".join(sorted(systems)),
+                             if_pairs=pairs)
     return build_sig_lookup(driver)
