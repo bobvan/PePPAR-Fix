@@ -174,3 +174,35 @@ flips the lever**:
 - The pre-London `soft_ticc_gate`/stiffer-Q grade applies only to a
   gate-lockout regime that current hardware is not in; keep it filed for
   hosts that re-enter that regime, not as the live lever.
+
+## Lab A/B result (2026-07-05 evening) — the sim lever is REFUTED
+
+Ran the A/B on PiFace: A = σ_do_freq 0.009 (default, 3 h reset-free) vs
+B = σ_do_freq 0.03 (`--sigma-do-freq-override`, 50 min), warm-started,
+settled chA TDEV:
+
+| τ (s) | 1 | 8 | 16 | **32** | 64 | 128 |
+|---|---|---|---|---|---|---|
+| A (0.009) | 57 | 167 | 361 | **454** | 420 | 318 |
+| B (0.030) | 44 | 193 | 393 | **450** | 391 | 493 |
+| B/A | −23% | +16% | +9% | **−1%** | −7% | +55%¹ |
+
+¹ low-confidence (B is 50 min). **At the τ=32 s hump: −1 %. The sim's
+−52 % prediction did not transfer.** Looser Q[3,3] gives only a modest
+short-τ win (τ=1 s −23 %) and trends worse at long τ; it does **not** move
+the hump.
+
+**Conclusion: the real 484 ps @ 32 s hump is insensitive to Q[3,3] over a
+3.3× change — its mechanism is NOT the freq-loop-vs-OCXO-RWFM the
+re-grounded sim modeled.** The sim mispredicted the lever in *both*
+regimes (stale → stiffer-Q/softgate; re-grounded → looser-Q; lab → neither
+moves the hump). It reproduces the hump's *shape* but not the physics that
+sets its amplitude or sensitivity, so **servo_sim is not a reliable
+predictor for this hump even directionally** — the mid-τ lever search must
+be **hardware-driven**. The harness/re-grounding tooling in this PR remains
+valid; only the sim's *lever recommendation* is refuted.
+
+Next hardware candidates (Q[3,3]-insensitivity points away from the freq
+loop): loop **bandwidth** via actuation cadence, Q[2,2]/measurement
+weighting, or the hump as a fixed loop resonance set by the 1 Hz cadence +
+gain. Data: `gt:~/gt/mtbaseline-20260705/{piface-qfreq-A-c1,piface-qfreq-B}`.
