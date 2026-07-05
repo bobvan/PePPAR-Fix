@@ -358,7 +358,13 @@ self-contained **peppar-fix node**:
   topology — currently treated as an out-of-scope black box), so the
   receiver's obs are already `(satellite − OCXO)`, rx-TCXO-free.
 - **Steering today:** the shipped **ESP32 firmware** disciplines the OCXO
-  from an error signal the mosaic-T produces.
+  from an error signal the mosaic-T produces — by default a multi-
+  constellation **float PPP** solution, optionally refined by **AtomiChron**
+  (Fugro's subscription *single-AC* correction service, which tightens
+  accuracy but ties the timescale to Fugro's). Our PPS label
+  "GNSSDO+AtomiChron" denotes this hardware running *with* that correction.
+  (The OCXO is quartz, Rb-*class* — distinct from the lab's actual Rb
+  standard, the FE-5680A, which is a separate 10 MHz reference / TICC clock.)
 
 The two changes that make it a peppar-fix target:
 
@@ -368,7 +374,11 @@ The two changes that make it a peppar-fix target:
    steering** — instead of the stock closed-loop discipline, the ESP32
    accepts an external frequency/DAC command from peppar-fix (which computes
    it from the mosaic-T obs), or peppar-fix drives the OCXO's EFC DAC
-   directly.
+   directly. This also **swaps the correction source**: the stock loop runs
+   Fugro's float-PPP/AtomiChron (their timescale, a subscription); peppar-fix
+   would run its own **PPP-AR** against our SSR streams — ambiguity-resolved,
+   carrier-phase-timing discipline, on our GPS/ITRF timescale, no
+   subscription. That's a real reason to do it, not just re-plumbing.
 
 The result is the moonshot architecture in a cheap off-the-shelf enclosure:
 a multi-GNSS L5 receiver clocked by a good OCXO (rx TCXO deleted), disciplined
