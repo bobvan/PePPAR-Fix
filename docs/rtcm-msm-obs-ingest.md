@@ -88,6 +88,15 @@ End-to-end proof of decode → obs-model → PPP.
   correctly. (cm-class PPP is a later refinement — the spike's job is to
   prove the *ingest*, not to out-survey IGS.)
 
+**Live-proven 2026-07-05** (PiPuss → `ntrip.data.gnss.ga.gov.au:443`,
+mount `ALIC00AUS0` = Alice Springs IGS, the account already has obs access):
+25 s yielded **51 GPS-MSM messages, 11 PRNs decoded**, and message **1006
+gave the station ARP (−4052052.74, 4212835.99, −2545104.59) m** = ALIC's
+published IGS position. Each AUSCORS mount carries **1074/1077 (GPS MSM) +
+1006 (ARP) + 1019 (GPS eph)** on one stream — obs, truth, and ephemeris
+together, so the LS-solve-and-compare needs no extra source. Remaining spike
+increment: wire 1019 eph → `ls_init` → residual vs the 1006 ARP.
+
 ## Build order
 
 1. **Spike** — `NtripStream`→MSM-decode→obs→LS-solve→compare-to-published

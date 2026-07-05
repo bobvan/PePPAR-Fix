@@ -113,7 +113,7 @@ def main() -> int:
     station_ecef = None
     last_sample = None
     try:
-        for msg in stream:                      # NtripStream yields decoded RTCM
+        for msg in stream.messages():           # NtripStream.messages() → decoded RTCM
             ident = getattr(msg, 'identity', str(getattr(msg, 'DF002', '')))
             if ident in ('1005', '1006'):       # station ARP (the "published" pos)
                 station_ecef = (float(msg.DF025), float(msg.DF026), float(msg.DF027))
