@@ -80,8 +80,11 @@ class DecodeRealMeasEpochTest(unittest.TestCase):
         from collections import Counter
         self.assertIn("GPS-L1CA", Counter(c["sig_name"] for c in cells))
 
-    def test_carrier_dnu_yields_no_phase(self):
-        # a valid carrier gives cp_cyc ≈ pr/λ (within a few thousand cycles)
+    def test_valid_carrier_consistent_with_range(self):
+        # (was test_carrier_dnu_yields_no_phase — a MISNOMER: it exercised the
+        # VALID-carrier path, never the DNU sentinel.  The real DNU case is
+        # pinned in ReferenceDecodeValuePinTest.)  A valid carrier gives
+        # cp_cyc ≈ pr/λ (within a few thousand cycles).
         _tow, cells = self.dec
         for c in cells:
             if c["cp_cyc"] is not None:
@@ -102,6 +105,67 @@ class DecodeRealMeasEpochTest(unittest.TestCase):
     def test_non_measepoch_returns_none(self):
         from types import SimpleNamespace
         self.assertIsNone(s.decode_meas_epoch(SimpleNamespace(identity="PVTGeodetic")))
+
+
+# Ground truth: mosaic_measepoch.sbf decoded by RTKLIB demo5 convbin 2.5.1
+# (`convbin -r sbf -v 3.04`), first epoch TOW=54341000 (2026-07-05 15:05:41 GPS).
+# RINEX obs codes → engine sig_name: GPS C1C/C2W/C2L = L1CA/L2W/L2CL;
+# GAL C1C/C7Q/C5Q = E1C/E5bQ/E5aQ; BDS C2I = B1I.  Each value is
+# (pseudorange_m, carrier_phase_cyc) — carrier None where RINEX has no phase
+# (the receiver flagged Do-Not-Use, CarrierMSB=-128).  An independent decoder
+# pinning the two subtle reconstructions the range/structure tests can't:
+# the Type2 code-offset sign (the L2 half of the IF combo) and the fine
+# carrier offset (the precision observable).  I-110210 (delta #287 review).
+_REF_DECODE = {
+    ("G06", "GPS-L1CA"): (21874273.281, 114950107.025),
+    ("G06", "GPS-L2W"):  (21874275.333, 89571517.435),
+    ("G11", "GPS-L2CL"): (21190399.120, 86771177.580),
+    # E08 is decoder channel index i=10 — its Type2 signals (E1C, E5aQ) are
+    # exactly what a transposed Type2 sub-block accessor (_j_i vs _i_j) drops
+    # or cross-contaminates.  These three are the transposition regression pin.
+    ("E08", "GAL-E1C"):  (25839086.724, 135785366.348),
+    ("E08", "GAL-E5bQ"): (25839086.668, 104043365.299),
+    ("E08", "GAL-E5aQ"): (25839089.098, 101398209.980),
+    ("C14", "BDS-B1I"):  (23493984.297, 122339409.977),
+    # G29 L1CA: valid pseudorange but the receiver flagged the carrier DNU —
+    # RINEX has no L1C phase, so cp_cyc must be None (the real DNU-path pin).
+    ("G29", "GPS-L1CA"): (24959135.824, None),
+}
+
+
+class ReferenceDecodeValuePinTest(unittest.TestCase):
+    """Pin the SBF decode to RTKLIB ground truth (values, not just structure).
+
+    Asserts specific (SV, signal) → PR/CP against an INDEPENDENT decoder so a
+    sign/scale error (tens of m PR, thousands of cyc) that
+    test_reconstructed_values_are_physical would wave through is caught.
+    """
+
+    def setUp(self):
+        _tow, cells = s.decode_meas_epoch(_load_meas_epoch())
+        self.by_key = {(c["sv"], c["sig_name"]): c for c in cells}
+
+    def test_pseudorange_and_carrier_match_rtklib(self):
+        for key, (pr, cp) in _REF_DECODE.items():
+            with self.subTest(key=key):
+                c = self.by_key.get(key)
+                self.assertIsNotNone(c, f"{key} missing from decode")
+                # PR: RINEX prints 3 decimals (mm); decode must match to <5 mm.
+                self.assertAlmostEqual(c["pr_m"], pr, delta=5e-3)
+                if cp is None:
+                    self.assertIsNone(c["cp_cyc"],
+                                      f"{key} carrier is DNU → cp must be None")
+                else:
+                    # CP: <0.01 cyc (RINEX 3-decimal rounding ~ 0.5 mcyc).
+                    self.assertIsNotNone(c["cp_cyc"])
+                    self.assertAlmostEqual(c["cp_cyc"], cp, delta=1e-2)
+
+    def test_dnu_carrier_yields_none(self):
+        # explicit DNU-path assertion (the misnamed old test never hit it):
+        # G29 L1CA has a valid PR but CarrierMSB == -128.
+        c = self.by_key[("G29", "GPS-L1CA")]
+        self.assertGreater(c["pr_m"], 1e6)      # PR still decoded
+        self.assertIsNone(c["cp_cyc"])          # carrier suppressed
 
 
 if __name__ == "__main__":
