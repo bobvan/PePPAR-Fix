@@ -442,6 +442,28 @@ ser.close()
 # Wait 15 seconds for boot
 ```
 
+**Caveat — the `dsrdtr=True` open/close above only resets from a *clean*
+DTR state.** If the port was last held by a process that cleared `HUPCL`
+(which `scripts/ticc.py` / `_SharedTiccPort` deliberately does, so DTR
+stays asserted on close and the *next* open won't reboot the TICC), then
+opening with `dsrdtr=True` and closing produces **no DTR edge** and the
+Arduino does **not** reset — the `<seconds> chA|chB` timestamps just keep
+climbing. Force the reset with an explicit DTR toggle instead:
+
+```python
+import serial, time
+ser = serial.Serial("/dev/ticc1", 115200)
+ser.dtr = False        # de-assert DTR (raise)
+time.sleep(0.5)
+ser.dtr = True         # assert (lower) → cap-coupled RESET pulse to the Mega
+# keep the port open; wait ~15 s for boot, then read
+```
+
+Confirm the reset actually took by checking the first `<seconds>`
+timestamp restarts near 0. The classic symptom that needs this: a stuck
+chB input that ignores even a known-good PPS (2026-07-05 PiFace, after a
+physical move — the DTR toggle un-stuck it and both channels returned).
+
 ### F9T EVKs have no USB serial number
 
 All F9T EVKs report the same VID:PID (`1546:01a9`) with no serial number.
