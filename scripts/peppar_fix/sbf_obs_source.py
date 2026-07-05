@@ -74,13 +74,37 @@ def _parse_hostport(spec, default_port=28784):
     return host, int(port) if port else default_port
 
 
+def _stopped(stop_event):
+    return stop_event is not None and stop_event.is_set()
+
+
+def _interruptible_wait(stop_event, secs):
+    """Sleep ``secs``, but wake immediately if ``stop_event`` fires.  Returns
+    True if we should stop (event set), False if the wait elapsed normally."""
+    if stop_event is None:
+        import time as _time
+        _time.sleep(secs)
+        return False
+    return stop_event.wait(secs)
+
+
 def run_sbf_tcp_source(args, obs_queue, stop_event, *, ssr=None,
-                       systems=None, sig_lookup=None):
+                       systems=None, sig_lookup=None,
+                       reconnect_delay=5.0, max_reconnect_delay=60.0):
     """Engine obs-source thread target: read SBF from a receiver's IP-server TCP
     port (``args.obs_sbf_tcp`` as ``host:port``) and fill ``obs_queue`` with
     ObservationEvents — in place of ``serial_reader``.  Broadcast ephemeris is
-    fed by the separate ``--eph-mount`` thread.  Blocks until ``stop_event`` or
-    the stream ends.
+    fed by the separate ``--eph-mount`` thread.
+
+    Supervises the connection: on a transient TCP drop or a stream end
+    (receiver reboot, network blip) it RECONNECTS with exponential backoff
+    (``reconnect_delay`` → ``max_reconnect_delay``, reset on a successful
+    connect), so an outage shows downstream as growing obs age rather than a
+    dead feed — parity with the MSM path's NtripStream (I-110209).  The backoff
+    is interruptible: ``stop_event`` breaks the loop promptly at every point
+    (before connecting, during the read, and during the backoff wait).  The
+    15 s socket timeout also bounds a stalled read so a wedged stream reconnects
+    rather than hanging forever.
     """
     import socket
 
@@ -92,20 +116,35 @@ def run_sbf_tcp_source(args, obs_queue, stop_event, *, ssr=None,
     if sig_lookup is None:
         sig_lookup = default_sig_lookup(systems,
                                         gps_l2=getattr(args, "msm_l2_sig", "GPS-L2W"))
-    sock = None
-    try:
-        sock = socket.create_connection((host, port), timeout=15)
-        stream = sock.makefile("rb")
-        log.info("SBF obs source: %s:%d", host, port)
-        n = sbf_obs_reader(SBFReader(stream, quitonerror=0),
-                           obs_queue, stop_event, sig_lookup,
-                           systems=systems, ssr=ssr)
-        log.info("SBF obs source ended (%d epochs queued)", n)
-    except Exception as e:                    # noqa: BLE001 - thread must log, not crash
-        log.error("SBF obs source failed: %s", e)
-    finally:
-        if sock is not None:
-            try:
-                sock.close()
-            except Exception:                 # noqa: BLE001
-                pass
+    backoff = reconnect_delay
+    total = 0
+    while not _stopped(stop_event):
+        sock = None
+        try:
+            sock = socket.create_connection((host, port), timeout=15)
+            backoff = reconnect_delay        # reset on a successful connect
+            stream = sock.makefile("rb")
+            log.info("SBF obs source connected: %s:%d", host, port)
+            n = sbf_obs_reader(SBFReader(stream, quitonerror=0),
+                               obs_queue, stop_event, sig_lookup,
+                               systems=systems, ssr=ssr)
+            total += n
+            if _stopped(stop_event):
+                break
+            # Reader returned without a stop → the stream ended (EOF/reset).
+            log.warning("SBF obs source stream ended (%d epochs this session) "
+                        "— reconnecting to %s:%d", n, host, port)
+        except Exception as e:                # noqa: BLE001 - thread must log, not crash
+            log.warning("SBF obs source connection error (%s) — retry in %.0fs",
+                        e, backoff)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:             # noqa: BLE001
+                    pass
+        # Interruptible backoff before the next connect attempt.
+        if _interruptible_wait(stop_event, backoff):
+            break
+        backoff = min(backoff * 2, max_reconnect_delay)
+    log.info("SBF obs source stopped (%d epochs queued total)", total)
