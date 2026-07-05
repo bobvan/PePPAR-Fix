@@ -10997,7 +10997,13 @@ def run(args):
     #     landed gated for validation first.
     if (known_ecef is None
             and getattr(args, 'no_antposest', False)
-            and getattr(args, 'nav2_bootstrap', False)):
+            and getattr(args, 'nav2_bootstrap', False)
+            and not _msm_source):
+        # An MSM/CORS source never feeds NAV2/NAV-PVT, so --nav2-bootstrap can
+        # only dead-wait ~15s then return None (with no LS-init fallback on this
+        # --no-antposest path — the RECOMMENDED mode).  Skip it and fall through
+        # to the existing no-seed handling; an MSM run should pass --known-pos
+        # (the CORS ARP is known anyway).  Completes the 3a/3b gating (delta #283).
         known_ecef, pos_sigma_m, pos_source = _nav2_bootstrap_seed(
             args, nav2_store, nav_pvt_store, stop_event, ape_sm)
         if known_ecef is not None:
