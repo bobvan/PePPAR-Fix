@@ -12,7 +12,8 @@ import math
 import unittest
 
 from peppar_fix.geo_frames import (
-    Frame, GeoPoint, convert, to_canonical, CANONICAL_REALIZATION)
+    Frame, GeoPoint, convert, to_canonical, static_reference_epoch,
+    CANONICAL_REALIZATION)
 
 # OPUS UFO1 ground truth (same physical point, two frames).
 _NAD83 = (157470.222, -4756189.544, 4232767.952)        # NAD83(2011)@2010.0
@@ -113,6 +114,47 @@ class ConversionTests(unittest.TestCase):
         # realization — using it is a loud error, not a silent shift.
         with self.assertRaises(ValueError):
             Frame("WGS84", _OBS_EPOCH)
+
+
+class Etrs89Tests(unittest.TestCase):
+    """ETRS89 (EUREF baseline datum, I-094951).  Plate-fixed to stable
+    Eurasia, coincident with ITRF at 1989.0, diverging ~2.5 cm/yr since."""
+
+    # A London-area ECEF (near the ufoLondon sites), treated as ETRS89.
+    _EU = (3978000.0, -12000.0, 4968000.0)
+
+    def test_etrs89_is_a_registered_realization(self):
+        # Was previously unregistered → Frame("ETRS89") raised → the whole
+        # EUREF baseline path crashed before it could convert a base.
+        f = Frame("ETRS89", 1989.0)
+        self.assertEqual(f.realization, "ETRS89")
+
+    def test_reference_epoch_is_1989(self):
+        self.assertEqual(static_reference_epoch("ETRS89"), 1989.0)
+        self.assertEqual(static_reference_epoch("NAD83(2011)"), 2010.0)
+
+    def test_etrs89_to_itrf2020_is_time_dependent(self):
+        # The defining property: ETRS89 ≡ ITRF at 1989.0 and diverges by
+        # Eurasian plate motion.  The 1989.0 convert is ~0; a 2026 convert
+        # is ~0.85 m — so the transform MUST carry the observation epoch.
+        p = GeoPoint(self._EU, Frame("ETRS89", 1989.0))
+        at1989 = convert(p, Frame(CANONICAL_REALIZATION, 1989.0))
+        at2026 = convert(p, Frame(CANONICAL_REALIZATION, 2026.5))
+        self.assertLess(_resid_mm(at1989.ecef, self._EU), 5.0)   # ~coincident
+        shift_m = _resid_mm(at2026.ecef, self._EU) / 1000.0
+        self.assertGreater(shift_m, 0.5)      # real plate motion, not ~0
+        self.assertLess(shift_m, 1.2)         # ~0.85 m, not a gross error
+        # And the source epoch tag doesn't change the result (geo_frames
+        # takes the obs epoch from the dynamic ITRF side).
+        p2010 = GeoPoint(self._EU, Frame("ETRS89", 2010.0))
+        alt = convert(p2010, Frame(CANONICAL_REALIZATION, 2026.5))
+        self.assertLess(_resid_mm(alt.ecef, at2026.ecef), 0.1)
+
+    def test_etrs89_itrf_roundtrip_self_consistent(self):
+        p = GeoPoint(self._EU, Frame("ETRS89", 1989.0))
+        itrf = convert(p, Frame(CANONICAL_REALIZATION, 2026.5))
+        back = convert(itrf, Frame("ETRS89", 1989.0))
+        self.assertLess(_resid_mm(back.ecef, self._EU), 1.0)   # << 1 mm-ish
 
 
 if __name__ == "__main__":

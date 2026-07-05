@@ -376,7 +376,7 @@ class ProcessOneObsTest(unittest.TestCase):
         self.assertIsNone(sol)
         self.assertIn("--base", last.error)
 
-    def test_rtk_with_cors_station_calls_fetcher(self):
+    def test_rtk_with_base_station_calls_fetcher(self):
         called = {}
 
         def fake_fetcher(station, year, doy, work_dir, **kw):
@@ -397,9 +397,9 @@ class ProcessOneObsTest(unittest.TestCase):
             ]
             sol, last = process_one_obs(
                 obs, tdp / "work", mode="rtk",
-                cors_station="dsp1",
+                base_station="dsp1",
                 rnx2rtkp_runner=self._make_runner_returning_pos(rows),
-                cors_fetcher=fake_fetcher,
+                base_fetcher=fake_fetcher,
             )
         self.assertIsNotNone(sol)
         self.assertEqual(sol.mode, "rtklib_cors")
@@ -415,15 +415,15 @@ class ProcessOneObsTest(unittest.TestCase):
             obs.write_text("stub")
             sol, last = process_one_obs(
                 obs, tdp / "work", mode="rtk",
-                cors_station="dsp1",
+                base_station="dsp1",
                 rnx2rtkp_runner=lambda *a, **kw: None,
-                cors_fetcher=fake_fetcher,
+                base_fetcher=fake_fetcher,
             )
         self.assertIsNone(sol)
         self.assertIn("CORS fetch failed", last.error)
 
-    def test_rtk_with_cors_ntrip_calls_capturer(self):
-        """When cors_ntrip is set, the live-NTRIP capturer is invoked
+    def test_rtk_with_base_ntrip_calls_capturer(self):
+        """When base_ntrip is set, the live-NTRIP capturer is invoked
         and its result is fed to rnx2rtkp as the base RINEX."""
         from peppar_fix.peppar_survey_cors import CorsNtripConfig
 
@@ -449,9 +449,9 @@ class ProcessOneObsTest(unittest.TestCase):
             cfg = CorsNtripConfig(host="peer.lab", port=2102, mount="PEPPAR")
             sol, last = process_one_obs(
                 obs, tdp / "work", mode="rtk",
-                cors_ntrip=cfg,
+                base_ntrip=cfg,
                 rnx2rtkp_runner=self._make_runner_returning_pos(rows),
-                cors_ntrip_capturer=fake_capturer,
+                base_ntrip_capturer=fake_capturer,
             )
         self.assertIsNotNone(sol)
         self.assertEqual(sol.mode, "rtklib_cors")
@@ -461,7 +461,7 @@ class ProcessOneObsTest(unittest.TestCase):
         # cors_base label propagates from the captured filename
         self.assertEqual(sol.cors_base, "captured-base.obs")
 
-    def test_rtk_cors_ntrip_capture_failure(self):
+    def test_rtk_base_ntrip_capture_failure(self):
         from peppar_fix.peppar_survey_cors import CorsNtripConfig
 
         def fake_capturer(cfg, work_dir):
@@ -474,9 +474,9 @@ class ProcessOneObsTest(unittest.TestCase):
             cfg = CorsNtripConfig(host="peer.lab", port=2102, mount="PEPPAR")
             sol, last = process_one_obs(
                 obs, tdp / "work", mode="rtk",
-                cors_ntrip=cfg,
+                base_ntrip=cfg,
                 rnx2rtkp_runner=lambda *a, **kw: None,
-                cors_ntrip_capturer=fake_capturer,
+                base_ntrip_capturer=fake_capturer,
             )
         self.assertIsNone(sol)
         self.assertIn("live NTRIP capture failed", last.error)
@@ -623,6 +623,20 @@ class BaselineDatumTest(unittest.TestCase):
         # deterministic + epoch-sensitive (plate motion)
         self.assertEqual(out, base_ecef_to_itrf2020(self._NAD83_BASE, 2026.4))
         self.assertNotEqual(out, base_ecef_to_itrf2020(self._NAD83_BASE, 2020.0))
+
+    def test_etrs89_base_converts_and_is_plate_motion_shifted(self):
+        # I-094951: ETRS89 was unregistered → this call CRASHED, so the EUREF
+        # baseline path never worked.  Now it converts, using ETRS89's own
+        # 1989.0 reference epoch (not the NAD83 2010.0 assumption) → a ~0.85 m
+        # Eurasian-plate-motion shift at 2026, native ITRF2020.
+        eu_base = (3978000.0, -12000.0, 4968000.0)
+        out = base_ecef_to_itrf2020(eu_base, 2026.5, base_realization="ETRS89")
+        d3 = sum((a - b) ** 2 for a, b in zip(out, eu_base)) ** 0.5
+        self.assertGreater(d3, 0.5)          # real plate motion, not ~0
+        self.assertLess(d3, 1.2)             # ~0.85 m, not garbage
+        # epoch-sensitive, and distinct from treating it as NAD83 would be
+        self.assertNotEqual(
+            out, base_ecef_to_itrf2020(eu_base, 2020.0, base_realization="ETRS89"))
 
     def test_write_config_injects_ant2_pos_for_baseline(self):
         with TemporaryDirectory() as td:

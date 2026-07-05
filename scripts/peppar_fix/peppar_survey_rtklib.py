@@ -46,7 +46,9 @@ from peppar_fix.arp_history import (
     DEFAULT_MAX_SIG0_M, DEFAULT_MIN_N_OBS, DEFAULT_N_DAYS, RunningArp,
     append_solution, apply_quality_filter, running_mean,
 )
-from peppar_fix.geo_frames import CANONICAL_REALIZATION, Frame, GeoPoint, convert
+from peppar_fix.geo_frames import (
+    CANONICAL_REALIZATION, Frame, GeoPoint, convert, static_reference_epoch,
+)
 from peppar_fix.position_state import (
     DEFAULT_POSITIONS_DIR, PositionState,
     decimal_year_from_mjd, save_survey_state, utc_now_iso,
@@ -417,17 +419,20 @@ def base_ecef_to_itrf2020(
 
     This is the load-bearing datum step for the baseline backend (I-071401 /
     the 2026-07-03 ufo1 lesson): the base carries a regional datum (NGS CORS =
-    NAD83(2011)@2010.0, EUREF = ETRS89@2010.0) that differs from ITRF2020 by up
-    to ~1 m of accumulated plate motion.  Pre-converting the BASE — not
-    round-tripping the RESULT — means the rover solution comes out NATIVE
-    ITRF2020, so the survey's ITRF2020 frame stamp is correct-by-construction
-    (never a pyproj round-trip of a result, which carries ~cm realization noise).
+    NAD83(2011)@2010.0, EUREF = ETRS89@1989.0) that differs from ITRF2020 by up
+    to ~1 m of accumulated plate motion (NAD83 ~1 m in CONUS; ETRS89 ~0.85 m in
+    Europe at 2026).  Pre-converting the BASE — not round-tripping the RESULT —
+    means the rover solution comes out NATIVE ITRF2020, so the survey's ITRF2020
+    frame stamp is correct-by-construction (never a pyproj round-trip of a
+    result, which carries ~cm realization noise).
     """
-    # NAD83(2011) is referenced to 2010.0.  TODO(S2): EUREF ETRS89 realizations
-    # vary (ETRF2000/2014/...) and may not be 2010.0 — S2's fetchers should
-    # supply the base's actual reference epoch rather than assume this.
-    static_epoch = 2010.0
-    src = GeoPoint(tuple(base_ecef), Frame(base_realization, static_epoch))
+    # Tag the source frame at its realization's OWN reference epoch (NAD83(2011)
+    # = 2010.0, ETRS89 = 1989.0) rather than assuming 2010.0 for all.  A plate-
+    # fixed coord is time-invariant, so geo_frames drives the plate-motion
+    # propagation from obs_epoch (the dynamic ITRF side) and this label just
+    # keeps the source Frame honest (I-094951, resolving the S2 TODO).
+    ref_epoch = static_reference_epoch(base_realization)
+    src = GeoPoint(tuple(base_ecef), Frame(base_realization, ref_epoch))
     out = convert(src, Frame(CANONICAL_REALIZATION, obs_epoch))
     return (float(out.ecef[0]), float(out.ecef[1]), float(out.ecef[2]))
 
@@ -673,34 +678,34 @@ def process_one_obs(
     work_dir: Path,
     *,
     mode: str = "ppp",
-    cors_station: str | None = None,
-    cors_rinex_path: Path | None = None,
+    base_station: str | None = None,
+    base_rinex_path: Path | None = None,
     base_realization: str = "NAD83(2011)",
-    cors_ntrip=None,  # peppar_survey_cors.CorsNtripConfig | None
+    base_ntrip=None,  # peppar_survey_cors.CorsNtripConfig | None
     nav_file: Path | None = None,
     rnx2rtkp_bin: str = DEFAULT_RNX2RTKP,
     timeout_s: int = DEFAULT_RNX2RTKP_TIMEOUT_S,
     rnx2rtkp_runner=invoke_rnx2rtkp,
-    cors_fetcher=fetch_cors_rinex,
-    cors_ntrip_capturer=None,  # injectable for tests
+    base_fetcher=fetch_cors_rinex,
+    base_ntrip_capturer=None,  # injectable for tests
 ) -> tuple[RtklibSolution | None, RtklibRunResult | None]:
     """Run rnx2rtkp on one obs file and aggregate into a solution.
 
     For mode="rtk", a CORS base RINEX is required, supplied via
     exactly one of:
-      - ``cors_rinex_path``: explicit path to a pre-staged base
-      - ``cors_station``: NOAA CORS station code; fetched by
-        ``cors_fetcher``
-      - ``cors_ntrip``: ``CorsNtripConfig`` for a live-NTRIP capture
+      - ``base_rinex_path``: explicit path to a pre-staged base
+      - ``base_station``: NOAA CORS station code; fetched by
+        ``base_fetcher``
+      - ``base_ntrip``: ``CorsNtripConfig`` for a live-NTRIP capture
         from a peer peppar-fix caster; streamed by
-        ``cors_ntrip_capturer``
+        ``base_ntrip_capturer``
     """
     last_result: RtklibRunResult | None = None
     base_obs: Path | None = None
     if mode == "rtk":
-        if cors_rinex_path is not None:
-            base_obs = cors_rinex_path
-        elif cors_station is not None:
+        if base_rinex_path is not None:
+            base_obs = base_rinex_path
+        elif base_station is not None:
             ydoy = doy_from_obs_name(obs_file)
             if ydoy is None:
                 return None, RtklibRunResult(
@@ -710,30 +715,30 @@ def process_one_obs(
                           "pass --cors-rinex-path explicitly",
                 )
             year, doy = ydoy
-            base_obs = cors_fetcher(cors_station, year, doy, work_dir)
+            base_obs = base_fetcher(base_station, year, doy, work_dir)
             if base_obs is None:
                 return None, RtklibRunResult(
                     obs_file=obs_file, mode=mode, returncode=-1,
                     pos_path=None,
-                    error=f"CORS fetch failed for station={cors_station} "
+                    error=f"CORS fetch failed for station={base_station} "
                           f"year={year} doy={doy}",
                 )
-        elif cors_ntrip is not None:
+        elif base_ntrip is not None:
             # Lazy import: avoid pulling peppar_survey_cors (and the
             # subprocess machinery it imports) into the static-CORS
             # paths that don't need it.
-            if cors_ntrip_capturer is None:
+            if base_ntrip_capturer is None:
                 from peppar_fix.peppar_survey_cors import (
-                    capture_cors_base_via_ntrip as cors_ntrip_capturer
+                    capture_cors_base_via_ntrip as base_ntrip_capturer
                 )
-            base_obs = cors_ntrip_capturer(cors_ntrip, work_dir)
+            base_obs = base_ntrip_capturer(base_ntrip, work_dir)
             if base_obs is None:
                 return None, RtklibRunResult(
                     obs_file=obs_file, mode=mode, returncode=-1,
                     pos_path=None,
                     error=f"live NTRIP capture failed for "
-                          f"{cors_ntrip.host}:{cors_ntrip.port}/"
-                          f"{cors_ntrip.mount}",
+                          f"{base_ntrip.host}:{base_ntrip.port}/"
+                          f"{base_ntrip.mount}",
                 )
         else:
             return None, RtklibRunResult(
@@ -821,8 +826,8 @@ def run_rtklib_backend(
     receiver_uid: str,
     *,
     mode: str = "ppp",
-    cors_station: str | None = None,
-    cors_rinex_path: Path | None = None,
+    base_station: str | None = None,
+    base_rinex_path: Path | None = None,
     base_realization: str = "NAD83(2011)",
     nav_file: Path | None = None,
     positions_dir: str | None = None,
@@ -833,11 +838,11 @@ def run_rtklib_backend(
     min_n_obs: int = DEFAULT_MIN_N_OBS,
     rnx2rtkp_bin: str = DEFAULT_RNX2RTKP,
     timeout_s: int = DEFAULT_RNX2RTKP_TIMEOUT_S,
-    cors_ntrip=None,
+    base_ntrip=None,
     dry_run: bool = False,
     rnx2rtkp_runner=invoke_rnx2rtkp,
-    cors_fetcher=fetch_cors_rinex,
-    cors_ntrip_capturer=None,
+    base_fetcher=fetch_cors_rinex,
+    base_ntrip_capturer=None,
     source_label: str | None = None,
 ) -> int:
     """Run rnx2rtkp over each obs file, archive each solution to
@@ -863,12 +868,12 @@ def run_rtklib_backend(
     work_dir = Path(work_dir)
     history_path = default_history_path(receiver_uid, history_dir)
     if source_label is None:
-        if mode == "rtk" and cors_ntrip is not None:
+        if mode == "rtk" and base_ntrip is not None:
             source_label = (
                 f"peppar-survey --rtklib --cors-ntrip "
-                f"{cors_ntrip.host}:{cors_ntrip.port}/{cors_ntrip.mount}")
-        elif mode == "rtk" and cors_station:
-            source_label = f"peppar-survey --baseline --base {cors_station}"
+                f"{base_ntrip.host}:{base_ntrip.port}/{base_ntrip.mount}")
+        elif mode == "rtk" and base_station:
+            source_label = f"peppar-survey --baseline --base {base_station}"
         else:
             source_label = "peppar-survey --rtklib"
 
@@ -880,16 +885,16 @@ def run_rtklib_backend(
         sol, last = process_one_obs(
             obs, work_dir / obs.stem,
             mode=mode,
-            cors_station=cors_station,
-            cors_rinex_path=cors_rinex_path,
+            base_station=base_station,
+            base_rinex_path=base_rinex_path,
             base_realization=base_realization,
-            cors_ntrip=cors_ntrip,
+            base_ntrip=base_ntrip,
             nav_file=nav_file,
             rnx2rtkp_bin=rnx2rtkp_bin,
             timeout_s=timeout_s,
             rnx2rtkp_runner=rnx2rtkp_runner,
-            cors_fetcher=cors_fetcher,
-            cors_ntrip_capturer=cors_ntrip_capturer,
+            base_fetcher=base_fetcher,
+            base_ntrip_capturer=base_ntrip_capturer,
         )
         if sol is None:
             n_failed += 1
