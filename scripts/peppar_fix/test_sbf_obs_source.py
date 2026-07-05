@@ -104,6 +104,36 @@ class ParseHostportTest(unittest.TestCase):
                          ("host.local", 28784))
 
 
+class ExtObsSourcePredicateTest(unittest.TestCase):
+    """The run()/run_bootstrap shared predicate — SBF must count as an external
+    obs source so the Phase-1 NAV2 seed-wait is skipped (delta #288 MEDIUM: the
+    generalization must reach run_bootstrap, not just run())."""
+
+    def setUp(self):
+        import peppar_fix_engine as eng
+        self.eng = eng
+
+    def _args(self, **kw):
+        base = dict(obs_ntrip_mount=None, obs_sbf_tcp=None)
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def test_sbf_is_ext_source(self):
+        a = self._args(obs_sbf_tcp="10.101.101.153:28784")
+        self.assertTrue(self.eng._is_sbf_source(a))
+        self.assertFalse(self.eng._is_msm_source(a))
+        self.assertTrue(self.eng._has_ext_obs_source(a))
+
+    def test_msm_is_ext_source(self):
+        a = self._args(obs_ntrip_mount="ALIC00AUS0")
+        self.assertTrue(self.eng._is_msm_source(a))
+        self.assertTrue(self.eng._has_ext_obs_source(a))
+
+    def test_serial_is_not_ext_source(self):
+        a = self._args()
+        self.assertFalse(self.eng._has_ext_obs_source(a))
+
+
 class RunSbfTcpSourceTest(unittest.TestCase):
     def test_reads_from_mocked_socket(self):
         # a fake socket whose makefile() serves the real fixture bytes;

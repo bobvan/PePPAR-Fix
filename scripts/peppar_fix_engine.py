@@ -1577,6 +1577,26 @@ def _build_ppp_filter(args):
     return PPPFilter(**kwargs)
 
 
+# ── External (non-serial) obs sources ──────────────────────────────────── #
+
+def _is_msm_source(args):
+    """True when the engine ingests RTCM MSM obs from an NTRIP mount."""
+    return bool(getattr(args, 'obs_ntrip_mount', None))
+
+
+def _is_sbf_source(args):
+    """True when the engine ingests Septentrio SBF obs from a TCP endpoint."""
+    return bool(getattr(args, 'obs_sbf_tcp', None))
+
+
+def _has_ext_obs_source(args):
+    """True when obs come from an external source (RTCM MSM or SBF) rather than
+    a serial UBX receiver.  Such sources never feed NAV2, so the NAV2 seed
+    waits (both here and in ``run``) must be skipped for all of them — see
+    #283 (MSM) and delta's #288 review (the SBF miss this helper prevents)."""
+    return _is_msm_source(args) or _is_sbf_source(args)
+
+
 # ── Phase 1: Bootstrap ─────────────────────────────────────────────────── #
 
 def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
@@ -1728,12 +1748,13 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
                     # LS-init.  Per Bob's directive 2026-04-30 +
                     # cold_boot_smoke run-1 finding (LS-init Phase-1
                     # converged at horiz-good + 2 km altitude error).
-                    # An RTCM MSM obs source (CORS/geodetic) never feeds NAV2,
-                    # so waiting for it is a pure dead-wait — go straight to
-                    # LS-init (validated on MadHat/ALIC: cold LS-init Phase-1
-                    # converged 2.66 m).  I-030423 fast-follow (bravo #281).
+                    # An external obs source (RTCM MSM CORS/geodetic, or
+                    # Septentrio SBF) never feeds NAV2, so waiting for it is a
+                    # pure dead-wait — go straight to LS-init (validated on
+                    # MadHat/ALIC: cold LS-init Phase-1 converged 2.66 m).
+                    # I-030423 fast-follow (bravo #281; SBF added per delta #288).
                     timeout_s = (
-                        0.0 if getattr(args, 'obs_ntrip_mount', None)
+                        0.0 if _has_ext_obs_source(args)
                         else float(getattr(args, 'nav2_seed_timeout_s', 30.0)))
                     if timeout_s > 0:
                         if nav2_wait_started is None:
@@ -10406,9 +10427,9 @@ def run(args):
     # the UBX diagnostic-message config and the NAV2/NAV-PVT seed waits (a
     # CORS/geodetic source never feeds them), and swaps serial_reader for the
     # matching reader.
-    _msm_source = bool(getattr(args, 'obs_ntrip_mount', None))
-    _sbf_source = bool(getattr(args, 'obs_sbf_tcp', None))
-    _ext_obs_source = _msm_source or _sbf_source
+    _msm_source = _is_msm_source(args)
+    _sbf_source = _is_sbf_source(args)
+    _ext_obs_source = _has_ext_obs_source(args)
     # Verify receiver config on open (defensive: re-applies if needed).
     # This opens/closes the serial port to check for dual-freq observations,
     # reconfigures if single-freq, then releases the port for serial_reader.
