@@ -10395,6 +10395,10 @@ def run(args):
     stop_event = threading.Event()
     gate_stats = None
     exit_code = 0
+    # RTCM MSM obs source (I-030423): observations come from an NTRIP MSM mount
+    # instead of a serial UBX receiver.  Skips serial-device detection + the
+    # UBX diagnostic-message config, and swaps serial_reader for the MSM reader.
+    _msm_source = bool(getattr(args, 'obs_ntrip_mount', None))
     # Verify receiver config on open (defensive: re-applies if needed).
     # This opens/closes the serial port to check for dual-freq observations,
     # reconfigures if single-freq, then releases the port for serial_reader.
@@ -10421,16 +10425,23 @@ def run(args):
     # If --receiver was explicitly set, force that driver (skip auto-detect).
     # args.receiver is None when unset (default applied later in main()).
     forced = get_driver(args.receiver) if args.receiver is not None else None
-    driver, receiver_identity = ensure_receiver_ready(
-        args.serial, args.baud, port_type=port_type,
-        systems=systems_for_check,
-        sfrbx_rate=args.sfrbx_rate,
-        measurement_rate_ms=args.measurement_rate_ms,
-        forced_driver=forced)
-    if driver is None:
-        driver = get_driver(args.receiver)
-        log.warning("Receiver check failed — falling back to %s (may lack dual-freq)",
-                    driver.name)
+    if _msm_source:
+        # No serial receiver to detect — pick a driver for its default signal
+        # config only; the MSM adapter builds its own sig_lookup.
+        driver, receiver_identity = get_driver(args.receiver), None
+        log.info("MSM obs source (%s) — skipping serial receiver detection",
+                 args.obs_ntrip_mount)
+    else:
+        driver, receiver_identity = ensure_receiver_ready(
+            args.serial, args.baud, port_type=port_type,
+            systems=systems_for_check,
+            sfrbx_rate=args.sfrbx_rate,
+            measurement_rate_ms=args.measurement_rate_ms,
+            forced_driver=forced)
+        if driver is None:
+            driver = get_driver(args.receiver)
+            log.warning("Receiver check failed — falling back to %s (may lack dual-freq)",
+                        driver.name)
     # Stash receiver identity for position persistence.  Priority:
     #   1. SEC-UNIQID from the receiver itself (F9T-class chips).
     #   2. Synthetic UID derived from the USB hardware serial — for
@@ -10687,58 +10698,61 @@ def run(args):
     # the existing pattern.  Receiver-side enabling is also handled
     # by configure_messages(), but that only runs on first-time
     # config; this burst guarantees enablement on every restart.
-    try:
-        from peppar_fix.receiver import send_cfg
-        from peppar_fix.gnss_stream import open_gnss
-        from pyubx2 import UBXReader as _UBR
-        _nav2_ser, _ = open_gnss(args.serial, args.baud)
-        _nav2_ubr = _UBR(_nav2_ser, protfilter=2)
-        # args.port_type is the user-facing port string ("UART",
-        # "UART2", "USB", "SPI", "I2C" per the --ubx-port choices).
-        # Translate to the u-blox CFG-VALSET key suffix.  Note "UART"
-        # maps to "UART1" — UBX keys use the indexed form even though
-        # the user-facing CLI / TOML uses bare "UART".
-        # Bug history: the previous code used PORT_SUFFIX.get
-        # (int-keyed) against this string, silently falling back to
-        # "USB" on every host.  Caught 2026-05-12 on MadHat F10T,
-        # where USB-suffixed keys NAK because the F10T has no USB
-        # port (the host-side /dev/f10t is the ArduSimple board's
-        # USB-UART bridge, not the F10T's own interface).
-        _PORT_SUFFIX_FOR_VALSET = {
-            "UART": "UART1", "UART2": "UART2",
-            "USB": "USB", "SPI": "SPI", "I2C": "I2C",
-        }
-        _pname = _PORT_SUFFIX_FOR_VALSET.get(
-            args.port_type, args.port_type or "USB")
-        _cfg_keys = {
-            "CFG_NAV2_OUT_ENABLED": 1,
-            f"CFG_MSGOUT_UBX_NAV2_PVT_{_pname}": 5,
-            f"CFG_MSGOUT_UBX_NAV_SIG_{_pname}": 1,
-            f"CFG_MSGOUT_UBX_NAV_CLOCK_{_pname}": 1,
-            f"CFG_MSGOUT_UBX_NAV_TIMEGPS_{_pname}": 5,
-        }
-        if extint_store is not None:
-            _cfg_keys[f"CFG_MSGOUT_UBX_TIM_TM2_{_pname}"] = 1
-        _ok_keys, _nak_keys = send_cfg(
-            _nav2_ser, _nav2_ubr, _cfg_keys,
-            "NAV2 + NAV-SIG/CLOCK/TIMEGPS + TIM-TM2 enable")
-        _nav2_ser.close()
-        if not _nak_keys:
-            extras = ", TIM-TM2" if extint_store is not None else ""
-            log.info("NAV2 + NAV-SIG + NAV-CLOCK + NAV-TIMEGPS%s"
-                     " enabled (position consensus + cascade diagnostics)",
-                     extras)
-        else:
-            # Per-key NAK identities already logged at WARNING by
-            # send_cfg().  Summary here gives the operator a single
-            # line to grep for + the specific NAKing key set.
-            log.warning(
-                "Post-config burst: %d/%d keys NAK (%s) — "
-                "position consensus + diagnostics may be unavailable",
-                len(_nak_keys), len(_cfg_keys),
-                ", ".join(sorted(_nak_keys)))
-    except Exception as e:
-        log.warning("Post-config burst attempt failed: %s (continuing)", e)
+    if _msm_source:
+        log.debug("MSM obs source — skipping the NAV2/UBX diagnostic config burst")
+    else:
+        try:
+            from peppar_fix.receiver import send_cfg
+            from peppar_fix.gnss_stream import open_gnss
+            from pyubx2 import UBXReader as _UBR
+            _nav2_ser, _ = open_gnss(args.serial, args.baud)
+            _nav2_ubr = _UBR(_nav2_ser, protfilter=2)
+            # args.port_type is the user-facing port string ("UART",
+            # "UART2", "USB", "SPI", "I2C" per the --ubx-port choices).
+            # Translate to the u-blox CFG-VALSET key suffix.  Note "UART"
+            # maps to "UART1" — UBX keys use the indexed form even though
+            # the user-facing CLI / TOML uses bare "UART".
+            # Bug history: the previous code used PORT_SUFFIX.get
+            # (int-keyed) against this string, silently falling back to
+            # "USB" on every host.  Caught 2026-05-12 on MadHat F10T,
+            # where USB-suffixed keys NAK because the F10T has no USB
+            # port (the host-side /dev/f10t is the ArduSimple board's
+            # USB-UART bridge, not the F10T's own interface).
+            _PORT_SUFFIX_FOR_VALSET = {
+                "UART": "UART1", "UART2": "UART2",
+                "USB": "USB", "SPI": "SPI", "I2C": "I2C",
+            }
+            _pname = _PORT_SUFFIX_FOR_VALSET.get(
+                args.port_type, args.port_type or "USB")
+            _cfg_keys = {
+                "CFG_NAV2_OUT_ENABLED": 1,
+                f"CFG_MSGOUT_UBX_NAV2_PVT_{_pname}": 5,
+                f"CFG_MSGOUT_UBX_NAV_SIG_{_pname}": 1,
+                f"CFG_MSGOUT_UBX_NAV_CLOCK_{_pname}": 1,
+                f"CFG_MSGOUT_UBX_NAV_TIMEGPS_{_pname}": 5,
+            }
+            if extint_store is not None:
+                _cfg_keys[f"CFG_MSGOUT_UBX_TIM_TM2_{_pname}"] = 1
+            _ok_keys, _nak_keys = send_cfg(
+                _nav2_ser, _nav2_ubr, _cfg_keys,
+                "NAV2 + NAV-SIG/CLOCK/TIMEGPS + TIM-TM2 enable")
+            _nav2_ser.close()
+            if not _nak_keys:
+                extras = ", TIM-TM2" if extint_store is not None else ""
+                log.info("NAV2 + NAV-SIG + NAV-CLOCK + NAV-TIMEGPS%s"
+                         " enabled (position consensus + cascade diagnostics)",
+                         extras)
+            else:
+                # Per-key NAK identities already logged at WARNING by
+                # send_cfg().  Summary here gives the operator a single
+                # line to grep for + the specific NAKing key set.
+                log.warning(
+                    "Post-config burst: %d/%d keys NAK (%s) — "
+                    "position consensus + diagnostics may be unavailable",
+                    len(_nak_keys), len(_cfg_keys),
+                    ", ".join(sorted(_nak_keys)))
+        except Exception as e:
+            log.warning("Post-config burst attempt failed: %s (continuing)", e)
 
     # Warm TICC port BEFORE the serial reader starts.
     # Opening the TICC may reboot the Arduino (DTR edge), which causes
@@ -10780,19 +10794,34 @@ def run(args):
     # start_ntrip_threads; TICC is the next increment.
     if _raw_bundle is not None:
         serial_kwargs['raw_bundle'] = _raw_bundle
-    t_serial = threading.Thread(
-        target=serial_reader,
-        args=(args.serial, args.baud, obs_queue, stop_event, beph, systems, ssr),
-        kwargs={**serial_kwargs, 'driver': driver, 'nav2_store': nav2_store,
-                'extint_store': extint_store,
-                'nav_sig_store': nav_sig_store,
-                'nav_clock_store': nav_clock_store,
-                'nav_time_gps_store': nav_time_gps_store,
-                'nav_pvt_store': nav_pvt_store},
-        daemon=True,
-    )
-    t_serial.start()
-    log.info(f"Serial: {args.serial} at {args.baud} baud")
+    if _msm_source:
+        # RTCM MSM obs source: fill obs_queue from the NTRIP MSM mount instead
+        # of a serial UBX receiver.  beph/ssr are already fed by the
+        # start_ntrip_threads eph/ssr threads (pair with --eph-mount).
+        from peppar_fix.msm_obs_source import run_msm_ntrip_source
+        t_serial = threading.Thread(
+            target=run_msm_ntrip_source,
+            args=(args, obs_queue, stop_event),
+            kwargs={'ssr': ssr, 'systems': systems},
+            daemon=True,
+        )
+        t_serial.start()
+        log.info(f"MSM obs source: {args.ntrip_caster}:{args.ntrip_port}/"
+                 f"{args.obs_ntrip_mount} (L1CA+{args.msm_l2_sig})")
+    else:
+        t_serial = threading.Thread(
+            target=serial_reader,
+            args=(args.serial, args.baud, obs_queue, stop_event, beph, systems, ssr),
+            kwargs={**serial_kwargs, 'driver': driver, 'nav2_store': nav2_store,
+                    'extint_store': extint_store,
+                    'nav_sig_store': nav_sig_store,
+                    'nav_clock_store': nav_clock_store,
+                    'nav_time_gps_store': nav_time_gps_store,
+                    'nav_pvt_store': nav_pvt_store},
+            daemon=True,
+        )
+        t_serial.start()
+        log.info(f"Serial: {args.serial} at {args.baud} baud")
 
     # Open CSV output
     out_f = None
@@ -12209,6 +12238,19 @@ Two-phase operation:
     ntrip.add_argument("--ntrip-port", type=int, default=2101)
     ntrip.add_argument("--ntrip-tls", action="store_true")
     ntrip.add_argument("--eph-mount", help="Broadcast ephemeris mountpoint")
+    ntrip.add_argument("--obs-ntrip-mount", default=None,
+                       help="RTCM 3 MSM observation mountpoint (a CORS/geodetic "
+                            "receiver stream).  When set, the engine ingests "
+                            "MSM observations from this NTRIP mount IN PLACE OF "
+                            "a serial UBX receiver — no --serial device is "
+                            "opened.  Reuses --ntrip-caster/-port/-user/"
+                            "-password; pair with --eph-mount for broadcast "
+                            "ephemeris (I-030423).  GPS-first.")
+    ntrip.add_argument("--msm-l2-sig", default="GPS-L2W",
+                       choices=["GPS-L2W", "GPS-L2CL", "GPS-L5Q"],
+                       help="Which L2/L5 signal to pair with L1 C/A for the "
+                            "iono-free combination on the MSM obs stream "
+                            "(default GPS-L2W = geodetic/CORS L2 Z-tracking).")
     ntrip.add_argument("--ssr-mount", help="SSR corrections mountpoint")
     ntrip.add_argument("--ssr-records-file", default=None,
                        help="Ingest SSR corrections from an external records "
