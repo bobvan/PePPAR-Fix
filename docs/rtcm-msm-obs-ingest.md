@@ -113,6 +113,17 @@ extended fields), ingests 1019 eph, forms iono-free pseudoranges, and runs
 The two-stream `--eph-mount` mode is **the pattern the real Leica GRX1200
 ingest needs** — receiver gives obs, eph comes from a BCEP nav stream.
 
+**Why the spike's vertical is loose (and why that's not a requirement).** The
+spike grades with `ls_init` — the engine's *coarse, troposphere-free
+single-point bootstrap* — purely to prove the decode is correct with the
+lightest possible harness. The ~12 m NAPERVILLE vertical is an `ls_init`
+property, **not** an RTCM-ingest one. The actual integration (build step 3)
+feeds MSM obs into the **same observation model** `PPPFilter` already
+consumes from UBX-RAWX, so the **existing ZTD/troposphere model, AR, and
+clock estimation apply unchanged — no new tropo code**. That format-parity
+is the entire point: the adapter's only job is to emit the engine's obs
+structure; everything downstream is source-agnostic.
+
 ## Build order
 
 1. **Spike** — `NtripStream`→MSM-decode→obs→LS-solve→compare-to-published
