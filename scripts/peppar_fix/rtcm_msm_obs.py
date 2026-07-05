@@ -146,20 +146,14 @@ def decode_msm_obs(msg):
     return prefix, tow_ms, cells
 
 
-def merge_msm_into_raw_obs(msg, sig_lookup, raw_obs=None):
-    """Decode one MSM message and merge it into ``raw_obs[sv][role]`` in the
-    exact shape ``realtime_ppp.rawx_to_observations`` builds (pr/cno/cp/lock_ms/
-    half_cyc/alpha_f1/alpha_f2/sig_name), using ``sig_lookup`` for role + IF
-    alphas.  Signals not in ``sig_lookup`` (not part of a configured IF pair)
-    are skipped.  Accumulates across the MSM messages of one epoch so a full
-    constellation set forms IF pairs together; returns ``raw_obs``.
-    """
+def cells_to_raw_obs(cells, sig_lookup, raw_obs=None):
+    """Merge decoded MSM ``cells`` into ``raw_obs[sv][role]`` in the exact shape
+    ``realtime_ppp.rawx_to_observations`` builds (pr/cno/cp/lock_ms/half_cyc/
+    alpha_f1/alpha_f2/sig_name), using ``sig_lookup`` for role + IF alphas.
+    Signals not in ``sig_lookup`` (not part of a configured IF pair) are
+    skipped.  Returns ``raw_obs`` (accumulates in place)."""
     if raw_obs is None:
         raw_obs = defaultdict(dict)
-    dec = decode_msm_obs(msg)
-    if dec is None:
-        return raw_obs
-    _, _tow_ms, cells = dec
     for c in cells:
         look = sig_lookup.get(c["sig_name"])
         if look is None:
@@ -176,6 +170,18 @@ def merge_msm_into_raw_obs(msg, sig_lookup, raw_obs=None):
             "sig_name": c["sig_name"],
         }
     return raw_obs
+
+
+def merge_msm_into_raw_obs(msg, sig_lookup, raw_obs=None):
+    """Decode one MSM message and merge it into ``raw_obs`` (see
+    :func:`cells_to_raw_obs`).  Accumulates across the MSM messages of one epoch
+    so a full constellation set forms IF pairs together; returns ``raw_obs``."""
+    if raw_obs is None:
+        raw_obs = defaultdict(dict)
+    dec = decode_msm_obs(msg)
+    if dec is None:
+        return raw_obs
+    return cells_to_raw_obs(dec[2], sig_lookup, raw_obs)
 
 
 def msm_messages_to_observations(msgs, systems, ssr, sig_lookup):
