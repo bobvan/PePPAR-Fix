@@ -102,7 +102,12 @@ def decode_meas_epoch(msg):
         return getattr(msg, f"{field}_{i:02d}", None)
 
     def t2(field, j, i):
-        return getattr(msg, f"{field}_{j:02d}_{i:02d}", None)
+        # pysbf2 names nested Type2 sub-block fields channel-index FIRST, then
+        # sub-block index: SigIdxLo_<i>_<j>.  (Getting this transposed reads a
+        # neighbouring channel's sub-block — invisible for channel i=1 where
+        # _01_01 is symmetric, corrupting every SV after it.  Caught by the
+        # RTKLIB reference-decode value pin, I-110210.)
+        return getattr(msg, f"{field}_{i:02d}_{j:02d}", None)
 
     for i in range(1, n1 + 1):
         sv = _svid_to_sv(t1("SVID", i))
