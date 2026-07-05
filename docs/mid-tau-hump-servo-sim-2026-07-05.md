@@ -123,15 +123,54 @@ warning). CLI `scripts/servo_sim.py --two-clock A B` now prints the real
 verdict — two clkpoc3 clocks p95 = 1.88 ns FAIL, same order + FAIL as the
 lab §4.4 result. This is the go/no-go gate the lab A/B needs.
 
-## Recommendation
+## Update 2026-07-05 — re-grounded to CURRENT hardware (supersedes the stale-preset grade)
 
-- Carry **`soft_ticc_gate` (#217)** forward as the lead lever for
-  TICC-primary hosts (clkpoc3-class); pair it with a *modest* stiffer
-  Q[3,3] (≈0.003), not coast.
-- **Do not** pursue coast / flywheel-trust as a mid-τ hump fix — it is a
-  short-τ lever and worsens the hump.
-- Treat piface-class (gated, high-drift, EXTINT-carried) separately — its
-  hump is resolution-limited, not sawtooth-injection; the fix there is a
-  cleaner mid-τ DO-phase observer (TDCP), not gate/Q tuning.
-- Build the faithful two-clock harness before the lab A/B so the gate is
-  the real acceptance metric.
+The grade above was on the pre-London presets. A parallel PiFace+PiPuss
+lab capture (`gt:~/gt/mtbaseline-20260705/`, `project_mtbaseline_current_hw`)
+shows those presets misdescribe the current hardware, and **re-grounding
+flips the lever**:
+
+- **The hump is real on current hardware** — PiFace settled chA TDEV humps
+  **484 ps @ τ=32 s** (52 ps @ 1 s clean; 3.2× the 354 ps budget). PiPuss
+  is 4050 ps @ 16 s, dominated by a chA/DO-PPS edge-jitter fault
+  (I-105924), not servo dynamics.
+- **Mechanism changed:** current hosts show **0 % OCXO-gate rejection**
+  (vs `piface-v1`'s 99.6 % lockout). So `soft_ticc_gate` (#217) targets a
+  pathology that isn't occurring — it is **moot** on current PiFace. The
+  live hump is an open-gate loop resonance: the IsoTemp OCXO's frequency
+  RWFM (DO char `coast_tdev_ref`=0.070 ns@1s, slope 1.118) showing through
+  above loop BW (shape = bump-and-*recover*, not the monotone rise DO-noise
+  alone would give).
+- **New preset `piface-current`** encodes the measured params (do_f0=+2.30,
+  no gate, real Q σ_do_phase=0.0564 / σ_do_freq=0.009, routed-qErr, DAC LSB
+  0.026). **Amplitude caveat:** the sim reproduces the hump *shape* but
+  over-produces its *amplitude* ~6× (the DO mid-τ freerun the coast char
+  extrapolates to is unpinned) — use for **relative** lever direction only;
+  grade absolute numbers by lab A/B.
+- **Re-grade verdict (relative, on `piface-current`):**
+
+  | lever | hump(16–64 s) | two-clock p95 | vs base |
+  |---|---|---|---|
+  | baseline (σ_do_freq=0.009) | 3071 ps | 12.6 ns | — |
+  | **looser Q[3,3] σ_do_freq→0.03** | **1464 ps** | **6.24 ns** | **−52 %** |
+  | stiffer Q[3,3] →0.003 | 5532 ps | 23.9 ns | +80 % |
+  | coast 8 s | 5365 ps | 21.3 ns | +75 % |
+  | Q[2,2] (phase) ±5× | ~3050 ps | ~12.7 ns | ±4 % (moot) |
+
+  **The lever is *looser* Q[3,3] (σ_do_freq), not stiffer** — it lets the
+  freq loop track the OCXO's RWFM above BW instead of trusting a stale
+  flywheel estimate. This **reverses** the stale-preset grade (which said
+  *stiffer* Q[3,3] + softgate) and the dayplan's "stiffer-Q/coast" lever
+  #2. Grading on stale presets would have sent the lab A/B the wrong way.
+
+## Recommendation (current)
+
+- **Lab A/B on PiFace** (only — PiPuss blocked by I-105924): interleaved,
+  reset-free, `σ_do_freq` = 0.009 (current) vs ~0.03 (looser), grade on the
+  real chA TDEV(32 s) + two-clock p95. The sim gives the *direction*
+  (looser Q[3,3]); the lab gives the *magnitude*.
+- **Do not** pursue coast/flywheel-trust or softgate for the current PiFace
+  hump — coast worsens it, softgate is moot at 0 % gate reject.
+- The pre-London `soft_ticc_gate`/stiffer-Q grade applies only to a
+  gate-lockout regime that current hardware is not in; keep it filed for
+  hosts that re-enter that regime, not as the live lever.

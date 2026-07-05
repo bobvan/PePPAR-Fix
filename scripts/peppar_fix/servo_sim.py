@@ -815,6 +815,36 @@ def preset(name: str, **overrides) -> SimConfig:
                           initial_phi_do_ns=200.0,
                           gate_sigma_ns=0.054, gate_k_sigma=10.0,
                           gate_min_age_s=60.0, **_PIF),
+        # ── CURRENT London hardware (mtbaseline 2026-07-05, I-084500) ──
+        # Measured from the settled arm-state of the real engine run, NOT
+        # the pre-London presets above (whose do_f0/gate no longer describe
+        # the hardware after the host+DO+receiver shuffle).  PiFace now runs
+        # an IsoTemp OCXO (ex-MadHat) with:
+        #   do_f0=+2.30 ppb, NO OCXO gate (measured 0% reject — vs piface-v1's
+        #   99.6% lockout), arms PPP+qErr+EXTINT+TICC with routed-qErr routing
+        #   'ext' (clean qErr innov 0.036 ns), TICC innov 0.71 ns.
+        # Real Q from state/dos/isotemp-ocxo131-100-madhat.toml:
+        #   sigma_do_phase=0.0564, sigma_do_freq=0.009; DO char
+        #   coast_tdev_ref=0.070 ns@1s slope 1.118 (strong OCXO RWFM), 16-bit
+        #   AD5693R LSB 0.026 ppb.
+        # CAVEAT (do NOT read absolute amplitude): with the do_wfm/do_rwfm
+        # below the sim reproduces the real hump's SHAPE (mid-τ bump-and-
+        # recover) but over-produces its amplitude ~6× (real chA hump is
+        # 484 ps@32s; the DO mid-τ freerun the coast char extrapolates to is
+        # unpinned).  Use for RELATIVE lever direction only; grade absolute
+        # numbers by lab A/B on PiFace.  Re-grade verdict (relative, robust):
+        # looser Q[3,3] (sigma_do_freq 0.009→~0.03) is the lead lever
+        # (hump −52%, two-clock p95 12.6→6.2 ns); coast + stiffer-Q both
+        # worsen it; Q[2,2] and softgate are moot (0% gate).
+        "piface-current": dict(
+            label="piface-current", do_f0_ppb=2.30,
+            sigma_do_phase_ns=0.0564, sigma_do_freq_ppb=0.009,
+            sigma_ticc_ns=0.060, sigma_tcxo_phase_ns=2.0, sigma_tcxo_freq_ppb=0.10,
+            use_ppp=True, use_qerr=True, use_extint=True, use_ticc=True,
+            use_tdcp=False, routed_qerr_enabled=True, ext_qerr_noise_ns=0.04,
+            gnss_pps_jitter_ns=0.7, rx_wfm_ppb=1.0, adjfine_lsb_ppb=0.026,
+            do_wpm_ns=0.01, do_wfm_ppb=0.11, do_rwfm_ppb_per_sqrt_s=0.05,
+            initial_phi_do_ns=200.0),
     }
     if name not in presets:
         raise KeyError(f"unknown preset {name!r}; have {sorted(presets)}")
