@@ -27,7 +27,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 from peppar_fix.rtcm_msm_obs import (
-    cells_to_raw_obs, decode_msm_obs, default_gps_sig_lookup,
+    cells_to_raw_obs, decode_msm_obs, default_sig_lookup,
 )
 
 log = logging.getLogger("peppar-fix.msm_source")
@@ -166,11 +166,12 @@ def run_msm_ntrip_source(args, obs_queue, stop_event, *, ssr=None,
     only produces observations.  Blocks until ``stop_event`` or the stream ends.
     """
     from ntrip_client import NtripStream
-    if sig_lookup is None:
-        sig_lookup = default_gps_sig_lookup(getattr(args, "msm_l2_sig", "GPS-L2W"))
     if systems is None:
         systems = (set(args.systems.split(",")) if getattr(args, "systems", None)
                    else {"gps"})
+    if sig_lookup is None:
+        sig_lookup = default_sig_lookup(systems,
+                                        gps_l2=getattr(args, "msm_l2_sig", "GPS-L2W"))
     use_tls = (getattr(args, "ntrip_tls", False)
                or getattr(args, "ntrip_port", 2101) == 443)
     stream = NtripStream(

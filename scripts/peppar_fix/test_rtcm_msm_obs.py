@@ -31,11 +31,13 @@ def _msm(msg_num, sats, sigs, rough, cells, *, cellmask=None):
     order; each is {pr_fine(ms), ph_fine(ms)|None, cno, lock, half}."""
     extended = (msg_num % 10) in (6, 7)
     nsat, nsig = len(sats), len(sigs)
-    attrs = dict(
-        DF002=msg_num, DF004=100000,
-        DF394=sum(1 << (64 - p) for p in sats),
-        DF395=sum(1 << (32 - s) for s in sigs),
-        DF396=(cellmask if cellmask is not None else (1 << (nsat * nsig)) - 1))
+    # per-constellation epoch field: GPS DF004, GAL DF248, BDS DF427
+    epoch_df = {107: "DF004", 109: "DF248", 112: "DF427"}.get(msg_num // 10, "DF004")
+    attrs = {
+        "DF002": msg_num, epoch_df: 100000,
+        "DF394": sum(1 << (64 - p) for p in sats),
+        "DF395": sum(1 << (32 - s) for s in sigs),
+        "DF396": (cellmask if cellmask is not None else (1 << (nsat * nsig)) - 1)}
     for i, rg in enumerate(rough):
         attrs[f"DF397_{i+1:02d}"] = int(rg)
         attrs[f"DF398_{i+1:02d}"] = rg - int(rg)
@@ -123,8 +125,29 @@ class DecodeMsmTest(unittest.TestCase):
         self.assertFalse(cells[0]["half_ok"])
 
     def test_unsupported_constellation_returns_none(self):
-        self.assertIsNone(m.decode_msm_obs(_msm(1097, [5], [2], [73.0],
-                          [{"pr_fine": 0.0004}])))   # 109x = Galileo, not in scope
+        # 108x = GLONASS (FDMA) — still out of scope (a deliberate follow-on)
+        self.assertIsNone(m.decode_msm_obs(_msm(1087, [5], [2], [73.0],
+                          [{"pr_fine": 0.0004}])))
+
+    def test_galileo_msm7_decodes_with_df248_epoch(self):
+        # E11 with E1C (sig 2) + E5aQ (sig 23); GAL epoch time is DF248, not DF004
+        msg = _msm(1097, [11], [2, 23], [73.0],
+                   [{"pr_fine": 0.0004, "ph_fine": 0.0004, "cno": 46, "lock": 5},
+                    {"pr_fine": 0.0005, "ph_fine": 0.0005, "cno": 44, "lock": 5}])
+        prefix, tow, cells = m.decode_msm_obs(msg)
+        self.assertEqual(prefix, "E")
+        self.assertEqual(tow, 100000)                 # read from DF248
+        by = {c["sig_name"]: c for c in cells}
+        self.assertEqual(set(by), {"GAL-E1C", "GAL-E5aQ"})
+        self.assertEqual(by["GAL-E1C"]["sv"], "E11")
+        self.assertAlmostEqual(by["GAL-E5aQ"]["freq_hz"], 1176.45e6)   # E5a band
+
+    def test_galileo_e5b_is_7band(self):
+        # sig 14 = 7I = E5bI (1207.14 MHz), NOT E5a/AltBOC
+        msg = _msm(1097, [11], [14], [73.0], [{"pr_fine": 0.0004}])
+        cells = m.decode_msm_obs(msg)[2]
+        self.assertEqual(cells[0]["sig_name"], "GAL-E5bI")
+        self.assertAlmostEqual(cells[0]["freq_hz"], 1207.14e6)
 
     def test_msm1_2_3_rejected(self):
         # MSM1/2/3 (num%10 in 1-3) have a compact/different field layout — must
@@ -186,6 +209,18 @@ class DefaultSigLookupTest(unittest.TestCase):
         self.assertIn("GPS-L2CL", look)
         self.assertNotIn("GPS-L2W", look)
 
+    def test_multignss_gps_gal(self):
+        # systems={gps,gal} → both IF pairs in the lookup (E1C+E5aQ for GAL)
+        look = m.default_sig_lookup({"gps", "gal"})
+        self.assertEqual(look["GPS-L1CA"][2], "f1")
+        self.assertEqual(look["GPS-L2W"][2], "f2")
+        self.assertEqual(look["GAL-E1C"][2], "f1")
+        self.assertEqual(look["GAL-E5aQ"][2], "f2")
+
+    def test_gps_only_has_no_gal_pair(self):
+        look = m.default_sig_lookup({"gps"})
+        self.assertNotIn("GAL-E1C", look)
+
 
 # --- test-only rawx fixture, matching test_rawx_to_observations ---
 _A1, _A2 = r.IF_PAIR_PARAMS[("GPS-L1CA", "GPS-L2CL")][1:]
@@ -243,6 +278,21 @@ class ParityWithRawxTest(unittest.TestCase):
             [msg], {"gps"}, None, look)
         self.assertEqual(obs, [])
         self.assertEqual(n_single, 1)
+
+    def test_galileo_forms_if_obs_through_shared_former(self):
+        # GAL 1097 (E1C+E5aQ) → the shared IF-former → an obs with sys='gal'.
+        # The second constellation is what breaks the GPS-only degeneracy (AR).
+        look = m.default_sig_lookup({"gps", "gal"})
+        msg = _msm(1097, [11], [2, 23], [73.0],
+                   [{"pr_fine": 0.0004, "ph_fine": 0.0004, "cno": 46, "lock": 5},
+                    {"pr_fine": 0.0005, "ph_fine": 0.0005, "cno": 44, "lock": 5}])
+        obs, _, _, _ = m.msm_messages_to_observations(
+            [msg], {"gps", "gal"}, None, look)
+        self.assertEqual(len(obs), 1)
+        self.assertEqual(obs[0]["sv"], "E11")
+        self.assertEqual(obs[0]["sys"], "gal")
+        self.assertEqual(obs[0]["f1_sig_name"], "GAL-E1C")
+        self.assertEqual(obs[0]["f2_sig_name"], "GAL-E5aQ")
 
 
 if __name__ == "__main__":
