@@ -1,0 +1,56 @@
+# PePPAR-Fix host config — SparkFun GNSSDO+ (SXT-D) on MadHat
+# =============================================================
+#
+# Explicit-use config (NOT auto-selected by hostname — MadHat's default
+# config/madhat.toml drives its i226/F9T).  Run the SXT-D discipline with:
+#
+#   peppar-fix --host-config config/madhat-sxtd.toml ...
+#
+# The SXT-D's DO is the STP3593LF double-oven OCXO, steered over the ESP32
+# "$W" external-control console added by the external-oscillator-control
+# firmware branch.  See docs/gnssdo-plus-integration.md.
+#
+# STATUS: actuator + firmware validated (2026-07-06).  Two prerequisites
+# before a full graded run — see docs/gnssdo-plus-integration.md §8:
+#   1. ppb-per-controlword sign+value must be CALIBRATED (placeholder below).
+#   2. Error source: the mosaic-T SBF obs seam (PR #287–#290) lives on
+#      `main`, not yet on delta/main — rebase/merge before using SBF here.
+
+[peppar]
+
+do_label = "gnssdo-sxtd-madhat"
+do_type  = "gnssdo"
+
+# ── Actuator: GNSSDO+ $W console ────────────────────────────────────
+# Serial = ESP32 front-panel USB (simplest; validated on /dev/ttyUSB0).
+# Alternatively transport="tcp" + gnssdo_host/gnssdo_port for the
+# mosaic-T IPS1 backdoor.
+gnssdo_transport = "serial"
+gnssdo_serial    = "/dev/ttyUSB0"
+gnssdo_baud      = 115200
+gnssdo_watchdog_s = 30
+
+# CALIBRATE THIS before disciplining.  STP3593LF datasheet ≈ 8e-4 ppb/LSB;
+# the SIGN (does a higher control word raise or lower frequency?) must be
+# measured.  Run:
+#   tools/calibrate_do.py --ticc-port /dev/ticcN --channel A \
+#       --gnssdo-transport serial --gnssdo-serial /dev/ttyUSB0 \
+#       --gnssdo-ppb-per-controlword 8e-4 --do-label gnssdo-sxtd-madhat \
+#       --sweep-ppb -5,5 --steps 11 --dwell 60
+# then copy the fitted slope here.
+gnssdo_ppb_per_controlword = 8e-4   # PLACEHOLDER — replace with calibrated value
+
+# ── Error source (phase for the servo) ──────────────────────────────
+# Preferred: the mosaic-T's own carrier-phase clock, via the SBF obs
+# seam (--obs-sbf-tcp host:port → PPP/TDCP dt_rx).  Requires the SBF
+# commits from `main`.  Enable the mosaic-T's IPS SBF MeasEpoch stream to
+# MadHat first (see the Mosaic-T SBF lab-test procedure).
+#   obs_sbf_tcp = "<mosaic-ip>:<port>"        # (key name pending rebase)
+#
+# Fallback demo without SBF: use a TICC as the phase reference (SXT-D
+# PPS OUT on chA vs a GNSS reference PPS on chB) — set ticc_port below.
+
+# ── Measurement / grading ───────────────────────────────────────────
+# chA = SXT-D PPS OUT (the disciplined DO), chB = reference PPS.
+# Grade with tools/plot_chA_tdev_goldilocks.py (chA detrended TDEV).
+# ticc_port = "/dev/ticcN"   # set to the TICC wired to SXT-D PPS OUT

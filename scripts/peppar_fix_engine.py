@@ -7943,6 +7943,47 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
         except Exception as e:
             log.error("ClockMatrix actuator init failed: %s", e)
             actuator = None
+    elif getattr(args, 'gnssdo_transport', None) is not None:
+        # SparkFun GNSSDO+ (SXT-D) STP3593LF OCXO, steered via the ESP32
+        # "$W,<controlword>" external-control console (see
+        # docs/gnssdo-plus-integration.md).  Transport is either the ESP32
+        # front-panel USB serial port or the mosaic-T IPS1 TCP backdoor.
+        try:
+            from peppar_fix.gnssdo_actuator import GnssdoActuator
+            slope = getattr(args, 'gnssdo_ppb_per_controlword', None)
+            if slope is None:
+                log.error("--gnssdo-ppb-per-controlword required for GNSSDO+ "
+                          "actuator (calibrate with tools/calibrate_do.py)")
+            else:
+                transport = args.gnssdo_transport
+                if transport == "tcp":
+                    if not getattr(args, 'gnssdo_host', None):
+                        raise ValueError("--gnssdo-host required for tcp transport")
+                    act_kw = dict(tcp=(args.gnssdo_host,
+                                       getattr(args, 'gnssdo_port', 28784)))
+                    where = "tcp %s:%d" % (args.gnssdo_host,
+                                           getattr(args, 'gnssdo_port', 28784))
+                else:  # serial
+                    if not getattr(args, 'gnssdo_serial', None):
+                        raise ValueError("--gnssdo-serial required for serial transport")
+                    act_kw = dict(serial_port=args.gnssdo_serial,
+                                  baud=getattr(args, 'gnssdo_baud', 115200) or 115200)
+                    where = args.gnssdo_serial
+                _gk = {}
+                if getattr(args, 'gnssdo_center_word', None) is not None:
+                    _gk['center_word'] = args.gnssdo_center_word
+                if getattr(args, 'gnssdo_word_min', None) is not None:
+                    _gk['word_min'] = args.gnssdo_word_min
+                if getattr(args, 'gnssdo_word_max', None) is not None:
+                    _gk['word_max'] = args.gnssdo_word_max
+                if getattr(args, 'gnssdo_watchdog_s', None) is not None:
+                    _gk['watchdog_s'] = args.gnssdo_watchdog_s
+                actuator = GnssdoActuator(ppb_per_code=slope, **act_kw, **_gk)
+                actuator_type = "gnssdo"
+                log.info("Using GNSSDO+ actuator: %s ppb/word=%.3e", where, slope)
+        except Exception as e:
+            log.error("GNSSDO+ actuator init failed: %s", e)
+            actuator = None
 
     # Fallback to PHC adjfine — only valid when we have a PHC.
     if actuator is None:
@@ -11729,6 +11770,16 @@ def _apply_host_config(args):
         "dac_code_max":     ("dac_code_max",     int),
         "dac_type":         ("dac_type",         str),
         "dac_gain":         ("dac_gain",         int),
+        "gnssdo_transport": ("gnssdo_transport", str),
+        "gnssdo_serial":    ("gnssdo_serial",    str),
+        "gnssdo_baud":      ("gnssdo_baud",      int),
+        "gnssdo_host":      ("gnssdo_host",      str),
+        "gnssdo_port":      ("gnssdo_port",      int),
+        "gnssdo_ppb_per_controlword": ("gnssdo_ppb_per_controlword", float),
+        "gnssdo_center_word": ("gnssdo_center_word", int),
+        "gnssdo_word_min":  ("gnssdo_word_min",  int),
+        "gnssdo_word_max":  ("gnssdo_word_max",  int),
+        "gnssdo_watchdog_s": ("gnssdo_watchdog_s", int),
         "tadd_gpio":        ("tadd_gpio",        int),
         "tadd_hold_s":      ("tadd_hold_s",      float),
         "ticc_port":        ("ticc_port",        str),
@@ -13038,6 +13089,36 @@ Two-phase operation:
                             "1=2× output (0..2×Vref).  Required for OCXOs that "
                             "need >Vref Vctrl to compensate freerun offset; "
                             "ignored for other DAC types.  See I-000711.")
+
+    # GNSSDO+ (SparkFun SXT-D) $W-console actuator — see
+    # docs/gnssdo-plus-integration.md and scripts/peppar_fix/gnssdo_actuator.py
+    servo.add_argument("--gnssdo-transport", default=None,
+                       choices=["serial", "tcp"],
+                       help="Steer a SparkFun GNSSDO+ (SXT-D) OCXO over its "
+                            "ESP32 '$W' console: 'serial' (ESP32 front-panel "
+                            "USB) or 'tcp' (mosaic-T IPS1 backdoor).")
+    servo.add_argument("--gnssdo-serial", default=None,
+                       help="GNSSDO+ ESP32 console serial device (e.g. /dev/ttyUSB0)")
+    servo.add_argument("--gnssdo-baud", type=int, default=None,
+                       help="GNSSDO+ console baud (default 115200)")
+    servo.add_argument("--gnssdo-host", default=None,
+                       help="GNSSDO+ mosaic-T IP for the TCP console backdoor")
+    servo.add_argument("--gnssdo-port", type=int, default=None,
+                       help="GNSSDO+ mosaic-T IPS1 console port (default 28784)")
+    servo.add_argument("--gnssdo-ppb-per-controlword", type=float, default=None,
+                       help="Frequency sensitivity in ppb per control-word LSB "
+                            "(STP3593LF ≈ 8e-4; sign must be characterized "
+                            "with tools/calibrate_do.py).")
+    servo.add_argument("--gnssdo-center-word", type=int, default=None,
+                       help="Control word defining 0 ppb (default: word read "
+                            "at setup — anchor to the live starting frequency)")
+    servo.add_argument("--gnssdo-word-min", type=int, default=None,
+                       help="Lower control-word clamp (default 0)")
+    servo.add_argument("--gnssdo-word-max", type=int, default=None,
+                       help="Upper control-word clamp (default 2^20-1 for STP3593LF)")
+    servo.add_argument("--gnssdo-watchdog-s", type=int, default=None,
+                       help="Firmware fail-safe watchdog to request via $T "
+                            "(default 30 s; must exceed the servo period)")
 
     # DO bootstrap (absorbed from phc_bootstrap.py)
     boot = ap.add_argument_group("DO bootstrap (automatic when --servo)")
