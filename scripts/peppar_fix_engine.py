@@ -4935,7 +4935,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     #      with ts2phc disciplining the PHC independently).
     servo_ctx = None
     ptp = None
-    want_servo = args.servo or getattr(args, 'ticc_port', None) is not None
+    want_servo = (args.servo or getattr(args, 'ticc_port', None) is not None
+                  or getattr(args, 'gnssdo_transport', None) is not None)
     if want_servo:
         if args.servo:
             # Open PTP device for bootstrap and servo
@@ -10780,7 +10781,8 @@ def run(args):
     # post-hoc index-matching against TICC chB events.
     qerr_store = None
     qerr_log_f = None
-    want_servo = args.servo or getattr(args, 'ticc_port', None) is not None
+    want_servo = (args.servo or getattr(args, 'ticc_port', None) is not None
+                  or getattr(args, 'gnssdo_transport', None) is not None)
     if want_servo:
         qerr_log_writer = None
         if getattr(args, 'qerr_log', None):
