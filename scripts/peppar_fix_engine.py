@@ -7711,6 +7711,21 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
         return False
     pps_freq_ppb, pps_freq_unc, dt_rx_ns, dt_rx_series, phi_end_ns = result
 
+    # Persist the freshly-measured dt_rx so the DOFreqEst (constructed later,
+    # in the servo-start path) seeds its rx-TCXO phase (φ_rx) from THIS value
+    # rather than a stale receiver-state copy left over from a prior run.  A
+    # stale seed — days old after the host was offline — is far from the live
+    # dt_rx and, against the tight seed covariance, blows up the rx-TCXO
+    # frequency state at startup (ptBoat 2026-07-06: 6 state_sanity resets,
+    # near exit-5).  This is the one bootstrap point common to every DO type.
+    _rx_uid = getattr(args, 'receiver_unique_id', None)
+    if _rx_uid is not None and dt_rx_ns is not None:
+        try:
+            from peppar_fix.receiver_state import save_dt_rx_to_receiver
+            save_dt_rx_to_receiver(_rx_uid, dt_rx_ns)
+        except Exception as e:
+            log.warning("Failed to persist bootstrap dt_rx: %s", e)
+
     if dfe_sm is not None:
         dfe_sm.transition(DOFreqEstState.FREQ_VERIFYING,
                           f"freq measured ({pps_freq_ppb:+.1f} ppb)")
@@ -8055,10 +8070,24 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
     receiver_uid_local = getattr(args, 'receiver_unique_id', None)
     if receiver_uid_local is not None:
         try:
-            from peppar_fix.receiver_state import load_receiver_state
+            from peppar_fix.receiver_state import (load_receiver_state,
+                                                   dt_rx_seed_if_fresh,
+                                                   DT_RX_SEED_MAX_AGE_S)
             rx = load_receiver_state(receiver_uid_local)
             if rx is not None:
-                bootstrap_dt_rx_ns = rx.get('tcxo', {}).get('last_known_dt_rx_ns')
+                # Staleness guard: a dt_rx older than DT_RX_SEED_MAX_AGE_S is a
+                # receiver clock bias from a prior life (reboot / offline gap),
+                # not the live one.  Seeding φ_tcxo from it blows up the rx-TCXO
+                # frequency state at startup, so reject it and fall back to the
+                # 2-state bootstrap.  The DO bootstrap refreshes this value on a
+                # good run (phc_bootstrap.save_dt_rx_to_receiver), so a healthy
+                # start seeds from a fresh dt_rx.
+                bootstrap_dt_rx_ns, _dt_rx_age_s = dt_rx_seed_if_fresh(rx)
+                if bootstrap_dt_rx_ns is None and _dt_rx_age_s is not None:
+                    log.warning(
+                        "DOFreqEst: ignoring stale receiver-state dt_rx "
+                        "(age=%.0f s > %.0f s)",
+                        _dt_rx_age_s, DT_RX_SEED_MAX_AGE_S)
         except Exception:
             pass
     if bootstrap_dt_rx_ns is not None:
