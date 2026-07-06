@@ -275,6 +275,20 @@ class SimConfig:
     initial_freq_ppb: float = 0.0      # bootstrap adjfine seed
     initial_dt_rx_ns: Optional[float] = 0.0  # None → 2-state mode
 
+    # pppArmPreconvergenceGate test hooks (Layer-2).  Model the ptBoat startup
+    # pathology: the Phase-2 FixedPos clock has not converged, so Arm 1's
+    # dt_rx is biased by a large amount while its reported sigma still looks
+    # honest (the overconfident-FixedPos case).  For t_now < garbage_window_s,
+    # add garbage_ns to dt_rx_ns and (if garbage_sigma_ns is None) keep the
+    # clean sigma_ppp_ns — i.e. a wrong value with a small σ.
+    ppp_startup_garbage_window_s: float = 0.0
+    ppp_startup_garbage_ns: float = 0.0
+    ppp_startup_garbage_sigma_ns: Optional[float] = None
+    # The engine's Arm-1 gate, modelled: withhold dt_rx (Arm 1) for
+    # t_now < gate_warmup_s, then snap x[0] to the trusted dt_rx on the
+    # rising edge (realign_rx_clock, x[1] untouched).  0.0 → gate disabled.
+    ppp_arm_gate_warmup_s: float = 0.0
+
     # softGateMidTau (I-092034): enable the soft TICC chi² gate (R-inflation,
     # always-admit) instead of the binary hard reject.  Default off →
     # DOFreqEst(soft_ticc_gate=False), the hard gate.  Used by the go/no-go
@@ -624,6 +638,31 @@ class ClosedLoopSim:
                     self.ekf.update(dt=gap_s)
                 else:
                     meas = self._emit()
+                    # pppArmPreconvergenceGate: inject a pre-convergence
+                    # garbage dt_rx (biased value, honest-looking σ) for the
+                    # startup window, then model the engine's Arm-1 gate.
+                    if ("dt_rx_ns" in meas
+                            and c.ppp_startup_garbage_window_s > 0.0
+                            and t_now < c.ppp_startup_garbage_window_s):
+                        # Linearly-decaying garbage: the filter reads the ramp
+                        # as a huge apparent rx frequency and x[1] blows past
+                        # the state-sanity bound (models the FixedPos clock
+                        # swinging as it converges, not a static offset).
+                        _frac = 1.0 - t_now / c.ppp_startup_garbage_window_s
+                        meas["dt_rx_ns"] += c.ppp_startup_garbage_ns * _frac
+                        if c.ppp_startup_garbage_sigma_ns is not None:
+                            meas["dt_rx_sigma_ns"] = \
+                                c.ppp_startup_garbage_sigma_ns
+                    if "dt_rx_ns" in meas and c.ppp_arm_gate_warmup_s > 0.0:
+                        if t_now < c.ppp_arm_gate_warmup_s:
+                            self._ppp_arm_withheld = True
+                            del meas["dt_rx_ns"]
+                            meas.pop("dt_rx_sigma_ns", None)
+                        elif getattr(self, "_ppp_arm_withheld", False):
+                            # Rising edge: snap x[0] to the trusted dt_rx.
+                            self.ekf.realign_rx_clock(
+                                meas["dt_rx_ns"] - float(self.ekf.x[0]))
+                            self._ppp_arm_withheld = False
                     # dt handed to the filter is the gap since the last
                     # correction; predict grows P over the coast.
                     meas["dt"] = gap_s
