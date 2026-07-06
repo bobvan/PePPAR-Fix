@@ -1749,6 +1749,29 @@ def ensure_receiver_ready(port, baud, port_type="USB", systems=None,
         if dual >= 4:
             log.info("Receiver already on %s: %d/%d SVs dual-freq",
                      forced_driver.name, dual, total)
+            # fixWarmRateChange: the receiver already has the forced driver's
+            # SIGNALS, but the requested measurement rate is NOT necessarily
+            # applied — configure_rate_ms only runs on the reconfigure path
+            # below, so a warm receiver would silently keep its prior rate and
+            # --measurement-rate-ms would be dropped (the engine's internal
+            # meas_rate_hz and the receiver would then disagree).  Assert the
+            # rate here too so the flag is authoritative on every start.  This
+            # runs during bring-up (before the servo loop) and is idempotent —
+            # re-asserting the same rate is a harmless CFG write.
+            if measurement_rate_ms is not None:
+                _ensure_imports()
+                ser, ubr = open_receiver(port, baud)
+                try:
+                    if configure_rate_ms(ser, ubr, measurement_rate_ms):
+                        log.info("Measurement rate asserted on warm receiver: "
+                                 "%d ms (%.1f Hz)", measurement_rate_ms,
+                                 1000.0 / measurement_rate_ms)
+                    else:
+                        log.warning("Measurement-rate config NAK'd on warm "
+                                    "receiver (%d ms) — kept prior rate",
+                                    measurement_rate_ms)
+                finally:
+                    ser.close()
             return forced_driver, identity
 
         log.info("Reconfiguring receiver for %s...", forced_driver.name)
