@@ -541,5 +541,54 @@ GNSSDO+ PPS, chB = dot166, Rb ref). **Morning: analyse chA detrended
 STP3593LF free-run ADEV/TDEV → replace the OCXO class-default Q** in
 `state/dos/gnssdo-sxtd-madhat.toml`, then re-grade the disciplined loop.
 
-Still open: **grade the disciplined chA TDEV** over an overnight (same TICC
-rig) once the free-run Q is measured — the actual "grade vs TICC".
+### Comparing our steering vs theirs — what's valid (2026-07-06)
+
+`tools/analyze_gnssdo_compare.py` computes the *metrologically valid*
+comparisons (not a naive TDEV-vs-TDEV):
+
+- **TDEV of the difference** `(our dt_rx − their RxClkBias)` — the two
+  *estimators'* relative stability (common OCXO cancels). This is the valid
+  one. Individual TDEVs are context only: our `dt_rx` is a **closed-loop
+  residual** (the signal we minimise — suppressed, not a clock; the
+  chA-vs-chA-chB trap), theirs is an open-loop estimate.
+- **TDEV is NOT run on the frequency corrections** — it's a phase metric.
+  Servo smoothness is a **PSD / roughness** question.
+
+On the 200 s snippet (settled window 141 s, so trustworthy only to τ≈17 s):
+
+```
+TDEV, detrended:  difference ★  τ1=5ps  τ4=11ps  τ8=24ps  τ16=41ps  (τ32=73ps, noisy)
+                  ours (resid)  τ1=4ps  ...              theirs  τ1=3ps  ...  (all ps-class, similar)
+```
+
+The **"we're smooth, they're bumpy" is real and shows in the PSD** of the
+correction signals (the roughness stat, 1.7×, understated it): at
+f > 0.05 Hz the Mosaic-T's `RxClkDrift` carries **~4–6× more power** than our
+`freq_ppb` — their per-epoch code/SPP estimate vs our loop-integrated
+command that rolls off. Low-f they match (both track the same slow OCXO
+motion). So: the smoothness gap = servo/measurement (PSD); the ~7.8 ns
+offset = the carrier-PPP-vs-AtomiChron **datum**, whose long-τ behaviour
+needs the longer capture below.
+
+### The two overnight captures (sequenced — they're mutually exclusive)
+
+The hardware can't free-run AND discipline at once, so:
+
+1. **Free-run** (running now): `gnssdo_freerun_hold.py` + TICC chA → STP3593LF
+   free-run ADEV/TDEV → measured Q into `state/dos/gnssdo-sxtd-madhat.toml`.
+2. **Disciplined grade + long compare** (after #1, with the measured Q): the
+   engine disciplining with `--gnssdo-compare-log` (stream
+   `MeasEpoch+PVTGeodetic`) **plus** a TICC capture of the disciplined chA:
+
+   ```sh
+   # mosaic: sso, Stream3, IPS2, MeasEpoch+PVTGeodetic, sec1 ; siss, IPS2, 28800
+   peppar-fix --host-config config/madhat-sxtd.toml \
+       --obs-sbf-tcp 10.101.101.153:28800 --eph-mount BCEP00BKG0 \
+       --ntrip-conf ntrip.conf --systems gps,gal --skip-bootstrap \
+       --duration 36000 --gnssdo-compare-log data/gnssdo-compare-long.csv
+   # separately: ticc_capture.py --device /dev/ticc4 --prefix gnssdo-disc-ticc
+   ```
+
+   → difference-TDEV out to long τ (`analyze_gnssdo_compare.py`) **and** the
+   honest disciplined-output grade (chA detrended TDEV,
+   `plot_chA_tdev_goldilocks.py`) — the real "grade vs TICC".
