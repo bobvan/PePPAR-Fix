@@ -96,7 +96,9 @@ def compute_phase_confidence(
          tightens to ~sub-cm at full window.
       2. AntPosEst per-epoch σ: meters-class cold-start, drops as
          the PPP filter converges.
-      3. Seed σ from the .ppp.toml / .survey.toml chosen at startup.
+      3. Seed σ from the .ppp.toml / .survey.toml chosen at startup —
+         or 0 for a --known-pos operator-asserted exact position, which
+         yields a zero phase leg (freq-limited σ_total).
       4. NAV2 hAcc — last resort, ~1–2 m.
       5. Unknown (cold-start gap before NAV2 first fix) → infinite σ.
 
@@ -119,7 +121,12 @@ def compute_phase_confidence(
                 pos_sigma_m=float(se),
                 source="antpos_epoch",
             )
-    if seed_sigma_m is not None and seed_sigma_m > 0:
+    if seed_sigma_m is not None and seed_sigma_m >= 0:
+        # >= 0 (not > 0) so a --known-pos host (σ=0, an operator-asserted EXACT
+        # position) contributes a ZERO phase leg → σ_total is freq-limited (the
+        # best case), instead of the seed branch being skipped and falling to
+        # nav2_hAcc / UNKNOWN — the most-certain position must not advertise the
+        # least-certain time (I-044524; delta #277 review).
         return PhaseConfidence(
             sigma_ns=float(seed_sigma_m) * SIGMA_POS_NS_PER_M,
             pos_sigma_m=float(seed_sigma_m),
