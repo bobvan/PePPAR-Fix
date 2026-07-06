@@ -84,8 +84,12 @@ ALLOWED_CLASSES = ("OCXO", "TCXO", "Rb", "PHC")
 # path) is DIFFERENT: the realized/naive frequency ratio (~0.7×) is per-chip,
 # so it MUST be measured (clockmatrix_combo_gain_char.py) and recorded in
 # [steering].combo_gain — same rule as the DAC's per-unit EFC slope.
+# GNSSDO_controlword (SparkFun GNSSDO+/SXT-D $W console): the STP3593LF
+# control-word→frequency gain is a fixed digital constant (8e-4 ppb/LSB),
+# so — like ClockMatrix_FCW — there is nothing per-unit to measure and the
+# steering-refuse gate must not fire on it.
 ALLOWED_ACTUATOR_TYPES = ("DAC", "PHC_adjfine", "ClockMatrix_FCW",
-                          "ClockMatrix_combo")
+                          "ClockMatrix_combo", "GNSSDO_controlword")
 
 
 # Class defaults per docs §"Class defaults".  Numbers are argued in PR
