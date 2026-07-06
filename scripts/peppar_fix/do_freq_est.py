@@ -266,12 +266,12 @@ class DOFreqEst:
         #   cm_phase — Arm 7, ClockMatrix DPLL PHASE_STATUS → x[2]
         self.last_arm_innov: dict[str, float | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
-            'extint': None, 'pseudo': None, 'ticc': None,
+            'extint': None, 'do_phase': None, 'pseudo': None, 'ticc': None,
             'cm_phase': None,
         }
         self.last_arm_S: dict[str, float | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
-            'extint': None, 'pseudo': None, 'ticc': None,
+            'extint': None, 'do_phase': None, 'pseudo': None, 'ticc': None,
             'cm_phase': None,
         }
         # Per-arm pull attribution (pullAttributionLog).  Captures K
@@ -285,17 +285,17 @@ class DOFreqEst:
         # Kalman gain recovered post-hoc as K = would_pull / innov.
         self.last_arm_K: dict[str, list[float] | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
-            'extint': None, 'pseudo': None, 'ticc': None,
+            'extint': None, 'do_phase': None, 'pseudo': None, 'ticc': None,
             'cm_phase': None,
         }
         self.last_arm_would_pull: dict[str, list[float] | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
-            'extint': None, 'pseudo': None, 'ticc': None,
+            'extint': None, 'do_phase': None, 'pseudo': None, 'ticc': None,
             'cm_phase': None,
         }
         self.last_arm_chi2: dict[str, float | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
-            'extint': None, 'pseudo': None, 'ticc': None,
+            'extint': None, 'do_phase': None, 'pseudo': None, 'ticc': None,
             'cm_phase': None,
         }
         self.last_ocxo_gate_rejected: bool = False
@@ -579,6 +579,7 @@ class DOFreqEst:
                qerr_freq_ppb=None, qerr_freq_sigma_ppb=None,
                tdcp_freq_ppb=None, tdcp_freq_sigma_ppb=None,
                extint_phase_ns=None, extint_sigma_ns=None,
+               do_phase_ns=None, do_phase_sigma_ns=None,
                ticc_diff_ns=None, ticc_sigma_ns=None,
                pseudo_phase_ns=None, pseudo_phase_sigma_ns=None,
                cm_phase_ns=None, cm_phase_sigma_ns=None,
@@ -667,6 +668,13 @@ class DOFreqEst:
                 # observer (~50 ps) and, on OTC hosts, usually the only one.
                 self.x[2] = cm_phase_ns
                 self.P[2, 2] = max(cm_phase_sigma_ns ** 2 if cm_phase_sigma_ns
+                                   else 100.0, 100.0)
+                self._need_phc_seed = False
+            elif do_phase_ns is not None:
+                # GNSSDO+ topology: the receiver clock IS the DO,
+                # so dt_rx directly seeds the DO-phase state x[2].
+                self.x[2] = do_phase_ns
+                self.P[2, 2] = max(do_phase_sigma_ns ** 2 if do_phase_sigma_ns
                                    else 100.0, 100.0)
                 self._need_phc_seed = False
             elif extint_phase_ns is not None:
@@ -758,6 +766,23 @@ class DOFreqEst:
                 H=np.array([[0.0, 0.0, 1.0, 0.0]]),
                 R=extint_sigma_ns ** 2,
                 arm_name='extint',
+            )
+
+        # ── Arm 8: do_phase (linear, observes x[2]) ──
+        # The DO's own clock phase vs GPS, measured DIRECTLY — for
+        # topologies where the receiver clock IS the disciplined oscillator
+        # (GNSSDO+/SXT-D: the mosaic-T runs off the steered OCXO, so its
+        # PPP carrier-phase dt_rx observes the DO phase, not a separate rx
+        # TCXO).  Same linear H as Arm 3 (EXTINT).  In this mode the PPP
+        # arm (Arm 1, which observes x[0]) is disabled by the caller so the
+        # single dt_rx measurement is not double-counted.
+        if do_phase_ns is not None and do_phase_sigma_ns is not None:
+            x_pred, P_pred = self._kalman_linear_update(
+                x_pred, P_pred,
+                z=do_phase_ns,
+                H=np.array([[0.0, 0.0, 1.0, 0.0]]),
+                R=do_phase_sigma_ns ** 2,
+                arm_name='do_phase',
             )
 
         # ── Arm 7: ClockMatrix PHASE_STATUS (linear, observes x[2]) ──
