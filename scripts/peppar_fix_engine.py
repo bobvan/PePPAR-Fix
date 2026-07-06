@@ -13781,7 +13781,7 @@ Two-phase operation:
         site_ref=getattr(args, 'peer_site_ref', '') or '',
     )
 
-    if not args.serial:
+    if not args.serial and not _has_ext_obs_source(args):
         log.error("--serial is required (via CLI or host config)")
         sys.exit(1)
 
