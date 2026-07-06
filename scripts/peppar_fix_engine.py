@@ -5296,6 +5296,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     # deferring.  The escalator drives flush→re-anchor→exit-5 at the defer site.
     stall_escalator = ObsStallEscalator(
         args.obs_stall_recovery_s, args.obs_stall_max_recoveries)
+    _corr_debug_last_mono = 0.0  # --debug-correlation rate limiter (CLOCK_MONOTONIC)
     # Queue monitoring: high-water marks (session max) + depth threshold alerts
     queue_hwm = {"obs_queue": 0, "obs_history": 0, "pps_history": 0}
     queue_alert_armed = {"obs_queue": True, "obs_history": True, "pps_history": True}
@@ -5406,6 +5407,34 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 if obs_event is None:
                     skip_stats["gate_wait_obs"] += 1
                     stall_s = time.monotonic() - last_usable_obs_wall
+                    # TRIGGER HUNT (I-164721, run with --obs-stall-recovery-s 0):
+                    # on each defer, peek (side-effect-free) the front obs vs
+                    # pps_history.  newest_age = how stale the newest PPS is in
+                    # CLOCK_MONOTONIC — if it grows unbounded during a wedge the
+                    # EXTTS reader stopped delivering (the prime suspect); if it
+                    # stays ~1s but obs still defer, the wedge is elsewhere.
+                    if getattr(args, "debug_correlation", False) and obs_history:
+                        _dbg_now = time.monotonic()
+                        if _dbg_now - _corr_debug_last_mono >= 1.0:
+                            _corr_debug_last_mono = _dbg_now
+                            _fobs = obs_history[0]
+                            _tsec = _target_timescale_sec(_fobs.gps_time, args)
+                            with servo_ctx["pps_history_lock"]:
+                                _ph = list(servo_ctx["pps_history"])
+                            if _ph:
+                                _dts = [_fobs.recv_mono - p.recv_mono for p in _ph]
+                                _in_win = sum(1 for d in _dts if 0.5 <= d <= 11.0)
+                                log.warning(
+                                    "[CORR_DEBUG] defer target_sec=%d obs.recv_mono=%.3f "
+                                    "| pps n=%d newest_age=%.2fs in_window=%d "
+                                    "newest_dt=%.3f oldest_dt=%.3f | newest_sec=%d "
+                                    "delta_sec=%d", _tsec, _fobs.recv_mono, len(_ph),
+                                    _dbg_now - _ph[-1].recv_mono, _in_win, _dts[-1],
+                                    _dts[0], _ph[-1].rounded_sec(),
+                                    _ph[-1].rounded_sec() - _tsec)
+                            else:
+                                log.warning("[CORR_DEBUG] defer target_sec=%d "
+                                            "pps_history EMPTY (no PPS at all)", _tsec)
                     if (
                         args.obs_idle_timeout_s is not None and
                         stall_s >= args.obs_idle_timeout_s and
@@ -12487,6 +12516,12 @@ Two-phase operation:
                        help="Minimum acceptable confidence for observation/PPS correlation")
     servo.add_argument("--max-correlation-window-s", type=float, default=None,
                        help="Max recv_mono delta for obs/PPS correlation (default: 11s, increase for high-latency transports like E810 I2C)")
+    servo.add_argument("--debug-correlation", action="store_true",
+                       help="TRIGGER HUNT (I-164721): on each obs defer, log [CORR_DEBUG] "
+                            "with pps_history newest_age (EXTTS-stalled tell), recv_dt "
+                            "window occupancy, and newest pps.rounded_sec vs target_sec, "
+                            "rate-limited ~1/s.  Pair with --obs-stall-recovery-s 0 to let "
+                            "the wedge develop and capture its onset.")
     servo.add_argument("--obs-stall-recovery-s", type=float, default=60.0,
                        help="Self-recover from a persistent obs-defer stall: after this "
                             "many seconds wedged (obs arriving but never correlating to a "
