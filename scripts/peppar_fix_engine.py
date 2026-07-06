@@ -10705,7 +10705,7 @@ def run(args):
     #   3. None — state persistence stays disabled.
     args.receiver_unique_id = (receiver_identity.get("unique_id")
                                if receiver_identity else None)
-    if args.receiver_unique_id is None:
+    if args.receiver_unique_id is None and args.serial:
         from peppar_fix.receiver import usb_serial_for_tty
         usb_serial = usb_serial_for_tty(args.serial)
         if usb_serial:
