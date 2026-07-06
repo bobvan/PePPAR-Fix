@@ -206,3 +206,30 @@ Next hardware candidates (Q[3,3]-insensitivity points away from the freq
 loop): loop **bandwidth** via actuation cadence, Q[2,2]/measurement
 weighting, or the hump as a fixed loop resonance set by the 1 Hz cadence +
 gain. Data: `gt:~/gt/mtbaseline-20260705/{piface-qfreq-A-c1,piface-qfreq-B}`.
+
+## Cadence A/B (2026-07-06) — the hump IS loop-bandwidth-limited (fix found)
+
+PiFace, σ held at 0.009, cadence the only variable: FAST = A-c1 (1 Hz,
+3 h) vs SLOW = coast every 8 s (`--min-interval 8 --max-interval 8`, 44 min,
+reset-free, verified dt_actual ≈ 8 s once converged):
+
+| τ (s) | 1 | 16 | **32** | 64 | 128 |
+|---|---|---|---|---|---|
+| FAST 1 Hz | 57 | 361 | **454** | 420 | 318 |
+| SLOW 8 s | 52 | 387 | 688 | **978** | 893 |
+| S/F | −9% | +7% | +51% | +133% | +181% |
+
+**FAST peaks 454 ps @ 32 s; SLOW peaks 978 ps @ 64 s** — coasting *grew*
+the hump ~2× and *pushed it to longer τ*. So the mid-τ hump **is a
+loop-dynamics feature set by the actuation cadence / loop bandwidth**, not a
+fixed DO/measurement floor. This **reconciles the Q[3,3] null**: the hump is
+bandwidth-limited by the **1 Hz cadence**, not the Kalman gain — Q[3,3] over
+3.3× did nothing, cadence over 8× moved it decisively.
+
+**Fix direction: *faster* actuation / higher loop BW** (slower worsened it +
+lengthened τ, so faster shrinks it and pushes it below the τ where DO noise
+bites). 1 Hz measurement is the bottleneck → next experiment: a **faster
+measurement rate** (`--measurement-rate-ms 500` = 2 Hz, if the F9T-20B
+supports it) or **TDCP at the full RAWX rate** (`two-site-sync-budget.md`
+§6.3). Sim, physics, and lab all agree here — unlike the Q[3,3] lever.
+Data: `gt:~/gt/mtbaseline-20260705/piface-cadence-slow8`.
