@@ -509,9 +509,37 @@ freq  -0.21 → -0.14 → -0.08 → -0.03 → +0.01 → +0.02 → +0.04 → +0.0
 near +0.05 ppb, **zero glitches, zero resets** — a locked loop. Clean
 teardown → `$E,0`; Mosaic-T restored; DO back on internal discipline.
 
-Still open: (a) **grade chA TDEV** over an overnight (the TICC rig is
-ready); (b) **do_freerun_char** the STP3593LF to replace the OCXO
-class-default Q; (c) **watch our steering vs the Mosaic-T's own solution**
-— decode `PVTGeodetic` (RxClkBias/RxClkDrift, AtomiChron-corrected) from
-SBF and log it alongside our `dt_rx` + control word (pysbf2 already parses
-the block).
+### Our steering vs the Mosaic-T's own solution (2026-07-06)
+
+Done: the SBF reader now also captures `PVTGeodetic` (`RxClkBias` /
+`RxClkDrift`, the Mosaic-T's own AtomiChron-corrected solution) into a
+`PvtClockStore`, and `_dt_rx_servo_epoch` logs it next to our steering
+(`--gnssdo-compare-log <csv>`; DT_RX log line too). A locked run showed:
+
+```
+ours:   dt_rx ~0.0 ns,  freq ~0.001–0.05 ppb   (we hold our carrier clock at 0)
+mosaic: RxClkBias +6.2 → +7.8 ns (slow drift),  RxClkDrift ~0.005 ppb
+```
+
+So our ps-class carrier-phase clock and the Mosaic-T's internal solution
+differ by **~7.8 ns with a slow relative drift** — the offset between the
+two clock *definitions* (carrier-phase PPP vs the receiver's own SPP/
+AtomiChron). Compare CSV archived at `~/gt/firmware/gnssdo-plus/
+gnssdo-compare-20260706.csv`. (`Mode` field TODO: pysbf2 doesn't expose it
+under that name; bias/drift are the signal.)
+
+### Free-run characterization (collecting 2026-07-06)
+
+`scripts/gnssdo_freerun_hold.py` holds the OCXO **free-running** for
+`do_freerun_char`: it takes external control (`$E,1`, SparkFun's loop
+stops) and re-writes the SAME control word every `--interval` s — a no-op
+frequency-wise that just kicks the firmware watchdog so it doesn't reclaim
+the oscillator. Running overnight on MadHat (`--duration 36000`, word held
+≈489537) alongside a TICC capture (`gnssdo-freerun-ticc-*.csv`, chA = free
+GNSSDO+ PPS, chB = dot166, Rb ref). **Morning: analyse chA detrended
+(`tools/plot_chA_tdev_goldilocks.py` / `build_do_characterization.py`) →
+STP3593LF free-run ADEV/TDEV → replace the OCXO class-default Q** in
+`state/dos/gnssdo-sxtd-madhat.toml`, then re-grade the disciplined loop.
+
+Still open: **grade the disciplined chA TDEV** over an overnight (same TICC
+rig) once the free-run Q is measured — the actual "grade vs TICC".
