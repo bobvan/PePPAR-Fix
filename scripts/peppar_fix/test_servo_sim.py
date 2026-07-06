@@ -9,7 +9,8 @@ import numpy as np
 import pytest
 
 from peppar_fix.servo_sim import (
-    ClosedLoopSim, SimConfig, preset, run_two_clock)
+    ClosedLoopSim, SimConfig, preset, run_two_clock,
+    two_clock_excursion_stats)
 
 
 def test_freerun_floor_calibrated():
@@ -94,13 +95,45 @@ def test_actuator_quantization_is_optional_and_bounded():
     assert not res.diverged()
 
 
-def test_two_clock_shared_gnss_runs():
+def test_two_clock_runs():
     """Two-clock differential returns aligned arrays and a finite diff."""
     a = preset("clkpoc3", duration_s=2000.0)
     b = preset("clkpoc3", duration_s=2000.0)
-    res_a, res_b, diff = run_two_clock(a, b, share_gnss=True)
+    res_a, res_b, diff = run_two_clock(a, b)
     assert len(diff) == len(res_a.t_s) == len(res_b.t_s)
     assert np.all(np.isfinite(diff))
+
+
+def test_two_clock_independent_realizations():
+    """Faithful shared-antenna harness (two-site-sync-budget §2): two
+    identically-configured clocks must be INDEPENDENT, not bit-identical.
+
+    The v1 bug shared the whole RNG (DO noise included) → diff ≈ 0.  With
+    independent per-host realizations the differential is a real,
+    nonzero stochastic process whose settled RMS is ~√2 the single-clock
+    settled RMS (σ²_Δ ≈ 2σ²_clock), not zero.
+    """
+    a = preset("clkpoc3", duration_s=3000.0)
+    b = preset("clkpoc3", duration_s=3000.0)   # same preset → same seed=0
+    res_a, res_b, diff = run_two_clock(a, b)
+    # Independent, not identical: the two DO trajectories differ.
+    assert not np.allclose(res_a.phi_do_true_ns, res_b.phi_do_true_ns)
+    st = two_clock_excursion_stats(diff, res_a.t_s, skip_s=600.0)
+    assert st["n"] > 0
+    assert st["rms"] > 0.05            # nonzero differential (ns)
+    # √2 scaling sanity: σ_Δ within a factor of ~2 of √2·σ_clock.
+    m = res_a.t_s >= 600.0
+    sig_a = float(np.std(res_a.phi_do_true_ns[m]))
+    assert 0.4 < st["rms"] / (np.sqrt(2) * sig_a) < 2.5
+
+
+def test_two_clock_share_gnss_deprecated():
+    """Passing the removed share_gnss knob warns but still runs faithfully."""
+    a = preset("clkpoc3", duration_s=1000.0)
+    b = preset("clkpoc3", duration_s=1000.0)
+    with pytest.warns(DeprecationWarning):
+        res_a, res_b, diff = run_two_clock(a, b, share_gnss=True)
+    assert not np.allclose(res_a.phi_do_true_ns, res_b.phi_do_true_ns)
 
 
 def test_determinism_same_seed():
@@ -504,9 +537,12 @@ def test_two_clock_state_sanity_diff_resilience():
     zeros x[2], B's stays at the corruption value."""
     cfg_a = _state_sanity_cfg(recovery_enabled=True)
     cfg_b = _state_sanity_cfg(recovery_enabled=False)
+    # The corruption is a deterministic poke (force_state_corruption_at_s),
+    # not RNG-driven, so the A-vs-B state comparison is independent of the
+    # per-host noise realizations; use distinct seeds (faithful harness).
     cfg_a.seed = 17
-    cfg_b.seed = 17
-    res_a, res_b, _ = run_two_clock(cfg_a, cfg_b, share_gnss=True)
+    cfg_b.seed = 18
+    res_a, res_b, _ = run_two_clock(cfg_a, cfg_b, seed_a=17, seed_b=18)
     # The fixture is constructed by run_two_clock — we need the
     # actual sims to read x[2] at end-of-run.  Reconstruct from the
     # est_phi_do_ns log (EKF's x[2] estimate per epoch).
