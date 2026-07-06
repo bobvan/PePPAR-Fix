@@ -30,15 +30,15 @@ gnssdo_serial    = "/dev/ttyUSB0"
 gnssdo_baud      = 115200
 gnssdo_watchdog_s = 30
 
-# CALIBRATE THIS before disciplining.  STP3593LF datasheet ≈ 8e-4 ppb/LSB;
-# the SIGN (does a higher control word raise or lower frequency?) must be
-# measured.  Run:
-#   tools/calibrate_do.py --ticc-port /dev/ticcN --channel A \
+# Calibrated 2026-07-06 via the ESP32 console ($W step / $R bias-slope):
+# bracketing W0±5000 gave -3.909 / +3.976 ppb → +7.885e-4 ppb/LSB, POSITIVE
+# (higher control word → higher frequency), 1.4% from the STP3593LF datasheet
+# 8e-4.  Quick 2-point check; refine with a multi-point TICC fit if needed:
+#   tools/calibrate_do.py --ticc-port /dev/ticc4 --channel A \
 #       --gnssdo-transport serial --gnssdo-serial /dev/ttyUSB0 \
-#       --gnssdo-ppb-per-controlword 8e-4 --do-label gnssdo-sxtd-madhat \
+#       --gnssdo-ppb-per-controlword 7.885e-4 --do-label gnssdo-sxtd-madhat \
 #       --sweep-ppb -5,5 --steps 11 --dwell 60
-# then copy the fitted slope here.
-gnssdo_ppb_per_controlword = 8e-4   # PLACEHOLDER — replace with calibrated value
+gnssdo_ppb_per_controlword = 7.885e-4   # measured 2026-07-06 (sign POSITIVE)
 
 # ── Error source (phase for the servo) ──────────────────────────────
 # Preferred: the mosaic-T's own carrier-phase clock, via the SBF obs
