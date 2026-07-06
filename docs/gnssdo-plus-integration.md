@@ -432,3 +432,42 @@ tools/plot_chA_tdev_goldilocks.py --host sxtd data/ticcN-*.csv teal \
 Acceptance: STP3593LF is a double-oven OCXO → **OCXO-class sync target**;
 grade against the per-clock budget (TDEV(1 s) ≤ ~150 ps, no positive-slope
 region below τ ≈ 1000 s) from `docs/two-site-sync-budget.md`.
+
+### Smoke run 2026-07-06 — pipeline assembles; one frontier remains
+
+First closed-loop bring-up on MadHat (branch `delta/gnssdoActuator`,
+rebased onto `main`). The **whole pipeline assembled and ran**:
+
+- Mosaic-T `10.101.101.153` SBF `MeasEpoch@1Hz` on IPS2:28800 → engine
+  `--obs-sbf-tcp` ingest → PPP. Position **converged** (σ 1.25 m, 42 s)
+  at the London site; broadcast eph + SSR via NTRIP.
+- Phase 2 → **`GNSSDO+ actuator: external control ON … anchor word=489538`**
+  — the actuator took control over `/dev/ttyUSB0`, DOFreqEst initialized
+  with OCXO class-default Q, calibrated slope +7.885e-4.
+- Clean shutdown ran `teardown()` → `$E,0`; the GNSSDO+ returned to
+  SparkFun internal discipline. (Earlier, an engine crash left it in
+  external control and the **firmware watchdog recovered it** in 30 s —
+  the failsafe works.)
+
+**Bugs found + fixed** (the SBF path had never driven a servo before —
+it was obs-only until now): the `--obs-sbf-tcp` path assumed
+`args.serial` in three places (`os.path.basename`, the `--serial`
+requirement, USB-serial UID synth); `want_servo` didn't trigger on a
+non-PHC/non-TICC actuator; and `GNSSDO_controlword` needed adding to the
+DO-schema actuator types. All committed.
+
+**The remaining frontier:** the servo held control but did **not write
+`$W`** — it sat at `[0] Awaiting correlatable observation (queued=128)`.
+DOFreqEst's actuation loop expects a **correlatable hardware phase
+event** (TICC chA / PHC EXTTS matched via `CLOCK_MONOTONIC`, per
+`docs/stream-timescale-correlation.md`). In the no-TICC/no-PHC gnssdo
+case the phase *is* the PPP `dt_rx`, which is a filter output, not a
+timestamped hardware event — so nothing satisfies the correlation gate.
+**Next task: wire PPP `dt_rx` as the servo's actuation phase arm for the
+receiver-obs-drives-actuation case** (FixedPosFilter `dt_rx` →
+DOFreqEst), so the loop closes. This is genuinely new servo territory —
+the SBF obs seam had only ever fed position/obs, never an actuator.
+
+Grading (chA TDEV) is unchanged and ready once the loop closes; the TICC
+rig (chA = GNSSDO+ PPS OUT, chB = dot166 OTC, Rb reference) stays a pure
+out-of-band monitor.
