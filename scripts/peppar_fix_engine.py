@@ -5395,7 +5395,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 gate=servo_ctx.get("correlation_gate") if servo_ctx else None,
             )
 
-            if servo_ctx is not None:
+            if servo_ctx is not None and not servo_ctx.get("dt_rx_phase"):
                 gate = servo_ctx["correlation_gate"]
                 dropped_before = gate.stats.dropped_unmatched
                 obs_event, pps_match = gate.pop_observation_match(
@@ -8841,6 +8841,10 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
         'ts_params': ts_params,
         'actuator': actuator,
         'cm_phase_source': cm_phase_source,
+        # GNSSDO+ topology: the receiver clock IS the DO, so the PPP
+        # carrier-phase dt_rx observes the DO phase directly — no PPS
+        # hardware event to correlate.  Routes to _dt_rx_servo_epoch.
+        'dt_rx_phase': actuator_type == "gnssdo",
         'servo': servo,
         'scheduler': scheduler,
         'sigma_freerun_short_ns': _sigma_freerun_short_ns,
@@ -9375,6 +9379,85 @@ def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
     return ("outlier", False)
 
 
+def _dt_rx_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
+    """Receiver-clock-is-DO servo epoch: PPP dt_rx → DOFreqEst (Arm 8) → actuator.
+
+    For a GNSSDO+/SXT-D the mosaic-T runs off the steered OCXO, so the PPP
+    carrier-phase dt_rx IS the DO phase vs GPS — there is no separate rx TCXO
+    and no PPS hardware edge to correlate.  dt_rx feeds DOFreqEst's ``do_phase``
+    arm (Arm 8, observes x[2]) and the PPP arm (Arm 1, x[0]) is left OFF so the
+    single measurement is not double-counted.  Mirrors _cm_servo_epoch (same
+    EKF, LQR, OCXO gate, state-sanity reset budget, adaptive scheduler); the
+    only difference is the phase source and which arm carries it.
+    """
+    servo = ctx['servo']            # DOFreqEst (same object as DAC/PHC/CM hosts)
+    scheduler = ctx['scheduler']
+
+    if dt_rx_ns is None:
+        if n_epochs % 10 == 0:
+            log.info("  [%d] No dt_rx this epoch", n_epochs)
+        return "no_phase"
+    phase_ns = dt_rx_ns
+
+    # Gross-excursion gate with a bounded reset budget before exit-5.
+    TRACK_OUTLIER_NS = args.track_outlier_ns
+    if TRACK_OUTLIER_NS is not None and abs(phase_ns) > TRACK_OUTLIER_NS:
+        ctx['consecutive_outliers'] = ctx.get('consecutive_outliers', 0) + 1
+        if ctx['consecutive_outliers'] >= 30:
+            if _request_servo_reset(ctx, 'dt_rx_outlier') == "reset":
+                ctx['consecutive_outliers'] = 0
+                return "outlier"
+            log.error("  %d consecutive dt_rx outliers — exiting (code 5)",
+                      ctx['consecutive_outliers'])
+            ctx['phc_diverged'] = True
+            return "outlier"
+        return "outlier"
+    ctx['consecutive_outliers'] = 0
+
+    # EKF wall-clock dt (clamped), tracked in ctx.
+    now_mono = time.monotonic()
+    last_mono = ctx.get('_dt_rx_last_mono')
+    dt_actual = (now_mono - last_mono) if last_mono is not None else 1.0
+    dt_actual = max(1e-3, min(dt_actual, 60.0))
+    ctx['_dt_rx_last_mono'] = now_mono
+
+    # DOFreqEst fusion.  dt_rx enters the do_phase arm (x[2]); the PPP arm
+    # (x[0]) is OFF (same oscillator).  Apply the NEGATIVE as the pull — the
+    # actuator's adjust_frequency_ppb(+ppb) speeds up the DO (same sign
+    # contract as adjfine).
+    freq_ppb = -servo.update(
+        dt=dt_actual,
+        do_phase_ns=phase_ns, do_phase_sigma_ns=dt_rx_sigma,
+    )
+
+    # State-sanity reset budget (mirror the standard epoch).
+    if servo.is_state_corrupted():
+        if _request_servo_reset(ctx, 'state_sanity') == "reset":
+            freq_ppb = -servo.freq
+        else:
+            log.error("  state-sanity sustained beyond reset budget — "
+                      "exiting for wrapper re-bootstrap (exit code 5).")
+            ctx['phc_diverged'] = True
+
+    # Clamp to the actuator authority.
+    max_ppb = (args.track_max_ppb
+               or getattr(ctx['actuator'], 'max_adj_ppb', 386.0))
+    if abs(freq_ppb) > max_ppb:
+        freq_ppb = math.copysign(max_ppb, freq_ppb)
+
+    if not args.freerun:
+        ctx['actuator'].adjust_frequency_ppb(freq_ppb)
+    ctx['adjfine_ppb'] = freq_ppb
+
+    scheduler.record_actuation(now_mono, freq_ppb)
+    scheduler.compute_adaptive_interval()
+
+    if n_epochs % 10 == 0:
+        log.info("  [%d] DT_RX: phase=%+.2fns dt=%.1fs freq=%+.2fppb interval=%d",
+                 n_epochs, phase_ns, dt_actual, freq_ppb, scheduler.interval)
+    return "ok"
+
+
 def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                  dt_rx_ns, dt_rx_sigma, n_used, known_ecef,
                  resid_rms, isb_gal_ns, isb_bds_ns, pps_match=None,
@@ -9391,6 +9474,8 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     cm_phase = ctx.get('cm_phase_source')
     if cm_phase is not None:
         return _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma)
+    if ctx.get('dt_rx_phase'):
+        return _dt_rx_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma)
 
     ptp = ctx.get('ptp')  # None in TICC-only mode
     servo = ctx['servo']
