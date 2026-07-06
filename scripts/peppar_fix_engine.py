@@ -13637,7 +13637,7 @@ Two-phase operation:
     if args.min_correlation_confidence is None:
         args.min_correlation_confidence = 0.5
     if getattr(args, 'measurement_rate_ms', None) is None:
-        _base = os.path.basename(args.serial)
+        _base = os.path.basename(args.serial) if args.serial else ""
         if _base.startswith("gnss") and _base[4:].isdigit():
             args.measurement_rate_ms = 2000  # kernel GNSS I2C: 0.5 Hz for lossless
         else:
@@ -13649,7 +13649,7 @@ Two-phase operation:
     # (unchanged); 200 ms → 5.0 Hz.
     args.meas_rate_hz = 1000.0 / float(args.measurement_rate_ms)
     if getattr(args, 'sfrbx_rate', None) is None:
-        _base = os.path.basename(args.serial)
+        _base = os.path.basename(args.serial) if args.serial else ""
         if _base.startswith("gnss") and _base[4:].isdigit():
             args.sfrbx_rate = 0  # kernel GNSS I2C: disable SFRBX
         else:
