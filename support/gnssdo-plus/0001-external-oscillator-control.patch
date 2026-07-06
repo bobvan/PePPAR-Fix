@@ -1,0 +1,610 @@
+From 4a1d4a2f4b4d9a72e4d6b9dc816a34bd613ea1f4 Mon Sep 17 00:00:00 2001
+From: Bob Van Valzah <Bob@vanvalzah.com>
+Date: Sun, 5 Jul 2026 16:35:52 -0500
+Subject: [PATCH 1/2] Add external oscillator control mode (for host-driven
+ discipline)
+
+Adds an opt-in mode that lets an external host discipline the oscillator
+directly instead of the built-in GNSSDO loop, over the existing ESP32
+console (USB or the mosaic-T TCP backdoor). Written for the PePPAR-Fix
+GNSS-disciplined-clock project but kept generic.
+
+New line-based console commands (any line beginning with '$'; every other
+keystroke still opens the interactive menu):
+
+  $E,1 / $E,0   enable/disable external control
+  $W,<word>     write the oscillator frequency control word (absolute);
+                implicitly enables external control and re-arms the watchdog
+  $T,<seconds>  set the fail-safe watchdog timeout
+  $R            report status (ext flag, control word, bias, state, watchdog)
+
+While external control is active the firmware holds a new
+STATE_GNSS_EXTERNAL_CONTROL, never calls updateTCXO() (a hard interlock in
+updateTCXO() backs this up), and keeps PPS and clock-bias telemetry running.
+
+Fail-safe: a watchdog (default 15 s, settable via $T or Operation menu item
+52, persisted) requires a discipline command at least that often. If the
+host goes quiet the firmware resets its servo integrator and resumes
+internal discipline from the oscillator's current control word. The
+external-control flag is never persisted, so a power cycle also returns the
+unit to internal discipline.
+
+To make the clean hand-back possible, the STP3593LF PI(D) integrator state
+was moved from function statics into the driver object, so rebuilding the
+driver (resetTcxoIntegrator()) reseeds it from the current control word for
+every oscillator type.
+---
+ Firmware/GNSSDO_Firmware/Begin.ino           |  30 +++
+ Firmware/GNSSDO_Firmware/ExternalControl.ino | 201 +++++++++++++++++++
+ Firmware/GNSSDO_Firmware/NVM.ino             |   3 +
+ Firmware/GNSSDO_Firmware/STP3593LF_OCXO.h    |   7 +
+ Firmware/GNSSDO_Firmware/STP3593LF_OCXO.ino  |  15 +-
+ Firmware/GNSSDO_Firmware/States.ino          |  57 ++++++
+ Firmware/GNSSDO_Firmware/menuMain.ino        |  13 +-
+ Firmware/GNSSDO_Firmware/menuSystem.ino      |  16 ++
+ Firmware/GNSSDO_Firmware/settings.h          |  14 ++
+ 9 files changed, 346 insertions(+), 10 deletions(-)
+ create mode 100644 Firmware/GNSSDO_Firmware/ExternalControl.ino
+
+diff --git a/Firmware/GNSSDO_Firmware/Begin.ino b/Firmware/GNSSDO_Firmware/Begin.ino
+index cdb0bd3..b542da9 100644
+--- a/Firmware/GNSSDO_Firmware/Begin.ino
++++ b/Firmware/GNSSDO_Firmware/Begin.ino
+@@ -661,12 +661,42 @@ void updateTCXO(double bias_ms)
+ // This function updates the TCXO using the specified bias and P&I terms
+ void updateTCXO(double bias_ms, double P, double I)
+ {
++    // Hard safety interlock: when an external host owns the oscillator, the
++    // internal discipline loop must never touch it. The state machine also
++    // holds STATE_GNSS_EXTERNAL_CONTROL in this case, so this is belt-and-
++    // suspenders - but keep it here so no future caller can slip past. See
++    // ExternalControl.ino.
++    if (externalControl)
++        return;
++
+     if (online.tcxo)
+     {
+         myTCXO->setFrequencyByBiasMillis(bias_ms, P, I);
+     }
+ }
+ 
++// Rebuild the oscillator driver so its PI integrator restarts from the
++// oscillator's *current* control word. Used when resuming internal discipline
++// after external control ends (watchdog bark or an explicit "$E,0"): the
++// external host may have moved the oscillator a long way, so we must not slam
++// it back to a stale integral. Rebuilding the driver is how the firmware has
++// always reset the integrator (see the commented reinit blocks in States.ino);
++// with the STP3593LF integrator now held in the driver object rather than in
++// function statics, the rebuild resets it cleanly for every oscillator type.
++void resetTcxoIntegrator()
++{
++    if (!online.tcxo)
++        return;
++
++    if (myTCXO != nullptr)
++    {
++        delete myTCXO;
++        myTCXO = nullptr;
++    }
++
++    beginTCXO(i2cTCXO, settings.printDebugMessages);
++}
++
+ // This function tells the TCXO to save its control value - if supported
+ void saveTCXO()
+ {
+diff --git a/Firmware/GNSSDO_Firmware/ExternalControl.ino b/Firmware/GNSSDO_Firmware/ExternalControl.ino
+new file mode 100644
+index 0000000..32ae1b3
+--- /dev/null
++++ b/Firmware/GNSSDO_Firmware/ExternalControl.ino
+@@ -0,0 +1,201 @@
++// External oscillator control
++// ============================
++//
++// This adds a small, line-based command channel to the ESP32 console so an
++// external host can discipline the oscillator directly, instead of the built-in
++// GNSSDO loop. It was written for PePPAR-Fix (a GNSS-disciplined precision clock
++// project) but is deliberately generic.
++//
++// The channel is the ordinary console, so it works over USB *and* over the
++// mosaic-T TCP backdoor (Operation menu -> "TCP Server (IPS1)"): connect a TCP
++// socket to the mosaic-T's IP on the configured port and you are talking to
++// this parser.
++//
++// A command is a single line beginning with '$'. updateSerial() (menuMain.ino)
++// routes '$' lines here; every other keystroke still opens the interactive menu.
++//
++//   $E,1            Enable external control  (suspend internal discipline)
++//   $E,0            Disable external control (resume internal discipline)
++//   $W,<word>       Write the oscillator frequency control word (absolute).
++//                   Implicitly enables external control and re-arms the
++//                   watchdog. This is the discipline command.
++//   $T,<seconds>    Set the external-control watchdog timeout (1..600 s)
++//   $R              Report status (see below)
++//
++// Replies are one line each and echo the command letter:
++//   $W,OK,<word>                    control word written; <word> read back
++//   $E,OK,<0|1>                     external control state after the command
++//   $T,OK,<seconds>                 watchdog timeout set
++//   $R,<ext>,<word>,<bias_s>,<state>,<watchdog_s>,<since_ms>
++//   $<letter>,ERR[,<reason>]        command rejected
++//
++// Fail-safe: once external control is open, a watchdog (updateSystemState() in
++// States.ino) requires a discipline command ($W) - or an explicit $E,1 - at
++// least every externalControlWatchdog_s seconds. If the host goes quiet the
++// firmware resets its servo integrator and resumes internal discipline. The
++// external-control flag is never persisted, so a power cycle also returns the
++// unit to internal discipline. PPS keeps running throughout.
++//
++// The control word is oscillator-specific:
++//   STP3593LF (GNSSDO+ / SXT-D OCXO): 20-bit unsigned, LSB = 8e-13 (0.8 ppt)
++//   SiT5811   (alternate OCXO):       39-bit signed
++//   SiT5358   (GNSSDO / SXT DCTCXO):  26-bit signed
++// getFrequencyControlWord() (see $R) returns the current word so the host can
++// seed its own servo before taking over.
++
++// Read the remainder of a command line (the leading '$' is already consumed)
++// into buf. Terminates on CR/LF, on buffer-full, or on a short idle timeout so
++// a partial line can never wedge the console. Returns the number of characters
++// captured.
++static size_t readExternalControlLine(char *buf, size_t bufLen)
++{
++    size_t spot = 0;
++    unsigned long lastChar_ms = millis();
++
++    while ((millis() - lastChar_ms) < 250) // Ample for a line already in flight
++    {
++        while (systemAvailable() > 0)
++        {
++            int c = systemRead();
++            lastChar_ms = millis();
++
++            if ((c == '\r') || (c == '\n'))
++            {
++                buf[spot] = '\0';
++                return spot;
++            }
++
++            if (spot < (bufLen - 1))
++                buf[spot++] = (char)c;
++            // If the line overflows we keep draining until CR/LF but stop storing
++        }
++    }
++
++    buf[spot] = '\0';
++    return spot;
++}
++
++// Parse a signed integer from s, skipping leading separators (space, comma,
++// tab). Sets *ok false if no digits were found.
++static long long parseExternalControlInt(const char *s, bool *ok)
++{
++    while ((*s == ' ') || (*s == ',') || (*s == '\t'))
++        s++;
++
++    char *end = nullptr;
++    long long value = strtoll(s, &end, 10);
++    *ok = (end != s);
++    return value;
++}
++
++// Handle one '$'-prefixed command line. Called from updateSerial() once the
++// leading '$' has been read.
++void parseExternalControlCommand()
++{
++    char line[48];
++    readExternalControlLine(line, sizeof(line));
++
++    // First non-space character is the command letter
++    char *p = line;
++    while (*p == ' ')
++        p++;
++    char cmd = *p++;
++
++    switch (cmd)
++    {
++    // ---- Write control word (the discipline command) ----------------------
++    case 'W':
++    case 'w': {
++        if (!online.tcxo)
++        {
++            systemPrintln("$W,ERR,NO_OSC");
++            break;
++        }
++
++        bool ok = false;
++        long long word = parseExternalControlInt(p, &ok);
++        if (!ok)
++        {
++            systemPrintln("$W,ERR,NO_VALUE");
++            break;
++        }
++
++        if (!externalControl)
++            beginExternalControl(); // Implicitly open the loop on the first write
++
++        externalControlLastCommand_ms = millis(); // Re-arm the watchdog
++
++        myTCXO->setFrequencyControlWord((int64_t)word);
++
++        systemPrintf("$W,OK,%lld\r\n", (long long)getFrequencyControlWord());
++        break;
++    }
++
++    // ---- Enable / disable external control --------------------------------
++    case 'E':
++    case 'e': {
++        bool ok = false;
++        long long enable = parseExternalControlInt(p, &ok);
++        if (!ok)
++        {
++            systemPrintln("$E,ERR,NO_VALUE");
++            break;
++        }
++
++        if (enable)
++        {
++            if (!online.tcxo)
++            {
++                systemPrintln("$E,ERR,NO_OSC");
++                break;
++            }
++            if (!externalControl)
++                beginExternalControl();
++            else
++                externalControlLastCommand_ms = millis(); // Re-arm
++            systemPrintln("$E,OK,1");
++        }
++        else
++        {
++            if (externalControl)
++                endExternalControl();
++            systemPrintln("$E,OK,0");
++        }
++        break;
++    }
++
++    // ---- Set the watchdog timeout -----------------------------------------
++    case 'T':
++    case 't': {
++        bool ok = false;
++        long long seconds = parseExternalControlInt(p, &ok);
++        if (!ok || (seconds < 1) || (seconds > 600))
++        {
++            systemPrintln("$T,ERR,RANGE");
++            break;
++        }
++        settings.externalControlWatchdog_s = (int)seconds; // Recorded to NVM at next settings save
++        systemPrintf("$T,OK,%d\r\n", settings.externalControlWatchdog_s);
++        break;
++    }
++
++    // ---- Report status ----------------------------------------------------
++    case 'R':
++    case 'r': {
++        char stateName[30];
++        uint32_t since_ms = externalControl ? (millis() - externalControlLastCommand_ms) : 0;
++        systemPrintf("$R,%d,%lld,%.6e,%s,%d,%lu\r\n",
++                     externalControl ? 1 : 0,
++                     (long long)getFrequencyControlWord(),
++                     tcxoClockBias_ms / 1000.0, // clock bias in seconds
++                     getState(systemState, stateName),
++                     settings.externalControlWatchdog_s,
++                     (unsigned long)since_ms);
++        break;
++    }
++
++    default:
++        systemPrintln("$,ERR,UNKNOWN");
++        break;
++    }
++}
+diff --git a/Firmware/GNSSDO_Firmware/NVM.ino b/Firmware/GNSSDO_Firmware/NVM.ino
+index c3e2169..f509883 100644
+--- a/Firmware/GNSSDO_Firmware/NVM.ino
++++ b/Firmware/GNSSDO_Firmware/NVM.ino
+@@ -117,6 +117,7 @@ void recordSystemSettingsToFile(File *settingsFile)
+     settingsFile->printf("%s=%0.3e\r\n", "tcxoRampStepSize_s", settings.tcxoRampStepSize_s);
+     settingsFile->printf("%s=%0.3f\r\n", "tcxoRampAsymmetry", settings.tcxoRampAsymmetry);
+     settingsFile->printf("%s=%d\r\n", "minimumRampRepeats", settings.minimumRampRepeats);
++    settingsFile->printf("%s=%d\r\n", "externalControlWatchdog_s", settings.externalControlWatchdog_s);
+ 
+     //settingsFile->printf("%s=%d\r\n", "", settings.);
+ 
+@@ -514,6 +515,8 @@ bool parseLine(char *theLine, Settings *settings, bool printDebug)
+         settings->tcxoRampAsymmetry = d;
+     else if (strcmp(settingName, "minimumRampRepeats") == 0)
+         settings->minimumRampRepeats = d;
++    else if (strcmp(settingName, "externalControlWatchdog_s") == 0)
++        settings->externalControlWatchdog_s = d;
+ 
+     //else if (strcmp(settingName, "") == 0)
+     //    settings-> = d;
+diff --git a/Firmware/GNSSDO_Firmware/STP3593LF_OCXO.h b/Firmware/GNSSDO_Firmware/STP3593LF_OCXO.h
+index 151f4a1..d99192a 100644
+--- a/Firmware/GNSSDO_Firmware/STP3593LF_OCXO.h
++++ b/Firmware/GNSSDO_Firmware/STP3593LF_OCXO.h
+@@ -9,6 +9,13 @@ class GNSSDO_STP3593LF : GNSSDO_TCXO
+     private:
+         SfeSTP3593LFArdI2C * _STP3593LF = nullptr; // Don't instantiate until we know what oscillators are connected
+ 
++        // PI(D) integrator state. Held in the object (not function statics) so
++        // that rebuilding the driver - resetTcxoIntegrator() in Begin.ino -
++        // reseeds the integrator from the oscillator's current control word.
++        bool _integratorInitialized = false;
++        double _integrator = 0.0;
++        double _previousChangeInLSBs = 0.0;
++
+     public:
+         // Constructor
+         GNSSDO_STP3593LF() : GNSSDO_TCXO() {}
+diff --git a/Firmware/GNSSDO_Firmware/STP3593LF_OCXO.ino b/Firmware/GNSSDO_Firmware/STP3593LF_OCXO.ino
+index e720807..01a241c 100644
+--- a/Firmware/GNSSDO_Firmware/STP3593LF_OCXO.ino
++++ b/Firmware/GNSSDO_Firmware/STP3593LF_OCXO.ino
+@@ -42,12 +42,14 @@ bool GNSSDO_STP3593LF::setFrequencyByBiasMillis(double bias, double Pk, double I
+ 
+     const double kSfeSTP3593LFFreqControlResolution = 8e-13;
+ 
+-    static double I;
+-    static bool initialized = false;
+-    if (!initialized)
++    // Integrator state now lives in the object (see STP3593LF_OCXO.h) so that
++    // resetTcxoIntegrator() can reseed it by rebuilding the driver.
++    double &I = _integrator;
++    if (!_integratorInitialized)
+     {
+         I = (double)getFrequencyControlWord(); // Initialize I with the current control word for a more reasonable startup
+-        initialized = true;
++        _integratorInitialized = true;
++        _previousChangeInLSBs = 0.0;
+     }
+ 
+     // Our setpoint is zero. Bias is the process value. Convert it to error
+@@ -90,9 +92,8 @@ bool GNSSDO_STP3593LF::setFrequencyByBiasMillis(double bias, double Pk, double I
+ 
+     double P = requiredChangeInLSBs * Pk * 1.333;
+     double dI = requiredChangeInLSBs * Ik * 0.6;
+-    static double previousChangeInLSBs = requiredChangeInLSBs;
+     double Dk = Ik * 0.15;
+-    double D = Dk * (previousChangeInLSBs - requiredChangeInLSBs);
++    double D = Dk * (_previousChangeInLSBs - requiredChangeInLSBs);
+     I += dI; // Add the delta to the integral
+ 
+     //systemPrintf("P %f I %f D %f\r\n", P, I, D);
+@@ -100,7 +101,7 @@ bool GNSSDO_STP3593LF::setFrequencyByBiasMillis(double bias, double Pk, double I
+ 
+     double newControlWordDbl = round(P + I + D); // Set the control word to proportional plus integral plus derivative
+ 
+-    previousChangeInLSBs = requiredChangeInLSBs;
++    _previousChangeInLSBs = requiredChangeInLSBs;
+ 
+ #else
+ 
+diff --git a/Firmware/GNSSDO_Firmware/States.ino b/Firmware/GNSSDO_Firmware/States.ino
+index b9ab9d1..0c7e4ce 100644
+--- a/Firmware/GNSSDO_Firmware/States.ino
++++ b/Firmware/GNSSDO_Firmware/States.ino
+@@ -20,6 +20,18 @@ void updateSystemState()
+         lastSystemStateUpdate = millis();
+         forceSystemStateUpdate = false;
+ 
++        // External-control watchdog (see ExternalControl.ino).
++        // If an external host has opened the discipline loop but has stopped
++        // sending discipline commands, fail safe: resume internal discipline.
++        // The external host must re-arm this watchdog with every command.
++        if (externalControl
++            && ((millis() - externalControlLastCommand_ms)
++                > ((uint32_t)settings.externalControlWatchdog_s * 1000UL)))
++        {
++            systemPrintln("External control watchdog expired - resuming internal discipline");
++            endExternalControl();
++        }
++
+         // Check to see if any external sources need to change state
+         if (newSystemStateRequested == true)
+         {
+@@ -586,6 +598,28 @@ void updateSystemState()
+         }
+         break;
+ 
++        // An external host (e.g. PePPAR-Fix) owns the oscillator.
++        // The internal discipline loop is suspended: we do NOT call updateTCXO
++        // here. We keep the clock-bias telemetry fresh, keep PPS running, and
++        // let the watchdog (top of this function) hand control back if the
++        // external host goes quiet. See ExternalControl.ino.
++        case (STATE_GNSS_EXTERNAL_CONTROL): {
++            if (gnssPVTUpdated) // Wait for PVT to be updated. It contains Error.
++            {
++                gnssPVTUpdated = false;
++
++                updateTCXOClockBias(); // Keep tcxoClockBias_ms fresh for telemetry / the external host
++
++                updateLockLED(); // Update Lock LED based on systemState
++                updateErrorLED();
++
++                // Keep PPS running while the external host disciplines the oscillator
++                if (!ppsStarted && !gnssError && configureGNSSPPS())
++                    ppsStarted = true;
++            }
++        }
++        break;
++
+         default: {
+             systemPrintf("Unknown state: %d\r\n", systemState);
+         }
+@@ -594,6 +628,29 @@ void updateSystemState()
+     }
+ }
+ 
++// Begin external oscillator control (called from ExternalControl.ino).
++// Suspends internal discipline and hands the oscillator to an external host.
++void beginExternalControl()
++{
++    externalControl = true;
++    externalControlLastCommand_ms = millis();
++    requestChangeState(STATE_GNSS_EXTERNAL_CONTROL);
++}
++
++// End external oscillator control - watchdog bark or an explicit "$E,0".
++// Resets the servo integrator so internal discipline resumes from the
++// oscillator's current control word (the external host may have moved it far),
++// then re-runs frequency locking. PPS is left running throughout.
++void endExternalControl()
++{
++    externalControl = false;
++    externalControlLastCommand_ms = millis();
++    resetTcxoIntegrator(); // Begin.ino - rebuild the driver so the integrator reseeds from the current control word
++    slewing = false;
++    secondsInPhaseLock = 0;
++    requestChangeState(STATE_GNSS_FINETIME);
++}
++
+ // System state changes may only occur within main state machine
+ // To allow state changes from external sources (ie, Button Tasks) requests can be made
+ // Requests are handled at the start of updateSystemState()
+diff --git a/Firmware/GNSSDO_Firmware/menuMain.ino b/Firmware/GNSSDO_Firmware/menuMain.ino
+index 82cd55d..0a360fa 100644
+--- a/Firmware/GNSSDO_Firmware/menuMain.ino
++++ b/Firmware/GNSSDO_Firmware/menuMain.ino
+@@ -3,9 +3,16 @@ void updateSerial()
+ {
+     if (systemAvailable())
+     {
+-        systemRead();
+-
+-        menuMain(); // Present user menu
++        byte incoming = systemRead();
++
++        // A leading '$' introduces a machine command for external oscillator
++        // control (used by PePPAR-Fix over USB or the mosaic-T TCP backdoor).
++        // Anything else opens the interactive menu, exactly as before. See
++        // ExternalControl.ino.
++        if (incoming == '$')
++            parseExternalControlCommand();
++        else
++            menuMain(); // Present user menu
+     }
+ }
+ 
+diff --git a/Firmware/GNSSDO_Firmware/menuSystem.ino b/Firmware/GNSSDO_Firmware/menuSystem.ino
+index 8123e57..7101017 100644
+--- a/Firmware/GNSSDO_Firmware/menuSystem.ino
++++ b/Firmware/GNSSDO_Firmware/menuSystem.ino
+@@ -440,6 +440,9 @@ void menuOperation()
+         systemPrint("51) TCP Server Port:                                    ");
+         systemPrintln(settings.tcpServerPort);
+ 
++        systemPrint("52) External control watchdog (s):                      ");
++        systemPrintln(settings.externalControlWatchdog_s);
++
+         if (presentTcxoSaveControl)
+             systemPrintln("60) Save TCXO control word to TCXO memory");
+ 
+@@ -751,6 +754,19 @@ void menuOperation()
+                 }
+             }
+         }
++        else if (incoming == 52)
++        {
++            systemPrint("Enter the external control watchdog timeout in seconds (1 to 600): ");
++            int seconds = getNumber(); // Returns EXIT, TIMEOUT, or long
++            if ((seconds != INPUT_RESPONSE_GETNUMBER_EXIT) &&
++                (seconds != INPUT_RESPONSE_GETNUMBER_TIMEOUT))
++            {
++                if (seconds < 1 || seconds > 600)
++                    systemPrintln("Error: watchdog timeout is out of range");
++                else
++                    settings.externalControlWatchdog_s = seconds; // Recorded to NVM at main menu exit
++            }
++        }
+         else if (presentTcxoSaveControl && (incoming == 60))
+         {
+             systemPrintln("\r\nSaving the TCXO control word to TCXO memory. Press 'y' to confirm:");
+diff --git a/Firmware/GNSSDO_Firmware/settings.h b/Firmware/GNSSDO_Firmware/settings.h
+index 5841f73..2390ca6 100644
+--- a/Firmware/GNSSDO_Firmware/settings.h
++++ b/Firmware/GNSSDO_Firmware/settings.h
+@@ -20,6 +20,7 @@ typedef enum
+     STATE_GNSS_ERROR_AFTER_FREQUENCY_LOCK,
+     STATE_GNSS_PHASE_LOCK, // GNSS has achieved phase lock. Maintain the bias using the PLL
+     STATE_GNSS_ERROR_AFTER_PHASE_LOCK,
++    STATE_GNSS_EXTERNAL_CONTROL, // An external host (e.g. PePPAR-Fix) owns the oscillator. Internal discipline is suspended. See ExternalControl.ino
+     STATE_NOT_SET, // Must be last on list
+ } SystemState;
+ volatile SystemState systemState = STATE_NOT_SET;
+@@ -27,6 +28,16 @@ SystemState lastSystemState = STATE_NOT_SET;
+ SystemState requestedSystemState = STATE_NOT_SET;
+ bool newSystemStateRequested = false;
+ 
++// External oscillator control (see ExternalControl.ino).
++// When externalControl is true, the internal discipline loop is suspended and
++// an external host owns the oscillator frequency control word - written over
++// the console (USB or the mosaic-T TCP backdoor). These are runtime-only and
++// are deliberately never persisted: after a power cycle the unit always comes
++// back up disciplining itself, so a stale external session can never leave the
++// oscillator un-serviced.
++volatile bool externalControl = false;            // true: internal discipline suspended
++volatile uint32_t externalControlLastCommand_ms = 0; // millis() of the last discipline command (watchdog kick)
++
+ typedef struct
+ {
+     const SystemState systemState;
+@@ -45,6 +56,7 @@ const SystemStatesName SystemStatesNames[] = {
+     { STATE_GNSS_ERROR_AFTER_FREQUENCY_LOCK, "ERROR_AFTER_FREQUENCY_LOCK" },
+     { STATE_GNSS_PHASE_LOCK, "PHASE_LOCK" },
+     { STATE_GNSS_ERROR_AFTER_PHASE_LOCK, "ERROR_AFTER_PHASE_LOCK" },
++    { STATE_GNSS_EXTERNAL_CONTROL, "EXTERNAL_CONTROL" },
+     { STATE_NOT_SET, "NOT_SET" },
+ };
+ 
+@@ -351,6 +363,8 @@ typedef struct
+     double tcxoRampAsymmetry = 1.0; // It seems STP3593 can't heat and cool at the same rate (updated if needed by beginTCXO)
+     int minimumRampRepeats = 1; // updated if needed by beginTCXO
+ 
++    int externalControlWatchdog_s = 15; // If external control is enabled and no discipline command arrives within this many seconds, fail safe and resume internal discipline. See ExternalControl.ino
++
+     // Add new settings above <------------------------------------------------------------>
+ 
+ } Settings;
+-- 
+2.47.3
+
+
+From 91897241b8896bd83992a3eb238bced6ba4f8087 Mon Sep 17 00:00:00 2001
+From: Bob Van Valzah <Bob@vanvalzah.com>
+Date: Mon, 6 Jul 2026 04:00:54 -0500
+Subject: [PATCH 2/2] Console: bare CR/LF no longer opens the interactive menu
+
+Hardware-testing the external-control channel revealed that any byte -
+including a stray line terminator - opened the interactive menu. A machine
+client sending line-oriented $ commands with CR, LF, or CRLF endings would
+have the trailing terminator drop the console into the menu, which then
+echoed and consumed subsequent commands. Ignore bare CR/LF in updateSerial()
+so the console is reliably scriptable; any other key still opens the menu.
+---
+ Firmware/GNSSDO_Firmware/menuMain.ino | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/Firmware/GNSSDO_Firmware/menuMain.ino b/Firmware/GNSSDO_Firmware/menuMain.ino
+index 0a360fa..a1b6cc6 100644
+--- a/Firmware/GNSSDO_Firmware/menuMain.ino
++++ b/Firmware/GNSSDO_Firmware/menuMain.ino
+@@ -5,6 +5,13 @@ void updateSerial()
+     {
+         byte incoming = systemRead();
+ 
++        // Bare line terminators never open the menu. This keeps the console
++        // scriptable: a machine client sending line-oriented '$' commands (CR,
++        // LF, or CRLF terminated) can't accidentally fall into the interactive
++        // menu on the trailing terminator. Press any other key to open the menu.
++        if ((incoming == '\r') || (incoming == '\n'))
++            return;
++
+         // A leading '$' introduces a machine command for external oscillator
+         // control (used by PePPAR-Fix over USB or the mosaic-T TCP backdoor).
+         // Anything else opens the interactive menu, exactly as before. See
+-- 
+2.47.3
+
