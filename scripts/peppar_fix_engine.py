@@ -9406,20 +9406,22 @@ def _dt_rx_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
     # feeding +dt_rx gave +freq → dt_rx diverged; -dt_rx converges.)
     do_phase_err_ns = -phase_ns
 
-    # Gross-excursion gate with a bounded reset budget before exit-5.
+    # Glitch rejection on the dt_rx INNOVATION (per-epoch jump), NOT the
+    # absolute value.  Unlike cm_phase (a small, already-aligned DO-vs-ref
+    # error), dt_rx is the absolute receiver-clock bias — legitimately large
+    # while acquiring lock and pulled to zero BY the servo.  An absolute gate
+    # would reject the whole acquisition.  Only a sudden jump is a glitch; skip
+    # that single epoch.  Runaway safety comes from the EKF state-sanity gate,
+    # the actuator authority clamp, and the firmware watchdog — not this gate.
     TRACK_OUTLIER_NS = args.track_outlier_ns
-    if TRACK_OUTLIER_NS is not None and abs(phase_ns) > TRACK_OUTLIER_NS:
-        ctx['consecutive_outliers'] = ctx.get('consecutive_outliers', 0) + 1
-        if ctx['consecutive_outliers'] >= 30:
-            if _request_servo_reset(ctx, 'dt_rx_outlier') == "reset":
-                ctx['consecutive_outliers'] = 0
-                return "outlier"
-            log.error("  %d consecutive dt_rx outliers — exiting (code 5)",
-                      ctx['consecutive_outliers'])
-            ctx['phc_diverged'] = True
-            return "outlier"
-        return "outlier"
-    ctx['consecutive_outliers'] = 0
+    _prev_dt_rx = ctx.get('_dt_rx_prev_ns')
+    ctx['_dt_rx_prev_ns'] = phase_ns
+    if (_prev_dt_rx is not None and TRACK_OUTLIER_NS is not None
+            and abs(phase_ns - _prev_dt_rx) > 10.0 * TRACK_OUTLIER_NS):
+        if n_epochs % 10 == 0:
+            log.info("  [%d] dt_rx glitch (Δ=%+.0fns) — skipping epoch",
+                     n_epochs, phase_ns - _prev_dt_rx)
+        return "glitch"
 
     # EKF wall-clock dt (clamped), tracked in ctx.
     now_mono = time.monotonic()
