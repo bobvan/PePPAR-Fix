@@ -114,7 +114,7 @@ def msm_ntrip_reader(messages, obs_queue, stop_event, sig_lookup, *,
     import time as _time
 
     from peppar_fix.event_time import ObservationEvent
-    now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+    now_fn = now_fn or (lambda: datetime.now(timezone.utc))  # wallclock-todo: GPS week from system clock; should derive from ephemeris
     asm = MsmEpochAssembler(sig_lookup, systems, ssr)
     n_epochs = 0
 

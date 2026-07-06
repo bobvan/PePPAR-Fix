@@ -49,7 +49,7 @@ def sbf_obs_reader(messages, obs_queue, stop_event, sig_lookup, *,
 
     from peppar_fix.event_time import ObservationEvent
     from realtime_ppp import raw_obs_to_if_observations
-    now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+    now_fn = now_fn or (lambda: datetime.now(timezone.utc))  # wallclock-todo: GPS week from system clock; should derive from ephemeris
     mono_fn = mono_fn or _time.monotonic
     n_epochs = 0
     for _raw, parsed in messages:
