@@ -9398,6 +9398,13 @@ def _dt_rx_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
             log.info("  [%d] No dt_rx this epoch", n_epochs)
         return "no_phase"
     phase_ns = dt_rx_ns
+    # Sign convention (measured on the SXT-D, 2026-07-06): applying +freq_ppb
+    # speeds the OCXO up, which makes the mosaic-T's dt_rx MORE positive — so
+    # positive dt_rx means the DO is AHEAD.  DOFreqEst's do_phase arm (like
+    # EXTINT) uses "positive = late, needs speed-up", so feed the NEGATED dt_rx
+    # as the DO-phase error to make the loop negative-feedback.  (Empirically:
+    # feeding +dt_rx gave +freq → dt_rx diverged; -dt_rx converges.)
+    do_phase_err_ns = -phase_ns
 
     # Gross-excursion gate with a bounded reset budget before exit-5.
     TRACK_OUTLIER_NS = args.track_outlier_ns
@@ -9427,7 +9434,7 @@ def _dt_rx_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
     # contract as adjfine).
     freq_ppb = -servo.update(
         dt=dt_actual,
-        do_phase_ns=phase_ns, do_phase_sigma_ns=dt_rx_sigma,
+        do_phase_ns=do_phase_err_ns, do_phase_sigma_ns=dt_rx_sigma,
     )
 
     # State-sanity reset budget (mirror the standard epoch).
