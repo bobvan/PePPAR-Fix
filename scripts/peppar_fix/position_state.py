@@ -93,7 +93,7 @@ def decimal_year_now() -> float:
     epoch for frame conversion at seed time.  Plate motion needs only
     year-coarse precision (~2 cm/yr), so the system clock is more than
     adequate and no GPS observation is required at seed time."""
-    return _decimal_year_from_dt(datetime.now(timezone.utc))
+    return _decimal_year_from_dt(datetime.now(timezone.utc))  # wallclock-ok: coarse decimal-year for ITRF epoch; day-level accuracy irrelevant
 
 
 def decimal_year_from_mjd(mjd: float) -> float:
@@ -313,7 +313,7 @@ def save_ppp_state(state: PositionState, uid,
 
 def utc_now_iso() -> str:
     """Return ISO 8601 UTC timestamp string in the project convention."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # wallclock-ok: state-file timestamp helper
 
 
 def save_survey_state(state: PositionState, uid,

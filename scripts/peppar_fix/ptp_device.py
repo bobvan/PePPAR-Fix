@@ -638,7 +638,7 @@ class PtpDevice:
         Returns (residual_ns, attempts=1, accepted=True).
         """
         if pps_anchor_ns is not None:
-            rt_now = time.clock_gettime_ns(time.CLOCK_REALTIME)
+            rt_now = time.clock_gettime_ns(time.CLOCK_REALTIME)  # wallclock-todo: PHC-bootstrap CLOCK_REALTIME transfer standard; staged review
             target_ns = pps_anchor_ns + (rt_now - pps_realtime_ns)
 
         phc_now, sys_now = self.read_phc_ns()
@@ -695,7 +695,7 @@ class PtpDevice:
         while time.monotonic() < deadline:
             attempts += 1
             if pps_anchor_ns is not None:
-                rt_now = time.clock_gettime_ns(time.CLOCK_REALTIME)
+                rt_now = time.clock_gettime_ns(time.CLOCK_REALTIME)  # wallclock-todo: PHC-bootstrap CLOCK_REALTIME transfer standard; staged review
                 target_ns = pps_anchor_ns + (rt_now - pps_realtime_ns)
             aim_ns = target_ns + phc_settime_lag_ns
             self.set_phc_ns(aim_ns)

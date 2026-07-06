@@ -193,7 +193,7 @@ class InBandNoiseEstimator:
             "corr_tdev": {str(k): v for k, v in self._corr_tdev.items()},
             "gap_count": self._gap_count,
             "corr_count": self._corr_count,
-            "updated": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "updated": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),  # wallclock-ok: state-file updated timestamp
         }
 
     @classmethod

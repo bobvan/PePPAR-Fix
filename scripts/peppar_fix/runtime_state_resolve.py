@@ -42,7 +42,7 @@ class ResolvedRuntime:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # wallclock-ok: state-file timestamp helper
 
 
 def resolve_runtime_state(do_uid: str, *, dos_dir: Optional[str] = None,

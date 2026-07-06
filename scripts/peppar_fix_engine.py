@@ -254,7 +254,7 @@ def make_raw_capture_bundle(args, systems, log):
         bundle.write_manifest(
             filter_config=filter_config_from_args(args),
             host=socket.gethostname(),
-            started_iso=datetime.now(tz=timezone.utc).isoformat(),
+            started_iso=datetime.now(tz=timezone.utc).isoformat(),  # wallclock-ok: record 'started' timestamp
             conventions={
                 "ztd_station": getattr(args, 'init_ztd_station', '') or '',
                 "known_pos": getattr(args, 'known_pos', '') or '',
@@ -1381,8 +1381,8 @@ def wait_for_ephemeris(beph, stop_event, systems=None, timeout_s=120):
     required = {SYS_TO_PREFIX[s] for s in (systems or {'gps', 'gal', 'bds'}) if s in SYS_TO_PREFIX}
     required.add('G')
     log.info(f"Waiting for broadcast ephemeris (need {required})...")
-    warmup_start = time.time()
-    while time.time() - warmup_start < timeout_s:
+    warmup_start = time.monotonic()  # CLOCK_MONOTONIC (interval)
+    while time.monotonic() - warmup_start < timeout_s:
         if stop_event.is_set():
             return False
         by_sys = {}
@@ -1392,7 +1392,7 @@ def wait_for_ephemeris(beph, stop_event, systems=None, timeout_s=120):
         if all(by_sys.get(p, 0) >= 8 for p in required):
             break
         time.sleep(1)
-        if int(time.time() - warmup_start) % 10 == 0:
+        if int(time.monotonic() - warmup_start) % 10 == 0:
             log.info(f"  Warmup: {beph.summary()}")
     log.info(f"Broadcast ephemeris ready: {beph.summary()}")
     return True
@@ -1426,11 +1426,11 @@ def wait_for_nav2_seed(nav2_store, stop_event, timeout_s=60.0,
         return None
     log.info("Waiting for %s seed (fixType=3, hAcc<%.0fm) up to %.0fs...",
              source_label, hacc_max_m, timeout_s)
-    start = time.time()
+    start = time.monotonic()  # CLOCK_MONOTONIC (interval)
     deadline = start + timeout_s
     last_log = 0.0
     _has_data = getattr(nav2_store, "has_data", None)
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         if stop_event.is_set():
             return None
         opinion = nav2_store.get_opinion(max_age_s=max_age_s)
@@ -1442,19 +1442,19 @@ def wait_for_nav2_seed(nav2_store, stop_event, timeout_s=60.0,
                 num_sv = opinion.get('num_sv', 0)
                 log.info("%s seed acquired: fixType=3 hAcc=%.2fm "
                          "nSV=%d after %.1fs",
-                         source_label, hacc, num_sv, time.time() - start)
+                         source_label, hacc, num_sv, time.monotonic() - start)
                 return ecef, float(hacc), int(num_sv)
         # Fast give-up: this PVT message isn't being emitted at all.
         # (Real stores expose has_data(); mocks may not — absence means
         # "assume present" so the regression harness is unaffected.)
         if (_has_data is not None
-                and time.time() - start >= no_data_grace_s
+                and time.monotonic() - start >= no_data_grace_s
                 and not _has_data()):
             log.warning("%s emitting no PVT after %.0fs — not available on "
                         "this receiver; falling through to next seed source.",
                         source_label, no_data_grace_s)
             return None
-        if time.time() - last_log >= 10.0:
+        if time.monotonic() - last_log >= 10.0:
             if opinion is None:
                 log.info("  %s not yet emitting a usable fix...", source_label)
             else:
@@ -1462,7 +1462,7 @@ def wait_for_nav2_seed(nav2_store, stop_event, timeout_s=60.0,
                          source_label, opinion.get('fix_type'),
                          f"{opinion.get('h_acc_m'):.2f}m"
                          if opinion.get('h_acc_m') is not None else "?")
-            last_log = time.time()
+            last_log = time.monotonic()
         time.sleep(1.0)
     log.warning("%s seed timed out after %.0fs — falling through to next "
                 "seed source.", source_label, timeout_s)
@@ -1660,7 +1660,7 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
     # path collapses Phase 1's CONVERGED gate down to a 1-epoch sanity
     # rather than the legacy 30-epoch ceremony.
     bootstrap_seed_source = None
-    start_time = time.time()
+    start_time = time.monotonic()  # CLOCK_MONOTONIC (interval)
     # W1/W2/W3: retry accounting for the convergence gate.  Each abort
     # (residual inconsistency or NAV2 horizontal mismatch) triggers a
     # scrub and the filter tries again.  Bounded by --bootstrap-max-retries.
@@ -1668,7 +1668,7 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
     last_gate_reason = None
 
     while not stop_event.is_set():
-        elapsed = time.time() - start_time
+        elapsed = time.monotonic() - start_time
 
         if args.timeout and elapsed > args.timeout:
             log.warning(f"Bootstrap timeout after {elapsed:.0f}s")
@@ -1758,7 +1758,7 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
                         else float(getattr(args, 'nav2_seed_timeout_s', 30.0)))
                     if timeout_s > 0:
                         if nav2_wait_started is None:
-                            nav2_wait_started = time.time()
+                            nav2_wait_started = time.monotonic()  # CLOCK_MONOTONIC (interval)
                             _fix = (opinion.get('fix_type')
                                     if opinion else None)
                             _hacc = (opinion.get('h_acc_m')
@@ -1768,7 +1768,7 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
                                 "h_acc=%s); waiting up to %.0fs "
                                 "before LS-init fallback",
                                 _fix, _hacc, timeout_s)
-                        elapsed = time.time() - nav2_wait_started
+                        elapsed = time.monotonic() - nav2_wait_started
                         if elapsed < timeout_s:
                             # Keep waiting; skip this epoch's init.
                             # Drop into the LS-init block below ONLY
@@ -1780,7 +1780,7 @@ def run_bootstrap(args, obs_queue, corrections, stop_event, out_w=None,
                     log.warning(
                         "NAV2 wait timed out after %.1fs; falling "
                         "back to LS-init",
-                        time.time() - nav2_wait_started)
+                        time.monotonic() - nav2_wait_started)
                 # Fallback: LS init via broadcast ephemeris.  SSR
                 # orbit corrections poison the absolute LS solver, so
                 # broadcast-only.  ~5 m accuracy, plenty for seeding
@@ -4752,7 +4752,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             import csv as _csv
             import socket as _socket
             _host = _socket.gethostname().split('.')[0]
-            _date = datetime.now(timezone.utc).strftime('%Y%j')
+            _date = datetime.now(timezone.utc).strftime('%Y%j')  # wallclock-ok: date-stamped filename
             _path = tdcp_log_path.format(host=_host, date=_date)
             _dir = os.path.dirname(_path)
             if _dir:
@@ -5198,7 +5198,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     prev_t = None
     n_epochs = 0
     n_epochs_total = 0  # counts all observation epochs, even when gate stalls
-    start_time = time.time()
+    start_time = time.monotonic()  # CLOCK_MONOTONIC (interval)
     skip_stats = {
         "gate_wait_obs": 0,
         "corr_wait": 0,
@@ -5265,7 +5265,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     obs_history = deque()
     try:
         while not stop_event.is_set():
-            if args.duration and (time.time() - start_time) > args.duration:
+            if args.duration and (time.monotonic() - start_time) > args.duration:
                 log.info(f"Duration limit reached ({args.duration}s)")
                 break
 
@@ -5953,7 +5953,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     _itow = servo_ctx.get('last_nav_clock_iTOW', '')
                     _n_used = int(getattr(filt, 'last_n_pr', 0))
                     _dtrx_w.writerow([
-                        datetime.now(tz=timezone.utc).isoformat(),
+                        datetime.now(tz=timezone.utc).isoformat(),  # wallclock-ok: record timestamp
                         f"{time.monotonic():.9f}",
                         _itow,
                         f"{dt_rx_ns:.6f}",
@@ -5986,7 +5986,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     _n_pr_ep = int(getattr(filt, 'last_n_pr', 0))
                     _n_td_ep = int(getattr(filt, 'last_n_td', 0))
                     _fs_w.writerow([
-                        datetime.now(tz=timezone.utc).isoformat(),
+                        datetime.now(tz=timezone.utc).isoformat(),  # wallclock-ok: record timestamp
                         f"{time.monotonic():.9f}",
                         f"{gps_time.timestamp():.6f}",
                         f"{float(getattr(filt, 'last_clk_pre', 0.0)):.6f}",
@@ -6027,7 +6027,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     _td_innov_map = {}
                     if _innov_td is not None and len(_innov_td) == len(_td_svs):
                         _td_innov_map = dict(zip(_td_svs, _innov_td))
-                    _ts_iso = datetime.now(tz=timezone.utc).isoformat()
+                    _ts_iso = datetime.now(tz=timezone.utc).isoformat()  # wallclock-ok: record timestamp
                     _mono = f"{time.monotonic():.9f}"
                     _epoch_unix = f"{gps_time.timestamp():.6f}"
                     _n_pr_ep = len(_pr_svs)
@@ -6105,7 +6105,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
 
             # Console status every 10 epochs
             if n_epochs % 10 == 0:
-                elapsed = time.time() - start_time
+                elapsed = time.monotonic() - start_time
                 log.info(
                     f"  [{n_epochs}] {ts_str[:19]} "
                     f"clk={dt_rx_ns:+.1f}ns ±{dt_rx_sigma:.2f}ns "
@@ -6365,7 +6365,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                         _set_clock_class(servo_ctx, "freerun")
                         servo_ctx['phc_diverged'] = True
                     return 5
-            now = time.time()
+            now = time.monotonic()  # CLOCK_MONOTONIC (interval)
             if now - last_skip_log >= 60.0:
                 log.info(f"  Skip stats: {skip_stats}")
                 last_skip_log = now
@@ -6405,7 +6405,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
         #   - Unhandled exception (still emits before exception
         #     propagates up; bake-in numbers preserved for the
         #     orchestrator's restart cycle)
-        elapsed = time.time() - start_time
+        elapsed = time.monotonic() - start_time
         log.info(f"Steady state complete: {elapsed:.0f}s, {n_epochs} epochs")
         rs = resid_log_stats
         log.info(
@@ -6602,7 +6602,7 @@ def _save_osc_freq_corr(ctx):
                     state["tcxo"]["last_known_dt_rx_ns"] = (
                         ctx['_prev_dt_rx_ns'])
                 state["tcxo"]["updated"] = time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime())  # wallclock-ok: formatted record timestamp
                 save_receiver_state(state)
         except Exception as e:
             log.warning("Failed to save rx TCXO state: %s", e)
@@ -7335,7 +7335,7 @@ def _do_bootstrap_phc(args, ptp, pps_freq_ppb, pps_freq_unc,
     # ── 3. Evaluate PHC phase ─────────────────────────────────────── #
     ptp.enable_extts(extts_ch, rising_edge=True)
     pps_event = ptp.read_one_rising_edge(timeout_s=3.0)
-    pps_realtime_ns = time.clock_gettime_ns(time.CLOCK_REALTIME)
+    pps_realtime_ns = time.clock_gettime_ns(time.CLOCK_REALTIME)  # wallclock-todo: PPS realtime read; correlation-core fix staged behind servo_sim
     ptp.disable_extts(extts_ch)
 
     if pps_event is None:
@@ -8479,7 +8479,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
                                 return
                             if ticc_log_w is not None:
                                 ticc_log_w.writerow([
-                                    datetime.now(tz=timezone.utc).isoformat(),
+                                    datetime.now(tz=timezone.utc).isoformat(),  # wallclock-ok: record timestamp
                                     f"{event.recv_mono:.9f}",
                                     event.ref_sec,
                                     event.ref_ps,
@@ -8538,7 +8538,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
                                 # Derive approximate PHC second from realtime
                                 # (PPS fires at the GPS second boundary; recv_mono
                                 # is within ~100ms of true PPS time)
-                                rt_ns = time.clock_gettime_ns(time.CLOCK_REALTIME)
+                                rt_ns = time.clock_gettime_ns(time.CLOCK_REALTIME)  # wallclock-todo: PPS realtime read; correlation-core fix staged behind servo_sim
                                 rt_sec = rt_ns // 1_000_000_000
                                 # Apply TAI offset if PHC is in TAI timescale
                                 offset_s = 0
@@ -9311,7 +9311,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                     ticc_measurement.ref_recv_mono, expected_offset_s=0.95)
                 _ql, _ = qerr_store.get(max_age_s=2.0)
                 _gpq_w.writerow([
-                    datetime.now(tz=timezone.utc).isoformat(), '',
+                    datetime.now(tz=timezone.utc).isoformat(), '',  # wallclock-ok: record timestamp
                     ticc_measurement.ref_sec, ticc_measurement.ref_ps,
                     f"{ticc_measurement.ref_recv_mono:.9f}",
                     f"{_qm:.4f}" if _qm is not None else '',
@@ -9965,7 +9965,7 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                 _ocxo_rej = getattr(servo, 'last_ocxo_gate_rejected', False)
                 _ocxo_rsn = getattr(servo, 'last_ocxo_gate_reason', '')
                 _arm_w.writerow([
-                    datetime.now(tz=timezone.utc).isoformat(),
+                    datetime.now(tz=timezone.utc).isoformat(),  # wallclock-ok: record timestamp
                     f"{time.monotonic():.9f}",
                     f"{_x[0]:.6f}", f"{_x[1]:.6f}",
                     f"{_x[2]:.6f}", f"{_x[3]:.6f}",

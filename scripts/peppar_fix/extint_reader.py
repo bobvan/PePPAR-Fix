@@ -206,7 +206,7 @@ class TimTm2Store:
         docs/pos-replay-capture-manifest.md §6).
         """
         host_mono = time.monotonic() if recv_mono is None else recv_mono
-        host_wall = time.time()
+        host_wall = time.time()  # wallclock-ok: extint log wall stamp; correlation uses host_mono (recv_mono)
         wnR = int(getattr(parsed, "wnR", 0))
         tow_ms = int(getattr(parsed, "towMsR", 0))
         tow_sub_ms_ns = int(getattr(parsed, "towSubMsR", 0))

@@ -143,7 +143,7 @@ def append_solution(
         "mount_sn": int(mount_sn),
         "quality_ok": bool(quality_ok),
         "ingested_at": (ingested_at
-                        or datetime.now(timezone.utc)).isoformat(),
+                        or datetime.now(timezone.utc)).isoformat(),  # wallclock-ok: record isoformat timestamp
         "src_pos_path": sol.src_path,
     }
     with open(p, "a") as f:

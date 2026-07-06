@@ -110,7 +110,7 @@ def new_receiver_state(identity, port):
     Returns:
         state dict ready for save_receiver_state()
     """
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')  # wallclock-ok: state-file record timestamp
     return {
         "unique_id": identity["unique_id"],
         "unique_id_hex": identity.get("unique_id_hex"),
@@ -135,7 +135,7 @@ def update_receiver_state(state, identity, port):
     Returns:
         (state, firmware_changed) tuple
     """
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')  # wallclock-ok: state-file record timestamp
     old_firmware = state.get("firmware")
     new_firmware = identity.get("firmware", "unknown")
     firmware_changed = (old_firmware != new_firmware
@@ -209,7 +209,7 @@ def save_position_to_receiver(unique_id, ecef, sigma_m, source, state_dir=None):
     if state is None:
         log.warning("Cannot save position — no state file for receiver %s", unique_id)
         return
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')  # wallclock-ok: state-file record timestamp
     state["last_known_position"] = {
         "ecef_m": [round(float(ecef[0]), 3),
                     round(float(ecef[1]), 3),

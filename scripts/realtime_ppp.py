@@ -288,7 +288,7 @@ class QErrStore:
         live correlation.
         """
         host_time = time.monotonic() if recv_mono is None else recv_mono
-        host_wall = time.time()
+        host_wall = time.time()  # wallclock-ok: qErr log wall stamp; correlation uses host_time (recv_mono)
         norm_tow = self._normalize_tow_ms(tow_ms)
         qerr_ns = qerr_ps / 1000.0
 
@@ -1880,7 +1880,6 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
 
                 # New RAWX epoch — process and enqueue.  Fields come from the
                 # vectorized rawx_decode arrays (rawx), not pyubx2 attributes.
-                ts = datetime.now(timezone.utc)  # Use wall clock for now
                 rcvTow = rawx.rcvTow
                 week = rawx.week
                 leapS = rawx.leapS
@@ -1980,7 +1979,7 @@ def serial_reader(port, baud, obs_queue, stop_event, beph, systems=None,
                         recv_mono = now_mono
                     if queue_remains is None:
                         queue_remains = bool(getattr(stream, 'in_waiting', 0))
-                    recv_utc = datetime.now(timezone.utc)
+                    recv_utc = datetime.now(timezone.utc)  # wallclock-ok: recv_utc record field; correlation uses recv_mono/gps_time
                     parse_age_s = max(0.0, now_mono - recv_mono)
                     base_confidence = estimate_correlation_confidence(
                         queue_remains=queue_remains,
@@ -2135,7 +2134,7 @@ def ntrip_reader(stream, beph, ssr, stop_event, label="NTRIP",
                 identity=identity,
                 message=None,
                 recv_mono=meta["recv_mono"],
-                recv_utc=datetime.now(timezone.utc),
+                recv_utc=datetime.now(timezone.utc),  # wallclock-ok: recv_utc record field; correlation uses recv_mono
                 queue_remains=meta["queue_remains"],
                 parse_age_s=meta["parse_age_s"],
                 correlation_confidence=meta["correlation_confidence"],
@@ -2386,10 +2385,10 @@ def run_realtime(args):
     # Wait for initial ephemeris before starting serial
     if args.eph_mount:
         log.info("Waiting for broadcast ephemeris...")
-        warmup_start = time.time()
-        while beph.n_satellites < 8 and time.time() - warmup_start < 120:
+        warmup_start = time.monotonic()  # CLOCK_MONOTONIC (interval)
+        while beph.n_satellites < 8 and time.monotonic() - warmup_start < 120:
             time.sleep(1)
-            if int(time.time() - warmup_start) % 10 == 0:
+            if int(time.monotonic() - warmup_start) % 10 == 0:
                 log.info(f"  Warmup: {beph.summary()}")
         log.info(f"Warmup complete: {beph.summary()}")
 
@@ -2423,11 +2422,11 @@ def run_realtime(args):
     # Main processing loop
     prev_t = None
     n_epochs = 0
-    start_time = time.time()
+    start_time = time.monotonic()  # CLOCK_MONOTONIC (interval)
     try:
         while not stop_event.is_set():
             # Check duration limit
-            if args.duration and (time.time() - start_time) > args.duration:
+            if args.duration and (time.monotonic() - start_time) > args.duration:
                 log.info(f"Duration limit reached ({args.duration}s)")
                 break
 
@@ -2473,7 +2472,7 @@ def run_realtime(args):
 
             # Console status every 10 epochs
             if n_epochs % 10 == 0:
-                elapsed = time.time() - start_time
+                elapsed = time.monotonic() - start_time
                 log.info(
                     f"  [{n_epochs}] {ts_str[:19]} "
                     f"clk={clk_ns:+.1f}ns ±{clk_sigma:.2f}ns "
@@ -2489,7 +2488,7 @@ def run_realtime(args):
         if out_f:
             out_f.close()
 
-    elapsed = time.time() - start_time
+    elapsed = time.monotonic() - start_time
     log.info(f"\n{'='*60}")
     log.info(f"  Real-time PPP complete")
     log.info(f"  Duration: {elapsed:.0f}s, Epochs: {n_epochs}")

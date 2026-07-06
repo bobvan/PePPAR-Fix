@@ -130,7 +130,7 @@ def save_do_state(state, state_dir=None):
 
 def new_do_state(unique_id, label=None):
     """Create a fresh DO state dict."""
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')  # wallclock-ok: state-file record timestamp
     return {
         "unique_id": unique_id,
         "label": label or unique_id,
@@ -154,7 +154,7 @@ def save_do_freq_offset(unique_id, adjfine_ppb, state_dir=None):
     # on do_label and omit unique_id; inject it so save_do_state doesn't
     # bail.  Without this the save silently no-ops.
     state["unique_id"] = unique_id
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')  # wallclock-ok: state-file record timestamp
     state["last_known_freq_offset_ppb"] = adjfine_ppb
     state["updated"] = now
     save_do_state(state, state_dir)
@@ -174,7 +174,7 @@ def save_last_dac_code(unique_id, code, state_dir=None):
     state["unique_id"] = unique_id
     table = state.setdefault("dac_code_by_temperature", {})
     table["last"] = int(code)
-    state["updated"] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    state["updated"] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')  # wallclock-ok: state-file record timestamp
     save_do_state(state, state_dir)
 
 
@@ -204,7 +204,7 @@ def save_do_characterization(unique_id, characterization, state_dir=None):
         state = new_do_state(unique_id)
     state["unique_id"] = unique_id
     state["characterization"] = characterization
-    state["updated"] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    state["updated"] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')  # wallclock-ok: state-file record timestamp
     save_do_state(state, state_dir)
 
 
@@ -350,7 +350,7 @@ def new_phc_state(ptp_path):
     mac = discover_phc_mac(ptp_path)
     driver = discover_phc_driver(ptp_path)
     uid = mac or ptp_path
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')  # wallclock-ok: state-file record timestamp
 
     return {
         "unique_id": uid,
