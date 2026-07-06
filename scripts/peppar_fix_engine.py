@@ -12346,12 +12346,15 @@ Two-phase operation:
                        help="Optional separate NTRIP credentials file for "
                             "the primary SSR mount (orbit/clock/biases).")
     ntrip.add_argument("--ssr-bias-mount", default=None,
-                       help="Optional secondary SSR mountpoint that "
-                            "contributes PHASE BIASES ONLY.  Pair e.g. "
-                            "CNES orbit/clock with WHU OSB phase biases "
-                            "keyed to F9T-tracked signals.  All non-"
-                            "phase-bias messages from this stream are "
-                            "ignored.  See docs/ssr-mount-survey.md.")
+                       help="Optional secondary SSR mountpoint contributing "
+                            "code AND phase bias gap-fill, routed gap-fill-only "
+                            "(GAP_FILL_SIGNALS): it fills signals the primary "
+                            "AC leaves blank (e.g. GPS C5Q/L5Q) without "
+                            "overwriting shared signals.  Pair e.g. BKG/CNES "
+                            "orbit/clock with WHU OSB biases keyed to F9T-"
+                            "tracked signals.  All non-bias messages from this "
+                            "stream are ignored.  See docs/ssr-mount-survey.md "
+                            "and docs/ac-datum-mixing.md.")
     ntrip.add_argument("--ssr-bias-ntrip-conf", default=None,
                        help="Credentials file for --ssr-bias-mount (same "
                             "INI format as --ntrip-conf).  Falls back to "
