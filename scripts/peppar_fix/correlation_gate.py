@@ -45,6 +45,15 @@ class StrictCorrelationGate:
         self.min_confidence = min_confidence
         self._recv_mono_anchored = False
 
+    def reanchor(self):
+        """Re-establish the recv_mono-to-stream-time anchor on the next
+        observation.  Called by the obs-defer wedge recovery in
+        ``run_steady_state`` after flushing PPS/obs history, so a stale anchor
+        can't keep the gate wedged.  Public so the recovery contract is explicit
+        rather than reaching into private state.
+        """
+        self._recv_mono_anchored = False
+
     def pop_observation_match(
         self,
         obs_history: deque,

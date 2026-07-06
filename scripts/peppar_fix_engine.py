@@ -4600,6 +4600,50 @@ def _apply_survey_refresh(event, known_ecef, sigma_pin_m, filt):
     return known_ecef, sigma_pin_m, None
 
 
+def _obs_stall_recovery_due(stall_s, last_recovery_mono, now_mono, recovery_s):
+    """Is an obs-defer wedge recovery attempt due this iteration?
+
+    True when recovery is enabled (``recovery_s`` truthy), the pipeline has been
+    stalled at least ``recovery_s`` seconds, AND at least ``recovery_s`` seconds
+    have elapsed since the previous attempt (so attempts are spaced, not fired
+    every loop iteration).  All times are CLOCK_MONOTONIC.  ``recovery_s`` of 0
+    or None disables recovery.
+    """
+    if not recovery_s:
+        return False
+    return (stall_s >= recovery_s
+            and (now_mono - last_recovery_mono) >= recovery_s)
+
+
+class ObsStallEscalator:
+    """Escalation ladder for the obs-defer wedge (see ``run_steady_state``).
+
+    ``on_defer(stall_s, now_mono)`` is called each iteration the gate defers and
+    returns the action due this defer: ``None`` (keep waiting), ``"recover"``
+    (flush PPS+obs history and re-anchor the gate), or ``"exit5"`` (recovery
+    exhausted — re-bootstrap).  ``on_consume()`` resets the ladder when an
+    observation finally correlates.  The loop delegates to this so the ladder is
+    directly unit-testable rather than re-implemented in a test.
+    """
+
+    def __init__(self, recovery_s, max_recoveries):
+        self.recovery_s = recovery_s
+        self.max_recoveries = max_recoveries
+        self.attempts = 0
+        self._last_recovery_mono = 0.0
+
+    def on_defer(self, stall_s, now_mono):
+        if not _obs_stall_recovery_due(
+                stall_s, self._last_recovery_mono, now_mono, self.recovery_s):
+            return None
+        self._last_recovery_mono = now_mono
+        self.attempts += 1
+        return "exit5" if self.attempts > self.max_recoveries else "recover"
+
+    def on_consume(self):
+        self.attempts = 0
+
+
 def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                      stop_event, qerr_store=None, out_w=None, nav2_store=None,
                      ape_sm=None, dfe_sm=None, ape_thread=None,
@@ -5232,6 +5276,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
         "n_stalls_gt_30s": 0,
         "max_stall_s": 0.0,
         "consumption_alarm": False,
+        "obs_stall_recoveries": 0,
     }
     # PPP-AR belongs in AntPosEst (the background PPPFilter that refines
     # position), not in DOFreqEst's FixedPosFilter loop.  DOFreqEst uses
@@ -5246,6 +5291,11 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     last_usable_obs_wall = last_obs_wall
     obs_idle_alarm = False
     deferred_alarm = False
+    # Obs-defer wedge self-recovery: a persistent stall (obs arriving but never
+    # correlating to a PPS) does not clear on its own — the gate just keeps
+    # deferring.  The escalator drives flush→re-anchor→exit-5 at the defer site.
+    stall_escalator = ObsStallEscalator(
+        args.obs_stall_recovery_s, args.obs_stall_max_recoveries)
     # Queue monitoring: high-water marks (session max) + depth threshold alerts
     queue_hwm = {"obs_queue": 0, "obs_history": 0, "pps_history": 0}
     queue_alert_armed = {"obs_queue": True, "obs_history": True, "pps_history": True}
@@ -5370,6 +5420,46 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                             time.monotonic() - last_obs_input_wall,
                         )
                         deferred_alarm = True
+                    # Self-recovery from a persistent obs-defer wedge.  Once obs
+                    # stop correlating to a PPS the gate keeps deferring forever
+                    # with no recovery path — the otcBob1 2026-07-06 stall sat
+                    # wedged ~11 h (146 us DO excursion) until a manual restart.
+                    # Escalate: first flush the correlation state and re-anchor
+                    # the gate (clears a state-based wedge without disturbing the
+                    # DO); if that hasn't taken after --obs-stall-max-recoveries
+                    # attempts, exit-5 for a clean wrapper re-bootstrap (a restart
+                    # is proven to clear it).  last_usable_obs_wall is NOT reset by
+                    # a flush, so stall_s measures the true continuous-stall time.
+                    # (servo_ctx is non-None here — this is inside the
+                    # correlation-gate path — so no re-guard needed.)
+                    _action = stall_escalator.on_defer(stall_s, time.monotonic())
+                    if _action == "exit5":
+                        log.error(
+                            "Observation pipeline wedged %.0fs across %d "
+                            "recovery attempts — exiting for re-bootstrap "
+                            "(exit code 5).",
+                            stall_s, args.obs_stall_max_recoveries,
+                        )
+                        if dfe_sm is not None:
+                            dfe_sm.transition(
+                                DOFreqEstState.HOLDOVER,
+                                "obs-defer wedge, recovery exhausted",
+                            )
+                        _set_clock_class(servo_ctx, "freerun")
+                        servo_ctx['phc_diverged'] = True
+                        return 5
+                    elif _action == "recover":
+                        log.warning(
+                            "Observation pipeline wedged %.0fs — recovery attempt "
+                            "%d/%d: flushing PPS+obs history and re-anchoring the "
+                            "correlation gate.",
+                            stall_s, stall_escalator.attempts,
+                            args.obs_stall_max_recoveries,
+                        )
+                        skip_stats["obs_stall_recoveries"] += 1
+                        _purge_pps_state(servo_ctx)
+                        gate.reanchor()
+                        obs_history.clear()
                     if added_obs and n_epochs % 10 == 0:
                         log.info(f"  [{n_epochs}] Awaiting correlatable observation "
                                  f"(queued={len(obs_history)})")
@@ -5382,6 +5472,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             last_obs_wall = time.monotonic()
             obs_idle_alarm = False
             deferred_alarm = False
+            stall_escalator.on_consume()  # correlation recovered — reset ladder
             last_usable_obs_wall = last_obs_wall
             if servo_ctx is not None:
                 _exit_holdover(servo_ctx, "fresh usable observation epoch received")
@@ -12396,6 +12487,16 @@ Two-phase operation:
                        help="Minimum acceptable confidence for observation/PPS correlation")
     servo.add_argument("--max-correlation-window-s", type=float, default=None,
                        help="Max recv_mono delta for obs/PPS correlation (default: 11s, increase for high-latency transports like E810 I2C)")
+    servo.add_argument("--obs-stall-recovery-s", type=float, default=60.0,
+                       help="Self-recover from a persistent obs-defer stall: after this "
+                            "many seconds wedged (obs arriving but never correlating to a "
+                            "PPS), flush PPS+obs history and re-anchor the correlation "
+                            "gate; after --obs-stall-max-recoveries such attempts, exit-5 "
+                            "for a clean re-bootstrap.  0 disables recovery (engine stays "
+                            "wedged — use only to capture a wedge with instrumentation).")
+    servo.add_argument("--obs-stall-max-recoveries", type=int, default=3,
+                       help="Max in-process obs-defer recovery attempts before exit-5 "
+                            "(default 3, ~4 min of continuous stall at the 60s cadence).")
     servo.add_argument("--kalman-servo", action="store_true",
                        help="Use 2-state Kalman filter + LQR servo instead of PI. "
                             "Optimal pull-in (no overshoot) and noise-matched "
