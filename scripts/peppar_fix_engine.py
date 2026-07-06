@@ -4615,6 +4615,35 @@ def _obs_stall_recovery_due(stall_s, last_recovery_mono, now_mono, recovery_s):
             and (now_mono - last_recovery_mono) >= recovery_s)
 
 
+class ObsStallEscalator:
+    """Escalation ladder for the obs-defer wedge (see ``run_steady_state``).
+
+    ``on_defer(stall_s, now_mono)`` is called each iteration the gate defers and
+    returns the action due this defer: ``None`` (keep waiting), ``"recover"``
+    (flush PPS+obs history and re-anchor the gate), or ``"exit5"`` (recovery
+    exhausted — re-bootstrap).  ``on_consume()`` resets the ladder when an
+    observation finally correlates.  The loop delegates to this so the ladder is
+    directly unit-testable rather than re-implemented in a test.
+    """
+
+    def __init__(self, recovery_s, max_recoveries):
+        self.recovery_s = recovery_s
+        self.max_recoveries = max_recoveries
+        self.attempts = 0
+        self._last_recovery_mono = 0.0
+
+    def on_defer(self, stall_s, now_mono):
+        if not _obs_stall_recovery_due(
+                stall_s, self._last_recovery_mono, now_mono, self.recovery_s):
+            return None
+        self._last_recovery_mono = now_mono
+        self.attempts += 1
+        return "exit5" if self.attempts > self.max_recoveries else "recover"
+
+    def on_consume(self):
+        self.attempts = 0
+
+
 def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                      stop_event, qerr_store=None, out_w=None, nav2_store=None,
                      ape_sm=None, dfe_sm=None, ape_thread=None,
@@ -5262,11 +5291,11 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     last_usable_obs_wall = last_obs_wall
     obs_idle_alarm = False
     deferred_alarm = False
-    # Obs-defer wedge self-recovery state: a persistent stall (obs arriving but
-    # never correlating to a PPS) does not clear on its own — the gate just keeps
-    # deferring.  These track escalation at the defer site below.
-    stall_recovery_attempts = 0
-    last_stall_recovery_mono = 0.0  # CLOCK_MONOTONIC
+    # Obs-defer wedge self-recovery: a persistent stall (obs arriving but never
+    # correlating to a PPS) does not clear on its own — the gate just keeps
+    # deferring.  The escalator drives flush→re-anchor→exit-5 at the defer site.
+    stall_escalator = ObsStallEscalator(
+        args.obs_stall_recovery_s, args.obs_stall_max_recoveries)
     # Queue monitoring: high-water marks (session max) + depth threshold alerts
     queue_hwm = {"obs_queue": 0, "obs_history": 0, "pps_history": 0}
     queue_alert_armed = {"obs_queue": True, "obs_history": True, "pps_history": True}
@@ -5401,41 +5430,35 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     # attempts, exit-5 for a clean wrapper re-bootstrap (a restart
                     # is proven to clear it).  last_usable_obs_wall is NOT reset by
                     # a flush, so stall_s measures the true continuous-stall time.
-                    if _obs_stall_recovery_due(
-                        stall_s, last_stall_recovery_mono, time.monotonic(),
-                        args.obs_stall_recovery_s,
-                    ):
-                        last_stall_recovery_mono = time.monotonic()
-                        stall_recovery_attempts += 1
-                        if stall_recovery_attempts > args.obs_stall_max_recoveries:
-                            log.error(
-                                "Observation pipeline wedged %.0fs across %d "
-                                "recovery attempts — exiting for re-bootstrap "
-                                "(exit code 5).",
-                                stall_s, args.obs_stall_max_recoveries,
+                    # (servo_ctx is non-None here — this is inside the
+                    # correlation-gate path — so no re-guard needed.)
+                    _action = stall_escalator.on_defer(stall_s, time.monotonic())
+                    if _action == "exit5":
+                        log.error(
+                            "Observation pipeline wedged %.0fs across %d "
+                            "recovery attempts — exiting for re-bootstrap "
+                            "(exit code 5).",
+                            stall_s, args.obs_stall_max_recoveries,
+                        )
+                        if dfe_sm is not None:
+                            dfe_sm.transition(
+                                DOFreqEstState.HOLDOVER,
+                                "obs-defer wedge, recovery exhausted",
                             )
-                            if dfe_sm is not None:
-                                dfe_sm.transition(
-                                    DOFreqEstState.HOLDOVER,
-                                    "obs-defer wedge, recovery exhausted",
-                                )
-                            if servo_ctx is not None:
-                                _set_clock_class(servo_ctx, "freerun")
-                                servo_ctx['phc_diverged'] = True
-                            return 5
+                        _set_clock_class(servo_ctx, "freerun")
+                        servo_ctx['phc_diverged'] = True
+                        return 5
+                    elif _action == "recover":
                         log.warning(
                             "Observation pipeline wedged %.0fs — recovery attempt "
                             "%d/%d: flushing PPS+obs history and re-anchoring the "
                             "correlation gate.",
-                            stall_s, stall_recovery_attempts,
+                            stall_s, stall_escalator.attempts,
                             args.obs_stall_max_recoveries,
                         )
                         skip_stats["obs_stall_recoveries"] += 1
-                        if servo_ctx is not None:
-                            _purge_pps_state(servo_ctx)
-                            _gate = servo_ctx.get("correlation_gate")
-                            if _gate is not None:
-                                _gate._recv_mono_anchored = False
+                        _purge_pps_state(servo_ctx)
+                        gate.reanchor()
                         obs_history.clear()
                     if added_obs and n_epochs % 10 == 0:
                         log.info(f"  [{n_epochs}] Awaiting correlatable observation "
@@ -5449,7 +5472,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             last_obs_wall = time.monotonic()
             obs_idle_alarm = False
             deferred_alarm = False
-            stall_recovery_attempts = 0  # correlation recovered
+            stall_escalator.on_consume()  # correlation recovered — reset ladder
             last_usable_obs_wall = last_obs_wall
             if servo_ctx is not None:
                 _exit_holdover(servo_ctx, "fresh usable observation epoch received")

@@ -75,52 +75,43 @@ class ObsStallRecoveryDueTest(unittest.TestCase):
 
 
 class EscalationLadderTest(unittest.TestCase):
-    """Replicate the loop's attempt-counting to prove the escalation timing:
+    """Drive the REAL ObsStallEscalator the loop delegates to (not a re-impl):
     with recovery_s=60 and max=3, a continuous stall recovers at 60/120/180 s
-    then exits-5 at 240 s (4th attempt exceeds the budget)."""
-
-    def _run_ladder(self, recovery_s=60.0, max_rec=3, horizon=400):
-        last_recovery = 0.0
-        attempts = 0
-        actions = []
-        for now in range(horizon):
-            stall_s = float(now)  # continuous stall since t=0, never consumed
-            if _due(stall_s, last_recovery, float(now), recovery_s):
-                last_recovery = float(now)
-                attempts += 1
-                if attempts > max_rec:
-                    actions.append(("exit5", now))
-                    break
-                actions.append(("recover", now))
-        return actions
+    then exits-5 at 240 s (4th attempt exceeds the budget), and a consumed obs
+    resets the ladder."""
 
     def test_recovers_three_times_then_exit5(self):
-        actions = self._run_ladder()
+        esc = engine.ObsStallEscalator(recovery_s=60.0, max_recoveries=3)
+        actions = []
+        for now in range(400):
+            action = esc.on_defer(float(now), float(now))  # continuous stall
+            if action:
+                actions.append((action, now))
+            if action == "exit5":
+                break
         self.assertEqual([a[0] for a in actions],
                          ["recover", "recover", "recover", "exit5"])
         self.assertEqual([a[1] for a in actions], [60, 120, 180, 240])
 
     def test_consumed_obs_resets_ladder(self):
-        # If an obs is consumed after the first recovery (attempts reset to 0 in
-        # the loop), the ladder restarts — no premature exit-5.
-        recovery_s = 60.0
-        last_recovery = 0.0
-        attempts = 0
+        # Recovers at 60/120; at 130 an obs finally correlates -> on_consume()
+        # resets attempts, and the host stays healthy -> never reaches exit-5.
+        esc = engine.ObsStallEscalator(recovery_s=60.0, max_recoveries=3)
         exit5 = False
         for now in range(400):
-            # Recovers at 60; at 130 an obs finally correlates (reset), then the
-            # host stays healthy — so we never reach exit-5.
-            stall_s = float(now) if now < 130 else 0.0
             if now == 130:
-                attempts = 0
-                last_recovery = 0.0
-            if stall_s and _due(stall_s, last_recovery, float(now), recovery_s):
-                last_recovery = float(now)
-                attempts += 1
-                if attempts > 3:
-                    exit5 = True
-                    break
+                esc.on_consume()
+            stall_s = float(now) if now < 130 else 0.0
+            if esc.on_defer(stall_s, float(now)) == "exit5":
+                exit5 = True
+                break
         self.assertFalse(exit5)
+        self.assertEqual(esc.attempts, 0)
+
+    def test_disabled_escalator_never_acts(self):
+        esc = engine.ObsStallEscalator(recovery_s=0, max_recoveries=3)
+        self.assertIsNone(esc.on_defer(9999.0, 9999.0))
+        self.assertEqual(esc.attempts, 0)
 
 
 if __name__ == "__main__":
