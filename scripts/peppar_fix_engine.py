@@ -9461,9 +9461,42 @@ def _dt_rx_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
     scheduler.record_actuation(now_mono, freq_ppb)
     scheduler.compute_adaptive_interval()
 
+    # our steering vs the mosaic-T's own solution (PVTGeodetic).
+    _pvt = getattr(args, '_pvt_store', None)
+    _their = _pvt.latest() if _pvt is not None else None
+    _word = getattr(ctx['actuator'], 'current_word', None)
+    if _their is not None:
+        _their_bias_ns = _their[1] * 1.0e6      # RxClkBias ms → ns
+        _their_drift_ppb = _their[2] * 1.0e3    # RxClkDrift ppm → ppb
+        _their_mode = _their[3]
+    else:
+        _their_bias_ns = _their_drift_ppb = float('nan')
+        _their_mode = -1
+
+    # optional per-epoch comparison CSV
+    _cw = ctx.get('_gnssdo_compare_w')
+    if _cw is None and getattr(args, 'gnssdo_compare_log', None):
+        import csv as _csv
+        _cf = open(args.gnssdo_compare_log, 'a', newline='')
+        _cw = _csv.writer(_cf)
+        if _cf.tell() == 0:
+            _cw.writerow(["mono_s", "our_dt_rx_ns", "our_control_word",
+                          "our_freq_ppb", "mosaic_rxclkbias_ns",
+                          "mosaic_rxclkdrift_ppb", "mosaic_mode"])
+        ctx['_gnssdo_compare_f'] = _cf
+        ctx['_gnssdo_compare_w'] = _cw
+    if _cw is not None:
+        _cw.writerow(["%.3f" % now_mono, "%.3f" % phase_ns,
+                      _word if _word is not None else "",
+                      "%.4f" % freq_ppb, "%.3f" % _their_bias_ns,
+                      "%.4f" % _their_drift_ppb, _their_mode])
+        ctx['_gnssdo_compare_f'].flush()
+
     if n_epochs % 10 == 0:
-        log.info("  [%d] DT_RX: phase=%+.2fns dt=%.1fs freq=%+.2fppb interval=%d",
-                 n_epochs, phase_ns, dt_actual, freq_ppb, scheduler.interval)
+        log.info("  [%d] DT_RX: ours phase=%+.2fns freq=%+.3fppb word=%s | "
+                 "mosaic bias=%+.2fns drift=%+.3fppb mode=%d | dt=%.1fs",
+                 n_epochs, phase_ns, freq_ppb, _word,
+                 _their_bias_ns, _their_drift_ppb, _their_mode, dt_actual)
     return "ok"
 
 
@@ -11171,11 +11204,16 @@ def run(args):
                 "--obs-sbf-tcp without --eph-mount: broadcast ephemeris must "
                 "come from somewhere or position/clock cannot solve.  Pair "
                 "with --eph-mount (e.g. BCEP00BKG0).")
-        from peppar_fix.sbf_obs_source import run_sbf_tcp_source
+        from peppar_fix.sbf_obs_source import run_sbf_tcp_source, PvtClockStore
+        # Capture the mosaic-T's OWN clock solution (PVTGeodetic RxClkBias /
+        # RxClkDrift, AtomiChron-corrected) so the servo can log it next to our
+        # carrier-phase dt_rx + control word — our steering vs theirs.
+        args._pvt_store = PvtClockStore()
         t_serial = threading.Thread(
             target=run_sbf_tcp_source,
             args=(args, obs_queue, stop_event),
-            kwargs={'ssr': ssr, 'systems': systems},
+            kwargs={'ssr': ssr, 'systems': systems,
+                    'pvt_store': args._pvt_store},
             daemon=True,
         )
         t_serial.start()
@@ -13215,6 +13253,12 @@ Two-phase operation:
     servo.add_argument("--gnssdo-watchdog-s", type=int, default=None,
                        help="Firmware fail-safe watchdog to request via $T "
                             "(default 30 s; must exceed the servo period)")
+    servo.add_argument("--gnssdo-compare-log", default=None, metavar="CSV",
+                       help="Log our carrier-phase steering (dt_rx, control "
+                            "word, freq) vs the mosaic-T's own PVTGeodetic "
+                            "solution (RxClkBias/RxClkDrift) per epoch, for "
+                            "comparison.  Requires PVTGeodetic in the SBF "
+                            "stream (sso ... MeasEpoch+PVTGeodetic).")
 
     # DO bootstrap (absorbed from phc_bootstrap.py)
     boot = ap.add_argument_group("DO bootstrap (automatic when --servo)")
