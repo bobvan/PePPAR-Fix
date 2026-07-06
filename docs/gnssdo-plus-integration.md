@@ -471,3 +471,47 @@ the SBF obs seam had only ever fed position/obs, never an actuator.
 Grading (chA TDEV) is unchanged and ready once the loop closes; the TICC
 rig (chA = GNSSDO+ PPS OUT, chB = dot166 OTC, Rb reference) stays a pure
 out-of-band monitor.
+
+### Loop closed 2026-07-06 — dt_rx actuation arm
+
+The frontier is closed. A new **`_dt_rx_servo_epoch`** (mirrors
+`_cm_servo_epoch`) handles the receiver-clock-is-DO topology, routed by a
+`dt_rx_phase` ctx flag (set when `actuator_type == "gnssdo"`):
+
+- main loop **bypasses the PPS correlation gate** (takes the `popleft`
+  path) so obs flow and `dt_rx` is computed with an empty `pps_history`;
+- `dt_rx` feeds a new **DOFreqEst Arm 8 `do_phase`** (observes x[2] = DO
+  phase, same H as EXTINT), with the PPP x[0] arm OFF (one oscillator, no
+  double-count) — reusing the EKF's LQR + state-sanity + rate-limit
+  safety.
+
+Two things the hardware taught us (both fixed):
+
+1. **Sign** — measured on the SXT-D: `+freq_ppb` speeds the OCXO up, which
+   drives `dt_rx` *more positive*, so positive `dt_rx` = DO ahead. The
+   `do_phase` arm uses "positive = late", so we feed **`-dt_rx`**. (First
+   run with `+dt_rx` diverged: `+6.5 → +263 ns`; a bounded, watchdog-
+   recovered runaway.)
+2. **Outlier gate** — `dt_rx` is the *absolute* receiver-clock bias
+   (legitimately large during acquisition), not a small aligned error, so
+   the absolute `TRACK_OUTLIER_NS` gate rejected the whole acquisition.
+   Replaced with a per-epoch **innovation (glitch)** gate; runaway safety
+   is the EKF state-sanity gate + actuator clamp + firmware watchdog.
+
+**Result (supervised, MadHat, obs from `10.101.101.153` SBF):**
+
+```
+phase +7.20 → +4.58 → +2.92 → +1.82 → +1.16 → +0.81 → +0.47 → +0.33 → +0.23 ns
+freq  -0.21 → -0.14 → -0.08 → -0.03 → +0.01 → +0.02 → +0.04 → +0.05 ppb
+```
+
+`dt_rx` converges from 7.2 ns to **~0.23 ns in ~2 min**, frequency settles
+near +0.05 ppb, **zero glitches, zero resets** — a locked loop. Clean
+teardown → `$E,0`; Mosaic-T restored; DO back on internal discipline.
+
+Still open: (a) **grade chA TDEV** over an overnight (the TICC rig is
+ready); (b) **do_freerun_char** the STP3593LF to replace the OCXO
+class-default Q; (c) **watch our steering vs the Mosaic-T's own solution**
+— decode `PVTGeodetic` (RxClkBias/RxClkDrift, AtomiChron-corrected) from
+SBF and log it alongside our `dt_rx` + control word (pysbf2 already parses
+the block).
