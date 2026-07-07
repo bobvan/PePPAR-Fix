@@ -221,6 +221,48 @@ def collect_phase_series(ticc_port: str, duration_s: float):
 
 # ── high-level reduction + JSON merge ────────────────────────────── #
 
+def deglitch_cycle_slips(samples, cycle_ps=100_000, tol_ps=25_000):
+    """Remove integer-cycle PPS steps from a GNSSDO+ free-run chA series.
+
+    **GNSSDO-hardware-specific — opt-in, NOT a default.**  The SparkFun
+    SXT(-D) delays the mosaic-T PPS until the next DO (10 MHz) rising edge
+    (a deliberate feature, on by default, overridable).  When the DO is
+    disciplined to GPS top-of-second the alignment barely moves; when the DO
+    FREE-RUNS it drifts against GPS ToS and the "next DO edge" periodically
+    jumps by exactly one 10 MHz period (100 ns = ``cycle_ps``) — a STEP, not
+    a spike.  These integer-cycle steps are an artifact of the alignment
+    feature, not DO noise: left in, two of them inflate a second-difference
+    stat (TDEV) ~14x and the linear detrend smears them into a fake wander
+    (fake white-FM).  This snaps them out.
+
+    Only a per-epoch jump within ``tol_ps`` of a NON-ZERO integer multiple of
+    ``cycle_ps`` is treated as a slip, so genuine sub-cycle DO motion is
+    untouched.  Assumes the per-epoch frequency-offset trend is « cycle_ps
+    (true for a held OCXO, ~1 ns/s « 100 ns).  On other DO hardware a 100 ns
+    jump may be a real defect — do NOT apply this blindly; it is keyed to the
+    GNSSDO PPS-alignment behaviour.
+
+    Args:
+        samples: list of ``(ref_sec, ref_ps)`` tuples (collect_phase_series /
+            a TICC chA CSV).
+    Returns:
+        ``(deglitched_samples, n_slips)`` — same shape, ref_ps corrected.
+    """
+    import numpy as np
+    if len(samples) < 3:
+        return list(samples), 0
+    secs = [s for s, _ in samples]
+    ps = np.array([p for _, p in samples], dtype=np.int64)
+    d = np.diff(ps)
+    n_cyc = np.round(d / cycle_ps)
+    resid = d - n_cyc * cycle_ps
+    is_slip = (n_cyc != 0) & (np.abs(resid) < tol_ps)
+    steps = np.where(is_slip, (n_cyc * cycle_ps).astype(np.int64), 0)
+    ps_out = ps.copy()
+    ps_out[1:] -= np.cumsum(steps).astype(np.int64)
+    return list(zip(secs, ps_out.tolist())), int(is_slip.sum())
+
+
 def analyze_samples(samples, target_freqs=_PSD_FREQS_HZ, taus_s=_TAUS_S):
     """Reduce raw TICC chA samples to the full analysis dict.
 
