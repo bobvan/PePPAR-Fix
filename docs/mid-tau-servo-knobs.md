@@ -180,6 +180,39 @@ fit. The mode is now the standing test bed for the single-oscillator roadmap
 and — with delta's knob-1 gate rebased on top — the place to validate knob 1
 / knob 2 / `do_freq_clamp` in sim before hardware.
 
+### Knob-2 lever sweep — which fixes the cascade (aiming delta's next arm)
+
+delta's decisive question: *does lowering OUR loop bandwidth alone stabilize
+the cascade, or must we touch the mosaic filter?* Swept the three levers at
+the SXT-D operating point (ungated-rail regime, `mosaic_alpha≈0.05`), stall-
+perturbed, measuring stability + mid-τ TDEV(100 s). **Absolute mid-τ runs ~6×
+delta's hardware (the preset's amplitude over-production) — read the levers
+RELATIVELY.**
+
+| lever | stabilizes? | mid-τ TDEV(100 s) |
+|---|---|---|
+| **(a)** lower our BW (tighter Q) | only at Q ≤ 1e-3 | **5.6–20.8 ns** (worst) |
+| **(b)** raise mosaic α (≥0.2, faster mosaic filter) | yes | **0.74 ns** (best) |
+| **(c)** bypass cascade (`--clock-model wno`, single loop) | yes, all Q | **~0.83 ns** |
+
+**Answer: lowering our bandwidth alone does NOT solve it.** Lever (a)
+stabilizes only by going to very tight Q, and that gives the *worst* mid-τ
+(the cascade forces a bad stability↔mid-τ tradeoff). You **must touch the
+mosaic filter**: (b) speed it up (best mid-τ, but needs the mosaic PVT
+smoothing config delta doesn't own) or (c) **bypass it — `--clock-model wno`**
+(delta owns it, no new code, nearly as good). Recommended next hardware arm:
+**tight-Q + `--clock-model wno`** (lever c); fall back to chasing the mosaic
+PVT config (b) if `wno`'s residual mosaic-side smoothing leaves the cascade
+intact.
+
+This is robust to the **Q-direction discrepancy** (my sim: tighter Q
+stabilizes lever a; delta's hardware: measured tight-Q *railed*) because
+lever (a) loses either way — it either doesn't stabilize (hardware) or
+stabilizes at unusable mid-τ (sim). The discrepancy itself flags that the
+cascade model reproduces the *spectrum* and the *tradeoff* but not the exact
+tight-Q hardware behaviour (candidate: word-limit windup under tight-Q); it
+does not change the decisive lever.
+
 ## Code shipped
 
 Gated, **default-off**, byte-identical when off:

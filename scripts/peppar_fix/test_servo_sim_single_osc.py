@@ -135,6 +135,29 @@ class TestMosaicCascadeRail(unittest.TestCase):
         self.assertTrue(r.diverged())
 
 
+class TestActuatorWordLimit(unittest.TestCase):
+    """actuator_max_ppb saturates the applied command (DAC word-limit) while
+    the filter's B uses the unclamped command (windup) — so a cascade rail
+    saturates near ±max (delta's +386 ppb) instead of overshooting to the
+    DOFreqEst max_ppb."""
+
+    def test_word_limit_bounds_applied_command(self):
+        base = dict(single_oscillator=True, single_osc_mosaic_filter=True,
+                    mosaic_alpha=0.03, mosaic_beta=0.003,
+                    single_osc_obs_sigma_ns=0.13, sigma_do_freq_ppb=0.01,
+                    sigma_do_phase_ns=0.0726, do_rwfm_ppb_per_sqrt_s=0.005,
+                    do_wfm_ppb=0.01, do_wpm_ns=0.01, coast_interval_s=1.0,
+                    processing_stall=(2000.0, 3.0))
+        unclamped = ClosedLoopSim(preset("piface-current", duration_s=3500.0,
+                                          **base)).run()
+        clamped = ClosedLoopSim(preset("piface-current", duration_s=3500.0,
+                                        actuator_max_ppb=386.0, **base)).run()
+        # Both rail, but the clamp saturates the trajectory far tighter than
+        # the unclamped overshoot.
+        self.assertGreater(np.nanmax(np.abs(unclamped.phi_do_true_ns)),
+                           10 * np.nanmax(np.abs(clamped.phi_do_true_ns)))
+
+
 class TestActuatorGain(unittest.TestCase):
 
     def test_gain_true_scales_plant(self):

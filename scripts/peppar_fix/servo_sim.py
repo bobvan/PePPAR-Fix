@@ -355,6 +355,13 @@ class SimConfig:
     # mosaic filter = more loop lag = more marginal.
     mosaic_alpha: float = 0.1
     mosaic_beta: float = 0.01
+    # Actuator word-limit (ppb): the DAC control word saturates at ±this.
+    # delta's abA1 railed at +386 ppb where control_word hit its limit.  The
+    # APPLIED command is clamped to ±actuator_max_ppb, but the filter's B
+    # still uses the UNCLAMPED command → the saturation mismatch is real
+    # actuator windup (part of the rail).  None → no clamp (DOFreqEst max_ppb
+    # only, far higher).
+    actuator_max_ppb: Optional[float] = None
     # Processing stall = (t_start_s, stall_s): the servo LOOP blocks for
     # stall_s (no read, no correction), the DO free-runs under the held
     # adjfine, then execution resumes and the next correction sees the whole
@@ -867,6 +874,10 @@ class ClosedLoopSim:
             applied = self.adjfine
             if c.adjfine_lsb_ppb > 0:
                 applied = round(applied / c.adjfine_lsb_ppb) * c.adjfine_lsb_ppb
+            if c.actuator_max_ppb is not None:
+                # DAC word saturates; the filter's B used the unclamped
+                # command, so the excess is actuator windup.
+                applied = min(c.actuator_max_ppb, max(-c.actuator_max_ppb, applied))
             self._step_truth(c.dt_s, applied)
 
             # disciplineModeFsm #107 binary-layer per-epoch evaluation.
