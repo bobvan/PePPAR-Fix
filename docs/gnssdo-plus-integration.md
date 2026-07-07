@@ -638,5 +638,23 @@ resets** — but it ran only **95 min**: at 20:32 the *position* filter tripped
 drift, not the servo), which killed the whole engine. The default mode runs
 Phase-1 bootstrap + AntPosEst; a **clock-only grade should use `--no-antposest`
 with a pinned ARP** so the position filter can't trip. (The 05:21 wrap-up cron
-also didn't fire — session was summarized overnight.) TODO: re-run with
-`--no-antposest` + the measured Q for the full long-τ grade + compare.
+also didn't fire — session was summarized overnight.)
+
+**Re-run 2026-07-07 (RUNNING):** `--no-antposest --known-pos <converged pos>
+--known-pos-frame ITRF2020` + the **measured Q**. Clean: `DOFreqEst Q
+sigma_do_phase=0.0726 (measured)`, dt_rx locked **sub-0.1 ns** (tighter than
+class-default), **zero resets, zero watchdog trips**. Collecting the long-τ
+compare (`gnssdo-compare-long2.csv`) + disciplined chA (`gnssdo-disc2-ticc`,
+de-glitch with `char_gnssdo_freerun`/`deglitch_cycle_slips` before TDEV).
+
+### PPS cycle-slips are a GNSSDO+ hardware feature (not a defect)
+
+The 100 ns steps are the SXT(-D)'s **PPS-to-DO-edge alignment** (delay the
+mosaic-T PPS to the next 10 MHz rising edge — on by default, overridable).
+Disciplined, the DO is steered to GPS ToS so the alignment barely moves (we
+"hardly notice"); free-running, the DO drifts across a 10 MHz cycle boundary
+and the PPS jumps exactly one cycle. So de-glitching is **GNSSDO-specific and
+opt-in** (`freerun_analysis.deglitch_cycle_slips`; on other DOs a 100 ns jump
+may be a real defect). The free-run slip rate (~0.4/h at the held word)
+measures how close the held frequency is to GPS. Override option (disable the
+alignment) exists — under evaluation.
