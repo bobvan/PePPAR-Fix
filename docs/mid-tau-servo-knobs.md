@@ -130,14 +130,39 @@ structurally, and the sim does not yet model them:
 | actuator → observation | open (DO obs is GPS-referenced) | **closed** (steering DO moves `dt_rx`) |
 | failure mode | coast on gate-out (bounded) | self-consistent **rail** |
 
-A faithful `single_oscillator=True` mode would: collapse the rx-TCXO and DO
-truth states into one; route the DO-phase truth into the `x[2]` arm as the
-sole observer (PPP/TICC/EXTINT off); and — the load-bearing part — close the
-**actuator→observation loop** so a steer of the DO shows up in the next
-`dt_rx`. That mode would (a) reproduce delta's rail deterministically, (b)
-let us validate knob 1 / knob 2 / `do_freq_clamp` in sim before hardware,
-and (c) be the standing test bed for the single-oscillator designs on the
-roadmap. Filed as a follow-up; scoped in the dayplan.
+**`single_oscillator=True` — BUILT (I-122448, PR stacked on #300).** The
+mode collapses the rx-TCXO+DO into one oscillator, routes the DO-phase truth
+into the `x[2]` arm as the sole observer (via `extint_phase_ns` =
+functionally delta's do_phase Arm 8), and closes the actuator→observation
+loop (the plant already does this). Two hardware-realism knobs: `actuator_
+gain_true` (imperfectly-known steering gain) and `single_osc_obs_lag_s` (the
+mosaic's internal clock-filter lag — the cascaded-loop dynamic that is
+genuinely single-oscillator).
+
+**Honest result — the mode does NOT reproduce delta's rail.** Driving the
+real `DOFreqEst`, no ingredient tried (dt_rx/do_phase glitch, `actuator_gain_
+true` 0.5–3×, `single_osc_obs_lag_s` 0–40 s, coast 1–60 s) reproduces delta's
+**tight-Q, normal-cadence** rail. Over a 12-combo {lag × gain} sweep at normal
+cadence, **0** show delta's tight-Q-rails pattern; the instabilities the mode
+*does* exhibit are the **opposite** Q-dependence — looser Q (higher loop BW)
+rails under observation lag (textbook delay-instability), and any topology
+rails under an extreme (≥45 s) coast. That long-coast rail is **not**
+single-oscillator-specific (the two-oscillator model rails there too).
+
+What this implies (a useful cross-check, not a dead end):
+1. delta's rail is almost certainly **perturbation-triggered**, not pure
+   tight-Q underdamping — consistent with knob 1 (a *gate*) fixing it, since
+   a gate cannot fix an underdamped loop. The trigger was the concurrent
+   `mosaic RxClkBias` ramp / dt_rx glitch through the sole ungated observer.
+2. Reproducing it in sim needs the **hardware-specific dynamics** the model
+   still idealizes: the mosaic's actual clock-filter response, the SXT-D's
+   measured actuator gain, and the real adaptive-scheduler cadence. Next
+   step is to **parameterize the mode from the SXT-D characterization**
+   (joint bravo↔delta) and re-check.
+
+The mode still delivers (b) the standing test bed for the single-oscillator
+designs on the roadmap and (c) — once SXT-D-parameterized — the place to
+validate knob 1 / knob 2 / `do_freq_clamp` before hardware.
 
 ## Code shipped
 

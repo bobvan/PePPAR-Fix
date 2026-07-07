@@ -307,6 +307,39 @@ class SimConfig:
     # ±clamp of its bootstrap nominal (a DO-freq pull-range seatbelt).
     # See docs/mid-tau-servo-knobs.md.
     do_freq_clamp_ppb: Optional[float] = None
+
+    # ── servoSimSingleOsc (I-122448): single-oscillator topology ──
+    # When True, model a GNSSDO+/SXT-D where the DO clocks the receiver:
+    #   * ONE oscillator (the DO) — no separate rx TCXO; the two-oscillator
+    #     arms (PPP dt_rx→x[0], qErr, TDCP, TICC) do not fire.
+    #   * the observation IS the DO phase vs GPS (the mosaic PPP dt_rx),
+    #     fed to the x[2] arm as the SOLE observer (via extint_phase_ns —
+    #     functionally delta's do_phase Arm 8, same H=[0,0,1,0]).
+    #   * the actuator→observation loop is closed by the plant exactly as
+    #     in two-osc mode (phi_do integrates the steered frequency, and the
+    #     observation reads phi_do) — plus actuator_gain_true below.
+    # See docs/mid-tau-servo-knobs.md "Single-oscillator mode".
+    single_oscillator: bool = False
+    # Sole-observer (mosaic dt_rx) 1σ, ns.  The SXT-D grade run measured
+    # dt_rx sub-0.1 ns; default 0.16 ns (delta's cited figure).
+    single_osc_obs_sigma_ns: float = 0.16
+    # TRUE actuator gain: ns/s of DO frequency per unit adjfine command.
+    # The filter's B assumes 1.0 (perfect knowledge); setting this ≠ 1.0
+    # models the real DO's imperfectly-known steering gain (see
+    # feedback: no default actuator gain).  A mismatch is a candidate
+    # rail driver — the filter mis-predicts its own steer and attributes
+    # the residual to DO drift.  1.0 → matched (byte-identical plant).
+    actuator_gain_true: float = 1.0
+    # Receiver internal clock-filter lag (s).  The mosaic produces its PPP
+    # dt_rx through its OWN clock estimator (a filter with dynamics), so the
+    # dt_rx the servo consumes is the DO phase passed through a 1st-order lag
+    # — NOT the instantaneous DO phase.  This cascaded lag (two filters in
+    # series: mosaic's + ours) is the genuinely single-oscillator dynamic
+    # the two-oscillator model lacks (there the DO-phase obs is a direct
+    # GPS-referenced read).  It eats phase margin → with tight measured-Q +
+    # the deadbeat x[3] term it drives the growing oscillation delta saw at
+    # NORMAL cadence.  0.0 → no lag (instantaneous obs).
+    single_osc_obs_lag_s: float = 0.0
     # One-shot dt_rx (Arm-1 PPP) glitch injection = (t_s, delta_ns): at the
     # first correction epoch with t ≥ t_s, add delta_ns to the emitted
     # dt_rx_ns.  Reproduces delta's -12 ns dt_rx step that ramped x[3] to
@@ -467,6 +500,8 @@ class ClosedLoopSim:
             soft_ticc_gate=cfg.soft_ticc_gate,
             do_freq_clamp_ppb=cfg.do_freq_clamp_ppb)
         self.adjfine = cfg.initial_freq_ppb
+        # single_oscillator receiver clock-filter lag state (see _emit).
+        self._rx_lag_state = cfg.initial_phi_do_ns
         # Binary layer for the gross-fault A/B (#107 consumption).
         self.binary_layer = BinaryLayer(
             consec_max_epochs=cfg.binary_layer_consec_max_epochs,
@@ -547,7 +582,9 @@ class ClosedLoopSim:
                             + rng.normal(0.0, c.do_rwfm_ppb_per_sqrt_s
                                          * math.sqrt(dt)))
         # DO phase: servo response + white FM (sets short-τ floor) + white PM.
-        self.truth.phi_do += (-(self.truth.f_do + adjfine) * dt
+        # actuator_gain_true scales the steer the DO *actually* applies vs
+        # the command the filter's B assumes (1.0); ≠1.0 = gain mismatch.
+        self.truth.phi_do += (-(self.truth.f_do + c.actuator_gain_true * adjfine) * dt
                               + rng.normal(0.0, c.do_wfm_ppb * math.sqrt(dt))
                               + rng.normal(0.0, c.do_wpm_ns))
 
@@ -557,6 +594,25 @@ class ClosedLoopSim:
         rng = self.rng
         t = self.truth
         m: dict = {"dt": c.dt_s}
+        if c.single_oscillator:
+            # Single-oscillator (GNSSDO+): the DO *is* the receiver clock, so
+            # the mosaic PPP dt_rx is the DO phase vs GPS.  It is the SOLE
+            # observer, fed to the x[2] arm (via extint_phase_ns = delta's
+            # do_phase Arm 8, same H).  No rx-TCXO arms, no TICC/qErr — the
+            # other use_* flags are ignored in this mode.
+            #
+            # The mosaic reports dt_rx through its OWN clock filter → a 1st-
+            # order lag on the DO phase (the cascaded-loop dynamic that makes
+            # single-osc genuinely different).  lag=0 → instantaneous.
+            phi_obs = t.phi_do
+            if c.single_osc_obs_lag_s > 0.0:
+                a = c.dt_s / (c.single_osc_obs_lag_s + c.dt_s)
+                self._rx_lag_state += a * (t.phi_do - self._rx_lag_state)
+                phi_obs = self._rx_lag_state
+            m["extint_phase_ns"] = phi_obs + rng.normal(
+                0.0, c.single_osc_obs_sigma_ns)
+            m["extint_sigma_ns"] = c.single_osc_obs_sigma_ns
+            return m
         if c.use_ppp:
             m["dt_rx_ns"] = t.phi_rx + rng.normal(0.0, c.sigma_ppp_ns)
             m["dt_rx_sigma_ns"] = c.sigma_ppp_ns
