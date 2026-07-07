@@ -101,6 +101,72 @@ Because there is no second oscillator, the disciplined-minus-free-run TDEV gap
 the chosen per-host `lqr_phase_gain` (+ any `max_interval`) land back here and
 in `config/madhat-sxtd.toml`.
 
+## A/B RESULT (2026-07-07): `L2` is the wrong knob — the frequency term governs both
+
+Ran −0.05 (baseline) and −0.005 back-to-back, class-default Q, 2 h each,
+`--no-antposest --known-pos`. **Both falsified the loop-bandwidth hypothesis:**
+
+| gain L2 | corner (theory) | TDEV(100 s) disciplined | stable? |
+|---|---|---|---|
+| −0.05 | ~20 s | 187 ps | ran away @ ~2.8 h (measured-Q) |
+| −0.005 | ~200 s | **172 ps** | stable 54 min, then **ran away to the rail** |
+
+Two observations, one cause:
+
+1. **Lowering L2 10× barely moved the mid-τ** (187 → 172 ps, still 3.3× the
+   54 ps free-run floor). If L2 set the bandwidth, τ = 100 s (well inside the
+   −0.005 corner) should have dropped toward the floor. It didn't.
+2. **−0.005 ran away just like −0.05** — stable ~54 min, then a perturbation
+   at 06:59 (our `dt_rx` glitched −12 ns while the mosaic `RxClkBias` ramped
+   +53 → +68 ns), the loop recovered `dt_rx` to 0, then a **steady +3 ns/epoch
+   phase ramp** wound `word` down to the rail (freq +386 ppb).
+
+**Why L2 can't fix either:** the LQR command is
+
+```
+u = −(L · x) = −( L2·x[2] + 1.0·x[3] )      # x[2]=phase, x[3]=DO-freq estimate
+```
+
+The **frequency-cancellation term `−1.0·x[3]` has gain 1.0 and is independent of
+`--lqr-phase-gain`.** It dominates the loop. So:
+
+- The **effective loop bandwidth is set by how fast the EKF updates `x[3]`**
+  (its frequency Kalman gain / `sigma_do_freq` process noise), **not by L2.**
+  That is why the mid-τ TDEV didn't move — the L2 phase term is a minor
+  contributor.
+- The **wind-up is `x[3]` diverging**: a `dt_rx` perturbation gets mis-attributed
+  into the frequency estimate, `u = −x[3]` drives the DO the wrong way, which
+  produces more phase error, which pushes `x[3]` further — positive feedback on
+  the gain-1.0 term. Lowering L2 leaves it untouched, so −0.005 railed too.
+
+This also corrects §"The oscillation is the same knob" above: the earlier
+measured-Q ring and this runaway are **both** the `x[3]` term, not L2.
+
+### The real knobs (next experiments — NOT another L2 value)
+
+1. **Robust innovation gating on `dt_rx`** so a carrier-phase glitch / receiver
+   clock perturbation cannot corrupt `x[3]`. This is the stability fix — the
+   runaway starts at a `dt_rx` perturbation the EKF swallows into frequency.
+2. **Slow the EKF frequency dynamics** (tighter `sigma_do_freq` / lower
+   frequency Kalman gain) — *this* is the actual mid-τ bandwidth knob. The
+   measured Q (tight `sigma_do_freq`) is the right direction for mid-τ; it was
+   reverted only because it rang **at the default L2** — i.e. it hit the same
+   `x[3]` instability. Tight-Q **plus knob 1** is the coherent experiment.
+3. **Anti-windup / slew limit on `u`** as a backstop so a mis-estimated `x[3]`
+   can't rail the actuator.
+
+### The `ClockSyncThreshold, usec500, on` finding
+
+The Mosaic-T is configured to steer/jump its own clock when `RxClkBias` exceeds
+500 µs. At the 68 ns bias here it did **not** fire, so it was **not** this
+runaway's trigger — but it is a latent hazard: if a future run lets the bias
+grow unbounded, the Mosaic will apply a **1 ms jump** that would catastrophically
+wind up the loop. For a DO we steer externally, evaluate setting the Mosaic to
+**not** steer its own clock (report-only), so there is exactly one control loop.
+
+**Do not run further L2 arms** (−0.001 etc.) until knobs 1–3 are addressed — the
+sweep is measuring a term that isn't in control.
+
 ## Watch-outs
 
 - **NAV2 watchdog** still runs under `--no-antposest` and trips on a diverged
