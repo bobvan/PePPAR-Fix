@@ -298,6 +298,18 @@ class SimConfig:
     # dt_rx_ns.  Reproduces delta's -12 ns dt_rx step that ramped x[3] to
     # the actuator rail.  None → no injection.
     dt_rx_glitch: Optional[tuple] = None
+    # One-shot DO-PHASE observation glitch = (t_s, delta_ns): at the first
+    # correction with t ≥ t_s, add delta_ns to the DO-phase arms (EXTINT +
+    # TICC).  A general DO-phase perturbation tool, and the closest this
+    # (two-oscillator) sim can get to delta's GNSSDO+ single-observer path
+    # by pairing with a sole-observer config (use_extint=True, use_ticc/
+    # use_ppp=False).  NOTE: this does NOT reproduce delta's x[3]→rail —
+    # even sole-observer + tight-Q, a glitch is absorbed and a sustained
+    # ramp is tracked stably (|x3|≤2 ppb).  The rail needs the single-
+    # oscillator structure the sim lacks (DO *is* the receiver clock →
+    # actuator→observation feedback); see docs/mid-tau-servo-knobs.md
+    # "single-oscillator mode".  None → no glitch.
+    do_phase_glitch: Optional[tuple] = None
     # DO-phase observation bias RAMP = (t_start_s, ns_per_s): from t_start,
     # add a linearly-growing bias to the DO-phase arms (EXTINT + TICC).
     # Models an rx-coupled PPS drift (e.g. a Mosaic RxClkBias ramp that the
@@ -596,6 +608,7 @@ class ClosedLoopSim:
         # midTauServoKnobs: one-shot dt_rx glitch, applied to the emitted
         # dt_rx_ns at the first correction with t ≥ t_glitch.
         _dt_rx_glitch_pending = (c.dt_rx_glitch is not None)
+        _do_phase_glitch_pending = (c.do_phase_glitch is not None)
         for k in range(n):
             # State-corruption injection (test hook).  Fires once when
             # t crosses force_state_corruption_at_s; pairs naturally
@@ -656,6 +669,17 @@ class ClosedLoopSim:
                             and "dt_rx_ns" in meas):
                         meas["dt_rx_ns"] += float(c.dt_rx_glitch[1])
                         _dt_rx_glitch_pending = False
+                    # One-shot DO-phase observation glitch (midTauServoKnobs):
+                    # the GNSSDO+ single-observer path — a glitch on the DO-
+                    # phase arm the servo steers on.
+                    if (_do_phase_glitch_pending
+                            and t_now >= float(c.do_phase_glitch[0])):
+                        _g = float(c.do_phase_glitch[1])
+                        if "extint_phase_ns" in meas:
+                            meas["extint_phase_ns"] += _g
+                        if "ticc_diff_ns" in meas:
+                            meas["ticc_diff_ns"] -= _g
+                        _do_phase_glitch_pending = False
                     # DO-phase observation bias ramp (midTauServoKnobs): an
                     # rx-coupled PPS drift reaching the DO-phase arms.  Enters
                     # via EXTINT/TICC (what the servo steers on), NOT the PPP

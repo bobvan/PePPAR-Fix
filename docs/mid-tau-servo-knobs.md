@@ -65,34 +65,79 @@ DO-phase observer gates itself out, and the loop free-runs.
 > with a controlled hardware Q A/B (loose 0.03 vs char-matched) on the
 > SXT-D before committing to measured-Q.**
 
-### Finding 2 — delta's `dt_rx → x[3] → rail` mechanism does **not** reproduce
+### Finding 2 — the rail is a **single-oscillator** phenomenon the (two-oscillator) sim can't yet model
 
-Driving the identical `DOFreqEst`, **no** modeled perturbation rails the
-actuator:
+> **Corrected after delta's PR #300 review (topology mismatch).** The first
+> cut of this finding said "the rail doesn't reproduce / dt_rx gating targets
+> the wrong arm." That is a **two-oscillator statement** and is right *only*
+> for the topology servo_sim models. delta's correction and a follow-up
+> sole-observer experiment sharpen it.
 
-* **dt_rx (PPP) glitch is decoupled from DO steering.** A −12 ns (even
-  −1000 ns) `dt_rx` glitch moves the rx-clock state `x[0]`, but the DO
-  output is **unchanged to machine zero** — the perturbation is below the
-  adjfine quantum. Mechanism: the DO-phase observation is **GPS-referenced**
-  (EXTINT reports `φ_do`; TICC reports `−φ_do − qErr(edge)`), so the rx
-  clock enters only through the sub-tick qErr sawtooth — because the F9T
-  PPS is GPS-locked, not free-running on the rx TCXO. `dt_rx` (the PPP
-  rx-clock offset, `x[0]`) is a *different* quantity and does not touch the
-  DO-phase arms. **So "dt_rx innovation gating" targets the wrong arm.**
+**servo_sim models the two-oscillator topology** (separate F9T rx TCXO + a
+disciplined DO; GPS-locked PPS). In that topology:
 
-* **DO-phase-obs corruption coasts, it doesn't rail.** A bias ramp on the
-  DO-phase arms *does* grow the DO output (9.8 → 595 ns at 0.5 ns/s), but
-  by gating **both** DO-phase arms out (chi²) → the servo loses its phase
-  observer and **coasts** → the DO free-runs. The **actuator stays bounded**
-  (|x3| ≤ 1.6 ppb, |adj| ≤ 1.9 ppb) at every ramp rate tried (0.02–1.0
-  ns/s). This is the *opposite* of delta's `x[3] → +386 ppb` rail.
+* A `dt_rx` (PPP, Arm 1 → `x[0]`) glitch **is** decoupled from DO steering:
+  −12 ns (even −1000 ns) moves `x[0]` but the DO output is unchanged to
+  machine zero (below the adjfine LSB), because the DO-phase observation is
+  GPS-referenced (EXTINT = `φ_do`; TICC = `−φ_do − qErr(edge)`; rx enters
+  only via the sub-tick qErr). `dt_rx_glitch` injects `meas['dt_rx_ns']` =
+  the Arm-1 PPP feed → this decoupled arm.
+* A DO-phase-obs bias ramp grows the DO output (9.8 → 595 ns at 0.5 ns/s)
+  but by gating **both** DO-phase arms out (chi²) → the servo **coasts** →
+  DO free-runs; the **actuator stays bounded** (|x3| ≤ 1.6 ppb, |adj| ≤ 1.9
+  ppb) at every rate 0.02–1.0 ns/s. **This coast-not-rail behaviour is
+  exactly why delta's knob 1 works** (see below).
 
-Conclusion: the sim's EKF + existing gates are **robust against the
-actuator rail**. delta's hardware rail comes from a coupling or input the
-sim does not model (candidates: the Mosaic-T's PPS/RxClkBias behavior
-feeding the DO-phase observation, or an actuator→measurement feedback path).
-**A captured hardware repro is needed to root-cause it** — the sim cannot
-currently serve as its test bed.
+**The GNSSDO+ is single-oscillator** (SXT-D OCXO clocks the Mosaic-T
+receiver). There the mosaic `dt_rx` **is** the DO-phase observation: the
+engine feeds it to the `x[2]` arm (`_dt_rx_servo_epoch`, PPP arm off), and
+that arm is the **sole** observer — no TICC, no EXTINT. delta's knob 1 (soft
+NIS innovation gate in `_kalman_linear_update`, covering all linear arms)
+adds to that sole observer the gate my TICC-based loop already has — which
+is precisely the "gate-out → coast, don't rail" defense of Finding 2b.
+Hardware confirms: with knob 1, freq bounded ±0.1 ppb where ungated railed
+to +386 ppb.
+
+**But the sim still can't reproduce the rail — even sole-observer.** A
+follow-up (`use_extint`-only, no TICC/PPP, tight measured-Q, glitch/ramp on
+the DO-phase obs) still does **not** rail: a one-shot glitch is absorbed,
+and a sustained ramp is *tracked stably* (|x3| ≤ 2 ppb, the DO faithfully
+follows the spurious ramp). The reason is structural: in the single-
+oscillator design **the DO is the receiver's clock**, so steering the DO
+*moves the observed quantity* (`dt_rx`) — an **actuator→observation feedback
+loop** that, with the gain-1.0 `x[3]` term and an ungated sole observer,
+closes into a self-consistent runaway. servo_sim's two-oscillator model
+observes the DO's *absolute* phase (`φ_do`) independently of the fact that,
+on a GNSSDO+, the same oscillator drives the observer — so the positive-
+feedback path that rails is simply absent.
+
+**Conclusion:** the rail is a property of the **single-oscillator topology**,
+not of `DOFreqEst` in isolation. To reproduce it (and to serve future
+single-oscillator designs) servo_sim needs a **single-oscillator mode** —
+see below.
+
+## Single-oscillator mode — the servo_sim gap
+
+servo_sim was built for the two-oscillator world (rx TCXO ≠ DO). Single-
+oscillator GNSSDO designs (GNSSDO+ SXT-D today; more coming) differ
+structurally, and the sim does not yet model them:
+
+| | two-oscillator (F9T + DO) | single-oscillator (GNSSDO+) |
+|---|---|---|
+| rx clock vs DO | **separate** oscillators | **same** oscillator |
+| `dt_rx` / PPP arm | rx TCXO offset (`x[0]`), decoupled | **is** the DO-phase obs (→ `x[2]`) |
+| DO-phase observers | TICC + EXTINT (gated) | mosaic `dt_rx`, **sole**, (pre-knob-1) ungated |
+| actuator → observation | open (DO obs is GPS-referenced) | **closed** (steering DO moves `dt_rx`) |
+| failure mode | coast on gate-out (bounded) | self-consistent **rail** |
+
+A faithful `single_oscillator=True` mode would: collapse the rx-TCXO and DO
+truth states into one; route the DO-phase truth into the `x[2]` arm as the
+sole observer (PPP/TICC/EXTINT off); and — the load-bearing part — close the
+**actuator→observation loop** so a steer of the DO shows up in the next
+`dt_rx`. That mode would (a) reproduce delta's rail deterministically, (b)
+let us validate knob 1 / knob 2 / `do_freq_clamp` in sim before hardware,
+and (c) be the standing test bed for the single-oscillator designs on the
+roadmap. Filed as a follow-up; scoped in the dayplan.
 
 ## Code shipped
 
