@@ -139,30 +139,46 @@ gain_true` (imperfectly-known steering gain) and `single_osc_obs_lag_s` (the
 mosaic's internal clock-filter lag — the cascaded-loop dynamic that is
 genuinely single-oscillator).
 
-**Honest result — the mode does NOT reproduce delta's rail.** Driving the
-real `DOFreqEst`, no ingredient tried (dt_rx/do_phase glitch, `actuator_gain_
-true` 0.5–3×, `single_osc_obs_lag_s` 0–40 s, coast 1–60 s) reproduces delta's
-**tight-Q, normal-cadence** rail. Over a 12-combo {lag × gain} sweep at normal
-cadence, **0** show delta's tight-Q-rails pattern; the instabilities the mode
-*does* exhibit are the **opposite** Q-dependence — looser Q (higher loop BW)
-rails under observation lag (textbook delay-instability), and any topology
-rails under an extreme (≥45 s) coast. That long-coast rail is **not**
-single-oscillator-specific (the two-oscillator model rails there too).
+**Reproducing delta's rail — it took the mosaic clock filter.** The *bare*
+topology (servo observing the DO phase directly) does **not** rail on any
+perturbation — a glitch is absorbed, a processing stall is absorbed, the loop
+is well-damped. That is itself a finding: delta's rail is **not** tight-Q
+underdamping (both class-default Q=0.01 *and* measured Q=8.4e-5 railed on
+hardware — confirmed by delta), and it is **not** a generic long-coast
+instability (that rails the two-oscillator model too).
 
-What this implies (a useful cross-check, not a dead end):
-1. delta's rail is almost certainly **perturbation-triggered**, not pure
-   tight-Q underdamping — consistent with knob 1 (a *gate*) fixing it, since
-   a gate cannot fix an underdamped loop. The trigger was the concurrent
-   `mosaic RxClkBias` ramp / dt_rx glitch through the sole ungated observer.
-2. Reproducing it in sim needs the **hardware-specific dynamics** the model
-   still idealizes: the mosaic's actual clock-filter response, the SXT-D's
-   measured actuator gain, and the real adaptive-scheduler cadence. Next
-   step is to **parameterize the mode from the SXT-D characterization**
-   (joint bravo↔delta) and re-check.
+The load-bearing single-oscillator dynamic is the **mosaic's own clock
+filter**. delta's captures prove `our_dt_rx_ns == mosaic_rxclkbias_ns` and
+`mosaic_rxclkdrift_ppb ≈ our_freq_ppb` — the servo does not observe the DO
+directly; it observes the **bias state of the mosaic-T's internal clock
+estimator**, a *second* filter (bias + drift, α-β) in series with our servo.
+`single_osc_mosaic_filter=True` models it. With the cascade in place, a short
+**processing stall** (`processing_stall`, delta's `max_stall_s≈2 s` trigger)
+tips the marginal two-filter loop, and the mosaic filter's bandwidth sets how
+far it goes:
 
-The mode still delivers (b) the standing test bed for the single-oscillator
-designs on the roadmap and (c) — once SXT-D-parameterized — the place to
-validate knob 1 / knob 2 / `do_freq_clamp` before hardware.
+| mosaic filter (α) | outcome | matches delta capture |
+|---|---|---|
+| fast (α≥0.2) | stable — stall absorbed | (clean lock) |
+| α≈0.1 | bounded **limit cycle** (freq ±~12 ppb) | knob1 (±1700 ns / ±7 ppb) |
+| slow (α≤0.05) | **rail** | abA1 (+386 ppb) |
+
+So the sim now reproduces delta's full **stable → limit-cycle → rail
+spectrum**, and it confirms the mechanism: a cascaded mosaic+servo loop made
+marginal by the mosaic filter, tipped by a short stall/glitch through the
+sole ungated observer. This is exactly why **knob 1 (a gate) works** — it
+caps the tip — and why it's necessary-but-not-sufficient (the *loop* is still
+marginal; knob 2 / damping is the cure).
+
+Remaining (a quantitative fit, not a mechanism gap): matching delta's *exact*
+limit-cycle amplitude (±1700 ns) and period (~10–15 min) needs (a) the SXT-D
+DAC **word-limit** (delta railed at +386 ppb where the control word
+saturated; the sim's `max_ppb` is far higher, so its rail overshoots) and
+(b) fitting α/β to the knob1 CSV trajectory. The knobs (`mosaic_alpha`,
+`mosaic_beta`, `processing_stall`, `actuator_gain_true`) are wired for that
+fit. The mode is now the standing test bed for the single-oscillator roadmap
+and — with delta's knob-1 gate rebased on top — the place to validate knob 1
+/ knob 2 / `do_freq_clamp` in sim before hardware.
 
 ## Code shipped
 

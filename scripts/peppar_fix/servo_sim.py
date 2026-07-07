@@ -340,6 +340,30 @@ class SimConfig:
     # the deadbeat x[3] term it drives the growing oscillation delta saw at
     # NORMAL cadence.  0.0 → no lag (instantaneous obs).
     single_osc_obs_lag_s: float = 0.0
+    # Mosaic internal clock filter (single-oscillator).  The mosaic-T does
+    # NOT report the instantaneous DO phase — it reports its OWN clock
+    # estimator's bias state.  The abA1/knob1 captures prove this: our_dt_rx_ns
+    # tracks mosaic_rxclkbias_ns exactly, and mosaic_rxclkdrift_ppb tracks
+    # our_freq_ppb.  So the observation is a SECOND filter (bias+drift, α-β)
+    # in series with our servo — the cascaded-loop dynamic that makes the
+    # single-oscillator loop marginally stable, so a short stall/glitch tips
+    # it into the ±1700 ns limit cycle (gated) or the rail (ungated).  When
+    # True, the sole observer reads the mosaic filter's bias, not phi_do.
+    single_osc_mosaic_filter: bool = False
+    # α-β gains of the mosaic clock filter (position, velocity).  Fit to the
+    # knob1 limit-cycle period (~10–15 min) / abA1 rail.  Lower = slower
+    # mosaic filter = more loop lag = more marginal.
+    mosaic_alpha: float = 0.1
+    mosaic_beta: float = 0.01
+    # Processing stall = (t_start_s, stall_s): the servo LOOP blocks for
+    # stall_s (no read, no correction), the DO free-runs under the held
+    # adjfine, then execution resumes and the next correction sees the whole
+    # accumulated gap (dt = stall_s) at once.  Distinct from a measurement-
+    # drop window (which predicts in 1 s steps and holds adjfine): a stall is
+    # a wall-clock jump — the engine's dt_actual = now_mono − last_mono.  This
+    # is delta's observed rail/limit-cycle trigger (max_stall_s ≈ 2 s; the
+    # knob1 capture shows 7.4 s stalls).  None → no stall.
+    processing_stall: Optional[tuple] = None
     # One-shot dt_rx (Arm-1 PPP) glitch injection = (t_s, delta_ns): at the
     # first correction epoch with t ≥ t_s, add delta_ns to the emitted
     # dt_rx_ns.  Reproduces delta's -12 ns dt_rx step that ramped x[3] to
@@ -502,6 +526,9 @@ class ClosedLoopSim:
         self.adjfine = cfg.initial_freq_ppb
         # single_oscillator receiver clock-filter lag state (see _emit).
         self._rx_lag_state = cfg.initial_phi_do_ns
+        # Mosaic α-β clock-filter states (bias ns, drift ppb); see _emit.
+        self._m_bias = cfg.initial_phi_do_ns
+        self._m_drift = 0.0
         # Binary layer for the gross-fault A/B (#107 consumption).
         self.binary_layer = BinaryLayer(
             consec_max_epochs=cfg.binary_layer_consec_max_epochs,
@@ -605,7 +632,17 @@ class ClosedLoopSim:
             # order lag on the DO phase (the cascaded-loop dynamic that makes
             # single-osc genuinely different).  lag=0 → instantaneous.
             phi_obs = t.phi_do
-            if c.single_osc_obs_lag_s > 0.0:
+            if c.single_osc_mosaic_filter:
+                # Mosaic α-β clock filter: predict bias with drift, then
+                # correct both toward the true DO phase.  The reported dt_rx
+                # is the mosaic's BIAS estimate — a 2nd filter in series with
+                # our servo (the cascaded loop that goes marginally stable).
+                self._m_bias += self._m_drift * c.dt_s
+                resid = t.phi_do - self._m_bias
+                self._m_bias += c.mosaic_alpha * resid
+                self._m_drift += (c.mosaic_beta / c.dt_s) * resid
+                phi_obs = self._m_bias
+            elif c.single_osc_obs_lag_s > 0.0:
                 a = c.dt_s / (c.single_osc_obs_lag_s + c.dt_s)
                 self._rx_lag_state += a * (t.phi_do - self._rx_lag_state)
                 phi_obs = self._rx_lag_state
@@ -721,7 +758,14 @@ class ClosedLoopSim:
                 _drop_wins.append(c.drop_measurements_window_s)
             _drop_wins.extend(c.induced_drop_windows or [])
             in_drop_win = any(w[0] <= t_now <= w[1] for w in _drop_wins)
-            if (k - last_correction_k) >= effective_every or k == 0:
+            # Processing stall: the loop is blocked (no read/correct) for
+            # stall_s.  Skip the correction entirely (and don't advance
+            # last_correction_k), so the DO free-runs under the held adjfine
+            # and the resume correction inherits the whole accumulated gap.
+            in_stall = (c.processing_stall is not None
+                        and float(c.processing_stall[0]) <= t_now
+                        < float(c.processing_stall[0]) + float(c.processing_stall[1]))
+            if ((k - last_correction_k) >= effective_every or k == 0) and not in_stall:
                 gap_s = max(c.dt_s, (k - last_correction_k) * c.dt_s)
                 if in_drop_win:
                     # Predict-only correction: P grows, no arm fires,
