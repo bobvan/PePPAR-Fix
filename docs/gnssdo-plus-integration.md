@@ -592,3 +592,34 @@ The hardware can't free-run AND discipline at once, so:
    → difference-TDEV out to long τ (`analyze_gnssdo_compare.py`) **and** the
    honest disciplined-output grade (chA detrended TDEV,
    `plot_chA_tdev_goldilocks.py`) — the real "grade vs TICC".
+
+### Free-run char result — chA is PPS-OUT-limited (2026-07-06)
+
+The 10 h free-run capture (`gnssdo_freerun_hold.py` + TICC chA) had a 35-min
+TICC gap; on the clean 4.6 h window (18:52–23:29 UTC): `freq_offset +0.93 ppb`,
+**TDEV(1s) = 0.64 ns**, **ADEV(1s) = 1.1e-9** (white-FM, rising TDEV to
+11.7 ns @ 1000 s). Derived would-be Q: `sigma_do_phase 1.34 ns /
+sigma_do_freq 0.0017 ppb`.
+
+**Verdict: LOOSER than the OCXO class default (0.1 ns / 0.001 ppb) → NOT
+written; class-default Q kept** (the loop already ran well on it).
+`ADEV(1s)=1.1e-9` is TCXO-class, ~100× worse than the STP3593LF's intrinsic
+~1e-11, because **TICC chA measures the Mosaic-T PPS OUT** — its ~ns
+PPS-generation jitter dominates the OCXO's clean 10 MHz. The EKF observes the
+DO via carrier-phase `dt_rx` (ps-class), so this PPS-OUT char over-estimates
+the DO process noise. Consequence for the grade below: the disciplined chA
+TDEV is **PPS-OUT-floored (~0.64 ns @ τ=1 s)**; the discipline benefit shows at
+**long τ** (disciplined chA stays low vs free-run rising to 11.7 ns). To
+characterize the DO as the EKF sees it, measure the OCXO 10 MHz directly, or run
+the engine `--freerun` (carrier-phase `dt_rx`) with the OCXO word held.
+Sidecar: `~/gt/firmware/gnssdo-plus/gnssdo-freerun-char-20260706.md`.
+
+### Disciplined grade + long compare — RUNNING (2026-07-06 ~18:58 CDT)
+
+Launched on MadHat (`--duration 36000`, class-default Q): engine disciplining
+with `--gnssdo-compare-log data/gnssdo-compare-long.csv` (stream
+`MeasEpoch+PVTGeodetic`) + `ticc_capture --prefix gnssdo-disc-ticc` (chA).
+Supervised start: dt_rx converged to sub-0.15 ns, freq ~+0.02 ppb, **zero
+resets**. Morning: `analyze_gnssdo_compare.py` (long-τ difference-TDEV) +
+`plot_chA_tdev_goldilocks.py` (disciplined chA grade, PPS-OUT-floored short-τ,
+discipline benefit at long τ).
