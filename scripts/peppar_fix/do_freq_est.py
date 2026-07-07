@@ -96,7 +96,8 @@ class DOFreqEst:
                  ocxo_trusted_gate=None,
                  routed_qerr=False,
                  soft_ticc_gate=False,
-                 do_freq_clamp_ppb=None):
+                 do_freq_clamp_ppb=None,
+                 lqr_phase_gain=-0.05):
         self.max_ppb = max_ppb
         # routedQErrArm (latestQErrChiSelect, docs/latest-qerr-chi-select.md):
         # per-edge COMPARATIVE chi² router for the TICC arm.  When enabled,
@@ -208,9 +209,17 @@ class DOFreqEst:
 
         # LQR: only DO states are controllable (x[2] = DO phase, x[3] = DO freq)
         # L[2] = phase gain (negative: positive φ_do = late → more u
-        #         → more adjfine → speed up → reduce lateness)
+        #         → more adjfine → speed up → reduce lateness).  Its
+        #         magnitude sets the phase-loop BANDWIDTH: u = L[2]·φ per
+        #         epoch → time-constant ≈ 1/|L[2]| epochs → corner ≈
+        #         |L[2]|/2π Hz.  Default -0.05 → ~20 s corner.  For a
+        #         low-noise DO whose free-run beats the GNSS reference out
+        #         to long τ (GNSSDO+ Rakon OCXO), push |L[2]| DOWN (e.g.
+        #         -0.001 → ~1000 s corner) so the DO free-runs below the
+        #         corner and the loop only tracks GNSS above it — see
+        #         docs/gnssdo-servo-loop-bandwidth.md.
         # L[3] = freq cancellation
-        self.L = np.array([0.0, 0.0, -0.05, 1.0])
+        self.L = np.array([0.0, 0.0, lqr_phase_gain, 1.0])
 
         self.freq = initial_freq
         # _last_u is the LQR u value.  Engine applies u as adjfine

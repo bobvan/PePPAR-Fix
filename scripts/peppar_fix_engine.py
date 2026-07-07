@@ -8430,6 +8430,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
         ocxo_trusted_gate=_ocxo_gate,
         routed_qerr=_qerr_latest_chi,
         soft_ticc_gate=getattr(args, 'soft_ticc_gate', False),
+        lqr_phase_gain=(getattr(args, 'lqr_phase_gain', None) or -0.05),
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
              "sigma_do=[%.4f ns, %.4f ppb], "
@@ -11914,6 +11915,7 @@ def _apply_host_config(args):
         "gnssdo_word_min":  ("gnssdo_word_min",  int),
         "gnssdo_word_max":  ("gnssdo_word_max",  int),
         "gnssdo_watchdog_s": ("gnssdo_watchdog_s", int),
+        "lqr_phase_gain":   ("lqr_phase_gain",   float),
         "tadd_gpio":        ("tadd_gpio",        int),
         "tadd_hold_s":      ("tadd_hold_s",      float),
         "ticc_port":        ("ticc_port",        str),
@@ -13253,6 +13255,15 @@ Two-phase operation:
     servo.add_argument("--gnssdo-watchdog-s", type=int, default=None,
                        help="Firmware fail-safe watchdog to request via $T "
                             "(default 30 s; must exceed the servo period)")
+    servo.add_argument("--lqr-phase-gain", type=float, default=None,
+                       help="DOFreqEst LQR phase-loop gain L[2] (negative; "
+                            "default -0.05).  Its magnitude sets the loop "
+                            "BANDWIDTH: corner ≈ |gain|/2π Hz (τ ≈ 1/|gain| "
+                            "epochs).  Push toward 0 (e.g. -0.001) for a "
+                            "low-noise DO whose free-run beats the GNSS "
+                            "reference below the crossover, so the DO free-runs "
+                            "below the corner — see "
+                            "docs/gnssdo-servo-loop-bandwidth.md.")
     servo.add_argument("--gnssdo-compare-log", default=None, metavar="CSV",
                        help="Log our carrier-phase steering (dt_rx, control "
                             "word, freq) vs the mosaic-T's own PVTGeodetic "

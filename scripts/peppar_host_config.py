@@ -53,6 +53,7 @@ KEYS = (
     "gnssdo_word_min",
     "gnssdo_word_max",
     "gnssdo_watchdog_s",
+    "lqr_phase_gain",
     "tadd_gpio",
     "tadd_hold_s",
     "ticc_port",
