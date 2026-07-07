@@ -161,6 +161,25 @@ measured-Q ring and this runaway are **both** the `x[3]` term, not L2.
    the ramp never starts. `madhat-sxtd.toml` sets `N = 5`. Per-arm
    `arm_gate_trips` counts trips (a healthy `dt_rx` arm trips ~never); the
    DT_RX log line shows `gate_trips=` once non-zero.
+
+   **Hardware result (2026-07-07, 3 h, default gain −0.05 + gate=5):** knob 1
+   converted the **rail into a bounded limit cycle**. No rail (freq bounded
+   ±7 ppb vs the prior +386 ppb runaway), and **67 min of perfect lock**
+   (phase ±0.2 ns, gate frozen at 19) — past the ~54 min point where the
+   ungated −0.005 arm railed. Then a 2–3 s processing stall kicked the
+   marginally-stable loop into a ±1700 ns limit cycle (freq ±7 ppb, our
+   `dt_rx` and the mosaic `RxClkBias` swinging *together* → the DO physically
+   oscillates; gate firing continuously, 19→6092 trips). **Clean-window
+   mid-τ TDEV:** short-τ on the OCXO floor (1 s = 49 ps, 5 s = 27 ps vs 45 ps
+   free-run) but the mid-τ hump persists (30 s = 274 ps, 100 s = 238 ps,
+   300 s = 276 ps, ~5× the floor) — **unchanged by knob 1, as expected.**
+   Verdict: knob 1 is **necessary but not sufficient** — it removes the
+   catastrophic rail and buys clean lock, but the mid-τ resonance / limit
+   cycle is a **loop-dynamics** problem (knob 2). Note the gate is
+   double-edged in a *real* excursion: the large innovations are genuine (the
+   DO truly is off), so capping them under-corrects and may prolong the
+   oscillation — the clean cure is damping the loop (knob 2) so it never
+   excurses, leaving the gate to fire only on true glitches.
 2. **Slow the EKF frequency dynamics** (tighter `sigma_do_freq` / lower
    frequency Kalman gain) — *this* is the actual mid-τ bandwidth knob. The
    measured Q (tight `sigma_do_freq`) is the right direction for mid-τ; it was
