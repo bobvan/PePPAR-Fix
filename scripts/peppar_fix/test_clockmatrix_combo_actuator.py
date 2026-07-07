@@ -27,6 +27,8 @@ from peppar_fix.clockmatrix_combo_actuator import (  # noqa: E402
 # DPLL3 register addresses (from the validated PoC / register map).
 _MODE = 0xC4B7
 _SLAVE0 = 0xC4B2
+_REF_MODE = 0xC4B5
+_REF_P0 = 0xC48F
 _BW = 0xC6C0
 _COMBO = 0xC6E4
 
@@ -62,12 +64,17 @@ class _FakeI2C:
         return new_val
 
 
-def _timebeat_initial():
+def _timebeat_initial(ref_p0=2, ref_mode=0x01):
     """A plausible pre-existing DPLL3 state: PLL/auto, some BW, SLAVE0 already
-    SRC_ID=8 (Timebeat's running value), a non-zero combo value."""
+    SRC_ID=8 (Timebeat's running value), a non-zero combo value.
+
+    Defaults model the OTC (ref already CLK2/manual, so the ref pin is a no-op);
+    pass ``ref_p0=5`` to model the OTC Mini (default REF_P0=CLK5, dead)."""
     init = {
         _MODE: 0x00,        # PLL/auto, state auto
         _SLAVE0: 0x28,      # EN + SRC_ID=8 (Timebeat's running value)
+        _REF_MODE: ref_mode,
+        _REF_P0: ref_p0,
         _BW: 0x34, _BW + 1: 0x12,  # arbitrary non-zero BW
     }
     # An arbitrary saved combo value (6 bytes).
@@ -148,6 +155,59 @@ class ComboActuatorSetupTeardownTest(unittest.TestCase):
         # MODE handed back in PLL/auto (NOT the saved write_freq) — timebeat
         # does not auto-recover a write_freq DPLL.
         self.assertEqual((i2c.read(_MODE, 1)[0] >> 3) & 0x07, 0)
+
+
+class ComboActuatorRefPinTest(unittest.TestCase):
+    """setup() must pin the phase reference to CLK<pps_clk> so PHASE_STATUS is
+    the live DO-vs-F9T error — the Mini fix (default REF_P0=CLK5 is dead)."""
+
+    def test_pins_ref_clk2_on_mini_default_clk5(self):
+        # OTC Mini: DPLL3 default REF_P0=CLK5, auto ref-mode → setup must
+        # rewrite to CLK2 + manual.
+        i2c = _FakeI2C(_timebeat_initial(ref_p0=5, ref_mode=0x00))
+        act = ClockMatrixComboActuator(i2c, dpll_id=3)  # pps_clk default 2
+        act.setup()
+        self.assertEqual(i2c.read(_REF_P0, 1)[0], 2, "REF_P0 must be CLK2")
+        self.assertEqual(i2c.read(_REF_MODE, 1)[0], 0x01, "REF_MODE manual")
+
+    def test_ref_pin_is_noop_when_already_clk2_manual(self):
+        # OTC: ref already CLK2/manual → setup must NOT touch the ref registers.
+        i2c = _FakeI2C(_timebeat_initial(ref_p0=2, ref_mode=0x01))
+        act = ClockMatrixComboActuator(i2c, dpll_id=3)
+        act.setup()
+        written = [addr for addr, _ in i2c.writes]
+        self.assertNotIn(_REF_P0, written)
+        self.assertNotIn(_REF_MODE, written)
+
+    def test_ref_pin_flips_auto_to_manual_keeping_clk2(self):
+        # OTC-CLK2-AUTO (per main's #299 review): if REF_P0 is already CLK2 but
+        # REF_MODE is AUTO(0x00), setup() DOES write — flipping auto→manual
+        # while leaving REF_P0=CLK2 (physical ref unchanged, benign) — and
+        # teardown restores AUTO.
+        i2c = _FakeI2C(_timebeat_initial(ref_p0=2, ref_mode=0x00))
+        act = ClockMatrixComboActuator(i2c, dpll_id=3)
+        act.setup()
+        self.assertEqual(i2c.read(_REF_P0, 1)[0], 2, "REF_P0 stays CLK2")
+        self.assertEqual(i2c.read(_REF_MODE, 1)[0], 0x01, "REF_MODE auto→manual")
+        act.teardown()
+        self.assertEqual(i2c.read(_REF_MODE, 1)[0], 0x00, "REF_MODE restored auto")
+        self.assertEqual(i2c.read(_REF_P0, 1)[0], 2, "REF_P0 still CLK2")
+
+    def test_teardown_restores_original_ref(self):
+        # Mini: setup pins CLK2, teardown must hand REF_P0/REF_MODE back exactly.
+        i2c = _FakeI2C(_timebeat_initial(ref_p0=5, ref_mode=0x00))
+        act = ClockMatrixComboActuator(i2c, dpll_id=3)
+        act.setup()
+        self.assertEqual(i2c.read(_REF_P0, 1)[0], 2)  # pinned
+        act.teardown()
+        self.assertEqual(i2c.read(_REF_P0, 1)[0], 5, "REF_P0 restored to CLK5")
+        self.assertEqual(i2c.read(_REF_MODE, 1)[0], 0x00, "REF_MODE restored")
+
+    def test_custom_pps_clk(self):
+        i2c = _FakeI2C(_timebeat_initial(ref_p0=5, ref_mode=0x00))
+        act = ClockMatrixComboActuator(i2c, dpll_id=3, pps_clk=3)
+        act.setup()
+        self.assertEqual(i2c.read(_REF_P0, 1)[0], 3, "REF_P0 must be CLK3")
 
 
 class ComboActuatorSteeringTest(unittest.TestCase):

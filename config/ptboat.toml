@@ -7,8 +7,13 @@ ptp_profile = "ptBoat"
 ptp_dev = "/dev/ptp0"
 ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
-# known_pos is NOT committed.  Position is loaded from
-# state/receivers/<uid>.json at runtime (Phase 1 bootstrap or --known-pos).
-# ptBoat's antenna is on a separate mount ~50 cm west of UFO1 and is
-# UN-SURVEYED as of 2026-06-25 — Phase 1 PPP estimates it for now.
+# Moved Chicago→London 2026-07-06; shares the ufoLondon1 antenna (PRIDE APC)
+# with otcBob1 via the GUS splitter.  arp_label seeds the position from
+# timelab/antennas.json.
+arp_label = "ufoLondon1"
+# ClockMatrix combo DO (state/dos/otc-ptboat-combo.toml, host-local).  With the
+# [ptp.ptBoat] clockmatrix_bus set, the engine disciplines the OCXO via the
+# combo bus (DPLL3) instead of the i226-PHC adjfine path.  timebeat must be
+# stopped.
+do_label = "otc-ptboat-combo"
 systems = "gps,gal"

@@ -133,10 +133,21 @@ perout_channel = 0
 # ClockMatrix COMBO-bus discipline (VALIDATED 2026-06-25: the combo servo beats
 # the hardware DPLL at mid-τ — P4 graded A/B).  DPLL3 = the OCXO DO; the combo
 # steers it via the combo bus AND reads on-chip PHASE_STATUS (no TICC, no wire).
-# F9T-PPS on CLK2 (OTC).  The engine builds ClockMatrixComboActuator from the
-# DO's measured combo_gain (state/dos/<do_label>.toml, host-local) and points
-# the phase observer at the actuator DPLL automatically.  Requires timebeat
-# stopped (MANUAL by design) + the DO registered ClockMatrix_combo.
+# F9T-PPS on CLK2 (per Timebeat, GNSS PPS is CLK2 on BOTH OTC and Mini).  The
+# engine builds ClockMatrixComboActuator from the DO's measured combo_gain
+# (state/dos/<do_label>.toml, host-local) and points the phase observer at the
+# actuator DPLL automatically.  Requires timebeat stopped (MANUAL by design) +
+# the DO registered ClockMatrix_combo.
+#
+# CLK5-vs-CLK2 (2026-07-07): otcBob1 was found running combo against REF_P0=CLK5
+# — a timebeat leftover, because the pre-#299 combo actuator never set REF_P0
+# from pps_clk (it read PHASE_STATUS read-only against whatever timebeat left).
+# CLK5 = i226-SDP1 (the i226 PHC's PPS, a 2-hop reference); CLK2 = the raw
+# F9T-PPS (1 hop, the intended DO-vs-F9T observer).  Both read live on otcBob1,
+# so CLK5 "worked" but is suboptimal.  #299 makes setup() pin REF_P0=pps_clk, so
+# with pps_clk=2 here it CORRECTS otcBob1 CLK5→CLK2 (not a regression).  Combo
+# re-baselines (combo-beats-timebeat, was measured on CLK5) should be redone on
+# CLK2.  See docs/clockmatrix-combo-clk-reference.md.
 clockmatrix_bus = 15
 clockmatrix_addr = "0x58"
 clockmatrix_dpll_actuator = 3
@@ -171,13 +182,20 @@ timescale = "tai"
 pps_pin = 0
 extts_channel = 0
 perout_channel = 0
-# ClockMatrix combo-bus discipline (Timebeat OTC Mini PT) — DISABLED until the
-# Mini bring-up is validated (DPLL3 must lock to CLK5=F9T-PPS first; the F9T was
-# stuck in survey-in as of 2026-06-25).  i2c-1 @0x58, DPLL3, F9T-PPS on CLK5.
-#clockmatrix_bus = 1
-#clockmatrix_addr = "0x58"
-#clockmatrix_dpll_actuator = 3
-#clockmatrix_pps_clk = 5
+# ClockMatrix combo-bus discipline (Timebeat OTC Mini PT) — VALIDATED on the
+# Mini 2026-07-07 (combo_gain≈0.99, R²0.9998, matches otcBob1).  DPLL3 = the
+# OCXO DO; the combo steers it while reading on-chip PHASE_STATUS.  The chip is
+# 0x58 on i2c-16 (the Mini's mux channel — the kernel i2c-mux driver
+# auto-selects, no manual 0x70 handling).  **F9T-PPS is on CLK2**, NOT CLK5:
+# the June "CLK5=F9T-PPS" note was wrong (CLK5 = i226-SDP1); the combo actuator
+# pins DPLL3's phase ref to CLK2 in setup() (Mini default REF_P0=CLK5 is dead).
+# Requires timebeat stopped (MANUAL by design; timebeat also re-applies its own
+# cached F9T fixed position on start, so the F9T fixed-ARP only holds with
+# timebeat off) + the DO registered ClockMatrix_combo (state/dos/<do_label>.toml).
+clockmatrix_bus = 16
+clockmatrix_addr = "0x58"
+clockmatrix_dpll_actuator = 3
+clockmatrix_pps_clk = 2
 # Servo tuning — mirror otcBob1 (same OCXO class).
 track_kp = 0.03
 track_ki = 0.001

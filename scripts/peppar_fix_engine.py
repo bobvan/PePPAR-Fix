@@ -6885,7 +6885,7 @@ def _actuator_plugins():
     return _ACTUATOR_PLUGINS
 
 
-def _build_clockmatrix_actuator(cm_i2c, cm_dpll, combo_params):
+def _build_clockmatrix_actuator(cm_i2c, cm_dpll, combo_params, pps_clk=2):
     """Select the ClockMatrix actuator from the DO's measured characterization.
 
     ``combo_params`` is ``do_char_resolve.resolve_combo_actuator_params(do_uid)``:
@@ -6919,7 +6919,8 @@ def _build_clockmatrix_actuator(cm_i2c, cm_dpll, combo_params):
             return (act, "clockmatrix_%s" % driver, True)
         from peppar_fix.clockmatrix_combo_actuator import ClockMatrixComboActuator
         return (ClockMatrixComboActuator(cm_i2c, dpll_id=cm_dpll,
-                                         combo_gain=combo_params['combo_gain']),
+                                         combo_gain=combo_params['combo_gain'],
+                                         pps_clk=pps_clk),
                 "clockmatrix_combo", True)
     from peppar_fix.clockmatrix_actuator import ClockMatrixActuator
     return (ClockMatrixActuator(cm_i2c, dpll_id=cm_dpll), "clockmatrix", False)
@@ -7924,8 +7925,9 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
                 bus_num=args.clockmatrix_bus,
                 addr=int(getattr(args, 'clockmatrix_addr', '0x58'), 0))
             cm_dpll = getattr(args, 'clockmatrix_dpll_actuator', 3)
+            cm_pps_clk = getattr(args, 'clockmatrix_pps_clk', 2)
             actuator, actuator_type, cm_one_dpll = _build_clockmatrix_actuator(
-                cm_i2c, cm_dpll, _combo_params)
+                cm_i2c, cm_dpll, _combo_params, pps_clk=cm_pps_clk)
             if cm_one_dpll:
                 # One-DPLL combo servo: the on-chip phase observer reads the
                 # SAME DPLL the combo steers (no separate measurement DPLL, no
@@ -7988,13 +7990,16 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
                 cm_i2c, dpll_id=cm_phase_dpll, pps_clk=cm_pps_clk)
             if actuator_type == "clockmatrix_combo":
                 # One-DPLL combo: the actuator already configured this DPLL
-                # (PLL/auto + BW≈0 + combo subscribe).  Do NOT call setup() —
-                # it would reconfigure the ref/PLL-mode and fight the combo
-                # config.  Just read PHASE_STATUS (read-only, like
-                # clockmatrix_combo_gain_char).  teardown() is then a no-op
-                # (no saved originals), leaving hand-back to the actuator.
+                # (PLL/auto + phase ref pinned to CLK2 + BW≈0 + combo
+                # subscribe).  Do NOT call setup() — it would re-drive the
+                # ref/PLL-mode and fight the combo config.  Just read
+                # PHASE_STATUS (read-only, like clockmatrix_combo_gain_char);
+                # the actuator's ref pin is what makes it live on the Mini.
+                # teardown() is then a no-op (no saved originals), leaving
+                # hand-back to the actuator.
                 log.info("ClockMatrix combo: reading PHASE_STATUS on DPLL_%d "
-                         "(read-only, no reconfigure)", cm_phase_dpll)
+                         "(read-only; actuator pinned ref=CLK%d)",
+                         cm_phase_dpll, cm_pps_clk)
             else:
                 cm_phase_source.setup()
                 log.info("Using ClockMatrix TDC phase source: DPLL_%d, CLK%d",
