@@ -180,7 +180,49 @@ fit. The mode is now the standing test bed for the single-oscillator roadmap
 and — with delta's knob-1 gate rebased on top — the place to validate knob 1
 / knob 2 / `do_freq_clamp` in sim before hardware.
 
-### Knob-2 lever sweep — which fixes the cascade (aiming delta's next arm)
+### Correction (2026-07-07) — the second filter is OURS, not the mosaic's
+
+The "mosaic clock filter" framing above is **mis-attributed**. After Bob's
+prompt and a read of the Septentrio mosaic reference guide + our own code, the
+physics and the lever conclusions stand, but the *owner* of the in-loop
+clock-smoothing filter is us, not the mosaic:
+
+- **We consume raw `MeasEpoch` carrier phase, never `RxClkBias`.** A repo grep
+  finds zero consumers of `RxClkBias`/`PVTCartesian`/`PVTGeodetic`. `RxClkBias`
+  is *"the clock bias term computed in the PVT solution"* — the mosaic's own
+  Kalman PVT clock, and it is exactly what the **SparkFun reference GNSSDO
+  servos on** (its ESP32 reads `RxClkBias` → steers the OCXO). Servoing on
+  `RxClkBias` would be "asking the mosaic's filtered opinion" — the wrong
+  question. Our ESP32 firmware **replaced** that SparkFun loop with our own
+  actuation (SparkFun `$W`), and we read raw phase, so that filter is out.
+
+- **With the external OCXO the mosaic cannot filter the frequency at all.**
+  The OCXO drives the mosaic's time base via `REF IN` (10 MHz; confirm with
+  the `EXT_FREQ` status bit). §2.3's free-running/steered clock modes are
+  *internal-oscillator* framing: "clock steering" physically tunes the mosaic's
+  own crystal — impossible for an external reference it only receives. So the
+  carrier phase, timestamped on the OCXO, is an inherently **raw** measure of
+  OCXO-vs-GPS phase. The mosaic's only clock operation is the discrete **1 ms
+  time-of-day jumps** (applied to code + phase, deterministic, removable via
+  the `CumClkJumps` field in MeasEpoch) — not a filter.
+
+- **So the only clock-smoothing filter in our loop is our own `FixedPosFilter`**
+  (its `random_walk` clock model turns the raw phase into `dt_rx`). That is
+  what `single_osc_mosaic_filter` / `mosaic_alpha`/`mosaic_beta` actually
+  model — the α-β stand-in for our FixedPosFilter's clock smoothing, *not* a
+  mosaic filter. (The knob names are kept for code continuity; read them as
+  "the in-loop clock filter.") The cascade is `FixedPosFilter → DOFreqEst` —
+  **both ours** — which is why lever (c) = `--clock-model wno` (collapse the
+  FixedPosFilter half) is the full receiver-side fix, and **no mosaic
+  reconfiguration is needed or even possible on the frequency.**
+
+Hardware checks to *verify* this holds (cheap, no change): (1) `ReceiverStatus`
+**`EXT_FREQ` set** (mosaic locked to the external 10 MHz, not its internal
+clock); (2) **nothing on `TimeSync`** — a 1 PPS there makes the mosaic sync its
+time base to that pulse, an extra path; (3) the engine **un-wraps
+`CumClkJumps`** so a 1 ms jump isn't misread as a phase glitch.
+
+### Knob-2 lever sweep — which fixes the in-loop clock filter (aiming delta's next arm)
 
 delta's decisive question: *does lowering OUR loop bandwidth alone stabilize
 the cascade, or must we touch the mosaic filter?* Swept the three levers at
@@ -192,18 +234,21 @@ RELATIVELY.**
 | lever | stabilizes? | mid-τ TDEV(100 s) |
 |---|---|---|
 | **(a)** lower our BW (tighter Q) | only at Q ≤ 1e-3 | **5.6–20.8 ns** (worst) |
-| **(b)** raise mosaic α (≥0.2, faster mosaic filter) | yes | **0.74 ns** (best) |
+| **(b)** widen the in-loop clock filter (α≥0.2, faster FixedPosFilter) | yes | **0.74 ns** (best) |
 | **(c)** bypass cascade (`--clock-model wno`, single loop) | yes, all Q | **~0.83 ns** |
 
 **Answer: lowering our bandwidth alone does NOT solve it.** Lever (a)
 stabilizes only by going to very tight Q, and that gives the *worst* mid-τ
-(the cascade forces a bad stability↔mid-τ tradeoff). You **must touch the
-mosaic filter**: (b) speed it up (best mid-τ, but needs the mosaic PVT
-smoothing config delta doesn't own) or (c) **bypass it — `--clock-model wno`**
-(delta owns it, no new code, nearly as good). Recommended next hardware arm:
-**tight-Q + `--clock-model wno`** (lever c); fall back to chasing the mosaic
-PVT config (b) if `wno`'s residual mosaic-side smoothing leaves the cascade
-intact.
+(the cascade forces a bad stability↔mid-τ tradeoff). You **must collapse the
+in-loop clock filter** — which, per the correction above, is *our own*
+FixedPosFilter, so we fully own the fix: (c) **`--clock-model wno`** collapses
+it (delta owns it, no new code) — this is the decisive lever. Lever (b)
+("raise the filter bandwidth") is nearly equivalent and slightly better mid-τ
+in sim, but it's just a different way to widen the *same* FixedPosFilter, not
+a mosaic change. Recommended next hardware arm: **tight-Q + `--clock-model
+wno`**. There is no residual *mosaic*-side smoothing to chase — with the
+external OCXO the mosaic can't filter the frequency; the only receiver-side
+artifact is the removable 1 ms `CumClkJumps` (verify the engine un-wraps it).
 
 This is robust to the **Q-direction discrepancy** (my sim: tighter Q
 stabilizes lever a; delta's hardware: measured tight-Q *railed*) because

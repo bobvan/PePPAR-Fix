@@ -340,19 +340,24 @@ class SimConfig:
     # the deadbeat x[3] term it drives the growing oscillation delta saw at
     # NORMAL cadence.  0.0 → no lag (instantaneous obs).
     single_osc_obs_lag_s: float = 0.0
-    # Mosaic internal clock filter (single-oscillator).  The mosaic-T does
-    # NOT report the instantaneous DO phase — it reports its OWN clock
-    # estimator's bias state.  The abA1/knob1 captures prove this: our_dt_rx_ns
-    # tracks mosaic_rxclkbias_ns exactly, and mosaic_rxclkdrift_ppb tracks
-    # our_freq_ppb.  So the observation is a SECOND filter (bias+drift, α-β)
-    # in series with our servo — the cascaded-loop dynamic that makes the
-    # single-oscillator loop marginally stable, so a short stall/glitch tips
-    # it into the ±1700 ns limit cycle (gated) or the rail (ungated).  When
-    # True, the sole observer reads the mosaic filter's bias, not phi_do.
+    # In-loop clock filter (single-oscillator).  MISNOMER (kept for code
+    # continuity, see docs/mid-tau-servo-knobs.md "Correction (2026-07-07)"
+    # + docs/misnomers.md): the α-β filter here models OUR OWN FixedPosFilter
+    # clock smoothing (random_walk), NOT a mosaic filter.  With the external
+    # OCXO on the mosaic's REF IN, the mosaic times against the OCXO and
+    # CANNOT filter/steer its frequency (no control) — and we consume raw
+    # MeasEpoch carrier phase, never the mosaic's PVT RxClkBias.  So the only
+    # in-loop clock-smoothing filter is ours; this models it.  The captures
+    # (our_dt_rx_ns ≈ mosaic_rxclkbias_ns, mosaic_rxclkdrift_ppb ≈ our_freq_
+    # ppb) are two estimators of the SAME physical DO clock agreeing, not a
+    # mosaic filter feeding us.  This SECOND filter (FixedPosFilter) in series
+    # with the DOFreqEst servo is the cascade that makes the loop marginally
+    # stable, so a short stall/glitch tips it into the ±1700 ns limit cycle
+    # (gated) or the rail (ungated).  Collapse it with --clock-model wno.
     single_osc_mosaic_filter: bool = False
-    # α-β gains of the mosaic clock filter (position, velocity).  Fit to the
-    # knob1 limit-cycle period (~10–15 min) / abA1 rail.  Lower = slower
-    # mosaic filter = more loop lag = more marginal.
+    # α-β gains of the in-loop (FixedPosFilter) clock filter (position,
+    # velocity).  Fit to the knob1 limit-cycle period (~10–15 min) / abA1
+    # rail.  Lower = slower filter = more loop lag = more marginal.
     mosaic_alpha: float = 0.1
     mosaic_beta: float = 0.01
     # Actuator word-limit (ppb): the DAC control word saturates at ±this.
