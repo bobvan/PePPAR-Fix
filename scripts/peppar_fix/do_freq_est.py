@@ -95,7 +95,8 @@ class DOFreqEst:
                  max_step_ppb=None,
                  ocxo_trusted_gate=None,
                  routed_qerr=False,
-                 soft_ticc_gate=False):
+                 soft_ticc_gate=False,
+                 do_freq_clamp_ppb=None):
         self.max_ppb = max_ppb
         # routedQErrArm (latestQErrChiSelect, docs/latest-qerr-chi-select.md):
         # per-edge COMPARATIVE chi² router for the TICC arm.  When enabled,
@@ -129,6 +130,24 @@ class DOFreqEst:
         # the very first epoch's adjfine is unconstrained because
         # there's no prior to rate-limit against.
         self.max_step_ppb = max_step_ppb
+        # midTauServoKnobs (I-084500, bravo↔delta): do_freq_clamp_ppb is a
+        # GATED, DEFAULT-OFF safety backstop against the actuator-rail runaway
+        # delta observed on the GNSSDO+ bench (x[3]→+386 ppb, adjfine word→
+        # rail).  Clamp the DO-freq estimate x[3] to within ±do_freq_clamp_ppb
+        # of its bootstrap nominal — an OCXO/DAC has a bounded pull range, so
+        # x[3] physically cannot wander further.  A peer to max_step_ppb: a
+        # cheap seatbelt that bounds a freq-state windup INSIDE the gross
+        # state-sanity bounds (±1e6 ppb) while root cause is investigated.
+        # None → byte-identical to pre-existing behavior.  x3 nominal set
+        # below once crystal_freq is known.  See docs/mid-tau-servo-knobs.md.
+        # NOTE: servo_sim (which drives this same DOFreqEst) does NOT reproduce
+        # the x[3] rail from any modeled perturbation — dt_rx glitches are
+        # decoupled from DO steering and DO-obs corruption gates-out→coasts
+        # (actuator stays ≤2 ppb).  This clamp is therefore an unvalidated
+        # HARDWARE seatbelt pending a captured repro, not a sim-proven fix.
+        self._do_freq_clamp_ppb = do_freq_clamp_ppb
+        self.n_do_freq_clamped = 0
+        self.last_do_freq_clamped = False
         self.tick_ns = tick_ns
         self.dt = 1.0
 
@@ -141,6 +160,9 @@ class DOFreqEst:
         phi_tcxo_init = initial_dt_rx_ns if initial_dt_rx_ns is not None else 0.0
         crystal_freq = base_freq if base_freq is not None else initial_freq
         self.x = np.array([phi_tcxo_init, 0.0, 0.0, -crystal_freq])
+        # x[3] nominal for the do_freq_clamp anti-windup (see above): the
+        # bootstrap DO-freq estimate.  The clamp bounds |x[3] - nominal|.
+        self._x3_nominal = -crystal_freq
 
         # F matrix — note F[2,3] is NEGATIVE: positive f_do (crystal
         # running fast) makes φ_do decrease (less late), because φ_do is
@@ -373,6 +395,8 @@ class DOFreqEst:
         crystal_freq = initial_freq
         self.x = np.array(
             [phi_tcxo_init, 0.0, 0.0, -crystal_freq])
+        # Re-anchor the do_freq_clamp nominal to the (post-reset) bootstrap.
+        self._x3_nominal = -crystal_freq
         if initial_dt_rx_ns is not None:
             self.P = np.diag([100.0**2, 10.0**2, 5000.0**2, 1.0**2])
             self._tcxo_initialized = True
@@ -663,6 +687,9 @@ class DOFreqEst:
             self.last_arm_S[_k] = None
         self.last_ocxo_gate_rejected = False
         self.last_ocxo_gate_reason = ""
+        # midTauServoKnobs per-epoch flag (cleared each epoch; set by the
+        # x[3] clamp below).
+        self.last_do_freq_clamped = False
 
         # ── Adaptive Q: boost during pull-in ──
         do_phase_abs = abs(self.x[2])
@@ -954,6 +981,22 @@ class DOFreqEst:
 
         self.x = x_pred
         self.P = P_pred
+
+        # midTauServoKnobs x[3] anti-windup clamp (default off).  Bound the
+        # DO-freq estimate to ±do_freq_clamp_ppb of its bootstrap nominal —
+        # an OCXO/DAC has a bounded pull range, so x[3] physically cannot
+        # wander further.  Catches a slow ramp INSIDE the gross state-sanity
+        # bounds (±1e6 ppb), which is where delta's runaway lived (x[3]
+        # ramped to a few hundred ppb, well under the sanity bound, and
+        # walked the actuator to the +386 ppb rail one max_step at a time).
+        # Applied before the LQR reads x[3] so u reflects the clamped state.
+        if self._do_freq_clamp_ppb is not None:
+            lo = self._x3_nominal - self._do_freq_clamp_ppb
+            hi = self._x3_nominal + self._do_freq_clamp_ppb
+            if self.x[3] < lo or self.x[3] > hi:
+                self.x[3] = min(hi, max(lo, self.x[3]))
+                self.n_do_freq_clamped += 1
+                self.last_do_freq_clamped = True
 
         # State-sanity guard (I-074400 defense #2 + ekfStateSanityNoRecovery
         # follow-up): detect state corruption that the chi-squared gate
