@@ -1,16 +1,16 @@
-# PePPAR Fix
+# PePPAR.Fix
 
-> **Precise time for a GNSS antenna that doesn't move.**
+> **Precise time from a fixed GNSS antenna**
 
-PePPAR Fix turns a stationary GNSS antenna into a precision clock. If your antenna
+PePPAR-Fix uses a stationary GNSS antenna to make a precision clock. If your antenna
 isn't going anywhere, you can survey its position **once** and then spend the *entire*
-GNSS solution on the one thing you actually want out of it: **time**. PePPAR Fix uses
+GNSS solution on the one thing you actually want out of it: **time**. PePPAR-Fix uses
 carrier-phase Precise Point Positioning to measure a local oscillator's error against
 GPS time and gently steers that oscillator to track it — without throwing away the
 oscillator's own excellent short-term stability.
 
 The name is a play on **PPP-AR** — *Precise Point Positioning with Ambiguity
-Resolution*, the geodetic technique at its core. (The "arr" is also for pirates.)
+Resolution*, the geodetic technique at its core.
 "Fix" is the GNSS fix it stands on.
 
 ---
@@ -18,7 +18,7 @@ Resolution*, the geodetic technique at its core. (The "arr" is also for pirates.
 ## Why a stationary antenna changes everything
 
 A roving GNSS receiver has to solve for *where it is* **and** *what time it is*,
-epoch after epoch. Position and clock trade off against each other, and the clock is
+second after second. Position and clock trade off against each other, and the clock is
 never better than the position solution allows.
 
 Hold the antenna still and that tradeoff disappears. Survey the antenna reference
@@ -32,16 +32,16 @@ one of the best time references you can build.
   stationary GNSS antenna
         │   raw carrier phase  +  real-time SSR corrections (NTRIP)
         ▼
-  ┌────────────────────────────────────────────────┐
+  ┌──────────────────────────────────────────────────┐
   │  peppar-fix : fixed-position PPP(-AR) filter     │ ◀── surveyed position
   │              + multi-arm Kalman / LQR servo      │     (peppar-survey, once)
   └───────────────────────────┬──────────────────────┘
                               │   frequency / phase steer
                               ▼
-  ┌────────────────────────────────────────────────┐
+  ┌──────────────────────────────────────────────────┐
   │  disciplined oscillator  ──▶  PPS / 10 MHz out   │  locked to GPS time,
   │                                                  │  short-term stability kept
-  └────────────────────────────────────────────────┘
+  └──────────────────────────────────────────────────┘
 ```
 
 ---
@@ -71,7 +71,7 @@ the receiver observes becomes a constraint on time.
 
 **Carrier phase, not just PPS.** A 1 PPS edge from a timing receiver is quantized to a
 few nanoseconds. The carrier phase is not — a fixed-position PPP filter can track the
-receiver clock to a few *picoseconds* per epoch. PePPAR Fix treats carrier-phase
+receiver clock to a few *picoseconds* per second. PePPAR-Fix treats carrier-phase
 `dt_rx` as a first-class servo input and uses PPS/qErr as complementary arms.
 
 **A two-oscillator budget.** The output can only ever be as good as the *better* of:
@@ -86,6 +86,16 @@ receiver clock to a few *picoseconds* per epoch. PePPAR Fix treats carrier-phase
 The whole design is organized around respecting both floors and adding nothing of its
 own in between.
 
+**A single-oscillator alternative.** Some receivers close this gap by construction.
+When the receiver's *own* reference is the oscillator we steer — as on the Septentrio
+Mosaic-T, which runs on an OCXO that PePPAR-Fix disciplines directly — the two floors
+collapse into one. The carrier phase then observes the disciplined oscillator itself:
+the receiver's clock estimate *is* the DO's error against GPS, with no separate
+receiver oscillator to inherit noise from. PePPAR-Fix recently gained support for this
+design, closing the loop from the Mosaic-T's own carrier-phase `dt_rx` to its
+oscillator — trading the freedom to steer an arbitrary external DO for a markedly
+cleaner error signal.
+
 ---
 
 ## What we're reaching for
@@ -98,7 +108,7 @@ guides the handoff so gently that it adds no noise, overshoot, or loop-bandwidth
 artifact of its own. Beating a bare PPS reference is *not* the goal — that's limited
 by receiver resolution, not by what the oscillators can actually deliver.
 
-**Two clocks that agree.** Any two PePPAR Fix clocks should produce PPS edges that
+**Two clocks that agree.** Any two PePPAR-Fix clocks should produce PPS edges that
 agree in phase within a probability-bounded excursion:
 
 | Configuration | Bound | Probability | Window |
@@ -107,7 +117,7 @@ agree in phase within a probability-bounded excursion:
 | Separate antennas, baseline ≤ 5 km | \|Δ\| ≤ 2 ns | 95% | any 1-hour window |
 
 **Clocks that bootstrap each other.** A longer-term ambition is peer discipline —
-PePPAR Fix nodes advertising and serving corrections to one another over the local
+PePPAR-Fix nodes advertising and serving corrections to one another over the local
 network, so a fresh clock can lean on a settled neighbor.
 
 ---
@@ -132,7 +142,7 @@ An honest snapshot — this is an active research system, not a finished product
 
 ## Supported hardware
 
-PePPAR Fix runs on commodity Linux single-board computers and off-the-shelf timing
+PePPAR-Fix runs on commodity Linux single-board computers and off-the-shelf timing
 hardware.
 
 | Role | Supported |
@@ -198,7 +208,7 @@ CLAUDE.md                 operating manual for contributors
 
 ## Status & license
 
-PePPAR Fix is a research project, developed against real hardware in a working timing
+PePPAR-Fix is a research project, developed against real hardware in a working timing
 lab. Interfaces change, targets are aspirational, and results are reported honestly —
 including the gap between where we are and the moonshot. It is **not** a product and
 carries no fitness or stability guarantees.
