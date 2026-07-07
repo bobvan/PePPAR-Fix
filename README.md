@@ -1,4 +1,4 @@
-# PePPAR.Fix
+# PePPAR-Fix
 
 > **Precise time from a fixed GNSS antenna**
 
@@ -86,15 +86,18 @@ receiver clock to a few *picoseconds* per second. PePPAR-Fix treats carrier-phas
 The whole design is organized around respecting both floors and adding nothing of its
 own in between.
 
-**A single-oscillator alternative.** Some receivers close this gap by construction.
-When the receiver's *own* reference is the oscillator we steer — as on the Septentrio
-Mosaic-T, which runs on an OCXO that PePPAR-Fix disciplines directly — the two floors
-collapse into one. The carrier phase then observes the disciplined oscillator itself:
-the receiver's clock estimate *is* the DO's error against GPS, with no separate
-receiver oscillator to inherit noise from. PePPAR-Fix recently gained support for this
-design, closing the loop from the Mosaic-T's own carrier-phase `dt_rx` to its
-oscillator — trading the freedom to steer an arbitrary external DO for a markedly
-cleaner error signal.
+**A single-oscillator alternative.** *Geodetic* receivers accept an **external clock
+input**, which closes the gap by construction. Such a receiver still has its own
+internal oscillator, but PePPAR-Fix disables it and feeds in an external oscillator it
+can steer — so the receiver measures its carrier phase against the very oscillator being
+disciplined. The two floors collapse into one: the receiver's clock estimate *is* the
+disciplined oscillator's error against GNSS time, a direct signal with no separate
+receiver oscillator to inherit noise from — and no "second hop" through a PPS aligned to
+an internal TCXO. The SparkFun GNSSDO+ — a Septentrio Mosaic-T fed by an on-board Rakon
+OCXO through its external-clock input — is the worked example PePPAR-Fix recently gained
+support for, closing the loop from the receiver's carrier-phase `dt_rx` to the OCXO.
+See **[the GNSS receiver clock hierarchy](docs/receiver-clock-hierarchy.md)** for the
+three tiers and where this design sits.
 
 ---
 
