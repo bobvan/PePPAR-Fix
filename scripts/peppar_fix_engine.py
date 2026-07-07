@@ -1219,12 +1219,16 @@ def load_ntrip_config(args):
             log.info("SSR credentials loaded from %s (caster=%s, mount=%s)",
                      ssr_conf_path, args.ssr_caster, args.ssr_mount)
 
-    # Optional secondary SSR mount that contributes PHASE BIASES ONLY —
-    # pairs with the primary ssr_mount which provides orbit/clock.  The
-    # design enables CNES SSRA00CNE0 (GAL biases correct for F9T) + WHU
-    # OSBC00WHU1 (GPS OSB correct for F9T L5Q) to jointly unlock GPS+GAL
-    # AR without waiting for a single AC that matches every F9T signal.
-    # See docs/ssr-mount-survey.md.
+    # Optional secondary SSR mount that contributes BIAS gap-fill (code AND
+    # phase) — pairs with the primary ssr_mount which provides orbit/clock.
+    # Its biases are routed gap-fill-only (GAP_FILL_SIGNALS allow-list in
+    # ssr_corrections.py): the secondary fills signals the primary AC leaves
+    # blank (e.g. GPS C5Q/L5Q, which both BKG SSRA00BKG0 and CNES SSRA00CNE0
+    # omit but WHU OSBC00WHU1 publishes) WITHOUT overwriting shared signals.
+    # So an F9T-L5 host gets GPS+GAL both corrected — float PPP (code bias)
+    # and AR (phase bias) — without a single AC that matches every F9T
+    # signal.  Validated on ptBoat 2026-07-06 (BKG orbit/clock + WHU GPS-L5
+    # code bias).  See docs/ssr-mount-survey.md and docs/ac-datum-mixing.md.
     ssr_bias_conf_path = getattr(args, 'ssr_bias_ntrip_conf', None)
     if ssr_bias_conf_path:
         conf = configparser.ConfigParser()
@@ -1321,9 +1325,12 @@ def start_ntrip_threads(args, beph, ssr, stop_event, raw_bundle=None):
             eph_mount=getattr(args, 'eph_mount', None),
         )
 
-    # Optional secondary SSR mount that contributes PHASE BIASES ONLY.
-    # Orbit/clock/code-bias/ephemeris all come from the primary mount;
-    # this stream's non-phase-bias messages are discarded in ntrip_reader.
+    # Optional secondary SSR mount that contributes BIAS gap-fill (code AND
+    # phase).  Orbit/clock/ephemeris come from the primary mount; this
+    # stream's non-bias messages are discarded in ntrip_reader, and its
+    # code+phase biases are routed gap-fill-only (GAP_FILL_SIGNALS) so they
+    # fill primary-AC coverage gaps without cross-AC datum mixing on shared
+    # signals.  See docs/ac-datum-mixing.md.
     ssr_bias_mount = getattr(args, 'ssr_bias_mount', None)
     if ssr_bias_mount:
         bias_host = (getattr(args, 'ssr_bias_caster', None)
@@ -12507,12 +12514,15 @@ Two-phase operation:
                        help="Optional separate NTRIP credentials file for "
                             "the primary SSR mount (orbit/clock/biases).")
     ntrip.add_argument("--ssr-bias-mount", default=None,
-                       help="Optional secondary SSR mountpoint that "
-                            "contributes PHASE BIASES ONLY.  Pair e.g. "
-                            "CNES orbit/clock with WHU OSB phase biases "
-                            "keyed to F9T-tracked signals.  All non-"
-                            "phase-bias messages from this stream are "
-                            "ignored.  See docs/ssr-mount-survey.md.")
+                       help="Optional secondary SSR mountpoint contributing "
+                            "code AND phase bias gap-fill, routed gap-fill-only "
+                            "(GAP_FILL_SIGNALS): it fills signals the primary "
+                            "AC leaves blank (e.g. GPS C5Q/L5Q) without "
+                            "overwriting shared signals.  Pair e.g. BKG/CNES "
+                            "orbit/clock with WHU OSB biases keyed to F9T-"
+                            "tracked signals.  All non-bias messages from this "
+                            "stream are ignored.  See docs/ssr-mount-survey.md "
+                            "and docs/ac-datum-mixing.md.")
     ntrip.add_argument("--ssr-bias-ntrip-conf", default=None,
                        help="Credentials file for --ssr-bias-mount (same "
                             "INI format as --ntrip-conf).  Falls back to "

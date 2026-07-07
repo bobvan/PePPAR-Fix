@@ -35,7 +35,7 @@ SCHEMA_VERSION = "1"
 STREAMS = {
     "ubx":      "ubx.cap",       # GNSS UBX: RAWX/SFRBX/NAV-*/TIM-TP (qErr here)
     "ssr":      "ssr.cap",       # RTCM SSR (orbit/clock/code+phase bias)
-    "ssr_bias": "ssr_bias.cap",  # secondary SSR mount, phase-bias-only (dual-mount)
+    "ssr_bias": "ssr_bias.cap",  # secondary SSR mount, code+phase bias gap-fill (dual-mount)
     "eph":      "eph.cap",       # broadcast eph (RTCM 1019/1042/1046 or SFRBX)
     "ticc":     "ticc.cap",      # TICC chA/chB lines
 }
