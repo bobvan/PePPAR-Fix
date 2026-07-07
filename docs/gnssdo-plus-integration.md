@@ -658,3 +658,10 @@ opt-in** (`freerun_analysis.deglitch_cycle_slips`; on other DOs a 100 ns jump
 may be a real defect). The free-run slip rate (~0.4/h at the held word)
 measures how close the held frequency is to GPS. Override option (disable the
 alignment) exists — under evaluation.
+
+Two open concerns about this circuit — a constant PPS-OUT **bias**, and
+**100 ns boundary steps while disciplined** if the operating point sits near a
+DO edge (flip-flop metastability) — plus the scope test that resolves them, are
+written up in [`gnssdo-plus-pps-alignment.md`](gnssdo-plus-pps-alignment.md).
+The disciplined grade run's chA cycle-slip rate is an in-situ check of the
+boundary-step concern.
