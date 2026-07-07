@@ -640,12 +640,38 @@ Phase-1 bootstrap + AntPosEst; a **clock-only grade should use `--no-antposest`
 with a pinned ARP** so the position filter can't trip. (The 05:21 wrap-up cron
 also didn't fire — session was summarized overnight.)
 
-**Re-run 2026-07-07 (RUNNING):** `--no-antposest --known-pos <converged pos>
---known-pos-frame ITRF2020` + the **measured Q**. Clean: `DOFreqEst Q
-sigma_do_phase=0.0726 (measured)`, dt_rx locked **sub-0.1 ns** (tighter than
-class-default), **zero resets, zero watchdog trips**. Collecting the long-τ
-compare (`gnssdo-compare-long2.csv`) + disciplined chA (`gnssdo-disc2-ticc`,
-de-glitch with `char_gnssdo_freerun`/`deglitch_cycle_slips` before TDEV).
+**Re-run 2026-07-07 — measured Q caused a loop instability.** With
+`--no-antposest --known-pos … ITRF2020` + the **measured Q** it started clean
+(dt_rx sub-0.1 ns, 2.8 h, zero outliers) then developed a **growing
+oscillation** (~120 s period, amplitude ±7 → ±13 → ±20 ns, DO oscillating in
+antiphase per the mosaic_bias) that wound up into a runaway (freq → +227 ppb,
+word → rail), stopped at 05:12 by the NAV2 watchdog (which `--no-antposest`
+does NOT disable). The DO recovered under SparkFun; **Q reverted to
+class-default**. The 12×-tighter measured `sigma_do_freq` is the difference
+from stable run #1 — a stiffer EKF frequency state → less loop damping.
+Caveat: run #1 only survived 95 min (position watchdog) < the 2.8 h this took
+to grow, so we can't fully rule out class-default ringing at long τ either.
+**Open: servo-stability work (LQR/scheduler damping vs a tight Q) before a
+tight-Q disciplined run.**
+
+**Results from the stable 2.6 h (before the oscillation):**
+
+- **Concern 2 (PPS-alignment boundary steps while disciplined) — favorable:**
+  **ZERO 100 ns cycle-slips** on the disciplined chA in 2.6 h (vs 0.4/h
+  free-running). Strong in-situ evidence the disciplined operating point sits
+  safely inside the alignment window, not near the DO-edge boundary. (Scope
+  test — `gnssdo-plus-pps-alignment.md` — still authoritative for the margin.)
+- **Grade (disciplined vs free-run chA TDEV):** comparable out to ~600–1000 s
+  (both sub-ns). At mid-τ the disciplined is ~3.5× *worse* (TDEV(100s) 187 ps
+  vs free-run 54 ps) — **the servo adds mid-τ noise** (loop-BW artifact; a
+  moonshot target is to not). The free-run OCXO is so good (ADEV floor
+  1.2e-12) that the discipline's crossover-win is **beyond ~1000 s**, past this
+  window. de-glitch (`char_gnssdo_freerun`) before TDEV.
+- **Difference-TDEV (ours − theirs), stable window:** 12 ps @ 1 s → 0.17 ns @
+  64 s → 0.38 ns @ 512 s (the two clock estimators, common OCXO removed).
+  *Theirs* is cleaner short-τ (3 ps — their PVT filter smooths) but **rises at
+  long τ** (they don't steer the OCXO; we do); *ours* is held flat by the loop.
+  Correction PSD: theirs ~4× bumpier at high f (again).
 
 ### PPS cycle-slips are a GNSSDO+ hardware feature (not a defect)
 
