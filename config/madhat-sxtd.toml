@@ -50,6 +50,14 @@ gnssdo_ppb_per_controlword = 7.885e-4   # measured 2026-07-06 (sign POSITIVE)
 # Fallback demo without SBF: use a TICC as the phase reference (SXT-D
 # PPS OUT on chA vs a GNSS reference PPS on chB) — set ticc_port below.
 
+# ── Servo robustness (knob 1) ───────────────────────────────────────
+# Soft NIS gate on the dt_rx (do_phase) arm.  Caps any single carrier-phase
+# innovation's influence at N sigma so a glitch cannot seed a frequency-state
+# runaway.  Root-caused 2026-07-07: a 75σ dt_rx jump the crude Δ-gate passed
+# wound x[3] to the +386 ppb rail.  Adaptive via P (large innovations during
+# acquisition still pass).  See docs/gnssdo-servo-loop-bandwidth.md §"real knobs".
+innov_gate_nsigma = 5.0
+
 # ── Measurement / grading ───────────────────────────────────────────
 # chA = SXT-D PPS OUT (the disciplined DO), chB = reference PPS.
 # Grade with tools/plot_chA_tdev_goldilocks.py (chA detrended TDEV).

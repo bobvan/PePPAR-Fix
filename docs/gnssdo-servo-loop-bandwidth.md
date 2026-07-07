@@ -147,6 +147,20 @@ measured-Q ring and this runaway are **both** the `x[3]` term, not L2.
 1. **Robust innovation gating on `dt_rx`** so a carrier-phase glitch / receiver
    clock perturbation cannot corrupt `x[3]`. This is the stability fix — the
    runaway starts at a `dt_rx` perturbation the EKF swallows into frequency.
+   **IMPLEMENTED (`--innov-gate-nsigma` / `innov_gate_nsigma`, 2026-07-07):** a
+   soft NIS cap in every linear arm (`_kalman_linear_update`). An arm whose
+   normalized innovation exceeds `N·√S` has its influence capped to `N` sigma by
+   inflating `S` — the measurement is **down-weighted, never rejected**, so
+   acquisition (legitimately large `dt_rx`) is untouched while a spike cannot
+   punch `x[3]`. The gate is **inherently adaptive** (`S` contains `P`): a big
+   innovation while `P` is large — acquisition — reads as few sigma and passes;
+   the same jump at lock (small `P`) is capped. Note the runaway ramp itself is
+   *self-consistent* (each epoch's innovation is small — the wrong `x[3]`
+   predicts the drift it causes), so the gate does not catch the ramp; it
+   catches the **seeding glitch** (the 06:59 −12 ns jump = 75σ at σ≈0.16 ns) so
+   the ramp never starts. `madhat-sxtd.toml` sets `N = 5`. Per-arm
+   `arm_gate_trips` counts trips (a healthy `dt_rx` arm trips ~never); the
+   DT_RX log line shows `gate_trips=` once non-zero.
 2. **Slow the EKF frequency dynamics** (tighter `sigma_do_freq` / lower
    frequency Kalman gain) — *this* is the actual mid-τ bandwidth knob. The
    measured Q (tight `sigma_do_freq`) is the right direction for mid-τ; it was

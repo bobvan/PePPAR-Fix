@@ -8431,6 +8431,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
         routed_qerr=_qerr_latest_chi,
         soft_ticc_gate=getattr(args, 'soft_ticc_gate', False),
         lqr_phase_gain=(getattr(args, 'lqr_phase_gain', None) or -0.05),
+        innov_gate_nsigma=getattr(args, 'innov_gate_nsigma', None),
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
              "sigma_do=[%.4f ns, %.4f ppb], "
@@ -9494,10 +9495,13 @@ def _dt_rx_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
         ctx['_gnssdo_compare_f'].flush()
 
     if n_epochs % 10 == 0:
+        _gate_trips = servo.arm_gate_trips.get('do_phase', 0)
         log.info("  [%d] DT_RX: ours phase=%+.2fns freq=%+.3fppb word=%s | "
-                 "mosaic bias=%+.2fns drift=%+.3fppb mode=%d | dt=%.1fs",
+                 "mosaic bias=%+.2fns drift=%+.3fppb mode=%d | dt=%.1fs"
+                 "%s",
                  n_epochs, phase_ns, freq_ppb, _word,
-                 _their_bias_ns, _their_drift_ppb, _their_mode, dt_actual)
+                 _their_bias_ns, _their_drift_ppb, _their_mode, dt_actual,
+                 (" | gate_trips=%d" % _gate_trips) if _gate_trips else "")
     return "ok"
 
 
@@ -11916,6 +11920,7 @@ def _apply_host_config(args):
         "gnssdo_word_max":  ("gnssdo_word_max",  int),
         "gnssdo_watchdog_s": ("gnssdo_watchdog_s", int),
         "lqr_phase_gain":   ("lqr_phase_gain",   float),
+        "innov_gate_nsigma": ("innov_gate_nsigma", float),
         "tadd_gpio":        ("tadd_gpio",        int),
         "tadd_hold_s":      ("tadd_hold_s",      float),
         "ticc_port":        ("ticc_port",        str),
@@ -13263,6 +13268,17 @@ Two-phase operation:
                             "low-noise DO whose free-run beats the GNSS "
                             "reference below the crossover, so the DO free-runs "
                             "below the corner — see "
+                            "docs/gnssdo-servo-loop-bandwidth.md.")
+    servo.add_argument("--innov-gate-nsigma", type=float, default=None,
+                       metavar="N",
+                       help="Soft normalized-innovation (NIS) gate on the "
+                            "DOFreqEst linear arms (knob 1).  An arm whose "
+                            "innovation exceeds N·√S has its influence CAPPED to "
+                            "N sigma (S inflated, never rejected) so a phase "
+                            "glitch cannot seed a frequency-state runaway "
+                            "(the 2026-07-07 GNSSDO+ rail).  Adaptive via P: a "
+                            "large innovation during acquisition passes.  "
+                            "Default off; try ~5 on the dt_rx/GNSSDO+ path — "
                             "docs/gnssdo-servo-loop-bandwidth.md.")
     servo.add_argument("--gnssdo-compare-log", default=None, metavar="CSV",
                        help="Log our carrier-phase steering (dt_rx, control "
