@@ -1100,6 +1100,12 @@ def apply_ptp_profile(args):
         args.gain_ref_sigma = profile.get("gain_ref_sigma", args.gain_ref_sigma)
     if args.converge_error_ns == 500.0:
         args.converge_error_ns = profile.get("converge_error_ns", args.converge_error_ns)
+    if args.ppp_arm_min_npr == 4:
+        args.ppp_arm_min_npr = profile.get("ppp_arm_min_npr", args.ppp_arm_min_npr)
+    if args.ppp_arm_max_resid_m is None:
+        args.ppp_arm_max_resid_m = profile.get("ppp_arm_max_resid_m", args.ppp_arm_max_resid_m)
+    if args.ppp_arm_warmup_epochs == 3:
+        args.ppp_arm_warmup_epochs = profile.get("ppp_arm_warmup_epochs", args.ppp_arm_warmup_epochs)
     if args.converge_min_scale == 2.0:
         args.converge_min_scale = profile.get("converge_min_scale", args.converge_min_scale)
     if args.gain_min_scale == 0.1:
@@ -5910,6 +5916,24 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
             resid_td_rms = (float(np.sqrt(np.mean(r_td ** 2)))
                             if len(r_td) > 0 else 0.0)
 
+            # Layer-2 Arm-1 pre-convergence gate (pppArmPreconvergenceGate):
+            # withhold dt_rx from DOFreqEst Arm 1 until the FixedPos clock
+            # solution is trustworthy.  dt_rx_sigma is OVERCONFIDENT during
+            # the startup transient — it reflects the spread of surviving PRs,
+            # not the accuracy of the pinned clock, so a filter with 2-3
+            # mutually-agreeing PRs can report a small σ on a megametre-wrong
+            # clock.  Gate on the honest signals instead: PR count,
+            # PR-residual RMS, and a short warmup.  Without this the
+            # pre-convergence dt_rx couples into the rx-freq state x[1] and
+            # trips state-sanity resets (ptBoat 2026-07-06).  Composes with
+            # the fresh-dt_rx seed (commit 68f8fad).
+            _ppp_arm_max_resid_m = (
+                args.ppp_arm_max_resid_m if args.ppp_arm_max_resid_m is not None
+                else args.watchdog_threshold)
+            ppp_arm_ok = (n_epochs >= args.ppp_arm_warmup_epochs
+                          and n_pr_used >= args.ppp_arm_min_npr
+                          and 0.0 < resid_pr_rms <= _ppp_arm_max_resid_m)
+
             # Shadow watchdog evaluation (no behavior change today).
             td_ok, pr_disturbance = watchdog_proposed.update(
                 resid_pr_rms, resid_td_rms, n_used)
@@ -6182,6 +6206,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                     resid_rms, isb_gal_ns, isb_bds_ns,
                     pps_match=pps_match,
                     gap_recovery=gap_recovery_this_epoch,
+                    ppp_arm_ok=ppp_arm_ok,
                 )
                 if servo_result == "no_pps":
                     skip_stats["servo_no_pps"] += 1
@@ -7711,6 +7736,21 @@ def _do_bootstrap_init(args, ptp, known_ecef, obs_queue, beph, ssr,
         return False
     pps_freq_ppb, pps_freq_unc, dt_rx_ns, dt_rx_series, phi_end_ns = result
 
+    # Persist the freshly-measured dt_rx so the DOFreqEst (constructed later,
+    # in the servo-start path) seeds its rx-TCXO phase (φ_rx) from THIS value
+    # rather than a stale receiver-state copy left over from a prior run.  A
+    # stale seed — days old after the host was offline — is far from the live
+    # dt_rx and, against the tight seed covariance, blows up the rx-TCXO
+    # frequency state at startup (ptBoat 2026-07-06: 6 state_sanity resets,
+    # near exit-5).  This is the one bootstrap point common to every DO type.
+    _rx_uid = getattr(args, 'receiver_unique_id', None)
+    if _rx_uid is not None and dt_rx_ns is not None:
+        try:
+            from peppar_fix.receiver_state import save_dt_rx_to_receiver
+            save_dt_rx_to_receiver(_rx_uid, dt_rx_ns)
+        except Exception as e:
+            log.warning("Failed to persist bootstrap dt_rx: %s", e)
+
     if dfe_sm is not None:
         dfe_sm.transition(DOFreqEstState.FREQ_VERIFYING,
                           f"freq measured ({pps_freq_ppb:+.1f} ppb)")
@@ -8055,10 +8095,24 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
     receiver_uid_local = getattr(args, 'receiver_unique_id', None)
     if receiver_uid_local is not None:
         try:
-            from peppar_fix.receiver_state import load_receiver_state
+            from peppar_fix.receiver_state import (load_receiver_state,
+                                                   dt_rx_seed_if_fresh,
+                                                   DT_RX_SEED_MAX_AGE_S)
             rx = load_receiver_state(receiver_uid_local)
             if rx is not None:
-                bootstrap_dt_rx_ns = rx.get('tcxo', {}).get('last_known_dt_rx_ns')
+                # Staleness guard: a dt_rx older than DT_RX_SEED_MAX_AGE_S is a
+                # receiver clock bias from a prior life (reboot / offline gap),
+                # not the live one.  Seeding φ_tcxo from it blows up the rx-TCXO
+                # frequency state at startup, so reject it and fall back to the
+                # 2-state bootstrap.  The DO bootstrap refreshes this value on a
+                # good run (phc_bootstrap.save_dt_rx_to_receiver), so a healthy
+                # start seeds from a fresh dt_rx.
+                bootstrap_dt_rx_ns, _dt_rx_age_s = dt_rx_seed_if_fresh(rx)
+                if bootstrap_dt_rx_ns is None and _dt_rx_age_s is not None:
+                    log.warning(
+                        "DOFreqEst: ignoring stale receiver-state dt_rx "
+                        "(age=%.0f s > %.0f s)",
+                        _dt_rx_age_s, DT_RX_SEED_MAX_AGE_S)
         except Exception:
             pass
     if bootstrap_dt_rx_ns is not None:
@@ -9270,8 +9324,14 @@ def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
 def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                  dt_rx_ns, dt_rx_sigma, n_used, known_ecef,
                  resid_rms, isb_gal_ns, isb_bds_ns, pps_match=None,
-                 gap_recovery=False):
-    """Process one servo epoch: read PPS, compute error, steer PHC."""
+                 gap_recovery=False, ppp_arm_ok=True):
+    """Process one servo epoch: read PPS, compute error, steer PHC.
+
+    ``ppp_arm_ok``: whether the FixedPos clock solution is trustworthy enough
+    to feed DOFreqEst Arm 1 (dt_rx).  Computed by the caller from PR count /
+    residual RMS / warmup; when False, Arm 1 is withheld (the Layer-2 Arm-1
+    pre-convergence gate).  Default True so the CM fast-path and other callers
+    are unaffected."""
 
     # ClockMatrix TDC fast path: read phase directly via I2C, skip EXTTS/PPS
     cm_phase = ctx.get('cm_phase_source')
@@ -9835,12 +9895,29 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
         # Used by fixedPosFilterNoiseLocate's TICC-only ablation to
         # answer: "Does FixedPosFilter actually contribute usable info
         # to chA, or is Arm 4 (TICC+qErr) doing all the work?"
-        if getattr(args, 'no_ppp_arm', False):
+        # Arm-1 gate: --no-ppp-arm (ablation) OR ppp_arm_ok=False (Layer-2
+        # pre-convergence gate — FixedPos clock not yet trustworthy).
+        _prev_arm_ok = ctx.get('_ppp_arm_ok_prev', True)
+        if getattr(args, 'no_ppp_arm', False) or not ppp_arm_ok:
             dt_rx_ns_arg = None
             dt_rx_sigma_arg = None
         else:
             dt_rx_ns_arg = dt_rx_ns
             dt_rx_sigma_arg = dt_rx_sigma
+            # Rising edge: Arm 1 was withheld last epoch (pre-convergence) and
+            # is admitted now.  Snap the EKF's rx-clock PHASE state x[0] to the
+            # freshly-trusted dt_rx (realign inflates P[0,0], clears x[0]'s
+            # cross-covariances, and leaves the rx-freq state x[1] UNCHANGED),
+            # so the first admitted innovation is ~0 and cannot spike x[1].
+            # Reuses the clkReset handoff primitive.
+            if (not _prev_arm_ok and dt_rx_ns is not None
+                    and hasattr(servo, 'realign_rx_clock')):
+                log.info("[PPP_ARM] Arm 1 admitted at epoch %d "
+                         "(FixedPos clock converged) — snapping rx-clock phase",
+                         n_epochs)
+                servo.realign_rx_clock(dt_rx_ns - float(servo.x[0]))
+        ctx['_ppp_arm_ok_prev'] = ppp_arm_ok and not getattr(
+            args, 'no_ppp_arm', False)
 
         # clkResetRealignsEkfRxState: a receiver clock reset (F9T
         # clkReset integer-ms realignment) or a post-gap re-anchor was
@@ -12732,6 +12809,27 @@ Two-phase operation:
                             "alone does NOT achieve (--no-ppp gates a "
                             "different source-mux layer).  See "
                             "fixedPosFilterNoiseLocate.")
+    servo.add_argument("--ppp-arm-min-npr", type=int, default=4,
+                       help="Minimum FixedPos PR count before DOFreqEst Arm 1 "
+                            "(dt_rx) is admitted (default 4 = the filter's "
+                            "observability floor).  Below this the pinned-"
+                            "clock solution is not over-determined, so dt_rx "
+                            "is withheld to keep a pre-convergence value from "
+                            "spiking the rx-freq state.  See "
+                            "pppArmPreconvergenceGate.")
+    servo.add_argument("--ppp-arm-max-resid-m", type=float, default=None,
+                       help="Maximum FixedPos pseudorange-residual RMS (m) "
+                            "before Arm 1 is admitted.  Default None → falls "
+                            "back to --watchdog-threshold (10 m), tying the "
+                            "Arm-1 bar to the same PR-quality scale the "
+                            "position watchdog uses.  Withholds dt_rx while "
+                            "the FixedPos clock is still converging "
+                            "(megametre residuals at startup).")
+    servo.add_argument("--ppp-arm-warmup-epochs", type=int, default=3,
+                       help="Withhold DOFreqEst Arm 1 for at least this many "
+                            "Phase-2 epochs regardless of the residual/PR "
+                            "gates (default 3), masking the first epochs "
+                            "before the FixedPos reports meaningful residuals.")
     servo.add_argument("--no-carrier", action="store_true",
                        help="Disable PPP Carrier Phase servo drive "
                             "(Carrier source disabled, PPS+PPP still available)")

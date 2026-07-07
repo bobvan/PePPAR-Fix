@@ -563,3 +563,68 @@ def test_two_clock_state_sanity_diff_resilience():
     # on the EKF state — operationally that's "recovered" vs "stuck".
     assert abs(end_x2_b) > 1e4 * abs(max(abs(end_x2_a), 1.0)), (
         f"A={abs(end_x2_a):.3e}, B={abs(end_x2_b):.3e}")
+
+
+# ── pppArmPreconvergenceGate — Layer-2 Arm-1 gate ── #
+
+def _ppp_arm_cfg(*, gate_warmup_s, garbage_ns=5e6, garbage_window_s=30.0):
+    """Arm-1 gate scenario: Arm 1 (PPP dt_rx) active, no qErr (so Arm 1 is
+    the dominant rx-freq influence — models ptBoat's 'qErr match miss'
+    windows), a decaying-garbage dt_rx during startup (the pre-convergence
+    FixedPos clock), and the engine reset budget + state-sanity recovery on
+    (engine defaults 6/300 s)."""
+    return preset(
+        "clkpoc3", duration_s=400.0,
+        use_ppp=True, use_qerr=False, use_tdcp=False, use_ticc=True,
+        state_sanity_recovery_enabled=True,
+        reset_budget_enabled=True, reset_budget_max=6,
+        reset_budget_window_s=300.0,
+        ppp_startup_garbage_window_s=garbage_window_s,
+        ppp_startup_garbage_ns=garbage_ns,
+        ppp_arm_gate_warmup_s=gate_warmup_s)
+
+
+def test_ppp_arm_gate_off_reproduces_blowup():
+    """Baseline: with the gate OFF, a pre-convergence garbage dt_rx couples
+    into the rx-freq state x[1] past the state-sanity bound, exhausts the
+    reset budget, and exit-5's — the ptBoat 2026-07-06 pathology."""
+    sim = ClosedLoopSim(_ppp_arm_cfg(gate_warmup_s=0.0))
+    res = sim.run()
+    assert len(sim.state_sanity_events) >= 1, \
+        "expected the x[1] blow-up to trip state-sanity with the gate off"
+    # The blow-up is severe enough to exhaust the 6/300 s budget → exit5.
+    assert sim.exit5_at is not None
+    assert not res.locked()
+
+
+def test_ppp_arm_gate_prevents_blowup():
+    """With the gate ON (warmup ≥ garbage window), Arm 1 is withheld through
+    the pre-convergence window, so x[1] never blows up: zero state-sanity
+    events, no exit-5, and the DO still converges (the gate is not holdover —
+    the other arms keep steering)."""
+    sim = ClosedLoopSim(_ppp_arm_cfg(gate_warmup_s=35.0))
+    res = sim.run()
+    assert sim.state_sanity_events == [], \
+        f"gate should prevent all blow-ups, got {sim.state_sanity_events}"
+    assert sim.exit5_at is None
+    assert res.locked(), "DO must still converge with Arm 1 gated at startup"
+
+
+def test_ppp_arm_gate_noop_on_clean_input():
+    """No-regression: with NO startup garbage, turning the gate on vs off
+    makes no material difference — both lock and their short-τ TDEV match.
+    The gate is a no-op once the (absent) transient window passes."""
+    off = ClosedLoopSim(preset(
+        "clkpoc3", duration_s=400.0, use_ppp=True, use_qerr=False,
+        use_ticc=True, ppp_arm_gate_warmup_s=0.0))
+    on = ClosedLoopSim(preset(
+        "clkpoc3", duration_s=400.0, use_ppp=True, use_qerr=False,
+        use_ticc=True, ppp_arm_gate_warmup_s=35.0))
+    r_off, r_on = off.run(), on.run()
+    assert r_off.locked() and r_on.locked()
+    # One-sided: the gate must not DEGRADE clean-input TDEV (it withholds a
+    # noisy arm briefly at startup, so it is neutral-to-helpful here).
+    assert r_on.tdev_1s() <= r_off.tdev_1s() * 1.2, \
+        f"gate degraded clean-input TDEV: off={r_off.tdev_1s()} on={r_on.tdev_1s()}"
+    # Steady state (post-300 s) is unaffected either way.
+    assert abs(r_on.max_excursion_ns() - r_off.max_excursion_ns()) < 2.0

@@ -42,6 +42,26 @@ class IndividualArmObservabilityTest(unittest.TestCase):
         self.assertLess(abs(after - (-100.0)), abs(before - (-100.0)),
                         "x[0] should be closer to measurement after update")
 
+    def test_preconvergence_dt_rx_blows_x1_withholding_prevents_it(self):
+        """pppArmPreconvergenceGate mechanism: a ramping (pre-convergence)
+        dt_rx fed to Arm 1 with a tiny (overconfident) sigma couples into the
+        rx-freq state x[1] past its 1e4 ppb state-sanity bound; the SAME ramp
+        with Arm 1 withheld leaves x[1] bounded.  Proves the fix's premise
+        independent of the closed-loop sim."""
+        fed = DOFreqEst(initial_dt_rx_ns=0.0)
+        for k in range(30):
+            frac = 1.0 - k / 30.0
+            fed.update(dt=1.0, dt_rx_ns=5e6 * frac, dt_rx_sigma_ns=0.1)
+        held = DOFreqEst(initial_dt_rx_ns=0.0)
+        for _ in range(30):
+            held.update(dt=1.0)  # Arm 1 withheld (dt_rx_ns=None) → predict only
+        self.assertGreater(
+            abs(float(fed.x[1])), 1e4,
+            "garbage dt_rx should blow x[1] past the 1e4 ppb bound")
+        self.assertLess(
+            abs(float(held.x[1])), 1e4,
+            "withholding Arm 1 should keep x[1] bounded")
+
     def test_qerr_freq_arm_pulls_x1_toward_measurement(self):
         servo = DOFreqEst(initial_dt_rx_ns=0.0)
         # Force x[1] to one frequency, observe the qErr arm pulling

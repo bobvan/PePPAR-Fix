@@ -268,6 +268,72 @@ def load_position_detail_from_receiver(unique_id, state_dir=None):
         return None, None, None
 
 
+# A receiver clock bias (dt_rx) is NOT persistent across a receiver reset or
+# a long engine gap — it only stays meaningful across a brief relaunch.  The
+# saved value is timestamped so consumers can reject a stale one.  Seeding the
+# DOFreqEst φ_rx state (which has a tight seed covariance) from a stale dt_rx
+# makes the first Arm-1 innovation a massive outlier that couples into the
+# rx-TCXO frequency state and drives a startup EKF blow-up (ptBoat 2026-07-06:
+# -15.9 ms seed 8 days stale vs live ~+2.6 ms → x[1] diverged to 2e5 ppb,
+# 6 state_sanity resets, near exit-5).
+DT_RX_SEED_MAX_AGE_S = 300.0
+
+
+def save_dt_rx_to_receiver(unique_id, dt_rx_ns, freq_offset_ppb=None,
+                           state_dir=None):
+    """Persist the rx-TCXO last-known dt_rx (and optional freq offset) into
+    the receiver's ``tcxo`` state block, stamped with the current UTC time.
+
+    The timestamp is what lets :func:`dt_rx_seed_if_fresh` reject a value that
+    is too old to seed the DOFreqEst rx-TCXO phase.
+    """
+    state = load_receiver_state(unique_id, state_dir)
+    if state is None:
+        log.warning("Cannot save dt_rx — no state file for receiver %s",
+                    unique_id)
+        return
+    tcxo = state.setdefault("tcxo", {})
+    if freq_offset_ppb is not None:
+        tcxo["last_known_freq_offset_ppb"] = float(freq_offset_ppb)
+    if dt_rx_ns is not None:
+        # Only bump the freshness timestamp when a real dt_rx is written —
+        # otherwise a freq-only save would mark a stale dt_rx as fresh and
+        # defeat dt_rx_seed_if_fresh().
+        tcxo["last_known_dt_rx_ns"] = float(dt_rx_ns)
+        tcxo["updated"] = datetime.now(  # wallclock-ok: dt_rx freshness stamp (state record)
+            timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    save_receiver_state(state, state_dir)
+
+
+def dt_rx_seed_if_fresh(state, max_age_s=DT_RX_SEED_MAX_AGE_S, now=None):
+    """Return ``(dt_rx_ns, age_s)`` from ``tcxo.last_known_dt_rx_ns`` iff it
+    was saved within ``max_age_s``; otherwise ``(None, age_s_or_None)``.
+
+    ``age_s`` is returned even on rejection so the caller can log why.  A
+    missing value, a missing/unparseable timestamp, a negative age (clock
+    stepped backward), or an age beyond ``max_age_s`` all reject the seed.
+    See :data:`DT_RX_SEED_MAX_AGE_S` for the rationale.
+    """
+    tcxo = (state or {}).get("tcxo", {}) or {}
+    dt_rx = tcxo.get("last_known_dt_rx_ns")
+    if dt_rx is None:
+        return None, None
+    updated = tcxo.get("updated")
+    if not updated:
+        return None, None
+    try:
+        saved = datetime.strptime(
+            updated, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None, None
+    if now is None:
+        now = datetime.now(timezone.utc)  # wallclock-ok: coarse seed-staleness age vs state record (injectable via now=)
+    age_s = (now - saved).total_seconds()
+    if age_s < 0 or age_s > max_age_s:
+        return None, age_s
+    return float(dt_rx), age_s
+
+
 def receiver_has_position(unique_id, state_dir=None):
     """Check whether a receiver has a stored position.
 
