@@ -288,6 +288,25 @@ class SimConfig:
     sigma_tcxo_freq_ppb: float = 0.1
     max_step_ppb: Optional[float] = None
 
+    # midTauServoKnobs (I-084500) DOFreqEst passthrough — default off
+    # (None → pre-existing behavior).  do_freq_clamp_ppb bounds x[3] to
+    # ±clamp of its bootstrap nominal (a DO-freq pull-range seatbelt).
+    # See docs/mid-tau-servo-knobs.md.
+    do_freq_clamp_ppb: Optional[float] = None
+    # One-shot dt_rx (Arm-1 PPP) glitch injection = (t_s, delta_ns): at the
+    # first correction epoch with t ≥ t_s, add delta_ns to the emitted
+    # dt_rx_ns.  Reproduces delta's -12 ns dt_rx step that ramped x[3] to
+    # the actuator rail.  None → no injection.
+    dt_rx_glitch: Optional[tuple] = None
+    # DO-phase observation bias RAMP = (t_start_s, ns_per_s): from t_start,
+    # add a linearly-growing bias to the DO-phase arms (EXTINT + TICC).
+    # Models an rx-coupled PPS drift (e.g. a Mosaic RxClkBias ramp that the
+    # GPS-locked-PPS model does NOT carry) reaching the DO-phase observation
+    # the servo steers on — the coupling path by which delta's runaway
+    # could actually rail the DO (a dt_rx/PPP glitch cannot, see notes).
+    # None → no bias.
+    do_obs_bias_ramp: Optional[tuple] = None
+
     # OCXO-trusted gate.  None → no gate (chi² gate inside DOFreqEst
     # still runs).  Otherwise (sigma_short_tau_ns, k_sigma, min_age_s).
     # disciplineModeFsm #95: sole-observer override for the OCXO gate.
@@ -419,7 +438,8 @@ class ClosedLoopSim:
             max_step_ppb=cfg.max_step_ppb,
             ocxo_trusted_gate=gate,
             routed_qerr=cfg.routed_qerr_enabled,
-            soft_ticc_gate=cfg.soft_ticc_gate)
+            soft_ticc_gate=cfg.soft_ticc_gate,
+            do_freq_clamp_ppb=cfg.do_freq_clamp_ppb)
         self.adjfine = cfg.initial_freq_ppb
         # Binary layer for the gross-fault A/B (#107 consumption).
         self.binary_layer = BinaryLayer(
@@ -573,6 +593,9 @@ class ClosedLoopSim:
         # value when the loop crosses force_state_corruption_at_s.
         # One-shot via this flag so we don't re-poke each epoch.
         _corruption_pending = (c.force_state_corruption_at_s is not None)
+        # midTauServoKnobs: one-shot dt_rx glitch, applied to the emitted
+        # dt_rx_ns at the first correction with t ≥ t_glitch.
+        _dt_rx_glitch_pending = (c.dt_rx_glitch is not None)
         for k in range(n):
             # State-corruption injection (test hook).  Fires once when
             # t crosses force_state_corruption_at_s; pairs naturally
@@ -627,6 +650,24 @@ class ClosedLoopSim:
                     # dt handed to the filter is the gap since the last
                     # correction; predict grows P over the coast.
                     meas["dt"] = gap_s
+                    # One-shot dt_rx glitch injection (midTauServoKnobs).
+                    if (_dt_rx_glitch_pending
+                            and t_now >= float(c.dt_rx_glitch[0])
+                            and "dt_rx_ns" in meas):
+                        meas["dt_rx_ns"] += float(c.dt_rx_glitch[1])
+                        _dt_rx_glitch_pending = False
+                    # DO-phase observation bias ramp (midTauServoKnobs): an
+                    # rx-coupled PPS drift reaching the DO-phase arms.  Enters
+                    # via EXTINT/TICC (what the servo steers on), NOT the PPP
+                    # arm — the path that CAN rail the DO.
+                    if c.do_obs_bias_ramp is not None:
+                        _t0, _rate = c.do_obs_bias_ramp
+                        if t_now >= float(_t0):
+                            _bias = float(_rate) * (t_now - float(_t0))
+                            if "extint_phase_ns" in meas:
+                                meas["extint_phase_ns"] += _bias
+                            if "ticc_diff_ns" in meas:
+                                meas["ticc_diff_ns"] -= _bias
                     self.adjfine = -self.ekf.update(**meas)
                 last_correction_k = k
                 if self.ekf.last_arm_innov.get("ticc") is not None:
