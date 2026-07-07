@@ -656,6 +656,43 @@ DEFAULT_ANTPOS_SUSTAIN_S = 60.0
 # must intervene; the bark continues showing in [CONFIDENCE] logs).
 DEFAULT_AUTO_MOVE_THRESHOLD_S = 3600.0
 
+# bootstrapMoveDetection (I-171600, docs/bootstrap-move-detection.md): the
+# gross-move threshold used at BOOTSTRAP to reject a stale saved position when
+# the host has been shut down and woken on a different antenna.  100 m is well
+# above NAV2's ~1.5-4 m receiver bias and any same-site antenna swap (which the
+# FixedPos absorbs and which we do NOT want to reject), and far below the
+# smallest cross-site move.  Same scale as the runtime WatchdogActor / the
+# pre-existing untrusted-seed LS validation.  Distinct from the runtime
+# DEFAULT_NAV2_THRESHOLD_M (10 m, graceful, sustained): this one is the
+# immediate cold-start HARD reject.
+MOVE_THRESHOLD_M = 100.0
+
+
+def detect_move(seed_ecef, live_ecef, threshold_m: float = MOVE_THRESHOLD_M):
+    """Has the antenna MOVED relative to a saved seed position?
+
+    Pure geometry: the 3D ECEF distance (metres) between the loaded seed and an
+    independent live fix (NAV2 opinion, or an LS fix).  Returns
+    ``(moved: bool, displ_m: float)``.  ``moved`` is True iff
+    ``displ_m > threshold_m``.  Answers "has it moved?", which is separate from
+    "is the seed precise?" — the caller must run this regardless of the seed's
+    claimed sigma (a stale-but-confident position is exactly the failure mode
+    this guards, e.g. ptBoat's Chicago .ppp.toml after moving to London).
+
+    Returns ``(False, None)`` if either position is missing/malformed, so a
+    missing live fix fails SAFE (no rejection of a good seed).
+    """
+    if seed_ecef is None or live_ecef is None:
+        return False, None
+    import numpy as np
+    try:
+        s = np.asarray(seed_ecef, dtype=float).reshape(3)
+        v = np.asarray(live_ecef, dtype=float).reshape(3)
+    except (TypeError, ValueError):
+        return False, None
+    displ_m = float(np.linalg.norm(s - v))
+    return displ_m > float(threshold_m), displ_m
+
 
 class WatchdogActor:
     """Decides slew / step / no-action from per-cycle watchdog state.

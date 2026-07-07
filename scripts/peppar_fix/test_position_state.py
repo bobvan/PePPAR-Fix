@@ -4,15 +4,19 @@ import os
 import tempfile
 import unittest
 
+import numpy as np
+
 from peppar_fix.geo_frames import CANONICAL_REALIZATION, Frame
 from peppar_fix.position_state import (
     AntPosEstWatchdog,
+    MOVE_THRESHOLD_M,
     PositionState,
     PppStateWriter,
     WatchdogActor,
     _format_toml,
     bump_mount_sn,
     compute_horizontal_displacement,
+    detect_move,
     decimal_year_from_iso,
     decimal_year_from_mjd,
     filter_current_mount,
@@ -1398,3 +1402,62 @@ class TestFrameThreading(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDetectMove(unittest.TestCase):
+    """bootstrapMoveDetection (I-171600): the gross-move gate must fire on a
+    cross-site move (ptBoat Chicago→London) and NOT on NAV2 bias / same-site
+    antenna swaps, and must fail safe on missing inputs."""
+
+    # Real ECEF: Chicago/Wheaton (ptBoat's stale .ppp.toml) and London
+    # (ufoLondon1, where it actually woke) — the exact 2026-07-06 case.
+    CHICAGO = np.array([157467.6958, -4756188.1762, 4232766.7829])
+    LONDON = np.array([3979316.0, -4257.0, 4966864.0])
+
+    def test_threshold_default(self):
+        self.assertEqual(MOVE_THRESHOLD_M, 100.0)
+
+    def test_same_position_not_moved(self):
+        moved, displ = detect_move(self.CHICAGO, self.CHICAGO)
+        self.assertFalse(moved)
+        self.assertAlmostEqual(displ, 0.0)
+
+    def test_nav2_bias_not_a_move(self):
+        # ~4 m offset (upper end of NAV2's receiver bias) must NOT trip.
+        moved, displ = detect_move(
+            self.CHICAGO, self.CHICAGO + np.array([3.0, 2.0, 1.5]))
+        self.assertFalse(moved)
+        self.assertLess(displ, MOVE_THRESHOLD_M)
+
+    def test_same_site_swap_not_a_move(self):
+        # 50 cm to a different mast on the same roof — the FixedPos absorbs it;
+        # not a move we reject.
+        moved, _ = detect_move(self.CHICAGO, self.CHICAGO + np.array([0.5, 0, 0]))
+        self.assertFalse(moved)
+
+    def test_cross_site_move_detected(self):
+        moved, displ = detect_move(self.CHICAGO, self.LONDON)
+        self.assertTrue(moved)
+        self.assertGreater(displ, 6_000_000)  # ~6142 km
+
+    def test_boundary(self):
+        # Just under vs just over the threshold.
+        near = self.CHICAGO + np.array([MOVE_THRESHOLD_M - 1.0, 0, 0])
+        far = self.CHICAGO + np.array([MOVE_THRESHOLD_M + 1.0, 0, 0])
+        self.assertFalse(detect_move(self.CHICAGO, near)[0])
+        self.assertTrue(detect_move(self.CHICAGO, far)[0])
+
+    def test_custom_threshold(self):
+        d = self.CHICAGO + np.array([50.0, 0, 0])
+        self.assertFalse(detect_move(self.CHICAGO, d, threshold_m=100.0)[0])
+        self.assertTrue(detect_move(self.CHICAGO, d, threshold_m=25.0)[0])
+
+    def test_missing_inputs_fail_safe(self):
+        # No live fix (or no seed) → never reject a good seed.
+        self.assertEqual(detect_move(self.CHICAGO, None), (False, None))
+        self.assertEqual(detect_move(None, self.LONDON), (False, None))
+
+    def test_accepts_list_and_tuple(self):
+        moved, displ = detect_move(list(self.CHICAGO), tuple(self.LONDON))
+        self.assertTrue(moved)
+        self.assertGreater(displ, 6_000_000)
