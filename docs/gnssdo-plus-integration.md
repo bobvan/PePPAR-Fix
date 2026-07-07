@@ -593,33 +593,50 @@ The hardware can't free-run AND discipline at once, so:
    honest disciplined-output grade (chA detrended TDEV,
    `plot_chA_tdev_goldilocks.py`) — the real "grade vs TICC".
 
-### Free-run char result — chA is PPS-OUT-limited (2026-07-06)
+### Free-run char — OCXO-class, once the cycle-slips are removed (2026-07-06)
 
 The 10 h free-run capture (`gnssdo_freerun_hold.py` + TICC chA) had a 35-min
-TICC gap; on the clean 4.6 h window (18:52–23:29 UTC): `freq_offset +0.93 ppb`,
-**TDEV(1s) = 0.64 ns**, **ADEV(1s) = 1.1e-9** (white-FM, rising TDEV to
-11.7 ns @ 1000 s). Derived would-be Q: `sigma_do_phase 1.34 ns /
-sigma_do_freq 0.0017 ppb`.
+TICC gap; analysed on the clean 4.6 h window (18:52–23:29 UTC).
 
-**Verdict: LOOSER than the OCXO class default (0.1 ns / 0.001 ppb) → NOT
-written; class-default Q kept** (the loop already ran well on it).
-`ADEV(1s)=1.1e-9` is TCXO-class, ~100× worse than the STP3593LF's intrinsic
-~1e-11, because **TICC chA measures the Mosaic-T PPS OUT** — its ~ns
-PPS-generation jitter dominates the OCXO's clean 10 MHz. The EKF observes the
-DO via carrier-phase `dt_rx` (ps-class), so this PPS-OUT char over-estimates
-the DO process noise. Consequence for the grade below: the disciplined chA
-TDEV is **PPS-OUT-floored (~0.64 ns @ τ=1 s)**; the discipline benefit shows at
-**long τ** (disciplined chA stays low vs free-run rising to 11.7 ns). To
-characterize the DO as the EKF sees it, measure the OCXO 10 MHz directly, or run
-the engine `--freerun` (carrier-phase `dt_rx`) with the OCXO word held.
-Sidecar: `~/gt/firmware/gnssdo-plus/gnssdo-freerun-char-20260706.md`.
+**First pass was WRONG** — reported `TDEV(1s)=0.64 ns`, ADEV(1s)=1.1e-9
+"TCXO-class, PPS-OUT-limited" and kept class-default Q. Bob was skeptical
+(the TICC is a confirmed 60 ps single-shot). The cause: the free-run had **2×
+−100 ns PPS cycle-slips** (the Mosaic places the PPS one 10 MHz cycle early,
+~1 per 2 h). TDEV is second-difference-based, so two 100 ns steps inflated it
+~14×, and the linear detrend smeared the steps into a fake 29.5 ns "wander"
+(fake white-FM).
 
-### Disciplined grade + long compare — RUNNING (2026-07-06 ~18:58 CDT)
+**De-glitched (snap the cycle-slip steps to −100 000 ps), the truth:**
+`residual std 29.5→2.47 ns`, `TDEV(1s)=45 ps` (right at the TICC floor — the
+PPS OUT *is* clean), `ADEV(1s)=7.8e-11`, **ADEV floor ~1.2e-12 @ 256 s** —
+genuine **OCXO-class**, exactly what a double-oven OCXO should be. Canonical Q
+(`analyze_samples` on de-glitched samples):
 
-Launched on MadHat (`--duration 36000`, class-default Q): engine disciplining
-with `--gnssdo-compare-log data/gnssdo-compare-long.csv` (stream
-`MeasEpoch+PVTGeodetic`) + `ticc_capture --prefix gnssdo-disc-ticc` (chA).
-Supervised start: dt_rx converged to sub-0.15 ns, freq ~+0.02 ppb, **zero
-resets**. Morning: `analyze_gnssdo_compare.py` (long-τ difference-TDEV) +
-`plot_chA_tdev_goldilocks.py` (disciplined chA grade, PPS-OUT-floored short-τ,
-discipline benefit at long τ).
+```
+[freerun_noise]  source="measured"  channel="DO PPS (chA vs TICC Rb)"
+sigma_do_phase_ns = 0.0726   (class-default 0.1 / clkPoC3 0.0425)
+sigma_do_freq_ppb = 0.000084 (class-default 0.001 / clkPoC3 0.000382 — 12× better)
+coast_tdev_ref_ns = 0.045   coast_tdev_slope = 0.82
+```
+
+**Beats the class default → WRITTEN** to `state/dos/gnssdo-sxtd-madhat.toml`
+(engine loads it, provenance=measured). The disciplined chA grade is therefore
+NOT floored at 0.64 ns — the PPS OUT is ~45 ps clean between cycle-slips.
+
+**Tooling gap:** `peppar_fix.freerun_analysis.analyze_samples` (and
+`plot_chA_tdev_goldilocks`) do NOT reject PPS cycle-slips — the naive run
+inflated everything. Add cycle-slip de-glitching (snap `|Δphase|` steps to
+integer 100 ns / one 10 MHz cycle) before ADEV/TDEV. Sidecar:
+`~/gt/firmware/gnssdo-plus/gnssdo-freerun-char-20260706.md`.
+
+### Disciplined grade run — clock was excellent, position watchdog cut it short
+
+Launched 2026-07-06 ~18:58 CDT (`--duration 36000`). The **clock discipline was
+excellent** — dt_rx held sub-0.15 ns, `clk=-0.1 ns ±0.12 ns`, **zero servo
+resets** — but it ran only **95 min**: at 20:32 the *position* filter tripped
+`[WATCHDOG_STEP_AUTO_MOVE] displ=5.704 m … exit code 5` (AntPosEst position
+drift, not the servo), which killed the whole engine. The default mode runs
+Phase-1 bootstrap + AntPosEst; a **clock-only grade should use `--no-antposest`
+with a pinned ARP** so the position filter can't trip. (The 05:21 wrap-up cron
+also didn't fire — session was summarized overnight.) TODO: re-run with
+`--no-antposest` + the measured Q for the full long-τ grade + compare.
