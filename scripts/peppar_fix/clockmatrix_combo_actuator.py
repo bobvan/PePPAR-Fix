@@ -16,15 +16,20 @@ This is the no-wire, no-TICC discipline path validated on otcBob1 DPLL3
     replacement) stays live.  Steer AND measure on the same channel, no
     external wire.  This is what lets one DPLL be a full software servo.
 
-The recipe (DPLL3 / OTC addresses, validated):
+The recipe (DPLL3, validated OTC + OTC Mini):
   1. Leave the DPLL in **PLL/auto** (``MODE`` pll_mode bits = 0) — keeps
      ``PHASE_STATUS`` live.
-  2. **Loop BW → ~0** (``BW`` = 1 µHz, ``[0x01, 0x00]``) so the hardware
+  2. **Pin the phase reference to CLK2** (``REF_MODE`` = manual, ``REF_P0`` =
+     ``pps_clk``) so ``PHASE_STATUS`` measures DO-vs-F9T-PPS.  No-op on the OTC
+     (DPLL3's ref is already CLK2), **load-bearing on the OTC Mini**: there the
+     default ``REF_P0`` = CLK5 (dead), so without this the servo's on-chip
+     observer reads a static zero and the loop is blind (ptBoat 2026-07-07).
+  3. **Loop BW → ~0** (``BW`` = 1 µHz, ``[0x01, 0x00]``) so the hardware
      loop filter injects nothing (no GNSS-derived steering leaks in).
-  3. **Subscribe to the SW-combo source**: ``COMBO_SLAVE_CFG_0`` = 0x28
+  4. **Subscribe to the SW-combo source**: ``COMBO_SLAVE_CFG_0`` = 0x28
      (``PRI_COMBO_SRC_EN=1, PRI_COMBO_SRC_ID=8``; SRC_ID 8 is the software
      combo value — 0..7 are real DPLLs).
-  4. **Steer** by writing ``COMBO_SW_VALUE_CNFG`` (signed **48-bit** FFO ×
+  5. **Steer** by writing ``COMBO_SW_VALUE_CNFG`` (signed **48-bit** FFO ×
      2⁻⁵³, i.e. ``val = round(ppb/1e9 × 2⁵³)``) — added to the DCO via the
      combo bus.
 
@@ -58,10 +63,18 @@ from peppar_fix.clockmatrix import ClockMatrixI2C
 
 log = logging.getLogger(__name__)
 
-# DPLL module bases (MODE = base+0x37, COMBO_SLAVE_CFG_0 = base+0x32)
+# DPLL module bases (MODE = base+0x37, COMBO_SLAVE_CFG_0 = base+0x32,
+# REF_MODE = base+0x35, REF_P0 = base+0x0F — same layout the phase source uses)
 _DPLL_BASES = {0: 0xC3B0, 1: 0xC400, 2: 0xC438, 3: 0xC480}
 _DPLL_MODE_OFFSET = 0x37
 _DPLL_COMBO_SLAVE0_OFFSET = 0x32
+_DPLL_REF_MODE_OFFSET = 0x35
+_DPLL_REF_P0_OFFSET = 0x0F
+
+# REF_MODE = 0x01 selects manual reference (priority slot 0 = REF_P0), so the
+# DPLL's PFD measures against a chosen CLK input regardless of the auto-select
+# priority table.  Matches ClockMatrixPhaseSource.setup().
+_REF_MODE_MANUAL = 0x01
 
 # DPLL_CTRL module bases (BW = base+0x04, COMBO_SW_VALUE_CNFG = base+0x28)
 _DPLL_CTRL_BASES = {0: 0xC600, 1: 0xC63C, 2: 0xC680, 3: 0xC6BC}
@@ -132,10 +145,15 @@ class ClockMatrixComboActuator(FrequencyActuator):
             supplies a measured value and refuses the default.
         max_ppb: steering envelope (realized ppb).  Default 1000.0 (runaway
             guard); the servo's own output clamp is the real limiter.
+        pps_clk: CLK input carrying the F9T PPS reference (default 2 = CLK2).
+            ``setup()`` pins the DPLL's phase reference to it so PHASE_STATUS is
+            the DO-vs-F9T error.  No-op on the OTC (ref already CLK2), required
+            on the OTC Mini (default ref = CLK5, dead).
     """
 
     def __init__(self, i2c: ClockMatrixI2C, dpll_id: int = 3,
-                 combo_gain: float = 1.0, max_ppb: float | None = None):
+                 combo_gain: float = 1.0, max_ppb: float | None = None,
+                 pps_clk: int = 2):
         if combo_gain == 0:
             raise ValueError("combo_gain must be non-zero")
         self._i2c = i2c
@@ -143,11 +161,14 @@ class ClockMatrixComboActuator(FrequencyActuator):
         self._combo_gain = float(combo_gain)
         self._max_ppb = (_DEFAULT_MAX_ADJ_PPB if max_ppb is None
                          else float(max_ppb))
+        self._pps_clk = int(pps_clk)
 
         dpll_base = _DPLL_BASES[dpll_id]
         ctrl_base = _DPLL_CTRL_BASES[dpll_id]
         self._mode_reg = dpll_base + _DPLL_MODE_OFFSET
         self._slave0_reg = dpll_base + _DPLL_COMBO_SLAVE0_OFFSET
+        self._ref_mode_reg = dpll_base + _DPLL_REF_MODE_OFFSET
+        self._ref_p0_reg = dpll_base + _DPLL_REF_P0_OFFSET
         self._bw_reg = ctrl_base + _DPLL_CTRL_BW_OFFSET
         self._combo_reg = ctrl_base + _DPLL_CTRL_COMBO_SW_OFFSET
 
@@ -156,6 +177,8 @@ class ClockMatrixComboActuator(FrequencyActuator):
         self._orig_bw: list | None = None
         self._orig_slave0: int | None = None
         self._orig_combo: bytes | None = None
+        self._orig_ref_mode: int | None = None
+        self._orig_ref_p0: int | None = None
         self._current_ppb = 0.0
 
     def setup(self) -> None:
@@ -181,10 +204,26 @@ class ClockMatrixComboActuator(FrequencyActuator):
         self._orig_bw = self._i2c.read(self._bw_reg, 2)
         self._orig_slave0 = self._i2c.read(self._slave0_reg, 1)[0]
         self._orig_combo = self._i2c.read(self._combo_reg, _COMBO_BYTES)
+        self._orig_ref_mode = self._i2c.read(self._ref_mode_reg, 1)[0]
+        self._orig_ref_p0 = self._i2c.read(self._ref_p0_reg, 1)[0]
         log.info("ClockMatrix combo DPLL_%d: orig BW=%s SLAVE0=0x%02X "
-                 "(SRC_ID=%d) — saved for hand-back",
+                 "(SRC_ID=%d) REF_MODE=0x%02X REF_P0=CLK%d — saved for hand-back",
                  self._dpll_id, list(self._orig_bw), self._orig_slave0,
-                 self._orig_slave0 & 0x0F)
+                 self._orig_slave0 & 0x0F, self._orig_ref_mode,
+                 self._orig_ref_p0)
+
+        # Pin the phase reference to the F9T PPS (CLK<pps_clk>, manual) so
+        # PHASE_STATUS is the live DO-vs-F9T error.  No-op on the OTC (already
+        # CLK2); load-bearing on the OTC Mini, whose default REF_P0=CLK5 is dead
+        # (the on-chip observer would otherwise read a static zero — the servo
+        # blind, ptBoat 2026-07-07).
+        if (self._orig_ref_p0 != self._pps_clk
+                or self._orig_ref_mode != _REF_MODE_MANUAL):
+            self._i2c.write(self._ref_p0_reg, [self._pps_clk])
+            self._i2c.write(self._ref_mode_reg, [_REF_MODE_MANUAL])
+            log.info("ClockMatrix combo DPLL_%d: pinned phase ref REF_P0=CLK%d "
+                     "REF_MODE=manual (PHASE_STATUS = DO-vs-F9T-PPS)",
+                     self._dpll_id, self._pps_clk)
 
         self._i2c.write(self._bw_reg, _BW_ZERO)
         self._i2c.write(self._slave0_reg, [_COMBO_SLAVE_SW_SOURCE])
@@ -210,10 +249,16 @@ class ClockMatrixComboActuator(FrequencyActuator):
             self._i2c.write(self._slave0_reg, [self._orig_slave0])
         if self._orig_bw is not None:
             self._i2c.write(self._bw_reg, list(self._orig_bw))
+        # Restore the phase-reference selection (REF_P0 + REF_MODE) so the
+        # hardware DPLL re-locks the way it did before we pinned CLK<pps_clk>.
+        if self._orig_ref_p0 is not None:
+            self._i2c.write(self._ref_p0_reg, [self._orig_ref_p0])
+        if self._orig_ref_mode is not None:
+            self._i2c.write(self._ref_mode_reg, [self._orig_ref_mode])
         if self._orig_mode is not None:
             self._i2c.write(self._mode_reg, [self._orig_mode & ~_PLL_MODE_MASK])
-        log.info("ClockMatrix combo DPLL_%d: restored (PLL/auto) — DO back on "
-                 "hardware DPLL", self._dpll_id)
+        log.info("ClockMatrix combo DPLL_%d: restored (PLL/auto, ref) — DO back "
+                 "on hardware DPLL", self._dpll_id)
         self._current_ppb = 0.0
 
     def adjust_frequency_ppb(self, ppb: float) -> float:
