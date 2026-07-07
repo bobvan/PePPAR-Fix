@@ -179,6 +179,20 @@ class ComboActuatorRefPinTest(unittest.TestCase):
         self.assertNotIn(_REF_P0, written)
         self.assertNotIn(_REF_MODE, written)
 
+    def test_ref_pin_flips_auto_to_manual_keeping_clk2(self):
+        # OTC-CLK2-AUTO (per main's #299 review): if REF_P0 is already CLK2 but
+        # REF_MODE is AUTO(0x00), setup() DOES write — flipping auto→manual
+        # while leaving REF_P0=CLK2 (physical ref unchanged, benign) — and
+        # teardown restores AUTO.
+        i2c = _FakeI2C(_timebeat_initial(ref_p0=2, ref_mode=0x00))
+        act = ClockMatrixComboActuator(i2c, dpll_id=3)
+        act.setup()
+        self.assertEqual(i2c.read(_REF_P0, 1)[0], 2, "REF_P0 stays CLK2")
+        self.assertEqual(i2c.read(_REF_MODE, 1)[0], 0x01, "REF_MODE auto→manual")
+        act.teardown()
+        self.assertEqual(i2c.read(_REF_MODE, 1)[0], 0x00, "REF_MODE restored auto")
+        self.assertEqual(i2c.read(_REF_P0, 1)[0], 2, "REF_P0 still CLK2")
+
     def test_teardown_restores_original_ref(self):
         # Mini: setup pins CLK2, teardown must hand REF_P0/REF_MODE back exactly.
         i2c = _FakeI2C(_timebeat_initial(ref_p0=5, ref_mode=0x00))
