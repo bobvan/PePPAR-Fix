@@ -55,6 +55,7 @@ KEYS = (
     "gnssdo_watchdog_s",
     "lqr_phase_gain",
     "innov_gate_nsigma",
+    "do_freq_clamp_ppb",
     "tadd_gpio",
     "tadd_hold_s",
     "ticc_port",

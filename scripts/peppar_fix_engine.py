@@ -8432,6 +8432,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
         soft_ticc_gate=getattr(args, 'soft_ticc_gate', False),
         lqr_phase_gain=(getattr(args, 'lqr_phase_gain', None) or -0.05),
         innov_gate_nsigma=getattr(args, 'innov_gate_nsigma', None),
+        do_freq_clamp_ppb=getattr(args, 'do_freq_clamp_ppb', None),
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
              "sigma_do=[%.4f ns, %.4f ppb], "
@@ -11921,6 +11922,7 @@ def _apply_host_config(args):
         "gnssdo_watchdog_s": ("gnssdo_watchdog_s", int),
         "lqr_phase_gain":   ("lqr_phase_gain",   float),
         "innov_gate_nsigma": ("innov_gate_nsigma", float),
+        "do_freq_clamp_ppb": ("do_freq_clamp_ppb", float),
         "tadd_gpio":        ("tadd_gpio",        int),
         "tadd_hold_s":      ("tadd_hold_s",      float),
         "ticc_port":        ("ticc_port",        str),
@@ -13280,6 +13282,15 @@ Two-phase operation:
                             "large innovation during acquisition passes.  "
                             "Default off; try ~5 on the dt_rx/GNSSDO+ path — "
                             "docs/gnssdo-servo-loop-bandwidth.md.")
+    servo.add_argument("--do-freq-clamp-ppb", type=float, default=None,
+                       metavar="PPB",
+                       help="Seatbelt (from #300, bravo): clamp the DOFreqEst "
+                            "DO-freq estimate x[3] to ±PPB of its bootstrap "
+                            "nominal — a DO has a bounded physical pull range.  "
+                            "Peer to --max-step-ppb; bounds a freq-state windup "
+                            "INSIDE the gross ±1e6 sanity bound so a runaway "
+                            "cannot walk the actuator to the hard rail.  Default "
+                            "off — docs/mid-tau-servo-knobs.md.")
     servo.add_argument("--gnssdo-compare-log", default=None, metavar="CSV",
                        help="Log our carrier-phase steering (dt_rx, control "
                             "word, freq) vs the mosaic-T's own PVTGeodetic "

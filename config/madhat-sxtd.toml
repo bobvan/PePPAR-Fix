@@ -58,6 +58,12 @@ gnssdo_ppb_per_controlword = 7.885e-4   # measured 2026-07-06 (sign POSITIVE)
 # acquisition still pass).  See docs/gnssdo-servo-loop-bandwidth.md §"real knobs".
 innov_gate_nsigma = 5.0
 
+# do_freq_clamp seatbelt (from #300, bravo): bound x[3] to ±30 ppb of nominal.
+# Belt-and-suspenders below the gate: allows the ~-6 ppb acquisition transient
+# and the ±7 ppb limit-cycle swing, but caps a true runaway far below the
+# actuator's +386 ppb hard rail.  See docs/mid-tau-servo-knobs.md.
+do_freq_clamp_ppb = 30.0
+
 # ── Measurement / grading ───────────────────────────────────────────
 # chA = SXT-D PPS OUT (the disciplined DO), chB = reference PPS.
 # Grade with tools/plot_chA_tdev_goldilocks.py (chA detrended TDEV).
