@@ -93,6 +93,7 @@ def sbf_obs_reader(messages, obs_queue, stop_event, sig_lookup, *,
     now_fn = now_fn or (lambda: datetime.now(timezone.utc))  # wallclock-todo: GPS week from system clock; should derive from ephemeris
     mono_fn = mono_fn or _time.monotonic
     n_epochs = 0
+    _prev_ccj = None   # last MeasEpoch CumClkJumps count (mosaic clock-jump monitor)
     for _raw, parsed in messages:
         if stop_event is not None and stop_event.is_set():
             break
@@ -105,6 +106,22 @@ def sbf_obs_reader(messages, obs_queue, stop_event, sig_lookup, *,
             continue
         if _ident != "MeasEpoch":
             continue
+        # CumClkJumps monitor (I-054229): the mosaic is free-running, so an
+        # increment in the cumulative clock-jump count means the receiver
+        # applied a ~1 ms clock STEP that lands in the carrier phase / dt_rx.
+        # Surface it — rare when the DO is locked (bias stays << 0.5 ms),
+        # common-mode and removable, and NOT a DO event — so it isn't misread
+        # downstream as a silent phase glitch.  (Auto-realign wiring to the
+        # servo is the remaining half of the bead.)
+        _ccj = getattr(parsed, "CumClkJumps", None)
+        if _ccj is not None:
+            if _prev_ccj is not None and _ccj != _prev_ccj:
+                log.warning("SBF mosaic clock JUMP: CumClkJumps %d→%d "
+                            "(%d-step ~1 ms discontinuity in the carrier phase "
+                            "at TOW=%s) — rare when locked, common-mode, not a "
+                            "DO event", _prev_ccj, _ccj, abs(_ccj - _prev_ccj),
+                            getattr(parsed, "TOW", "?"))
+            _prev_ccj = _ccj
         raw_obs = meas_epoch_to_raw_obs(parsed, sig_lookup)
         obs, _r, _no, _ns = raw_obs_to_if_observations(raw_obs, systems, ssr)
         if obs:
