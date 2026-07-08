@@ -290,3 +290,38 @@ would be fixing a disproven mechanism.
    a servo fix.
 3. Enable `do_freq_clamp_ppb` (set to the SXT-D's measured pull range) as
    a seatbelt against catastrophic rail-to-word-limit while investigating.
+
+### Actuator settling-noise term — the short-τ penalty (charlieActuatorNoise)
+
+charlie's OTC hardware Q sweep confirmed #300's mid-τ win but exposed a
+short-τ COST of looser Q the excursion metric had folded away: a TDEV bump
+that **peaks at τ≈4 s and grows with looser Q** (loose Q=0.03: TDEV rises
+1s=0.46 → 4s=1.02 then falls; tight Q=1.4e-4 stays flat-low). The sim's clean
+frequency actuator never reproduced it — a frequency-steering servo can only
+inject noise that integrates to phase over τ, so it shows at *long* τ, never
+at 1–4 s.
+
+`actuator_noise_gain` / `actuator_noise_tau_s` model the missing mechanism: a
+**bounded AR(1) PHASE transient** (DAC-write + DPLL settling/ringing) kicked
+by each adjustment, kick std = `gain·|Δapplied|`, correlation time `tau_s`.
+Phase (not frequency) because charlie's TDEV *rises then falls* — the
+signature of a bounded/stationary phase process; the peak sits at τ≈`tau_s`.
+Because the kick scales with the per-epoch adjustment magnitude, looser Q
+(bigger adjustments) grows the bump — reproducing the Q-dependence. Default
+`gain=0` → byte-identical.
+
+Status: the term reproduces the qualitative signature (bump at τ≈`tau_s`,
+grows with adjustment magnitude / Q, absent at tight Q). Precise magnitude +
+the scaling law (linear vs superlinear in `|Δapplied|`) need charlie's
+5-point TDEV-vs-Q calibration — 2 endpoints can't pin it, and the sim's
+loose/tight adjustment ratio (~7×) is smaller than charlie's actuator-
+contribution ratio (~20×), which itself is a clue the scaling may be
+superlinear.
+
+**Early two-timescale finding (needs the calibration to confirm):** the naive
+"loose estimator + `max_step_ppb` slew" does **not** work — a slew tight
+enough to quiet the short-τ bump (it caps `|Δapplied|`) also caps the loop's
+tracking and **winds up / diverges** at long τ. The real fix is a *low-pass*
+on the actuation (smooth the per-epoch command jitter without capping the mean
+rate) + anti-windup, not a hard rate limit. Testable in sim once the term is
+calibrated.
