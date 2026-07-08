@@ -7,7 +7,7 @@ name = "peppar-fix"
 version = "0.1.0"
 description = "GNSS-disciplined precision clock using carrier-phase PPP"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "BSD-3-Clause"}
 requires-python = ">=3.11"
 authors = [
     {name = "Bob Van Valzah"},

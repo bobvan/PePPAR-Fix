@@ -216,4 +216,4 @@ lab. Interfaces change, targets are aspirational, and results are reported hones
 including the gap between where we are and the moonshot. It is **not** a product and
 carries no fitness or stability guarantees.
 
-MIT-licensed. © Bob Van Valzah.
+BSD 3-Clause licensed — see [LICENSE](LICENSE). © Bob Van Valzah.
