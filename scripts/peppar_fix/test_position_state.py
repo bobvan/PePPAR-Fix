@@ -9,6 +9,7 @@ import numpy as np
 from peppar_fix.geo_frames import CANONICAL_REALIZATION, Frame
 from peppar_fix.position_state import (
     AntPosEstWatchdog,
+    MOVE_CONFIRM_FIXES,
     MOVE_THRESHOLD_M,
     PositionState,
     PppStateWriter,
@@ -16,6 +17,7 @@ from peppar_fix.position_state import (
     _format_toml,
     bump_mount_sn,
     compute_horizontal_displacement,
+    confirm_move,
     detect_move,
     decimal_year_from_iso,
     decimal_year_from_mjd,
@@ -1461,3 +1463,59 @@ class TestDetectMove(unittest.TestCase):
         moved, displ = detect_move(list(self.CHICAGO), tuple(self.LONDON))
         self.assertTrue(moved)
         self.assertGreater(displ, 6_000_000)
+
+
+class TestConfirmMove(unittest.TestCase):
+    """confirm_move (BUG-2, main's #298 review): the DESTRUCTIVE move path must
+    require MEDIAN-over-N-fixes confirmation so a single borderline-geometry LS
+    outlier can't invalidate a good seed's history, and must report
+    'insufficient' (not a false 'not_moved') when the sky is too degraded to
+    collect enough fixes."""
+
+    def test_real_move_all_far(self):
+        # A real move: every LS fix shows ~6000 km → 'moved'.
+        seps = [6.14e6, 6.14e6, 6.13e6, 6.15e6, 6.14e6]
+        decision, med = confirm_move(seps)
+        self.assertEqual(decision, "moved")
+        self.assertGreater(med, 6_000_000)
+
+    def test_single_outlier_does_not_trip(self):
+        # Good seed, but one LS epoch threw a 500 m multipath/DOP outlier.
+        # Median stays low → 'not_moved' (does NOT destroy the seed).
+        seps = [3.0, 5.0, 500.0, 4.0, 6.0]
+        decision, med = confirm_move(seps)
+        self.assertEqual(decision, "not_moved")
+        self.assertLess(med, MOVE_THRESHOLD_M)
+
+    def test_good_seed_not_moved(self):
+        seps = [2.0, 4.0, 3.0, 5.0, 1.0]
+        self.assertEqual(confirm_move(seps)[0], "not_moved")
+
+    def test_insufficient_fixes(self):
+        # Fewer than MOVE_CONFIRM_FIXES valid fixes → 'insufficient' (defer to
+        # the runtime watchdog; never act destructively on thin evidence).
+        self.assertEqual(confirm_move([])[0], "insufficient")
+        self.assertEqual(confirm_move([6.14e6, 6.14e6])[0], "insufficient")
+        decision, med = confirm_move([6.14e6] * (MOVE_CONFIRM_FIXES - 1))
+        self.assertEqual(decision, "insufficient")
+        self.assertIsNone(med)
+
+    def test_majority_far_median_confirms(self):
+        # A real move where a couple fixes were noisy-low still confirms,
+        # because the MAJORITY (median) is far.
+        seps = [6.14e6, 6.14e6, 6.14e6, 50.0, 80.0]
+        self.assertEqual(confirm_move(seps)[0], "moved")
+
+    def test_drops_none_and_nan(self):
+        seps = [3.0, None, float("nan"), 5.0, 4.0, 2.0]  # 4 usable → enough
+        # Need >= MOVE_CONFIRM_FIXES usable; 4 usable here with default 5.
+        self.assertEqual(confirm_move(seps)[0], "insufficient")
+        seps2 = [3.0, None, 5.0, 4.0, 2.0, 6.0]  # 5 usable
+        self.assertEqual(confirm_move(seps2)[0], "not_moved")
+
+    def test_custom_threshold_and_min_fixes(self):
+        seps = [50.0, 60.0, 55.0]
+        self.assertEqual(confirm_move(seps, threshold_m=25.0, min_fixes=3)[0],
+                         "moved")
+        self.assertEqual(confirm_move(seps, threshold_m=100.0, min_fixes=3)[0],
+                         "not_moved")
