@@ -1,0 +1,5 @@
+# Plotly plot exports are machine-generated and inline the full plotly.js
+# bundle (~4.9 MB each), which makes GitHub Linguist report the repo as
+# mostly HTML.  Mark them generated so they're excluded from language stats
+# and collapsed in diffs.
+plots/*.html linguist-generated=true
