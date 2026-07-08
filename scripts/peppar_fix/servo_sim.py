@@ -307,6 +307,75 @@ class SimConfig:
     # ±clamp of its bootstrap nominal (a DO-freq pull-range seatbelt).
     # See docs/mid-tau-servo-knobs.md.
     do_freq_clamp_ppb: Optional[float] = None
+
+    # ── servoSimSingleOsc (I-122448): single-oscillator topology ──
+    # When True, model a GNSSDO+/SXT-D where the DO clocks the receiver:
+    #   * ONE oscillator (the DO) — no separate rx TCXO; the two-oscillator
+    #     arms (PPP dt_rx→x[0], qErr, TDCP, TICC) do not fire.
+    #   * the observation IS the DO phase vs GPS (the mosaic PPP dt_rx),
+    #     fed to the x[2] arm as the SOLE observer (via extint_phase_ns —
+    #     functionally delta's do_phase Arm 8, same H=[0,0,1,0]).
+    #   * the actuator→observation loop is closed by the plant exactly as
+    #     in two-osc mode (phi_do integrates the steered frequency, and the
+    #     observation reads phi_do) — plus actuator_gain_true below.
+    # See docs/mid-tau-servo-knobs.md "Single-oscillator mode".
+    single_oscillator: bool = False
+    # Sole-observer (mosaic dt_rx) 1σ, ns.  The SXT-D grade run measured
+    # dt_rx sub-0.1 ns; default 0.16 ns (delta's cited figure).
+    single_osc_obs_sigma_ns: float = 0.16
+    # TRUE actuator gain: ns/s of DO frequency per unit adjfine command.
+    # The filter's B assumes 1.0 (perfect knowledge); setting this ≠ 1.0
+    # models the real DO's imperfectly-known steering gain (see
+    # feedback: no default actuator gain).  A mismatch is a candidate
+    # rail driver — the filter mis-predicts its own steer and attributes
+    # the residual to DO drift.  1.0 → matched (byte-identical plant).
+    actuator_gain_true: float = 1.0
+    # Receiver internal clock-filter lag (s).  The mosaic produces its PPP
+    # dt_rx through its OWN clock estimator (a filter with dynamics), so the
+    # dt_rx the servo consumes is the DO phase passed through a 1st-order lag
+    # — NOT the instantaneous DO phase.  This cascaded lag (two filters in
+    # series: mosaic's + ours) is the genuinely single-oscillator dynamic
+    # the two-oscillator model lacks (there the DO-phase obs is a direct
+    # GPS-referenced read).  It eats phase margin → with tight measured-Q +
+    # the deadbeat x[3] term it drives the growing oscillation delta saw at
+    # NORMAL cadence.  0.0 → no lag (instantaneous obs).
+    single_osc_obs_lag_s: float = 0.0
+    # In-loop clock filter (single-oscillator).  MISNOMER (kept for code
+    # continuity, see docs/mid-tau-servo-knobs.md "Correction (2026-07-07)"
+    # + docs/misnomers.md): the α-β filter here models OUR OWN FixedPosFilter
+    # clock smoothing (random_walk), NOT a mosaic filter.  With the external
+    # OCXO on the mosaic's REF IN, the mosaic times against the OCXO and
+    # CANNOT filter/steer its frequency (no control) — and we consume raw
+    # MeasEpoch carrier phase, never the mosaic's PVT RxClkBias.  So the only
+    # in-loop clock-smoothing filter is ours; this models it.  The captures
+    # (our_dt_rx_ns ≈ mosaic_rxclkbias_ns, mosaic_rxclkdrift_ppb ≈ our_freq_
+    # ppb) are two estimators of the SAME physical DO clock agreeing, not a
+    # mosaic filter feeding us.  This SECOND filter (FixedPosFilter) in series
+    # with the DOFreqEst servo is the cascade that makes the loop marginally
+    # stable, so a short stall/glitch tips it into the ±1700 ns limit cycle
+    # (gated) or the rail (ungated).  Collapse it with --clock-model wno.
+    single_osc_mosaic_filter: bool = False
+    # α-β gains of the in-loop (FixedPosFilter) clock filter (position,
+    # velocity).  Fit to the knob1 limit-cycle period (~10–15 min) / abA1
+    # rail.  Lower = slower filter = more loop lag = more marginal.
+    mosaic_alpha: float = 0.1
+    mosaic_beta: float = 0.01
+    # Actuator word-limit (ppb): the DAC control word saturates at ±this.
+    # delta's abA1 railed at +386 ppb where control_word hit its limit.  The
+    # APPLIED command is clamped to ±actuator_max_ppb, but the filter's B
+    # still uses the UNCLAMPED command → the saturation mismatch is real
+    # actuator windup (part of the rail).  None → no clamp (DOFreqEst max_ppb
+    # only, far higher).
+    actuator_max_ppb: Optional[float] = None
+    # Processing stall = (t_start_s, stall_s): the servo LOOP blocks for
+    # stall_s (no read, no correction), the DO free-runs under the held
+    # adjfine, then execution resumes and the next correction sees the whole
+    # accumulated gap (dt = stall_s) at once.  Distinct from a measurement-
+    # drop window (which predicts in 1 s steps and holds adjfine): a stall is
+    # a wall-clock jump — the engine's dt_actual = now_mono − last_mono.  This
+    # is delta's observed rail/limit-cycle trigger (max_stall_s ≈ 2 s; the
+    # knob1 capture shows 7.4 s stalls).  None → no stall.
+    processing_stall: Optional[tuple] = None
     # One-shot dt_rx (Arm-1 PPP) glitch injection = (t_s, delta_ns): at the
     # first correction epoch with t ≥ t_s, add delta_ns to the emitted
     # dt_rx_ns.  Reproduces delta's -12 ns dt_rx step that ramped x[3] to
@@ -467,6 +536,11 @@ class ClosedLoopSim:
             soft_ticc_gate=cfg.soft_ticc_gate,
             do_freq_clamp_ppb=cfg.do_freq_clamp_ppb)
         self.adjfine = cfg.initial_freq_ppb
+        # single_oscillator receiver clock-filter lag state (see _emit).
+        self._rx_lag_state = cfg.initial_phi_do_ns
+        # Mosaic α-β clock-filter states (bias ns, drift ppb); see _emit.
+        self._m_bias = cfg.initial_phi_do_ns
+        self._m_drift = 0.0
         # Binary layer for the gross-fault A/B (#107 consumption).
         self.binary_layer = BinaryLayer(
             consec_max_epochs=cfg.binary_layer_consec_max_epochs,
@@ -547,7 +621,9 @@ class ClosedLoopSim:
                             + rng.normal(0.0, c.do_rwfm_ppb_per_sqrt_s
                                          * math.sqrt(dt)))
         # DO phase: servo response + white FM (sets short-τ floor) + white PM.
-        self.truth.phi_do += (-(self.truth.f_do + adjfine) * dt
+        # actuator_gain_true scales the steer the DO *actually* applies vs
+        # the command the filter's B assumes (1.0); ≠1.0 = gain mismatch.
+        self.truth.phi_do += (-(self.truth.f_do + c.actuator_gain_true * adjfine) * dt
                               + rng.normal(0.0, c.do_wfm_ppb * math.sqrt(dt))
                               + rng.normal(0.0, c.do_wpm_ns))
 
@@ -557,6 +633,35 @@ class ClosedLoopSim:
         rng = self.rng
         t = self.truth
         m: dict = {"dt": c.dt_s}
+        if c.single_oscillator:
+            # Single-oscillator (GNSSDO+): the DO *is* the receiver clock, so
+            # the mosaic PPP dt_rx is the DO phase vs GPS.  It is the SOLE
+            # observer, fed to the x[2] arm (via extint_phase_ns = delta's
+            # do_phase Arm 8, same H).  No rx-TCXO arms, no TICC/qErr — the
+            # other use_* flags are ignored in this mode.
+            #
+            # The mosaic reports dt_rx through its OWN clock filter → a 1st-
+            # order lag on the DO phase (the cascaded-loop dynamic that makes
+            # single-osc genuinely different).  lag=0 → instantaneous.
+            phi_obs = t.phi_do
+            if c.single_osc_mosaic_filter:
+                # Mosaic α-β clock filter: predict bias with drift, then
+                # correct both toward the true DO phase.  The reported dt_rx
+                # is the mosaic's BIAS estimate — a 2nd filter in series with
+                # our servo (the cascaded loop that goes marginally stable).
+                self._m_bias += self._m_drift * c.dt_s
+                resid = t.phi_do - self._m_bias
+                self._m_bias += c.mosaic_alpha * resid
+                self._m_drift += (c.mosaic_beta / c.dt_s) * resid
+                phi_obs = self._m_bias
+            elif c.single_osc_obs_lag_s > 0.0:
+                a = c.dt_s / (c.single_osc_obs_lag_s + c.dt_s)
+                self._rx_lag_state += a * (t.phi_do - self._rx_lag_state)
+                phi_obs = self._rx_lag_state
+            m["extint_phase_ns"] = phi_obs + rng.normal(
+                0.0, c.single_osc_obs_sigma_ns)
+            m["extint_sigma_ns"] = c.single_osc_obs_sigma_ns
+            return m
         if c.use_ppp:
             m["dt_rx_ns"] = t.phi_rx + rng.normal(0.0, c.sigma_ppp_ns)
             m["dt_rx_sigma_ns"] = c.sigma_ppp_ns
@@ -665,7 +770,14 @@ class ClosedLoopSim:
                 _drop_wins.append(c.drop_measurements_window_s)
             _drop_wins.extend(c.induced_drop_windows or [])
             in_drop_win = any(w[0] <= t_now <= w[1] for w in _drop_wins)
-            if (k - last_correction_k) >= effective_every or k == 0:
+            # Processing stall: the loop is blocked (no read/correct) for
+            # stall_s.  Skip the correction entirely (and don't advance
+            # last_correction_k), so the DO free-runs under the held adjfine
+            # and the resume correction inherits the whole accumulated gap.
+            in_stall = (c.processing_stall is not None
+                        and float(c.processing_stall[0]) <= t_now
+                        < float(c.processing_stall[0]) + float(c.processing_stall[1]))
+            if ((k - last_correction_k) >= effective_every or k == 0) and not in_stall:
                 gap_s = max(c.dt_s, (k - last_correction_k) * c.dt_s)
                 if in_drop_win:
                     # Predict-only correction: P grows, no arm fires,
@@ -767,6 +879,10 @@ class ClosedLoopSim:
             applied = self.adjfine
             if c.adjfine_lsb_ppb > 0:
                 applied = round(applied / c.adjfine_lsb_ppb) * c.adjfine_lsb_ppb
+            if c.actuator_max_ppb is not None:
+                # DAC word saturates; the filter's B used the unclamped
+                # command, so the excess is actuator windup.
+                applied = min(c.actuator_max_ppb, max(-c.actuator_max_ppb, applied))
             self._step_truth(c.dt_s, applied)
 
             # disciplineModeFsm #107 binary-layer per-epoch evaluation.

@@ -130,14 +130,133 @@ structurally, and the sim does not yet model them:
 | actuator → observation | open (DO obs is GPS-referenced) | **closed** (steering DO moves `dt_rx`) |
 | failure mode | coast on gate-out (bounded) | self-consistent **rail** |
 
-A faithful `single_oscillator=True` mode would: collapse the rx-TCXO and DO
-truth states into one; route the DO-phase truth into the `x[2]` arm as the
-sole observer (PPP/TICC/EXTINT off); and — the load-bearing part — close the
-**actuator→observation loop** so a steer of the DO shows up in the next
-`dt_rx`. That mode would (a) reproduce delta's rail deterministically, (b)
-let us validate knob 1 / knob 2 / `do_freq_clamp` in sim before hardware,
-and (c) be the standing test bed for the single-oscillator designs on the
-roadmap. Filed as a follow-up; scoped in the dayplan.
+**`single_oscillator=True` — BUILT (I-122448, PR stacked on #300).** The
+mode collapses the rx-TCXO+DO into one oscillator, routes the DO-phase truth
+into the `x[2]` arm as the sole observer (via `extint_phase_ns` =
+functionally delta's do_phase Arm 8), and closes the actuator→observation
+loop (the plant already does this). Two hardware-realism knobs: `actuator_
+gain_true` (imperfectly-known steering gain) and `single_osc_obs_lag_s` (the
+mosaic's internal clock-filter lag — the cascaded-loop dynamic that is
+genuinely single-oscillator).
+
+**Reproducing delta's rail — it took the mosaic clock filter.** The *bare*
+topology (servo observing the DO phase directly) does **not** rail on any
+perturbation — a glitch is absorbed, a processing stall is absorbed, the loop
+is well-damped. That is itself a finding: delta's rail is **not** tight-Q
+underdamping (both class-default Q=0.01 *and* measured Q=8.4e-5 railed on
+hardware — confirmed by delta), and it is **not** a generic long-coast
+instability (that rails the two-oscillator model too).
+
+The load-bearing single-oscillator dynamic is the **mosaic's own clock
+filter**. delta's captures prove `our_dt_rx_ns == mosaic_rxclkbias_ns` and
+`mosaic_rxclkdrift_ppb ≈ our_freq_ppb` — the servo does not observe the DO
+directly; it observes the **bias state of the mosaic-T's internal clock
+estimator**, a *second* filter (bias + drift, α-β) in series with our servo.
+`single_osc_mosaic_filter=True` models it. With the cascade in place, a short
+**processing stall** (`processing_stall`, delta's `max_stall_s≈2 s` trigger)
+tips the marginal two-filter loop, and the mosaic filter's bandwidth sets how
+far it goes:
+
+| mosaic filter (α) | outcome | matches delta capture |
+|---|---|---|
+| fast (α≥0.2) | stable — stall absorbed | (clean lock) |
+| α≈0.1 | bounded **limit cycle** (freq ±~12 ppb) | knob1 (±1700 ns / ±7 ppb) |
+| slow (α≤0.05) | **rail** | abA1 (+386 ppb) |
+
+So the sim now reproduces delta's full **stable → limit-cycle → rail
+spectrum**, and it confirms the mechanism: a cascaded mosaic+servo loop made
+marginal by the mosaic filter, tipped by a short stall/glitch through the
+sole ungated observer. This is exactly why **knob 1 (a gate) works** — it
+caps the tip — and why it's necessary-but-not-sufficient (the *loop* is still
+marginal; knob 2 / damping is the cure).
+
+Remaining (a quantitative fit, not a mechanism gap): matching delta's *exact*
+limit-cycle amplitude (±1700 ns) and period (~10–15 min) needs (a) the SXT-D
+DAC **word-limit** (delta railed at +386 ppb where the control word
+saturated; the sim's `max_ppb` is far higher, so its rail overshoots) and
+(b) fitting α/β to the knob1 CSV trajectory. The knobs (`mosaic_alpha`,
+`mosaic_beta`, `processing_stall`, `actuator_gain_true`) are wired for that
+fit. The mode is now the standing test bed for the single-oscillator roadmap
+and — with delta's knob-1 gate rebased on top — the place to validate knob 1
+/ knob 2 / `do_freq_clamp` in sim before hardware.
+
+### Correction (2026-07-07) — the second filter is OURS, not the mosaic's
+
+The "mosaic clock filter" framing above is **mis-attributed**. After Bob's
+prompt and a read of the Septentrio mosaic reference guide + our own code, the
+physics and the lever conclusions stand, but the *owner* of the in-loop
+clock-smoothing filter is us, not the mosaic:
+
+- **We consume raw `MeasEpoch` carrier phase, never `RxClkBias`.** A repo grep
+  finds zero consumers of `RxClkBias`/`PVTCartesian`/`PVTGeodetic`. `RxClkBias`
+  is *"the clock bias term computed in the PVT solution"* — the mosaic's own
+  Kalman PVT clock, and it is exactly what the **SparkFun reference GNSSDO
+  servos on** (its ESP32 reads `RxClkBias` → steers the OCXO). Servoing on
+  `RxClkBias` would be "asking the mosaic's filtered opinion" — the wrong
+  question. Our ESP32 firmware **replaced** that SparkFun loop with our own
+  actuation (SparkFun `$W`), and we read raw phase, so that filter is out.
+
+- **With the external OCXO the mosaic cannot filter the frequency at all.**
+  The OCXO drives the mosaic's time base via `REF IN` (10 MHz; confirm with
+  the `EXT_FREQ` status bit). §2.3's free-running/steered clock modes are
+  *internal-oscillator* framing: "clock steering" physically tunes the mosaic's
+  own crystal — impossible for an external reference it only receives. So the
+  carrier phase, timestamped on the OCXO, is an inherently **raw** measure of
+  OCXO-vs-GPS phase. The mosaic's only clock operation is the discrete **1 ms
+  time-of-day jumps** (applied to code + phase, deterministic, removable via
+  the `CumClkJumps` field in MeasEpoch) — not a filter.
+
+- **So the only clock-smoothing filter in our loop is our own `FixedPosFilter`**
+  (its `random_walk` clock model turns the raw phase into `dt_rx`). That is
+  what `single_osc_mosaic_filter` / `mosaic_alpha`/`mosaic_beta` actually
+  model — the α-β stand-in for our FixedPosFilter's clock smoothing, *not* a
+  mosaic filter. (The knob names are kept for code continuity; read them as
+  "the in-loop clock filter.") The cascade is `FixedPosFilter → DOFreqEst` —
+  **both ours** — which is why lever (c) = `--clock-model wno` (collapse the
+  FixedPosFilter half) is the full receiver-side fix, and **no mosaic
+  reconfiguration is needed or even possible on the frequency.**
+
+Hardware checks to *verify* this holds (cheap, no change): (1) `ReceiverStatus`
+**`EXT_FREQ` set** (mosaic locked to the external 10 MHz, not its internal
+clock); (2) **nothing on `TimeSync`** — a 1 PPS there makes the mosaic sync its
+time base to that pulse, an extra path; (3) the engine **un-wraps
+`CumClkJumps`** so a 1 ms jump isn't misread as a phase glitch.
+
+### Knob-2 lever sweep — which fixes the in-loop clock filter (aiming delta's next arm)
+
+delta's decisive question: *does lowering OUR loop bandwidth alone stabilize
+the cascade, or must we touch the mosaic filter?* Swept the three levers at
+the SXT-D operating point (ungated-rail regime, `mosaic_alpha≈0.05`), stall-
+perturbed, measuring stability + mid-τ TDEV(100 s). **Absolute mid-τ runs ~6×
+delta's hardware (the preset's amplitude over-production) — read the levers
+RELATIVELY.**
+
+| lever | stabilizes? | mid-τ TDEV(100 s) |
+|---|---|---|
+| **(a)** lower our BW (tighter Q) | only at Q ≤ 1e-3 | **5.6–20.8 ns** (worst) |
+| **(b)** widen the in-loop clock filter (α≥0.2, faster FixedPosFilter) | yes | **0.74 ns** (best) |
+| **(c)** bypass cascade (`--clock-model wno`, single loop) | yes, all Q | **~0.83 ns** |
+
+**Answer: lowering our bandwidth alone does NOT solve it.** Lever (a)
+stabilizes only by going to very tight Q, and that gives the *worst* mid-τ
+(the cascade forces a bad stability↔mid-τ tradeoff). You **must collapse the
+in-loop clock filter** — which, per the correction above, is *our own*
+FixedPosFilter, so we fully own the fix: (c) **`--clock-model wno`** collapses
+it (delta owns it, no new code) — this is the decisive lever. Lever (b)
+("raise the filter bandwidth") is nearly equivalent and slightly better mid-τ
+in sim, but it's just a different way to widen the *same* FixedPosFilter, not
+a mosaic change. Recommended next hardware arm: **tight-Q + `--clock-model
+wno`**. There is no residual *mosaic*-side smoothing to chase — with the
+external OCXO the mosaic can't filter the frequency; the only receiver-side
+artifact is the removable 1 ms `CumClkJumps` (verify the engine un-wraps it).
+
+This is robust to the **Q-direction discrepancy** (my sim: tighter Q
+stabilizes lever a; delta's hardware: measured tight-Q *railed*) because
+lever (a) loses either way — it either doesn't stabilize (hardware) or
+stabilizes at unusable mid-τ (sim). The discrepancy itself flags that the
+cascade model reproduces the *spectrum* and the *tradeoff* but not the exact
+tight-Q hardware behaviour (candidate: word-limit windup under tight-Q); it
+does not change the decisive lever.
 
 ## Code shipped
 

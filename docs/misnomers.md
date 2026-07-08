@@ -658,3 +658,26 @@ model/serial is confirmed from `timelab/gear.md` (e.g.
 **Notes**: Deferred — kept as-is during the move to preserve the char→engine
 linkage (renaming mid-swap risks breaking resolution).  Rename deliberately
 when next touching PiPuss's DO state.
+
+## 2026-07-07 — servo_sim single-oscillator (I-122448)
+
+### `single_osc_mosaic_filter` / `mosaic_alpha` / `mosaic_beta` — Misleading
+
+**Where**: `scripts/peppar_fix/servo_sim.py` (SimConfig fields + `_emit`)
+**Claim**: an α-β model of the **mosaic-T's** internal clock filter, a
+receiver-side filter feeding us a smoothed observation.
+**Actual**: models **our own `FixedPosFilter`** clock smoothing
+(`random_walk`), which turns raw MeasEpoch carrier phase into `dt_rx`.
+The mosaic does NOT filter the observable here: with the external OCXO on
+`REF IN` the mosaic times against the OCXO and cannot filter/steer its
+frequency (no control), and we consume raw MeasEpoch, never the mosaic's
+PVT `RxClkBias`.  The captures where `our_dt_rx_ns ≈ mosaic_rxclkbias_ns`
+are two estimators of the same physical DO clock agreeing, not the mosaic
+feeding us its filter output.
+**Why it matters**: implies the fix is a mosaic reconfiguration; the real
+lever is `--clock-model wno` (collapse our FixedPosFilter).  A reader could
+chase mosaic PVT-smoothing settings that don't exist for an external ref.
+**Proposed**: `in_loop_clock_filter` / `clkfilt_alpha` / `clkfilt_beta`.
+**Notes**: shipped in PR #301; do NOT rename in isolation (blame churn).
+Rename when next editing servo_sim's single-osc block.  Full reasoning:
+`docs/mid-tau-servo-knobs.md` "Correction (2026-07-07)".
