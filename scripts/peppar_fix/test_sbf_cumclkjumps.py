@@ -43,6 +43,12 @@ def _run(measepochs, monkeypatch):
     monkeypatch.setattr(S, "meas_epoch_to_raw_obs", lambda *a, **k: [])
     monkeypatch.setattr(realtime_ppp, "raw_obs_to_if_observations",
                         lambda *a, **k: ([], None, 0, 0))
+    # Be robust to the pre-existing full-suite logging pollution (I-153714):
+    # a polluter leaves a global logging.disable() set, which would suppress
+    # our WARNING regardless of handlers.  Clear it + force the logger state.
+    logging.disable(logging.NOTSET)
+    S.log.disabled = False
+    S.log.setLevel(logging.WARNING)
     cap = _Capture()
     cap.setLevel(logging.WARNING)
     S.log.addHandler(cap)
