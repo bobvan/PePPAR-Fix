@@ -367,6 +367,21 @@ class SimConfig:
     # actuator windup (part of the rail).  None → no clamp (DOFreqEst max_ppb
     # only, far higher).
     actuator_max_ppb: Optional[float] = None
+    # Actuator settling noise (charlieActuatorNoise, I-084500).  A real
+    # actuator (combo DAC write + DPLL settling) does NOT apply a frequency
+    # correction cleanly — each adjustment kicks off a noisy transient that
+    # (a) SCALES with the adjustment magnitude and (b) has a characteristic
+    # settling/correlation time of ~2-4 s (NOT white per-epoch noise).  On
+    # charlie's OTC hardware this shows as a TDEV short-τ BUMP that PEAKS at
+    # τ≈4 s and GROWS with looser Q (looser Q → bigger per-epoch adjustments
+    # → bigger transient).  Modeled as a colored (AR(1)) FREQUENCY
+    # perturbation on the DO whose per-epoch innovation std = gain·|Δapplied|
+    # and whose correlation time = tau_s.  gain=0 → off (byte-identical).
+    # The sim's clean frequency actuator misses this entirely, so this is
+    # what makes the sim predictive for the loose-Q short-τ penalty / the
+    # knee.  Calibrate gain+tau to charlie's TDEV(τ)-vs-Q curve.
+    actuator_noise_gain: float = 0.0     # ppb-freq-noise per ppb of |Δapplied|
+    actuator_noise_tau_s: float = 3.0    # settling/correlation time (s)
     # Processing stall = (t_start_s, stall_s): the servo LOOP blocks for
     # stall_s (no read, no correction), the DO free-runs under the held
     # adjfine, then execution resumes and the next correction sees the whole
@@ -541,6 +556,10 @@ class ClosedLoopSim:
         # Mosaic α-β clock-filter states (bias ns, drift ppb); see _emit.
         self._m_bias = cfg.initial_phi_do_ns
         self._m_drift = 0.0
+        # Actuator settling-noise state (AR(1) freq perturbation) + the prior
+        # applied command, for the |Δapplied| drive.  See _step_truth.
+        self._act_noise = 0.0
+        self._prev_applied = None
         # Binary layer for the gross-fault A/B (#107 consumption).
         self.binary_layer = BinaryLayer(
             consec_max_epochs=cfg.binary_layer_consec_max_epochs,
@@ -626,6 +645,24 @@ class ClosedLoopSim:
         self.truth.phi_do += (-(self.truth.f_do + c.actuator_gain_true * adjfine) * dt
                               + rng.normal(0.0, c.do_wfm_ppb * math.sqrt(dt))
                               + rng.normal(0.0, c.do_wpm_ns))
+        # Actuator settling noise (charlieActuatorNoise): a BOUNDED AR(1)
+        # PHASE transient — each adjustment kicks a DPLL settling/ringing
+        # excursion that decays over tau_s.  Modeled as a phase (not a freq)
+        # perturbation because charlie's TDEV RISES then FALLS, peaking at
+        # τ≈tau_s (the signature of a stationary/bounded phase process); a
+        # freq perturbation would instead keep rising past τ.  The kick std
+        # scales with the adjustment magnitude |Δapplied|, so looser Q (bigger
+        # per-epoch adjustments) grows the bump.  Carried on phi_do as a
+        # bounded offset (add the per-step CHANGE so it doesn't accumulate).
+        if c.actuator_noise_gain > 0.0:
+            d_app = (0.0 if self._prev_applied is None
+                     else abs(adjfine - self._prev_applied))
+            rho = math.exp(-dt / c.actuator_noise_tau_s)
+            new_act = (rho * self._act_noise
+                       + c.actuator_noise_gain * d_app * rng.normal())
+            self.truth.phi_do += (new_act - self._act_noise)
+            self._act_noise = new_act
+        self._prev_applied = adjfine
 
     # ── sensors ──
     def _emit(self) -> dict:
