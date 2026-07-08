@@ -1346,7 +1346,8 @@ class FixedPosFilter:
 
     def __init__(self, pos_ecef, init_ztd_m=0.0, init_ztd_sigma_m=0.5,
                  r_calibration=None, q_clk_step=None, q_clk_rate_step=None,
-                 q_ztd_step=None, meas_rate_hz=1.0):
+                 q_ztd_step=None, meas_rate_hz=1.0,
+                 clock_model='random_walk'):
         """Fixed-position PPP filter.
 
         Args:
@@ -1396,6 +1397,22 @@ class FixedPosFilter:
                                 else self.Q_CLK_RATE_DEFAULT)
         self.q_ztd_step = (float(q_ztd_step) if q_ztd_step is not None
                             else self.Q_ZTD_DEFAULT)
+        # gnssdoCascadeCollapse (I-122448, delta↔bravo): clock-phase model.
+        # 'random_walk' (default, legacy) = the tight 2-state (phase+rate)
+        # clock that SMOOTHS dt_rx — for a single-oscillator GNSSDO+ where the
+        # DO servo consumes dt_rx = x[IDX_CLK], that smoothing is a SECOND
+        # filter in series with the servo (the cascade Bravo's #301 sim
+        # reproduced: it forces a stability↔mid-τ tradeoff and rails/limit-
+        # cycles on a perturbation).  'wno' collapses the cascade: each predict
+        # resets the clock-PHASE prior (decouple + wide), so dt_rx carries no
+        # inter-epoch memory/lag and the servo's OWN EKF is the only in-loop
+        # filter.  The clock-RATE state keeps its dynamics.  Mirrors PPPFilter's
+        # wno block.  Only 'random_walk' and 'wno' are meaningful for the
+        # 2-state FixedPos clock.  See docs/gnssdo-servo-loop-bandwidth.md.
+        # Only 'wno' changes behaviour here; 'calibrated_white' is a
+        # PPPFilter rx-TCXO concept with no meaning for the 2-state FixedPos
+        # clock, so anything other than 'wno' falls back to 'random_walk'.
+        self.clock_model = 'wno' if clock_model == 'wno' else 'random_walk'
         self.pos = np.array(pos_ecef)
         self.x = np.zeros(self.N_STATES)     # [clock, clock_rate, dZTD, isb_gal, isb_bds] in meters
         self.x[self.IDX_ZTD] = float(init_ztd_m)
@@ -1498,7 +1515,22 @@ class FixedPosFilter:
         Q[self.IDX_ZTD, self.IDX_ZTD] = self.q_ztd_step * dt
         Q[self.IDX_ISB_GAL, self.IDX_ISB_GAL] = 1e-6 * dt  # GAL ISB random walk
         Q[self.IDX_ISB_BDS, self.IDX_ISB_BDS] = 1e-6 * dt  # BDS ISB random walk
-        self.P += Q
+        if self.clock_model == 'wno':
+            # gnssdoCascadeCollapse: white-noise clock PHASE.  Reset the
+            # IDX_CLK prior each epoch — decouple it from every other state
+            # and open its variance wide — so the clock phase is an
+            # independent unknown per epoch (no accumulated smoothing memory).
+            # dt_rx = x[IDX_CLK] is then lag-free (the cascade's 2nd filter is
+            # removed); the DO servo's own EKF does the smoothing.  Q[0,0]
+            # above is overwritten by the wide prior.  The clock-RATE state
+            # (IDX_CLK_RATE) keeps its Q, so frequency tracking is unaffected.
+            # Mirrors PPPFilter's wno formulation (WNO_CLK_PRIOR_VAR).
+            self.P += Q
+            self.P[self.IDX_CLK, :] = 0.0
+            self.P[:, self.IDX_CLK] = 0.0
+            self.P[self.IDX_CLK, self.IDX_CLK] = WNO_CLK_PRIOR_VAR
+        else:
+            self.P += Q
         # Stash this epoch's Q-injection magnitude on each tracked state
         # so the filter-state log can plot it alongside the measurement
         # update.  See --filter-state-log.

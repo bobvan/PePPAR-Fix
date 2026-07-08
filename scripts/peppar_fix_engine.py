@@ -4770,7 +4770,12 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                           q_clk_step=q_clk_step_arg,
                           q_clk_rate_step=q_clk_rate_step_arg,
                           q_ztd_step=q_ztd_step_arg,
-                          meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0))
+                          meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
+                          clock_model=(getattr(args, 'fixedpos_clock_model', None) or 'random_walk'))
+    log.info("FixedPosFilter clock_model=%s%s", filt.clock_model,
+             "  (dt_rx WHITE — cascade-collapsed for the DO servo)"
+             if filt.clock_model == 'wno'
+             else "  (2-state RW clock, dt_rx smoothed)")
     filt.prev_clock = 0.0
 
     # TDCP estimator — runs alongside the FixedPosFilter on the same
@@ -4935,7 +4940,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     #      with ts2phc disciplining the PHC independently).
     servo_ctx = None
     ptp = None
-    want_servo = args.servo or getattr(args, 'ticc_port', None) is not None
+    want_servo = (args.servo or getattr(args, 'ticc_port', None) is not None
+                  or getattr(args, 'gnssdo_transport', None) is not None)
     if want_servo:
         if args.servo:
             # Open PTP device for bootstrap and servo
@@ -5394,7 +5400,7 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 gate=servo_ctx.get("correlation_gate") if servo_ctx else None,
             )
 
-            if servo_ctx is not None:
+            if servo_ctx is not None and not servo_ctx.get("dt_rx_phase"):
                 gate = servo_ctx["correlation_gate"]
                 dropped_before = gate.stats.dropped_unmatched
                 obs_event, pps_match = gate.pop_observation_match(
@@ -6005,6 +6011,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                                 init_ztd_m=init_ztd_m,
                                 init_ztd_sigma_m=init_ztd_sigma_m,
                                 meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
+                                clock_model=(getattr(args, 'fixedpos_clock_model', None)
+                                                     or 'random_walk'),
                             )
                             prev_t = None
                             watchdog.reset()
@@ -6960,7 +6968,13 @@ def _bootstrap_measure_freq_and_clock(args, timestamper, known_ecef, obs_queue,
     log.info("Running %d-epoch FixedPosFilter for clock estimate...",
              args.bootstrap_epochs)
     filt = FixedPosFilter(known_ecef,
-                          meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0))
+                          meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
+                          clock_model=(getattr(args, 'fixedpos_clock_model', None)
+                                               or 'random_walk'))
+    log.info("FixedPosFilter clock_model=%s%s", filt.clock_model,
+             "  (dt_rx WHITE — cascade-collapsed for the DO servo)"
+             if filt.clock_model == 'wno'
+             else "  (2-state RW clock, dt_rx smoothed)")
     prev_t = None
     dt_rx_ns = None
     dt_rx_sigma_ns = None
@@ -7943,9 +7957,82 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
         except Exception as e:
             log.error("ClockMatrix actuator init failed: %s", e)
             actuator = None
+    elif getattr(args, 'gnssdo_transport', None) is not None:
+        # SparkFun GNSSDO+ (SXT-D) STP3593LF OCXO, steered via the ESP32
+        # "$W,<controlword>" external-control console (see
+        # docs/gnssdo-plus-integration.md).  Transport is either the ESP32
+        # front-panel USB serial port or the mosaic-T IPS1 TCP backdoor.
+        try:
+            from peppar_fix.gnssdo_actuator import GnssdoActuator
+            slope = getattr(args, 'gnssdo_ppb_per_controlword', None)
+            if slope is None:
+                # Refuse rather than fall back to the datasheet default: the
+                # control-word→frequency gain INCLUDING ITS SIGN is safety-
+                # critical (a wrong sign is positive feedback straight to the
+                # rail).  Require the calibrated, sign-confirmed value from the
+                # host config.  See feedback_no_default_actuator_gain.
+                raise ValueError(
+                    "--gnssdo-ppb-per-controlword (or gnssdo_ppb_per_"
+                    "controlword in the host config) is REQUIRED for the "
+                    "GNSSDO+ actuator — the sign-confirmed control-word gain; "
+                    "calibrate with tools/calibrate_do.py, do not default it")
+            else:
+                transport = args.gnssdo_transport
+                if transport == "tcp":
+                    if not getattr(args, 'gnssdo_host', None):
+                        raise ValueError("--gnssdo-host required for tcp transport")
+                    act_kw = dict(tcp=(args.gnssdo_host,
+                                       getattr(args, 'gnssdo_port', 28784)))
+                    where = "tcp %s:%d" % (args.gnssdo_host,
+                                           getattr(args, 'gnssdo_port', 28784))
+                else:  # serial
+                    if not getattr(args, 'gnssdo_serial', None):
+                        raise ValueError("--gnssdo-serial required for serial transport")
+                    act_kw = dict(serial_port=args.gnssdo_serial,
+                                  baud=getattr(args, 'gnssdo_baud', 115200) or 115200)
+                    where = args.gnssdo_serial
+                _gk = {}
+                if getattr(args, 'gnssdo_center_word', None) is not None:
+                    _gk['center_word'] = args.gnssdo_center_word
+                if getattr(args, 'gnssdo_word_min', None) is not None:
+                    _gk['word_min'] = args.gnssdo_word_min
+                if getattr(args, 'gnssdo_word_max', None) is not None:
+                    _gk['word_max'] = args.gnssdo_word_max
+                if getattr(args, 'gnssdo_watchdog_s', None) is not None:
+                    _gk['watchdog_s'] = args.gnssdo_watchdog_s
+                actuator = GnssdoActuator(ppb_per_code=slope, **act_kw, **_gk)
+                actuator_type = "gnssdo"
+                # Bound the scheduler coast under the firmware watchdog (bravo
+                # review): the $T watchdog is re-armed ONLY by the per-epoch
+                # $W, so a coast longer than gnssdo_watchdog_s lets SparkFun
+                # silently reclaim the OCXO and fight our loop.  Cap the coast
+                # ceiling to watchdog-5s (never below min_interval).
+                _wd = getattr(args, 'gnssdo_watchdog_s', None) or 30
+                _cap = max(args.min_interval, _wd - 5)
+                if args.max_interval > _cap:
+                    log.info("GNSSDO+ watchdog=%ds → capping scheduler "
+                             "max_interval %d→%d s (keep coast < watchdog)",
+                             _wd, args.max_interval, _cap)
+                    args.max_interval = _cap
+                log.info("Using GNSSDO+ actuator: %s ppb/word=%.3e",
+                         where, slope)
+        except Exception as e:
+            log.error("GNSSDO+ actuator init failed: %s", e)
+            actuator = None
 
     # Fallback to PHC adjfine — only valid when we have a PHC.
     if actuator is None:
+        # Seatbelt (main review, PR #303): if the GNSSDO+ actuator was
+        # explicitly requested (--gnssdo-transport) but failed to build —
+        # e.g. a missing/uncalibrated, sign-unconfirmed gain — REFUSE rather
+        # than silently fall back to steering a PHC.  On a dual-actuator host
+        # (i226 PHC + GNSSDO+ on TCP) have_phc is True, so without this guard
+        # a GNSSDO+ mis-config would mask itself by steering the WRONG DO.
+        if getattr(args, 'gnssdo_transport', None) is not None:
+            log.error("--gnssdo-transport was requested but its actuator "
+                      "could not be built (see above) — refusing rather than "
+                      "steering a PHC/other DO")
+            return 1
         if not have_phc:
             log.error("TICC-only servo requires a DAC or ClockMatrix actuator "
                       "(no PHC available for adjfine fallback)")
@@ -8388,6 +8475,9 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
         ocxo_trusted_gate=_ocxo_gate,
         routed_qerr=_qerr_latest_chi,
         soft_ticc_gate=getattr(args, 'soft_ticc_gate', False),
+        lqr_phase_gain=(getattr(args, 'lqr_phase_gain', None) or -0.05),
+        innov_gate_nsigma=getattr(args, 'innov_gate_nsigma', None),
+        do_freq_clamp_ppb=getattr(args, 'do_freq_clamp_ppb', None),
     )
     log.info("DOFreqEst 4-state: sigma_ticc=%.3f ns, "
              "sigma_do=[%.4f ns, %.4f ppb], "
@@ -8799,6 +8889,10 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
         'ts_params': ts_params,
         'actuator': actuator,
         'cm_phase_source': cm_phase_source,
+        # GNSSDO+ topology: the receiver clock IS the DO, so the PPP
+        # carrier-phase dt_rx observes the DO phase directly — no PPS
+        # hardware event to correlate.  Routes to _dt_rx_servo_epoch.
+        'dt_rx_phase': actuator_type == "gnssdo",
         'servo': servo,
         'scheduler': scheduler,
         'sigma_freerun_short_ns': _sigma_freerun_short_ns,
@@ -9333,6 +9427,145 @@ def _servo_outlier_decision(ctx, outlier_observable_ns, track_outlier_ns,
     return ("outlier", False)
 
 
+def _dt_rx_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
+    """Receiver-clock-is-DO servo epoch: PPP dt_rx → DOFreqEst (Arm 8) → actuator.
+
+    For a GNSSDO+/SXT-D the mosaic-T runs off the steered OCXO, so the PPP
+    carrier-phase dt_rx IS the DO phase vs GPS — there is no separate rx TCXO
+    and no PPS hardware edge to correlate.  dt_rx feeds DOFreqEst's ``do_phase``
+    arm (Arm 8, observes x[2]) and the PPP arm (Arm 1, x[0]) is left OFF so the
+    single measurement is not double-counted.  Mirrors _cm_servo_epoch (same
+    EKF, LQR, OCXO gate, state-sanity reset budget, adaptive scheduler); the
+    only difference is the phase source and which arm carries it.
+    """
+    servo = ctx['servo']            # DOFreqEst (same object as DAC/PHC/CM hosts)
+    scheduler = ctx['scheduler']
+
+    if dt_rx_ns is None:
+        if n_epochs % 10 == 0:
+            log.info("  [%d] No dt_rx this epoch", n_epochs)
+        return "no_phase"
+    phase_ns = dt_rx_ns
+    # Sign convention (measured on the SXT-D, 2026-07-06): applying +freq_ppb
+    # speeds the OCXO up, which makes the mosaic-T's dt_rx MORE positive — so
+    # positive dt_rx means the DO is AHEAD.  DOFreqEst's do_phase arm (like
+    # EXTINT) uses "positive = late, needs speed-up", so feed the NEGATED dt_rx
+    # as the DO-phase error to make the loop negative-feedback.  (Empirically:
+    # feeding +dt_rx gave +freq → dt_rx diverged; -dt_rx converges.)
+    do_phase_err_ns = -phase_ns
+
+    # Glitch rejection on the dt_rx INNOVATION (per-epoch jump), NOT the
+    # absolute value.  Unlike cm_phase (a small, already-aligned DO-vs-ref
+    # error), dt_rx is the absolute receiver-clock bias — legitimately large
+    # while acquiring lock and pulled to zero BY the servo.  An absolute gate
+    # would reject the whole acquisition.  Only a sudden jump is a glitch; skip
+    # that single epoch.  Runaway safety comes from the EKF state-sanity gate,
+    # the actuator authority clamp, and the firmware watchdog — not this gate.
+    TRACK_OUTLIER_NS = args.track_outlier_ns
+    _prev_dt_rx = ctx.get('_dt_rx_prev_ns')
+    if (_prev_dt_rx is not None and TRACK_OUTLIER_NS is not None
+            and abs(phase_ns - _prev_dt_rx) > 10.0 * TRACK_OUTLIER_NS):
+        # Reject this spike but do NOT advance _prev to it — otherwise the
+        # NEXT epoch is compared against the spike and a single glitch skips
+        # two epochs.  Keep the last accepted value as the reference.
+        if n_epochs % 10 == 0:
+            log.info("  [%d] dt_rx glitch (Δ=%+.0fns) — skipping epoch",
+                     n_epochs, phase_ns - _prev_dt_rx)
+        return "glitch"
+    ctx['_dt_rx_prev_ns'] = phase_ns   # advance only on an accepted epoch
+
+    # EKF wall-clock dt (clamped), tracked in ctx.
+    now_mono = time.monotonic()
+    last_mono = ctx.get('_dt_rx_last_mono')
+    dt_actual = (now_mono - last_mono) if last_mono is not None else 1.0
+    dt_actual = max(1e-3, min(dt_actual, 60.0))
+    ctx['_dt_rx_last_mono'] = now_mono
+
+    # DOFreqEst fusion.  dt_rx enters the do_phase arm (x[2]); the PPP arm
+    # (x[0]) is OFF (same oscillator).  Apply the NEGATIVE as the pull — the
+    # actuator's adjust_frequency_ppb(+ppb) speeds up the DO (same sign
+    # contract as adjfine).
+    freq_ppb = -servo.update(
+        dt=dt_actual,
+        do_phase_ns=do_phase_err_ns, do_phase_sigma_ns=dt_rx_sigma,
+    )
+
+    # State-sanity reset budget (mirror the standard epoch).
+    if servo.is_state_corrupted():
+        if _request_servo_reset(ctx, 'state_sanity') == "reset":
+            freq_ppb = -servo.freq
+        else:
+            log.error("  state-sanity sustained beyond reset budget — "
+                      "exiting for wrapper re-bootstrap (exit code 5).")
+            ctx['phc_diverged'] = True
+
+    # Clamp to the actuator authority.
+    max_ppb = (args.track_max_ppb
+               or getattr(ctx['actuator'], 'max_adj_ppb', 386.0))
+    if abs(freq_ppb) > max_ppb:
+        freq_ppb = math.copysign(max_ppb, freq_ppb)
+
+    if not args.freerun:
+        try:
+            ctx['actuator'].adjust_frequency_ppb(freq_ppb)
+        except Exception as e:
+            # A serial/TCP hiccup on the $W console must not kill run() (the
+            # main loop only catches KeyboardInterrupt).  Skip this epoch; the
+            # DO stays safe under the firmware $T watchdog, and the next epoch
+            # re-attempts.  Only a sustained loss matters, and that surfaces
+            # via the watchdog reclaiming the DO.
+            if n_epochs % 10 == 0:
+                log.warning("  [%d] actuator write failed (%s) — skipping "
+                            "epoch (DO held by firmware watchdog)",
+                            n_epochs, e)
+            return "actuator_error"
+    ctx['adjfine_ppb'] = freq_ppb
+
+    scheduler.record_actuation(now_mono, freq_ppb)
+    scheduler.compute_adaptive_interval()
+
+    # our steering vs the mosaic-T's own solution (PVTGeodetic).
+    _pvt = getattr(args, '_pvt_store', None)
+    _their = _pvt.latest() if _pvt is not None else None
+    _word = getattr(ctx['actuator'], 'current_word', None)
+    if _their is not None:
+        _their_bias_ns = _their[1] * 1.0e6      # RxClkBias ms → ns
+        _their_drift_ppb = _their[2] * 1.0e3    # RxClkDrift ppm → ppb
+        _their_mode = _their[3]
+    else:
+        _their_bias_ns = _their_drift_ppb = float('nan')
+        _their_mode = -1
+
+    # optional per-epoch comparison CSV
+    _cw = ctx.get('_gnssdo_compare_w')
+    if _cw is None and getattr(args, 'gnssdo_compare_log', None):
+        import csv as _csv
+        _cf = open(args.gnssdo_compare_log, 'a', newline='')
+        _cw = _csv.writer(_cf)
+        if _cf.tell() == 0:
+            _cw.writerow(["mono_s", "our_dt_rx_ns", "our_control_word",
+                          "our_freq_ppb", "mosaic_rxclkbias_ns",
+                          "mosaic_rxclkdrift_ppb", "mosaic_mode"])
+        ctx['_gnssdo_compare_f'] = _cf
+        ctx['_gnssdo_compare_w'] = _cw
+    if _cw is not None:
+        _cw.writerow(["%.3f" % now_mono, "%.3f" % phase_ns,
+                      _word if _word is not None else "",
+                      "%.4f" % freq_ppb, "%.3f" % _their_bias_ns,
+                      "%.4f" % _their_drift_ppb, _their_mode])
+        ctx['_gnssdo_compare_f'].flush()
+
+    if n_epochs % 10 == 0:
+        _gate_trips = servo.arm_gate_trips.get('do_phase', 0)
+        log.info("  [%d] DT_RX: ours phase=%+.2fns freq=%+.3fppb word=%s | "
+                 "mosaic bias=%+.2fns drift=%+.3fppb mode=%d | dt=%.1fs"
+                 "%s",
+                 n_epochs, phase_ns, freq_ppb, _word,
+                 _their_bias_ns, _their_drift_ppb, _their_mode, dt_actual,
+                 (" | gate_trips=%d" % _gate_trips) if _gate_trips else "")
+    return "ok"
+
+
 def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
                  dt_rx_ns, dt_rx_sigma, n_used, known_ecef,
                  resid_rms, isb_gal_ns, isb_bds_ns, pps_match=None,
@@ -9349,6 +9582,8 @@ def _servo_epoch(ctx, args, filt, obs_event, corr_snapshot, n_epochs,
     cm_phase = ctx.get('cm_phase_source')
     if cm_phase is not None:
         return _cm_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma)
+    if ctx.get('dt_rx_phase'):
+        return _dt_rx_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma)
 
     ptp = ctx.get('ptp')  # None in TICC-only mode
     servo = ctx['servo']
@@ -10663,7 +10898,7 @@ def run(args):
     #   3. None — state persistence stays disabled.
     args.receiver_unique_id = (receiver_identity.get("unique_id")
                                if receiver_identity else None)
-    if args.receiver_unique_id is None:
+    if args.receiver_unique_id is None and args.serial:
         from peppar_fix.receiver import usb_serial_for_tty
         usb_serial = usb_serial_for_tty(args.serial)
         if usb_serial:
@@ -10739,7 +10974,8 @@ def run(args):
     # post-hoc index-matching against TICC chB events.
     qerr_store = None
     qerr_log_f = None
-    want_servo = args.servo or getattr(args, 'ticc_port', None) is not None
+    want_servo = (args.servo or getattr(args, 'ticc_port', None) is not None
+                  or getattr(args, 'gnssdo_transport', None) is not None)
     if want_servo:
         qerr_log_writer = None
         if getattr(args, 'qerr_log', None):
@@ -11034,11 +11270,16 @@ def run(args):
                 "--obs-sbf-tcp without --eph-mount: broadcast ephemeris must "
                 "come from somewhere or position/clock cannot solve.  Pair "
                 "with --eph-mount (e.g. BCEP00BKG0).")
-        from peppar_fix.sbf_obs_source import run_sbf_tcp_source
+        from peppar_fix.sbf_obs_source import run_sbf_tcp_source, PvtClockStore
+        # Capture the mosaic-T's OWN clock solution (PVTGeodetic RxClkBias /
+        # RxClkDrift, AtomiChron-corrected) so the servo can log it next to our
+        # carrier-phase dt_rx + control word — our steering vs theirs.
+        args._pvt_store = PvtClockStore()
         t_serial = threading.Thread(
             target=run_sbf_tcp_source,
             args=(args, obs_queue, stop_event),
-            kwargs={'ssr': ssr, 'systems': systems},
+            kwargs={'ssr': ssr, 'systems': systems,
+                    'pvt_store': args._pvt_store},
             daemon=True,
         )
         t_serial.start()
@@ -11729,6 +11970,20 @@ def _apply_host_config(args):
         "dac_code_max":     ("dac_code_max",     int),
         "dac_type":         ("dac_type",         str),
         "dac_gain":         ("dac_gain",         int),
+        "gnssdo_transport": ("gnssdo_transport", str),
+        "gnssdo_serial":    ("gnssdo_serial",    str),
+        "gnssdo_baud":      ("gnssdo_baud",      int),
+        "gnssdo_host":      ("gnssdo_host",      str),
+        "gnssdo_port":      ("gnssdo_port",      int),
+        "gnssdo_ppb_per_controlword": ("gnssdo_ppb_per_controlword", float),
+        "gnssdo_center_word": ("gnssdo_center_word", int),
+        "gnssdo_word_min":  ("gnssdo_word_min",  int),
+        "gnssdo_word_max":  ("gnssdo_word_max",  int),
+        "gnssdo_watchdog_s": ("gnssdo_watchdog_s", int),
+        "lqr_phase_gain":   ("lqr_phase_gain",   float),
+        "innov_gate_nsigma": ("innov_gate_nsigma", float),
+        "do_freq_clamp_ppb": ("do_freq_clamp_ppb", float),
+        "fixedpos_clock_model": ("fixedpos_clock_model", str),
         "tadd_gpio":        ("tadd_gpio",        int),
         "tadd_hold_s":      ("tadd_hold_s",      float),
         "ticc_port":        ("ticc_port",        str),
@@ -12253,7 +12508,25 @@ Two-phase operation:
                           "pessimistic.  See "
                           "docs/clock-state-modeling.md option (A).  "
                           "'wno' = PRIDE/RTKLIB-style white-noise rx "
-                          "clock (P[clk] reset wide-open each epoch).")
+                          "clock (P[clk] reset wide-open each epoch).  "
+                          "Affects ONLY the PPPFilter position filter; the "
+                          "time-only FixedPosFilter clock is set separately "
+                          "via --fixedpos-clock-model.")
+    pos.add_argument("--fixedpos-clock-model", default=None,
+                     choices=("random_walk", "wno"),
+                     help="Clock model for the time-only FixedPosFilter "
+                          "(--no-antposest path), whose x[IDX_CLK] IS the "
+                          "dt_rx a single-oscillator GNSSDO+ servo steers on.  "
+                          "random_walk (default) = the 2-state (phase+rate) "
+                          "clock that SMOOTHS dt_rx — a second filter in "
+                          "series with the servo (the cascade that forces the "
+                          "mid-τ hump / limit-cycle).  'wno' collapses that "
+                          "cascade (resets the clock-phase prior each epoch → "
+                          "lag-free dt_rx; the servo's own EKF is the only "
+                          "in-loop filter).  Kept independent of --clock-model "
+                          "so a PPPFilter position-drift recipe (wno) does NOT "
+                          "silently whiten the servo input.  See "
+                          "docs/gnssdo-servo-loop-bandwidth.md.")
     pos.add_argument("--q-ztd-antpos", type=float, default=None,
                      metavar="M_PER_SQRT_S",
                      help="ZTD random-walk process-noise coefficient "
@@ -13039,6 +13312,71 @@ Two-phase operation:
                             "need >Vref Vctrl to compensate freerun offset; "
                             "ignored for other DAC types.  See I-000711.")
 
+    # GNSSDO+ (SparkFun SXT-D) $W-console actuator — see
+    # docs/gnssdo-plus-integration.md and scripts/peppar_fix/gnssdo_actuator.py
+    servo.add_argument("--gnssdo-transport", default=None,
+                       choices=["serial", "tcp"],
+                       help="Steer a SparkFun GNSSDO+ (SXT-D) OCXO over its "
+                            "ESP32 '$W' console: 'serial' (ESP32 front-panel "
+                            "USB) or 'tcp' (mosaic-T IPS1 backdoor).")
+    servo.add_argument("--gnssdo-serial", default=None,
+                       help="GNSSDO+ ESP32 console serial device (e.g. /dev/ttyUSB0)")
+    servo.add_argument("--gnssdo-baud", type=int, default=None,
+                       help="GNSSDO+ console baud (default 115200)")
+    servo.add_argument("--gnssdo-host", default=None,
+                       help="GNSSDO+ mosaic-T IP for the TCP console backdoor")
+    servo.add_argument("--gnssdo-port", type=int, default=None,
+                       help="GNSSDO+ mosaic-T IPS1 console port (default 28784)")
+    servo.add_argument("--gnssdo-ppb-per-controlword", type=float, default=None,
+                       help="Frequency sensitivity in ppb per control-word LSB "
+                            "(STP3593LF ≈ 8e-4; sign must be characterized "
+                            "with tools/calibrate_do.py).")
+    servo.add_argument("--gnssdo-center-word", type=int, default=None,
+                       help="Control word defining 0 ppb (default: word read "
+                            "at setup — anchor to the live starting frequency)")
+    servo.add_argument("--gnssdo-word-min", type=int, default=None,
+                       help="Lower control-word clamp (default 0)")
+    servo.add_argument("--gnssdo-word-max", type=int, default=None,
+                       help="Upper control-word clamp (default 2^20-1 for STP3593LF)")
+    servo.add_argument("--gnssdo-watchdog-s", type=int, default=None,
+                       help="Firmware fail-safe watchdog to request via $T "
+                            "(default 30 s; must exceed the servo period)")
+    servo.add_argument("--lqr-phase-gain", type=float, default=None,
+                       help="DOFreqEst LQR phase-loop gain L[2] (negative; "
+                            "default -0.05).  Its magnitude sets the loop "
+                            "BANDWIDTH: corner ≈ |gain|/2π Hz (τ ≈ 1/|gain| "
+                            "epochs).  Push toward 0 (e.g. -0.001) for a "
+                            "low-noise DO whose free-run beats the GNSS "
+                            "reference below the crossover, so the DO free-runs "
+                            "below the corner — see "
+                            "docs/gnssdo-servo-loop-bandwidth.md.")
+    servo.add_argument("--innov-gate-nsigma", type=float, default=None,
+                       metavar="N",
+                       help="Soft normalized-innovation (NIS) gate on the "
+                            "DOFreqEst linear arms (knob 1).  An arm whose "
+                            "innovation exceeds N·√S has its influence CAPPED to "
+                            "N sigma (S inflated, never rejected) so a phase "
+                            "glitch cannot seed a frequency-state runaway "
+                            "(the 2026-07-07 GNSSDO+ rail).  Adaptive via P: a "
+                            "large innovation during acquisition passes.  "
+                            "Default off; try ~5 on the dt_rx/GNSSDO+ path — "
+                            "docs/gnssdo-servo-loop-bandwidth.md.")
+    servo.add_argument("--do-freq-clamp-ppb", type=float, default=None,
+                       metavar="PPB",
+                       help="Seatbelt (from #300, bravo): clamp the DOFreqEst "
+                            "DO-freq estimate x[3] to ±PPB of its bootstrap "
+                            "nominal — a DO has a bounded physical pull range.  "
+                            "Peer to --max-step-ppb; bounds a freq-state windup "
+                            "INSIDE the gross ±1e6 sanity bound so a runaway "
+                            "cannot walk the actuator to the hard rail.  Default "
+                            "off — docs/mid-tau-servo-knobs.md.")
+    servo.add_argument("--gnssdo-compare-log", default=None, metavar="CSV",
+                       help="Log our carrier-phase steering (dt_rx, control "
+                            "word, freq) vs the mosaic-T's own PVTGeodetic "
+                            "solution (RxClkBias/RxClkDrift) per epoch, for "
+                            "comparison.  Requires PVTGeodetic in the SBF "
+                            "stream (sso ... MeasEpoch+PVTGeodetic).")
+
     # DO bootstrap (absorbed from phc_bootstrap.py)
     boot = ap.add_argument_group("DO bootstrap (automatic when --servo)")
     boot.add_argument("--pps-out-pin", type=int, default=-1,
@@ -13554,7 +13892,7 @@ Two-phase operation:
     if args.min_correlation_confidence is None:
         args.min_correlation_confidence = 0.5
     if getattr(args, 'measurement_rate_ms', None) is None:
-        _base = os.path.basename(args.serial)
+        _base = os.path.basename(args.serial) if args.serial else ""
         if _base.startswith("gnss") and _base[4:].isdigit():
             args.measurement_rate_ms = 2000  # kernel GNSS I2C: 0.5 Hz for lossless
         else:
@@ -13566,7 +13904,7 @@ Two-phase operation:
     # (unchanged); 200 ms → 5.0 Hz.
     args.meas_rate_hz = 1000.0 / float(args.measurement_rate_ms)
     if getattr(args, 'sfrbx_rate', None) is None:
-        _base = os.path.basename(args.serial)
+        _base = os.path.basename(args.serial) if args.serial else ""
         if _base.startswith("gnss") and _base[4:].isdigit():
             args.sfrbx_rate = 0  # kernel GNSS I2C: disable SFRBX
         else:
@@ -13698,7 +14036,7 @@ Two-phase operation:
         site_ref=getattr(args, 'peer_site_ref', '') or '',
     )
 
-    if not args.serial:
+    if not args.serial and not _has_ext_obs_source(args):
         log.error("--serial is required (via CLI or host config)")
         sys.exit(1)
 

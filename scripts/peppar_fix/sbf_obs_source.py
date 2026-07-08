@@ -36,8 +36,49 @@ def sbf_gps_time(tow_ms, wnc):
     return _GPS_EPOCH + timedelta(seconds=int(wnc) * _WEEK_S + int(tow_ms) / 1000.0)
 
 
+import threading as _threading
+
+
+class PvtClockStore:
+    """Latest mosaic-T OWN clock solution, from SBF PVTGeodetic.
+
+    RxClkBias (ms) and RxClkDrift (ppm) are the receiver's own clock-error
+    and frequency-offset estimates.  On an AtomiChron / PPP-timing mosaic-T
+    these are its *corrected* solution — so logging them next to PePPAR-Fix's
+    carrier-phase dt_rx and control word lets us compare our steering against
+    theirs (docs/gnssdo-plus-integration.md).  Thread-safe: the SBF reader
+    thread writes, the servo thread reads.
+    """
+
+    _DNU = -1.0e10   # SBF Do-Not-Use sentinel is ~-2e10; anything below is invalid
+
+    def __init__(self):
+        self._lock = _threading.Lock()
+        self._latest = None   # (tow_ms, rxclkbias_ms, rxclkdrift_ppm, mode)
+
+    def update_from_sbf(self, msg):
+        bias = getattr(msg, "RxClkBias", None)
+        if bias is None or bias <= self._DNU:
+            return
+        drift = getattr(msg, "RxClkDrift", None)
+        mode = getattr(msg, "Mode", None)
+        tow = getattr(msg, "TOW", None)
+        snap = (tow,
+                float(bias),
+                float(drift) if drift is not None else float("nan"),
+                int(mode) if mode is not None else -1)
+        with self._lock:
+            self._latest = snap
+
+    def latest(self):
+        """Return (tow_ms, rxclkbias_ms, rxclkdrift_ppm, mode) or None."""
+        with self._lock:
+            return self._latest
+
+
 def sbf_obs_reader(messages, obs_queue, stop_event, sig_lookup, *,
-                   systems=None, ssr=None, now_fn=None, mono_fn=None):
+                   systems=None, ssr=None, now_fn=None, mono_fn=None,
+                   pvt_store=None):
     """Reader loop: consume pysbf2-parsed SBF ``messages`` (an iterator, e.g.
     ``SBFReader`` over a socket), decode each MeasEpoch into IF observations via
     the SHARED former, and push ``ObservationEvent``\\ s onto ``obs_queue`` —
@@ -55,7 +96,14 @@ def sbf_obs_reader(messages, obs_queue, stop_event, sig_lookup, *,
     for _raw, parsed in messages:
         if stop_event is not None and stop_event.is_set():
             break
-        if parsed is None or getattr(parsed, "identity", "") != "MeasEpoch":
+        if parsed is None:
+            continue
+        _ident = getattr(parsed, "identity", "")
+        if _ident == "PVTGeodetic":
+            if pvt_store is not None:
+                pvt_store.update_from_sbf(parsed)
+            continue
+        if _ident != "MeasEpoch":
             continue
         raw_obs = meas_epoch_to_raw_obs(parsed, sig_lookup)
         obs, _r, _no, _ns = raw_obs_to_if_observations(raw_obs, systems, ssr)
@@ -89,7 +137,7 @@ def _interruptible_wait(stop_event, secs):
 
 
 def run_sbf_tcp_source(args, obs_queue, stop_event, *, ssr=None,
-                       systems=None, sig_lookup=None,
+                       systems=None, sig_lookup=None, pvt_store=None,
                        reconnect_delay=5.0, max_reconnect_delay=60.0):
     """Engine obs-source thread target: read SBF from a receiver's IP-server TCP
     port (``args.obs_sbf_tcp`` as ``host:port``) and fill ``obs_queue`` with
@@ -127,7 +175,7 @@ def run_sbf_tcp_source(args, obs_queue, stop_event, *, ssr=None,
             log.info("SBF obs source connected: %s:%d", host, port)
             n = sbf_obs_reader(SBFReader(stream, quitonerror=0),
                                obs_queue, stop_event, sig_lookup,
-                               systems=systems, ssr=ssr)
+                               systems=systems, ssr=ssr, pvt_store=pvt_store)
             total += n
             if _stopped(stop_event):
                 break

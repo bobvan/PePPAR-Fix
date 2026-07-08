@@ -1,0 +1,90 @@
+# PePPAR-Fix host config — SparkFun GNSSDO+ (SXT-D) on MadHat
+# =============================================================
+#
+# Explicit-use config (NOT auto-selected by hostname — MadHat's default
+# config/madhat.toml drives its i226/F9T).  Run the SXT-D discipline with:
+#
+#   peppar-fix --host-config config/madhat-sxtd.toml ...
+#
+# The SXT-D's DO is the STP3593LF double-oven OCXO, steered over the ESP32
+# "$W" external-control console added by the external-oscillator-control
+# firmware branch.  See docs/gnssdo-plus-integration.md.
+#
+# STATUS: actuator + firmware validated (2026-07-06).  Two prerequisites
+# before a full graded run — see docs/gnssdo-plus-integration.md §8:
+#   1. ppb-per-controlword sign+value must be CALIBRATED (placeholder below).
+#   2. Error source: the mosaic-T SBF obs seam (PR #287–#290) lives on
+#      `main`, not yet on delta/main — rebase/merge before using SBF here.
+
+[peppar]
+
+do_label = "gnssdo-sxtd-madhat"
+do_type  = "gnssdo"
+
+# ── Actuator: GNSSDO+ $W console ────────────────────────────────────
+# Serial = ESP32 front-panel USB (simplest; validated on /dev/ttyUSB0).
+# Alternatively transport="tcp" + gnssdo_host/gnssdo_port for the
+# mosaic-T IPS1 backdoor.
+gnssdo_transport = "serial"
+gnssdo_serial    = "/dev/ttyUSB0"
+gnssdo_baud      = 115200
+gnssdo_watchdog_s = 30
+
+# WATCHDOG COUPLING (bravo review, PR #303): the firmware $T watchdog is
+# re-armed ONLY by the per-epoch $W (adjust_frequency_ppb).  If the adaptive
+# scheduler ever coasts longer than gnssdo_watchdog_s, the SparkFun firmware
+# reclaims the OCXO and resumes its own discipline — peppar-fix would then
+# silently fight the internal loop.  The engine ENFORCES this automatically:
+# when the GNSSDO+ actuator is active it caps the scheduler max_interval to
+# gnssdo_watchdog_s - 5 s (see the gnssdo actuator branch).  No config knob
+# needed; a keepalive-$W-during-coast would lift the ceiling (not yet built).
+
+# Calibrated 2026-07-06 via the ESP32 console ($W step / $R bias-slope):
+# bracketing W0±5000 gave -3.909 / +3.976 ppb → +7.885e-4 ppb/LSB, POSITIVE
+# (higher control word → higher frequency), 1.4% from the STP3593LF datasheet
+# 8e-4.  Quick 2-point check; refine with a multi-point TICC fit if needed:
+#   tools/calibrate_do.py --ticc-port /dev/ticc4 --channel A \
+#       --gnssdo-transport serial --gnssdo-serial /dev/ttyUSB0 \
+#       --gnssdo-ppb-per-controlword 7.885e-4 --do-label gnssdo-sxtd-madhat \
+#       --sweep-ppb -5,5 --steps 11 --dwell 60
+gnssdo_ppb_per_controlword = 7.885e-4   # measured 2026-07-06 (sign POSITIVE)
+
+# ── Error source (phase for the servo) ──────────────────────────────
+# Preferred: the mosaic-T's own carrier-phase clock, via the SBF obs
+# seam (--obs-sbf-tcp host:port → PPP/TDCP dt_rx).  Requires the SBF
+# commits from `main`.  Enable the mosaic-T's IPS SBF MeasEpoch stream to
+# MadHat first (see the Mosaic-T SBF lab-test procedure).
+#   obs_sbf_tcp = "<mosaic-ip>:<port>"        # (key name pending rebase)
+#
+# Fallback demo without SBF: use a TICC as the phase reference (SXT-D
+# PPS OUT on chA vs a GNSS reference PPS on chB) — set ticc_port below.
+
+# ── Servo robustness (knob 1) ───────────────────────────────────────
+# Soft NIS gate on the dt_rx (do_phase) arm.  Caps any single carrier-phase
+# innovation's influence at N sigma so a glitch cannot seed a frequency-state
+# runaway.  Root-caused 2026-07-07: a 75σ dt_rx jump the crude Δ-gate passed
+# wound x[3] to the +386 ppb rail.  Adaptive via P (large innovations during
+# acquisition still pass).  See docs/gnssdo-servo-loop-bandwidth.md §"real knobs".
+innov_gate_nsigma = 5.0
+
+# do_freq_clamp seatbelt (from #300, bravo): bound x[3] to ±30 ppb of nominal.
+# Belt-and-suspenders below the gate: allows the ~-6 ppb acquisition transient
+# and the ±7 ppb limit-cycle swing, but caps a true runaway far below the
+# actuator's +386 ppb hard rail.  See docs/mid-tau-servo-knobs.md.
+do_freq_clamp_ppb = 30.0
+
+# ── Servo mid-τ (knob 2) — the cascade-collapse ─────────────────────
+# The FixedPosFilter clock (whose x[IDX_CLK] IS the dt_rx this servo steers
+# on) defaults to a 2-state random-walk that SMOOTHS dt_rx — a second filter
+# in series with the servo (the cascade that forces the mid-τ hump / limit-
+# cycle).  'wno' collapses it: dt_rx becomes lag-free per epoch, the servo's
+# own EKF is the only in-loop filter.  Validated on MadHat 2026-07-08 (armC):
+# tight-Q + wno held phase ±0.6 ns for 2 h and dropped mid-τ onto the free-run
+# floor (100 s 238→103 ps, 300 s ≈ floor).  Independent of --clock-model (which
+# stays PPPFilter-only).  See docs/gnssdo-servo-loop-bandwidth.md.
+fixedpos_clock_model = "wno"
+
+# ── Measurement / grading ───────────────────────────────────────────
+# chA = SXT-D PPS OUT (the disciplined DO), chB = reference PPS.
+# Grade with tools/plot_chA_tdev_goldilocks.py (chA detrended TDEV).
+# ticc_port = "/dev/ticcN"   # set to the TICC wired to SXT-D PPS OUT

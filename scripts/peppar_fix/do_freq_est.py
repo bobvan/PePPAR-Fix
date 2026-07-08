@@ -96,7 +96,9 @@ class DOFreqEst:
                  ocxo_trusted_gate=None,
                  routed_qerr=False,
                  soft_ticc_gate=False,
-                 do_freq_clamp_ppb=None):
+                 do_freq_clamp_ppb=None,
+                 lqr_phase_gain=-0.05,
+                 innov_gate_nsigma=None):
         self.max_ppb = max_ppb
         # routedQErrArm (latestQErrChiSelect, docs/latest-qerr-chi-select.md):
         # per-edge COMPARATIVE chi² router for the TICC arm.  When enabled,
@@ -117,6 +119,21 @@ class DOFreqEst:
         # Default off → byte-identical hard gate.  See the gate block in
         # update() and docs ref two-site-sync-budget.md §3.2.1.
         self._soft_ticc_gate = bool(soft_ticc_gate)
+        # dtRxInnovGate (knob 1, docs/gnssdo-servo-loop-bandwidth.md §"real
+        # knobs"): a soft normalized-innovation (NIS) gate in every linear arm.
+        # When set, an arm whose innovation exceeds `innov_gate_nsigma`·√S has
+        # its influence CAPPED to that many sigma by inflating S (equivalently
+        # R) so the effective NIS == nsigma² — the measurement is never fully
+        # rejected (no acquisition stall) but a glitch cannot punch the state.
+        # This protects the frequency state x[3] from a phase glitch seeding a
+        # self-consistent runaway (the 2026-07-07 GNSSDO+ rail: a 75σ dt_rx
+        # jump the crude Δ-gate let through).  The gate is inherently adaptive:
+        # S contains P, so a large innovation during acquisition (large P) reads
+        # as fewer sigma and passes, while the same jump at lock (small P) is
+        # capped.  None = OFF → byte-identical to pre-gate behavior; enabled per
+        # host (currently the dt_rx/GNSSDO+ path only).
+        self.innov_gate_nsigma = (float(innov_gate_nsigma)
+                                  if innov_gate_nsigma is not None else None)
         # L3 of the TDCP slip-protection stack: per-epoch actuator
         # rate limit.  None = disabled (today's behavior preserved).
         # When set, |adjfine_new - adjfine_prev| is clamped to this
@@ -208,9 +225,17 @@ class DOFreqEst:
 
         # LQR: only DO states are controllable (x[2] = DO phase, x[3] = DO freq)
         # L[2] = phase gain (negative: positive φ_do = late → more u
-        #         → more adjfine → speed up → reduce lateness)
+        #         → more adjfine → speed up → reduce lateness).  Its
+        #         magnitude sets the phase-loop BANDWIDTH: u = L[2]·φ per
+        #         epoch → time-constant ≈ 1/|L[2]| epochs → corner ≈
+        #         |L[2]|/2π Hz.  Default -0.05 → ~20 s corner.  For a
+        #         low-noise DO whose free-run beats the GNSS reference out
+        #         to long τ (GNSSDO+ Rakon OCXO), push |L[2]| DOWN (e.g.
+        #         -0.001 → ~1000 s corner) so the DO free-runs below the
+        #         corner and the loop only tracks GNSS above it — see
+        #         docs/gnssdo-servo-loop-bandwidth.md.
         # L[3] = freq cancellation
-        self.L = np.array([0.0, 0.0, -0.05, 1.0])
+        self.L = np.array([0.0, 0.0, lqr_phase_gain, 1.0])
 
         self.freq = initial_freq
         # _last_u is the LQR u value.  Engine applies u as adjfine
@@ -266,12 +291,12 @@ class DOFreqEst:
         #   cm_phase — Arm 7, ClockMatrix DPLL PHASE_STATUS → x[2]
         self.last_arm_innov: dict[str, float | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
-            'extint': None, 'pseudo': None, 'ticc': None,
+            'extint': None, 'do_phase': None, 'pseudo': None, 'ticc': None,
             'cm_phase': None,
         }
         self.last_arm_S: dict[str, float | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
-            'extint': None, 'pseudo': None, 'ticc': None,
+            'extint': None, 'do_phase': None, 'pseudo': None, 'ticc': None,
             'cm_phase': None,
         }
         # Per-arm pull attribution (pullAttributionLog).  Captures K
@@ -285,18 +310,34 @@ class DOFreqEst:
         # Kalman gain recovered post-hoc as K = would_pull / innov.
         self.last_arm_K: dict[str, list[float] | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
-            'extint': None, 'pseudo': None, 'ticc': None,
+            'extint': None, 'do_phase': None, 'pseudo': None, 'ticc': None,
             'cm_phase': None,
         }
         self.last_arm_would_pull: dict[str, list[float] | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
-            'extint': None, 'pseudo': None, 'ticc': None,
+            'extint': None, 'do_phase': None, 'pseudo': None, 'ticc': None,
             'cm_phase': None,
         }
         self.last_arm_chi2: dict[str, float | None] = {
             'ppp': None, 'qerr': None, 'tdcp': None,
-            'extint': None, 'pseudo': None, 'ticc': None,
+            'extint': None, 'do_phase': None, 'pseudo': None, 'ticc': None,
             'cm_phase': None,
+        }
+        # dtRxInnovGate: R-inflation factor the soft NIS gate applied to each
+        # arm this epoch (1.0 = admitted un-inflated; >1 = capped).  Reset to
+        # None each epoch alongside the other per-arm diagnostics.
+        self.last_arm_gate_infl: dict[str, float | None] = {
+            'ppp': None, 'qerr': None, 'tdcp': None,
+            'extint': None, 'do_phase': None, 'pseudo': None, 'ticc': None,
+            'cm_phase': None,
+        }
+        # Cumulative count of gate trips per arm (a run-long health metric —
+        # a healthy dt_rx arm trips ~never; frequent trips mean the reference
+        # is glitchy or σ is mis-set).
+        self.arm_gate_trips: dict[str, int] = {
+            'ppp': 0, 'qerr': 0, 'tdcp': 0,
+            'extint': 0, 'do_phase': 0, 'pseudo': 0, 'ticc': 0,
+            'cm_phase': 0,
         }
         self.last_ocxo_gate_rejected: bool = False
         self.last_ocxo_gate_reason: str = ""
@@ -579,6 +620,7 @@ class DOFreqEst:
                qerr_freq_ppb=None, qerr_freq_sigma_ppb=None,
                tdcp_freq_ppb=None, tdcp_freq_sigma_ppb=None,
                extint_phase_ns=None, extint_sigma_ns=None,
+               do_phase_ns=None, do_phase_sigma_ns=None,
                ticc_diff_ns=None, ticc_sigma_ns=None,
                pseudo_phase_ns=None, pseudo_phase_sigma_ns=None,
                cm_phase_ns=None, cm_phase_sigma_ns=None,
@@ -669,6 +711,13 @@ class DOFreqEst:
                 self.P[2, 2] = max(cm_phase_sigma_ns ** 2 if cm_phase_sigma_ns
                                    else 100.0, 100.0)
                 self._need_phc_seed = False
+            elif do_phase_ns is not None:
+                # GNSSDO+ topology: the receiver clock IS the DO,
+                # so dt_rx directly seeds the DO-phase state x[2].
+                self.x[2] = do_phase_ns
+                self.P[2, 2] = max(do_phase_sigma_ns ** 2 if do_phase_sigma_ns
+                                   else 100.0, 100.0)
+                self._need_phc_seed = False
             elif extint_phase_ns is not None:
                 self.x[2] = extint_phase_ns
                 self.P[2, 2] = max(extint_sigma_ns ** 2 if extint_sigma_ns
@@ -685,6 +734,7 @@ class DOFreqEst:
         for _k in self.last_arm_innov:
             self.last_arm_innov[_k] = None
             self.last_arm_S[_k] = None
+            self.last_arm_gate_infl[_k] = None
         self.last_ocxo_gate_rejected = False
         self.last_ocxo_gate_reason = ""
         # midTauServoKnobs per-epoch flag (cleared each epoch; set by the
@@ -758,6 +808,23 @@ class DOFreqEst:
                 H=np.array([[0.0, 0.0, 1.0, 0.0]]),
                 R=extint_sigma_ns ** 2,
                 arm_name='extint',
+            )
+
+        # ── Arm 8: do_phase (linear, observes x[2]) ──
+        # The DO's own clock phase vs GPS, measured DIRECTLY — for
+        # topologies where the receiver clock IS the disciplined oscillator
+        # (GNSSDO+/SXT-D: the mosaic-T runs off the steered OCXO, so its
+        # PPP carrier-phase dt_rx observes the DO phase, not a separate rx
+        # TCXO).  Same linear H as Arm 3 (EXTINT).  In this mode the PPP
+        # arm (Arm 1, which observes x[0]) is disabled by the caller so the
+        # single dt_rx measurement is not double-counted.
+        if do_phase_ns is not None and do_phase_sigma_ns is not None:
+            x_pred, P_pred = self._kalman_linear_update(
+                x_pred, P_pred,
+                z=do_phase_ns,
+                H=np.array([[0.0, 0.0, 1.0, 0.0]]),
+                R=do_phase_sigma_ns ** 2,
+                arm_name='do_phase',
             )
 
         # ── Arm 7: ClockMatrix PHASE_STATUS (linear, observes x[2]) ──
@@ -1086,11 +1153,35 @@ class DOFreqEst:
         which is essential for post-mortems on chi-squared-gate trips.
         """
         innov = z - (H @ x_pred).item()
-        S = (H @ P_pred @ H.T + R).item()
+        HPHt = (H @ P_pred @ H.T).item()
+        S = S_raw = HPHt + R
+        # dtRxInnovGate (knob 1): soft normalized-innovation cap.  If the
+        # innovation exceeds `innov_gate_nsigma`·√S, inflate S so the effective
+        # NIS is exactly nsigma² — i.e. treat the measurement as if it landed
+        # at the gate boundary.  K = P·Hᵀ/S then shrinks by S/S_gated, capping
+        # this arm's state pull at nsigma·(pull it would make at the boundary).
+        # A one-epoch glitch is de-fanged (its influence bounded) without being
+        # discarded, so a genuine sustained shift is still tracked over several
+        # epochs while a transient spike cannot seed x[3].  None → no gate.
+        infl = 1.0
+        gate = self.innov_gate_nsigma
+        # gate > 0 required: gate==0 would divide by zero below (and a
+        # zero-sigma gate is meaningless — it would reject everything).
+        if gate is not None and gate > 0.0 and S > 0.0:
+            nis = (innov * innov) / S
+            if nis > gate * gate:
+                S_gated = (innov * innov) / (gate * gate)   # → NIS_eff = gate²
+                infl = S_gated / S
+                S = S_gated
+                if arm_name is not None:
+                    self.arm_gate_trips[arm_name] += 1
         K = (P_pred @ H.T) / S
         if arm_name is not None:
+            # Record the RAW S/chi² (pre-inflation) so post-mortems see the
+            # true outlier magnitude; `gate_infl` reports how hard it was capped.
             self.last_arm_innov[arm_name] = innov
-            self.last_arm_S[arm_name] = S
+            self.last_arm_S[arm_name] = S_raw
+            self.last_arm_gate_infl[arm_name] = infl
             # Pull attribution (pullAttributionLog): record K and the
             # would-have-applied state delta before the caller's gate
             # checks.  These are the same K and (K·innov) the update
@@ -1099,7 +1190,8 @@ class DOFreqEst:
             _K_flat = K.flatten()
             self.last_arm_K[arm_name] = _K_flat.tolist()
             self.last_arm_would_pull[arm_name] = (_K_flat * innov).tolist()
-            self.last_arm_chi2[arm_name] = (innov * innov / S) if S > 0 else 0.0
+            self.last_arm_chi2[arm_name] = (innov * innov / S_raw
+                                            if S_raw > 0 else 0.0)
         x_new = x_pred + K.flatten() * innov
         P_new = P_pred - np.outer(K.flatten(), K.flatten()) * S
         return x_new, P_new
