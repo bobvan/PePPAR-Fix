@@ -4770,7 +4770,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                           q_clk_step=q_clk_step_arg,
                           q_clk_rate_step=q_clk_rate_step_arg,
                           q_ztd_step=q_ztd_step_arg,
-                          meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0))
+                          meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
+                          clock_model=getattr(args, 'clock_model', 'random_walk'))
     filt.prev_clock = 0.0
 
     # TDCP estimator — runs alongside the FixedPosFilter on the same
@@ -6006,6 +6007,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                                 init_ztd_m=init_ztd_m,
                                 init_ztd_sigma_m=init_ztd_sigma_m,
                                 meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
+                                clock_model=getattr(args, 'clock_model',
+                                                    'random_walk'),
                             )
                             prev_t = None
                             watchdog.reset()
@@ -6961,7 +6964,13 @@ def _bootstrap_measure_freq_and_clock(args, timestamper, known_ecef, obs_queue,
     log.info("Running %d-epoch FixedPosFilter for clock estimate...",
              args.bootstrap_epochs)
     filt = FixedPosFilter(known_ecef,
-                          meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0))
+                          meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
+                          clock_model=getattr(args, 'clock_model',
+                                              'random_walk'))
+    log.info("FixedPosFilter clock_model=%s%s", filt.clock_model,
+             "  (dt_rx WHITE — cascade-collapsed for the DO servo)"
+             if filt.clock_model == 'wno'
+             else "  (2-state RW clock, dt_rx smoothed)")
     prev_t = None
     dt_rx_ns = None
     dt_rx_sigma_ns = None
