@@ -74,6 +74,13 @@ class InnovGateTest(unittest.TestCase):
         self.assertEqual(s.arm_gate_trips['do_phase'], 0)
         self.assertAlmostEqual(s.last_arm_gate_infl['do_phase'], 1.0, places=9)
 
+    def test_gate_zero_does_not_divide_by_zero(self):
+        # innov_gate_nsigma=0 must not raise (guard is gate>0, not just !=None).
+        s = DOFreqEst(innov_gate_nsigma=0.0)
+        _lock(s)
+        s.update(dt=1.0, do_phase_ns=12.0, do_phase_sigma_ns=0.16)  # no crash
+        self.assertEqual(s.arm_gate_trips['do_phase'], 0)  # gate inactive
+
     def test_acquisition_large_dt_rx_not_gated(self):
         # Freshly seeded (large P[2,2]), a legitimately large dt_rx during
         # acquisition must NOT be gated — S is large so NIS is modest.

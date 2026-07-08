@@ -4771,7 +4771,11 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                           q_clk_rate_step=q_clk_rate_step_arg,
                           q_ztd_step=q_ztd_step_arg,
                           meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
-                          clock_model=getattr(args, 'clock_model', 'random_walk'))
+                          clock_model=(getattr(args, 'fixedpos_clock_model', None) or 'random_walk'))
+    log.info("FixedPosFilter clock_model=%s%s", filt.clock_model,
+             "  (dt_rx WHITE — cascade-collapsed for the DO servo)"
+             if filt.clock_model == 'wno'
+             else "  (2-state RW clock, dt_rx smoothed)")
     filt.prev_clock = 0.0
 
     # TDCP estimator — runs alongside the FixedPosFilter on the same
@@ -6007,8 +6011,8 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                                 init_ztd_m=init_ztd_m,
                                 init_ztd_sigma_m=init_ztd_sigma_m,
                                 meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
-                                clock_model=getattr(args, 'clock_model',
-                                                    'random_walk'),
+                                clock_model=(getattr(args, 'fixedpos_clock_model', None)
+                                                     or 'random_walk'),
                             )
                             prev_t = None
                             watchdog.reset()
@@ -6965,8 +6969,8 @@ def _bootstrap_measure_freq_and_clock(args, timestamper, known_ecef, obs_queue,
              args.bootstrap_epochs)
     filt = FixedPosFilter(known_ecef,
                           meas_rate_hz=getattr(args, 'meas_rate_hz', 1.0),
-                          clock_model=getattr(args, 'clock_model',
-                                              'random_walk'))
+                          clock_model=(getattr(args, 'fixedpos_clock_model', None)
+                                               or 'random_walk'))
     log.info("FixedPosFilter clock_model=%s%s", filt.clock_model,
              "  (dt_rx WHITE — cascade-collapsed for the DO servo)"
              if filt.clock_model == 'wno'
@@ -7962,8 +7966,16 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
             from peppar_fix.gnssdo_actuator import GnssdoActuator
             slope = getattr(args, 'gnssdo_ppb_per_controlword', None)
             if slope is None:
-                log.error("--gnssdo-ppb-per-controlword required for GNSSDO+ "
-                          "actuator (calibrate with tools/calibrate_do.py)")
+                # Refuse rather than fall back to the datasheet default: the
+                # control-word→frequency gain INCLUDING ITS SIGN is safety-
+                # critical (a wrong sign is positive feedback straight to the
+                # rail).  Require the calibrated, sign-confirmed value from the
+                # host config.  See feedback_no_default_actuator_gain.
+                raise ValueError(
+                    "--gnssdo-ppb-per-controlword (or gnssdo_ppb_per_"
+                    "controlword in the host config) is REQUIRED for the "
+                    "GNSSDO+ actuator — the sign-confirmed control-word gain; "
+                    "calibrate with tools/calibrate_do.py, do not default it")
             else:
                 transport = args.gnssdo_transport
                 if transport == "tcp":
@@ -7990,7 +8002,20 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
                     _gk['watchdog_s'] = args.gnssdo_watchdog_s
                 actuator = GnssdoActuator(ppb_per_code=slope, **act_kw, **_gk)
                 actuator_type = "gnssdo"
-                log.info("Using GNSSDO+ actuator: %s ppb/word=%.3e", where, slope)
+                # Bound the scheduler coast under the firmware watchdog (bravo
+                # review): the $T watchdog is re-armed ONLY by the per-epoch
+                # $W, so a coast longer than gnssdo_watchdog_s lets SparkFun
+                # silently reclaim the OCXO and fight our loop.  Cap the coast
+                # ceiling to watchdog-5s (never below min_interval).
+                _wd = getattr(args, 'gnssdo_watchdog_s', None) or 30
+                _cap = max(args.min_interval, _wd - 5)
+                if args.max_interval > _cap:
+                    log.info("GNSSDO+ watchdog=%ds → capping scheduler "
+                             "max_interval %d→%d s (keep coast < watchdog)",
+                             _wd, args.max_interval, _cap)
+                    args.max_interval = _cap
+                log.info("Using GNSSDO+ actuator: %s ppb/word=%.3e",
+                         where, slope)
         except Exception as e:
             log.error("GNSSDO+ actuator init failed: %s", e)
             actuator = None
@@ -9427,13 +9452,16 @@ def _dt_rx_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
     # the actuator authority clamp, and the firmware watchdog — not this gate.
     TRACK_OUTLIER_NS = args.track_outlier_ns
     _prev_dt_rx = ctx.get('_dt_rx_prev_ns')
-    ctx['_dt_rx_prev_ns'] = phase_ns
     if (_prev_dt_rx is not None and TRACK_OUTLIER_NS is not None
             and abs(phase_ns - _prev_dt_rx) > 10.0 * TRACK_OUTLIER_NS):
+        # Reject this spike but do NOT advance _prev to it — otherwise the
+        # NEXT epoch is compared against the spike and a single glitch skips
+        # two epochs.  Keep the last accepted value as the reference.
         if n_epochs % 10 == 0:
             log.info("  [%d] dt_rx glitch (Δ=%+.0fns) — skipping epoch",
                      n_epochs, phase_ns - _prev_dt_rx)
         return "glitch"
+    ctx['_dt_rx_prev_ns'] = phase_ns   # advance only on an accepted epoch
 
     # EKF wall-clock dt (clamped), tracked in ctx.
     now_mono = time.monotonic()
@@ -9467,7 +9495,19 @@ def _dt_rx_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
         freq_ppb = math.copysign(max_ppb, freq_ppb)
 
     if not args.freerun:
-        ctx['actuator'].adjust_frequency_ppb(freq_ppb)
+        try:
+            ctx['actuator'].adjust_frequency_ppb(freq_ppb)
+        except Exception as e:
+            # A serial/TCP hiccup on the $W console must not kill run() (the
+            # main loop only catches KeyboardInterrupt).  Skip this epoch; the
+            # DO stays safe under the firmware $T watchdog, and the next epoch
+            # re-attempts.  Only a sustained loss matters, and that surfaces
+            # via the watchdog reclaiming the DO.
+            if n_epochs % 10 == 0:
+                log.warning("  [%d] actuator write failed (%s) — skipping "
+                            "epoch (DO held by firmware watchdog)",
+                            n_epochs, e)
+            return "actuator_error"
     ctx['adjfine_ppb'] = freq_ppb
 
     scheduler.record_actuation(now_mono, freq_ppb)
@@ -11932,6 +11972,7 @@ def _apply_host_config(args):
         "lqr_phase_gain":   ("lqr_phase_gain",   float),
         "innov_gate_nsigma": ("innov_gate_nsigma", float),
         "do_freq_clamp_ppb": ("do_freq_clamp_ppb", float),
+        "fixedpos_clock_model": ("fixedpos_clock_model", str),
         "tadd_gpio":        ("tadd_gpio",        int),
         "tadd_hold_s":      ("tadd_hold_s",      float),
         "ticc_port":        ("ticc_port",        str),
@@ -12456,7 +12497,25 @@ Two-phase operation:
                           "pessimistic.  See "
                           "docs/clock-state-modeling.md option (A).  "
                           "'wno' = PRIDE/RTKLIB-style white-noise rx "
-                          "clock (P[clk] reset wide-open each epoch).")
+                          "clock (P[clk] reset wide-open each epoch).  "
+                          "Affects ONLY the PPPFilter position filter; the "
+                          "time-only FixedPosFilter clock is set separately "
+                          "via --fixedpos-clock-model.")
+    pos.add_argument("--fixedpos-clock-model", default=None,
+                     choices=("random_walk", "wno"),
+                     help="Clock model for the time-only FixedPosFilter "
+                          "(--no-antposest path), whose x[IDX_CLK] IS the "
+                          "dt_rx a single-oscillator GNSSDO+ servo steers on.  "
+                          "random_walk (default) = the 2-state (phase+rate) "
+                          "clock that SMOOTHS dt_rx — a second filter in "
+                          "series with the servo (the cascade that forces the "
+                          "mid-τ hump / limit-cycle).  'wno' collapses that "
+                          "cascade (resets the clock-phase prior each epoch → "
+                          "lag-free dt_rx; the servo's own EKF is the only "
+                          "in-loop filter).  Kept independent of --clock-model "
+                          "so a PPPFilter position-drift recipe (wno) does NOT "
+                          "silently whiten the servo input.  See "
+                          "docs/gnssdo-servo-loop-bandwidth.md.")
     pos.add_argument("--q-ztd-antpos", type=float, default=None,
                      metavar="M_PER_SQRT_S",
                      help="ZTD random-walk process-noise coefficient "

@@ -1165,7 +1165,9 @@ class DOFreqEst:
         # epochs while a transient spike cannot seed x[3].  None → no gate.
         infl = 1.0
         gate = self.innov_gate_nsigma
-        if gate is not None and S > 0.0:
+        # gate > 0 required: gate==0 would divide by zero below (and a
+        # zero-sigma gate is meaningless — it would reject everything).
+        if gate is not None and gate > 0.0 and S > 0.0:
             nis = (innov * innov) / S
             if nis > gate * gate:
                 S_gated = (innov * innov) / (gate * gate)   # → NIS_eff = gate²
