@@ -1,505 +1,219 @@
-# PePPAR Fix — Fixed-Position PPP-AR Disciplined Oscillator
+# PePPAR-Fix
 
-A carrier-phase GNSS disciplined oscillator for precision UTC phase alignment.
-Uses fixed-position PPP-AR (Precise Point Positioning with Ambiguity Resolution)
-to continuously estimate receiver clock offset and steer a NIC's PTP Hardware
-Clock — replacing the traditional PPS + qErr approach with sub-nanosecond
-carrier-phase corrections.
+> **Precise time from a fixed GNSS antenna**
 
-*"Arr" = Ambiguity Resolution (and pirates).*
+PePPAR-Fix uses a stationary GNSS antenna to make a precision clock. If your antenna
+isn't going anywhere, you can survey its position **once** and then spend the *entire*
+GNSS solution on the one thing you actually want out of it: **time**. PePPAR-Fix uses
+carrier-phase Precise Point Positioning to measure a local oscillator's error against
+GPS time and gently steers that oscillator to track it — without throwing away the
+oscillator's own excellent short-term stability.
 
-## Stability target
+The name is a play on **PPP-AR** — *Precise Point Positioning with Ambiguity
+Resolution*, the geodetic technique at its core.
+"Fix" is the GNSS fix it stands on.
 
-The goal is to faithfully transfer the **long-term stability of GPS
-time** to the **Disciplined Oscillator** (DO) — the crystal at the
-servo's actuator (e.g., the i226 TCXO, or the OCXO on Timebeat OTC
-hardware via the ClockMatrix) — while preserving the DO's **superior
-short-term stability**.
+---
 
-Two oscillators bound the achievable result:
+## Why a stationary antenna changes everything
 
-1. **The DO** — the servo can't make it more stable than its own
-   free-running noise floor.  It can only steer the DO's frequency,
-   not eliminate its phase noise.
+A roving GNSS receiver has to solve for *where it is* **and** *what time it is*,
+second after second. Position and clock trade off against each other, and the clock is
+never better than the position solution allows.
 
-2. **The GNSS receiver's oscillator (RX TCXO)** — every carrier-phase
-   observation is tainted by the receiver's clock noise.  Servo inputs
-   derived from the receiver (PPP dt_rx, PPS edges with qErr) inherit
-   this floor.  We can't pull the DO below the RX TCXO's stability
-   using GNSS-based inputs.
-
-The **moonshot target**: at every tau, the DO output is as stable as
-the *best* of (DO free-running noise floor, RX TCXO noise floor).  At
-short tau the better oscillator's noise floor should shine through
-unmolested by the discipline loop.  At long tau the DO should track
-GPS time as faithfully as the receiver allows.  The discipline loop
-should guide the transition ever so gently — no servo-induced noise,
-no overshoot, no loop-bandwidth artifacts.
-
-Beating PPS or PPS+qErr alone is not the goal — those measurements are
-limited by the F9T's resolution, not by what either oscillator can
-actually deliver.
-
-We are searching for:
-
-- The best **servo input** — PPS, PPS+qErr, PPP carrier phase, PPP-AR
-- The best **servo tuning** — loop bandwidth, gain scheduling
-- The right **bootstrap initialization** — drift file, frequency seed
-- The right **measurement chain** — TICC, EXTTS, on-chip TDC
-
-Along the way we characterize and illustrate each obstacle:
-measurement noise floors, quantization errors, oscillator drift,
-two-oscillator differentials, loop dynamics.  Visual stories live in
-`docs/visual-stories.md`.
-
-## System structure
+Hold the antenna still and that tradeoff disappears. Survey the antenna reference
+point once — to the centimeter — and pin it. Now every carrier-phase measurement the
+receiver makes, normally spent chasing position, becomes a measurement of the
+**receiver's clock** instead. Sub-centimeter position knowledge converts directly
+into sub-nanosecond time knowledge. A GNSS antenna that doesn't move turns out to be
+one of the best time references you can build.
 
 ```
-peppar-fix (orchestration)
-│
-├── Cold boot (no state files)
-│   └── Bootstrap position → save position file
-│   └── Bootstrap PHC → save drift file, characterization
-│
-├── Warm boot (state files exist, sanity-checked)
-│   └── Load position, verify against live LS fix
-│   └── Bootstrap PHC phase + frequency from PPS
-│
-└── Engine (always runs after boot)
-    ├── Observations: serial reader (UBX RAWX, SFRBX, TIM-TP)
-    ├── Corrections: NTRIP streams (broadcast eph, SSR orbits/clocks/biases)
-    ├── EKF: FixedPosFilter (clock + ISBs, 1 Hz)
-    ├── EKF: fine position refinement (slow, mm-level, future AR)
-    ├── Position watchdog (detect antenna movement)
-    ├── NTRIP caster output (bootstrap peers)
-    └── PHC servo (optional, when --servo /dev/ptpN)
-        ├── Error sources compete: PPS, PPS+qErr, PPS+PPP
-        ├── PI controller → adjfine()
-        └── Adaptive discipline interval (M7)
+  stationary GNSS antenna
+        │   raw carrier phase  +  real-time SSR corrections (NTRIP)
+        ▼
+  ┌──────────────────────────────────────────────────┐
+  │  peppar-fix : fixed-position PPP(-AR) filter     │ ◀── surveyed position
+  │              + multi-arm Kalman / LQR servo      │     (peppar-survey, once)
+  └───────────────────────────┬──────────────────────┘
+                              │   frequency / phase steer
+                              ▼
+  ┌──────────────────────────────────────────────────┐
+  │  disciplined oscillator  ──▶  PPS / 10 MHz out   │  locked to GPS time,
+  │                                                  │  short-term stability kept
+  └──────────────────────────────────────────────────┘
 ```
 
-The engine runs with or without a PHC. Without `--servo`, it still combines
-observations with corrections, runs the EKFs, refines position, and can
-serve as an NTRIP caster. With `--servo`, the PHC discipline loop runs
-as one more consumer of the engine's output.
+---
 
-Bootstrap (`phc_bootstrap.py`) guarantees the PHC starts within ±10 us
-phase and ±10 ppb frequency, so the engine's servo has no warmup or step
-logic — PI tracking begins from epoch 1.
+## Two tools
 
-## Why this exists
+**`peppar-fix`** — the real-time discipline engine. It ingests raw GNSS observations
+plus a real-time correction stream, runs a fixed-position PPP(-AR) filter to estimate
+the local clock continuously (1–10 Hz), and steers a **disciplined oscillator** (DO)
+to hold it to GPS time. It fuses several independent error sources — PPS edges, the
+receiver's fine time-pulse quantization error (qErr), carrier-phase `dt_rx`, and an
+external time-interval counter — through a Kalman/LQR servo.
 
-The best PPS-based PHC discipline (SatPulse with qErr correction) achieves
-~6 ns mean offset.  The PPS+qErr error signal is:
-- **Discrete** — one correction per second
-- **Coarse** — ±4-5 ns quantization on modern u-blox receivers
-- **Code-phase limited** — fundamentally bounded by pseudorange noise
+**`peppar-survey`** — the companion that establishes the ground truth `peppar-fix`
+stands on. It determines the authoritative antenna reference point (ARP) offline from
+a surveying-grade backend (PRIDE PPP-AR), to the centimeter. In the recommended
+time-only mode this survey is load-bearing: the engine pins the position from it and
+never estimates position at runtime, so all of its estimation power goes to the clock.
 
-Carrier-phase observations are ~100x more precise than code.  A fixed-position
-PPP-AR filter can estimate the receiver clock continuously at 1-10 Hz with
-sub-nanosecond precision, giving a much richer error signal to the PHC servo.
+---
 
-Critically, carrier phase provides the clock *frequency* (dt_dot) at sub-ppb
-precision.  The PPS path through the NIC's SDP pin (~15-30 ns jitter on i226)
-only needs to carry the slowly-varying *phase* correction — not the frequency —
-so it can be averaged much more aggressively than in a PPS-only GPSDO.
+## How it works
 
-## Architecture
+**Time-only architecture.** With the position pinned from a survey, the engine skips
+its own position filter entirely and runs a fixed-position clock solution. Everything
+the receiver observes becomes a constraint on time.
 
-```
-┌──────────────┐  UBX-RXM-RAWX        ┌───────────────┐
-│  u-blox F9T  │──────────────────────▸│               │
-│  (serial)    │  L1+L5 code+carrier   │  Fixed-Pos    │
-└──────────────┘                       │  PPP-AR       │
-                                       │  Kalman       │──▸ adjfine(PHC)
-┌──────────────┐  RTCM3-SSR (NTRIP)   │  Filter       │
-│  IGS/CNES    │──────────────────────▸│               │
-│  (CLK93 etc) │  orbits, clocks,     │               │
-└──────────────┘  phase biases         └───────────────┘
-```
+**Carrier phase, not just PPS.** A 1 PPS edge from a timing receiver is quantized to a
+few nanoseconds. The carrier phase is not — a fixed-position PPP filter can track the
+receiver clock to a few *picoseconds* per second. PePPAR-Fix treats carrier-phase
+`dt_rx` as a first-class servo input and uses PPS/qErr as complementary arms.
 
-### Fixed position simplifies PPP-AR dramatically
+**A two-oscillator budget.** The output can only ever be as good as the *better* of:
 
-| Full PPP-AR (moving) | PePPAR Fix (fixed) |
+1. **The disciplined oscillator (DO)** — the crystal being steered. The servo can
+   move its frequency but cannot erase its phase noise; below the loop bandwidth, the
+   DO's own free-running floor is what you get.
+2. **The GNSS receiver's oscillator (RX TCXO)** — every carrier-phase observation
+   carries the receiver's clock noise, so any GNSS-derived correction inherits that
+   floor.
+
+The whole design is organized around respecting both floors and adding nothing of its
+own in between.
+
+**A single-oscillator alternative.** *Geodetic* receivers accept an **external clock
+input**, which closes the gap by construction. Such a receiver still has its own
+internal oscillator, but PePPAR-Fix disables it and feeds in an external oscillator it
+can steer — so the receiver measures its carrier phase against the very oscillator being
+disciplined. The two floors collapse into one: the receiver's clock estimate *is* the
+disciplined oscillator's error against GNSS time, a direct signal with no separate
+receiver oscillator to inherit noise from — and no "second hop" through a PPS aligned to
+an internal TCXO. The SparkFun GNSSDO+ — a Septentrio Mosaic-T fed by an on-board Rakon
+OCXO through its external-clock input — is the worked example PePPAR-Fix recently gained
+support for, closing the loop from the receiver's carrier-phase `dt_rx` to the OCXO.
+See **[the GNSS receiver clock hierarchy](docs/receiver-clock-hierarchy.md)** for the
+three tiers and where this design sits.
+
+---
+
+## What we're reaching for
+
+**The moonshot.** At *every* averaging time τ, the disciplined output should be as
+stable as the *best* of (the DO's free-running floor, the receiver oscillator's
+floor). At short τ the quieter oscillator shines through untouched; at long τ the
+output tracks GPS time as faithfully as the receiver allows; and the discipline loop
+guides the handoff so gently that it adds no noise, overshoot, or loop-bandwidth
+artifact of its own. Beating a bare PPS reference is *not* the goal — that's limited
+by receiver resolution, not by what the oscillators can actually deliver.
+
+**Two clocks that agree.** Any two PePPAR-Fix clocks should produce PPS edges that
+agree in phase within a probability-bounded excursion:
+
+| Configuration | Bound | Probability | Window |
+|---|---|---|---|
+| Shared antenna (same RF via splitter) | \|Δ\| ≤ 1 ns | 95% | any τ from 0.1 s to ~1000 s |
+| Separate antennas, baseline ≤ 5 km | \|Δ\| ≤ 2 ns | 95% | any 1-hour window |
+
+**Clocks that bootstrap each other.** A longer-term ambition is peer discipline —
+PePPAR-Fix nodes advertising and serving corrections to one another over the local
+network, so a fresh clock can lean on a settled neighbor.
+
+---
+
+## Where we are
+
+An honest snapshot — this is an active research system, not a finished product:
+
+- ✅ **PPP-AR works** — GPS + Galileo ambiguity resolution, with sub-centimeter
+  cross-host *position* agreement on a shared antenna.
+- ✅ **Time-only architecture** — survey-pinned ARP + fixed-position clock solution,
+  validated against the full position-filter baseline.
+- ✅ **Carrier-phase discipline** — a time-differenced carrier-phase servo arm
+  reaching ~15 ps TDEV(1 s) in prototype, well below what PPS can resolve.
+- 🚧 **Cross-host agreement** — currently ~10–15 ns (95th percentile) between two
+  settled clocks: roughly 10× from the 1 ns shared-antenna moonshot, and the present
+  frontier.
+- 🚧 **Robustness** — ongoing work on cross-stream measurement correlation,
+  self-recovering fault handling, and honest confidence reporting.
+
+---
+
+## Supported hardware
+
+PePPAR-Fix runs on commodity Linux single-board computers and off-the-shelf timing
+hardware.
+
+| Role | Supported |
 |---|---|
-| Estimate X, Y, Z every epoch | Position known (from bootstrap or survey) |
-| 15-30 min convergence | Seconds (clock-only after bootstrap) |
-| Velocity + dynamics states | None |
-| ~30-50 state Kalman filter | ~25-45 states, simpler process noise |
+| **GNSS receiver** | u-blox ZED-F9T (timing, dual-freq L1/L5), ZED-F9P, ZED-X20P, NEO-F10T; Septentrio Mosaic-T (SBF) |
+| **Disciplined oscillator / actuator** | Any Linux PTP Hardware Clock steered via `adjfine` (e.g. an Intel i226 NIC's TCXO); DAC-steered OCXOs (16/18-bit); external frequency-control-word oscillators. A generic actuator seam lets new DO hardware drop in. |
+| **Measurement / grading** | TAPR TICC (~60 ps time-interval counter); PHC `EXTTS` PPS timestamping; on-chip TDCs |
+| **Corrections** | Real-time SSR over NTRIP (IGS Real-Time Service and mirrors) + broadcast ephemeris |
+| **Compute** | Raspberry Pi 4/5 or x86-64 Linux |
 
-### State vector
+The oscillator you steer sets the ceiling. OCXO-class parts (ADEV(1 s) ≲ 1×10⁻¹¹) can
+reach the sub-nanosecond cross-host target; TCXO-class parts are supported and useful
+for exercising the measurement chain, but their free-running noise above the loop
+bandwidth puts the moonshot out of reach.
 
-**Bootstrap phase** (first run, ~30 min):
-```
-x = [X, Y, Z, dt_rx, dt_dot, ZWD, N1, N2, ..., Nn, ISB_gal, ISB_bds]
-```
-Position converges to cm-level, then is saved and frozen.
+> **Grade with a real counter.** Servo output should be graded with a time-interval
+> counter (the TICC, ~60 ps). On-chip `EXTTS` timestamps are convenient but quantize
+> at the receiver's clock period (~8 ns), which flatters short-τ results — fine for
+> tracking, misleading for grading.
 
-**Operational phase** (all subsequent runs):
-```
-x = [dt_rx, dt_dot, ZWD, N1, N2, ..., Nn, ISB_gal, ISB_bds]
-```
-Clock converges in seconds.  The filter outputs `dt_rx` at observation rate —
-this is the PHC servo's error signal.
+---
 
-### Dual-frequency ionosphere cancellation
+## Getting started
 
-With L1 + L5 (GPS) or E1 + E5a (Galileo), the ionosphere-free combination
-eliminates first-order ionospheric delay.  No external ionosphere model needed.
+`peppar-fix` is driven by an orchestration wrapper; you normally don't invoke the
+component scripts directly.
 
-### Real-time IGS corrections
-
-SSR (State Space Representation) corrections from IGS real-time service:
-- Satellite orbit corrections (cm-level)
-- Satellite clock corrections (sub-ns)
-- Phase biases (for integer ambiguity resolution)
-- Delivered via NTRIP (e.g., CNES CLK93 stream, ~5-30s latency)
-
-### Starting position accuracy
-
-A u-blox survey-in position (±2 m XY, ±4 m Z) is fine.  The filter absorbs
-the initial position error into clock bias and converges the position during
-bootstrap.  4 m vertical error ≈ 13 ns initial clock bias, which resolves
-in minutes once carrier-phase ambiguities fix.
-
-## Hardware requirements and limitations
-
-### Required: PPS → SDP IN (closes the control loop)
-
-The GNSS receiver's PPS output must be wired to an SDP input pin on the PHC.
-This is the only way to observe the PHC's actual phase relative to GNSS time
-and close the discipline loop.  Without it, PePPAR Fix can compute a clock
-model from carrier-phase observations, but has no way to measure the PHC's
-TCXO frequency offset — the loop is open.
-
-The Kalman filter estimates the *GNSS receiver's* clock (dt_rx, dt_dot), not
-the PHC's clock.  The PHC has its own TCXO with an unknown, temperature-
-dependent frequency offset that must be observed and corrected.  Each PPS
-edge timestamped by the PHC via SDP provides that observation:
-
-```
-PHC error = T_phc(PPS) − T_true(PPS)
-          = PHC timestamp of PPS edge − (GPS second + dt_rx from filter)
-```
-
-PePPAR Fix gains over SatPulse because carrier phase provides the frequency
-component (dt_dot) at sub-ppb precision.  The noisy SDP path (~15-30 ns
-jitter on i226) only needs to carry the slowly-varying phase correction,
-not the frequency — so it can be averaged much more aggressively.
-
-### Optional: SDP OUT (disciplined PPS or other frequencies)
-
-If a second SDP pin is available, the PHC can generate a disciplined PPS
-output (or other frequencies) for external instrumentation or verification.
-Without SDP OUT, the disciplined PHC is only accessible to software on the
-host — there is no physical output path without significant precision loss.
-
-### Limitation: PHC and PHY TX clock are independent
-
-On standard Intel NICs (i210, i225, i226, E810), the PHC is a digital
-timestamp counter adjusted by `adjfine()`.  The Ethernet PHY's transmit
-clock runs from a separate fixed crystal.  Disciplining the PHC does **not**
-change the Ethernet wire frequency.  There is no connection between the two
-clock domains.
-
-This means:
-- **No SyncE from a disciplined PHC** on standard Intel NICs.  Even on the
-  E810 (which has SyncE via a dedicated DPLL), the PHC and the SyncE DPLL
-  are separate subsystems.
-- **PTP is the network path** for distributing the disciplined time.  PTP
-  Sync/Follow_Up messages embed PHC timestamps — a better-disciplined PHC
-  produces more accurate timestamps — but the transfer is limited by
-  network packet jitter and HW timestamp resolution, not by the PHC
-  discipline quality.
-
-### Expected performance vs. GPSDO-driven PTP GM
-
-A PePPAR Fix PTP GM should significantly outperform an ordinary GPSDO-driven
-PTP GM (where GPSDO → PPS → SDP → PHC discipline) because:
-- Same PTP packet path to the slave, same HW timestamp precision
-- But the GM's PHC timestamps are more accurate: carrier-phase frequency
-  tracking (sub-ppb) vs. PPS-only (~20 ns jitter per edge)
-- The bottleneck shifts from "how well is the GM's PHC disciplined" to
-  "how well does PTP transfer that discipline to the slave"
-
-### Development hardware
-
-| Component | Model | Notes |
-|-----------|-------|-------|
-| SBC | Raspberry Pi 5 | TimeHat host |
-| NIC | TimeHAT v5 (Intel i226) | TCXO ±280 ppb, 4 SDP pins, current dev platform |
-| NIC | Intel E810-XXVDA4T | OCXO, onboard F9T, SyncE, 4×25G — on order |
-| GNSS | u-blox ZED-F9T (EVK) | L1/L5, UBX-RXM-RAWX at 1 Hz, external USB |
-| Antenna | Patch2 | Active, L1/L5, roof-mounted |
-| NTRIP | IGS real-time service | BCEP00BKG0 (eph), SSRA00BKG0 (SSR) |
-
-## Setup
-
-```bash
-# Create a venv (once, on each host that runs PePPAR Fix)
+```sh
+# One-time, per host:
 python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+venv/bin/pip install -e '.[analysis]'      # engine + analysis tools
 
-# On Debian/Raspberry Pi OS with externally-managed Python:
-#   If `python3 -m venv` fails, install the venv package first:
-#   sudo apt install python3-venv
-#
-# The venv isolates deps from the system Python and ensures
-# consistent versions across hosts (TimeHat, PiPuss, dev machines).
+# You need two things before a time run:
+#   1. A surveyed antenna position   (peppar-survey, or --known-pos)
+#   2. A real-time correction stream  (NTRIP SSR — see ntrip.conf.example)
+
+# Discipline a PHC-based DO at a surveyed position, time-only:
+scripts/peppar-fix --no-antposest --servo /dev/ptp0 --pps-pin 1
 ```
 
-System packages (not in pip):
-- `linuxptp` — provides `phc_ctl` for PHC clock stepping (`sudo apt install linuxptp`)
+Real-time PPP needs SSR corrections; register for the free
+[IGS Real-Time Service](https://igs.org/rts/access/) and put your credentials in
+`ntrip.conf` (see `ntrip.conf.example`).
 
-### E810 GNSS driver fix (required for E810-XXVDA4T)
+Design notes and research write-ups live in [`docs/`](docs/); contributor operating
+knowledge is in [`CLAUDE.md`](CLAUDE.md).
 
-The stock `ice` kernel driver for E810 NICs has a GNSS I2C buffering bug
-that delays observation delivery by ~2 seconds, making real-time PHC
-discipline impossible.  This affects all Linux kernels through at least
-6.17 and Intel's out-of-tree driver v2.4.5.  A patched driver is included:
-
-```bash
-cd drivers/ice-gnss-streaming
-./build-and-install.sh --load
-```
-
-See `drivers/ice-gnss-streaming/README.md` for details, symptoms, and
-how to verify the fix.  This is not needed for USB-connected GNSS
-receivers (e.g. TimeHat with F9T EVK on `/dev/ttyACM0`).
-
-## Quick start — Milestone 1: Raw observations
-
-```bash
-source venv/bin/activate
-
-# Configure F9T (factory reset → signals → survey-in → enable messages)
-python scripts/configure_f9t.py /dev/gnss-top --port-type USB
-
-# Log observations (Ctrl-C or --duration to stop)
-python tools/log_observations.py /dev/gnss-top --baud 9600 --duration 3600
-```
-
-### configure_f9t.py
-
-Configures a u-blox ZED-F9T for PPP-AR:
-1. Factory reset (controlled SW reset)
-2. Enable dual-frequency: GPS L1C/A+L5, Galileo E1+E5a, BeiDou B1+B2a
-3. Disable GLONASS (FDMA complicates ambiguity resolution)
-4. Set measurement rate (1-10 Hz, default 1 Hz)
-5. Enable UBX messages: RXM-RAWX, RXM-SFRBX, NAV-PVT, NAV-SAT, TIM-TP
-6. Disable NMEA output (bandwidth)
-7. Start survey-in (300s, 5m accuracy — enough to bootstrap PPP-AR)
-8. Set UART baud to 460800 (headroom for 10 Hz RAWX)
-9. Save to flash
-
-### log_observations.py
-
-Captures observations to CSV + raw UBX binary:
-- `<prefix>_rawx.csv` — per-SV per-epoch: pseudorange, carrier phase, Doppler, C/N0
-- `<prefix>_pvt.csv` — position/velocity/time (for bootstrap monitoring)
-- `<prefix>_timtp.csv` — PPS quantization error
-- `<prefix>_raw.ubx` — raw binary (for replay with different parsers)
-
-## Implementation plan
-
-### Phase 1: Observation pipeline
-
-- ✓ Configure F9T for dual-frequency raw observations
-- ✓ Log RXM-RAWX, RXM-SFRBX, NAV-PVT, TIM-TP to CSV + binary
-- Parse UBX-NAV-SAT (satellite positions, or compute from broadcast ephemeris)
-- Connect to NTRIP caster, decode RTCM3-SSR corrections
-- Log everything for offline development
-
-### Phase 2: Offline Kalman filter (Python/numpy)
-
-- Implement the fixed-position filter in Python for rapid iteration
-- Process logged RXM-RAWX + SSR data
-- Validate clock estimates against TICC measurements from the PE rig
-- Bootstrap: estimate position, verify convergence
-- Operational: freeze position, verify clock-only mode
-
-### Phase 3: Real-time filter + PHC discipline
-
-- Port filter to real-time operation (Python or Rust)
-- Output clock corrections to a PHC servo (adjfine)
-- Compare ADEV against SatPulse (PPS+qErr) baseline
-- Measure improvement at various tau
-
-### Phase 4: Holdover (future)
-
-- Characterize the TimeHAT TCXO (drift, temperature sensitivity)
-- Model oscillator behavior in the Kalman filter
-- Predict and compensate drift during GNSS outages
-
-## References
-
-- [SatPulse](https://satpulse.net/) — PPS+qErr baseline to beat
-- [PRIDE-PPPAR](https://github.com/PrideLab/PRIDE-PPPAR) — PPP-AR reference
-- [ginan](https://github.com/GeoscienceAustralia/ginan) — Full GNSS toolkit
-- [RTKLIB](https://github.com/tomojitakasu/RTKLIB) — Classic GNSS processing
-- [IGS Real-Time Service](https://igs.org/rts/) — SSR correction streams
-- [CNES CLK93](http://www.ppp-wizard.net/products/REAL_TIME/) — Free SSR stream
-- [u-blox F9T Integration Manual](https://content.u-blox.com/sites/default/files/ZED-F9T_IntegrationManual_UBX-21040375.pdf)
-
-## Quick start — Milestone 4: Real-time clock estimation
-
-```bash
-source venv/bin/activate
-
-# 1. Register for IGS Real-Time Service: https://igs.org/rts/access/
-#    You'll receive a username and password for the NTRIP caster.
-#    Save credentials in ntrip.conf (see ntrip.conf.example).
-
-# 2. Real-time mode (live F9T + NTRIP corrections):
-python scripts/realtime_ppp.py \
-    --serial /dev/gnss-top --baud 9600 \
-    --known-pos "LAT,LON,ALT" \
-    --ntrip-conf ntrip.conf --eph-mount BCEP00BKG0 \
-    --systems gps,gal --duration 3600 --out data/realtime_1h.csv
-
-# 3. Replay mode (validate with existing data):
-python scripts/realtime_ppp.py \
-    --replay data/rawx_1h_top_20260303.csv \
-    --sp3 data/gfz_mgx_062.sp3 \
-    --clk data/GFZ0MGXRAP_062_30S.CLK \
-    --osb data/GFZ0MGXRAP_062_OSB.BIA \
-    --known-pos "LAT,LON,ALT" \
-    --systems gal --out data/replay_test.csv
-```
-
-## Quick start — Milestone 6: PHC servo with competitive error sources
-
-```bash
-source venv/bin/activate
-
-# 1. Configure F9T (ensures TIM-TP, dual-freq signals, timing mode):
-python scripts/configure_f9t.py /dev/gnss-top --port-type USB
-
-# 2. Run servo (needs /dev/ptp0 with SDP extts — i226 TimeHat):
-#    PHC device must be the i226 NIC, not the RPi built-in MAC.
-sudo chmod 666 /dev/ptp0   # or add udev rule for ptp group
-python scripts/phc_servo.py \
-    --serial /dev/gnss-top --baud 9600 \
-    --known-pos "LAT,LON,ALT" \
-    --ntrip-conf ntrip.conf --eph-mount BCEP00BKG0 \
-    --ptp-dev /dev/ptp0 --extts-pin 1 \
-    --systems gps,gal --duration 3600 \
-    --log data/servo_log.csv
-
-# 3. Analyze results (TDEV/ADEV plots, requires TICC data):
-python tools/analysis/analyze_servo.py data/servo_log.csv
-```
-
-The servo selects the best error source at each epoch:
-- **PPS-only** (±20 ns) — always available, used during early startup
-- **PPS+qErr** (±2-3 ns) — once TIM-TP arrives, removes PPS quantization noise
-- **Carrier-phase** (±0.1 ns) — once PPP filter converges (~20 epochs)
-
-### NTRIP caster registration
-
-The IGS Real-Time Service requires free registration at https://igs.org/rts/access/.
-Key mountpoints on `products.igs-ip.net:2101`:
-- **BCEP00BKG0** — broadcast ephemeris (GPS+GLO+GAL+BDS+QZS, RTCM 1019/1042/1045/1046)
-- **SSRA00CNE0** — CNES SSR corrections (standard RTCM SSR: 1059/1060/1242/1243/1260/1261)
-- **SSRA00CNE1** — CNES SSR corrections (IGS SSR format: 4076_023/025/026/063/065/066/103/105/106)
+---
 
 ## Repository layout
 
 ```
-.
-├── scripts/
-│   ├── configure_f9t.py      # F9T configuration (reset → signals → survey-in)
-│   ├── log_observations.py   # Raw observation logger (RAWX, PVT, TIM-TP)
-│   ├── solve_pseudorange.py  # M2: GPS L1 pseudorange solver + SP3 parser
-│   ├── solve_dualfreq.py     # M2: Dual-freq IF combination solver
-│   ├── solve_ppp.py          # M3: Multi-GNSS PPP EKF + FixedPosFilter
-│   ├── solve_gim.py          # Single-freq + GIM ionosphere solver
-│   ├── ppp_corrections.py    # M3: File-based SP3/CLK/OSB correction parsers
-│   ├── broadcast_eph.py      # M4: Broadcast ephemeris → ECEF (Keplerian model)
-│   ├── ntrip_client.py       # M4: NTRIP v2 client for RTCM3 streams
-│   ├── ssr_corrections.py    # M4: Real-time SSR correction state manager
-│   ├── realtime_ppp.py       # M4: Real-time PPP orchestrator + QErrStore
-│   ├── phc_servo.py          # M6: PHC discipline loop (competitive error sources)
-│   ├── analyze_servo.py      # TDEV/ADEV analysis + TICC integration
-│   ├── ticc.py               # TAPR TICC time interval counter interface
-│   └── qerr_test.py          # Quick TIM-TP qErr variance validation
-├── config/
-│   ├── 99-timehat-devices.rules  # udev rules for F9T + TICC
-│   └── receivers.toml            # Device configuration
-├── docs/
-│   ├── hw-labels.md          # hw: bead label convention for hardware scheduling
-│   └── nic-survey.md         # PHC hardware survey (PPS IN+OUT qualified)
-├── timelab/
-│   └── resources.json        # Lab hardware inventory (hosts, NICs, receivers, TICCs, antennas, wiring)
-├── data/                     # Observation runs + correction products
-├── requirements.txt          # Python dependencies
-└── README.md
+scripts/
+  peppar-fix              orchestration wrapper — start here
+  peppar_fix_engine.py    real-time PPP + servo engine
+  peppar_fix/             engine internals: filter, servo, correlation, actuators
+  ...                     analysis, capture, and configuration tools
+docs/                     design notes and research write-ups
+CLAUDE.md                 operating manual for contributors
 ```
 
-## Deployment goal
+---
 
-PePPAR Fix should be a self-contained software package that can be downloaded
-and run on any Linux host with:
-- A PTP Hardware Clock (PHC) with SDP pins or SyncE output (e.g., Intel i210/i225/i226)
-- A dual-frequency GNSS receiver outputting UBX-RXM-RAWX (e.g., u-blox F9T)
-- Internet access for NTRIP SSR corrections
+## Status & license
 
-**TODO (post-M4):** The tool needs an install/setup phase that handles:
-- Dependency checks (linuxptp, kernel PTP support, serial access)
-- PHC discovery and pin mapping (`testptp -c`, SDP enumeration)
-- PPS OUT configuration (periodic output on an available SDP pin for
-  external verification — see `phc-pps-out.service` on TimeHat)
-- GNSS receiver detection and protocol version
-- NTRIP credential configuration
-- systemd service installation
+PePPAR-Fix is a research project, developed against real hardware in a working timing
+lab. Interfaces change, targets are aspirational, and results are reported honestly —
+including the gap between where we are and the moonshot. It is **not** a product and
+carries no fitness or stability guarantees.
 
-This can't be just `pip install && run` — hardware configuration is required.
-
-### Stretch goal: SyncE frequency distribution via Renesas DPLL
-
-The "PHC and PHY are independent" limitation (above) has one exception:
-on **Timebeat OTC hardware** (OTC, OTC Mini PT), the onboard **Renesas
-8A34002 ClockMatrix** generates the 25 MHz reference clock that feeds the
-i226 PHY.  PePPAR Fix could steer the *actual Ethernet wire frequency* —
-not just the PHC timestamp counter — by writing frequency adjustments to
-the 8A34002 via I2C.
-
-Two independent control paths:
-1. `adjfine()` on the i226 PHC — adjusts timestamps (PTP accuracy)
-2. Renesas 8A34002 DPLL steering — adjusts wire frequency (SyncE)
-
-A downstream host with SyncE receive capability (e.g., Intel E810) could
-recover the GNSS-disciplined frequency from the Ethernet signal, enabling
-physical-layer frequency syntonization without SDP pins or PPS cables.
-
-The kernel has an in-tree driver (`ptp_clockmatrix.c`, `rsmu_i2c.c`) and
-Renesas ships `pcm4l` for userspace DPLL control. The i226 doesn't need
-SyncE receive support — it acts as a SyncE source, with the Renesas DPLL
-providing the disciplined reference.
-
-This does **not** enable White Rabbit.  WR requires FPGA-based DMTD (Dual
-Mixer Time Difference) for sub-ns phase measurement — the i226 has no DMTD
-capability.  PTP+SyncE from OTC hardware achieves ~50-100 ns, not WR's
-sub-ns.
-
-**Note:** This only applies to hardware with the Renesas clock generator
-(Timebeat OTC boards). Plain i225/i226 NICs (including the TimeHAT) use a
-fixed crystal and cannot do SyncE. SDP pins remain required on those
-platforms.
-
-## Status
-
-**Milestone 4 in progress**: Real-time PPP clock estimation.
-
-| Milestone | Status | Description |
-|-----------|--------|-------------|
-| M1 | Done | F9T configuration + observation logging |
-| M2 | Done | Pseudorange position solver (GPS L1, dual-freq IF) |
-| M3 | Done | Fixed-position clock estimation (file-based SP3+CLK+OSB) |
-| M4 | **Active** | Real-time operation (NTRIP + broadcast eph + SSR corrections) |
-
-M3 results (file-based, GAL-only): ADEV τ=1s: 1.5e-9, τ=30s: 2.3e-10.
-Geometry error floor ~1.3m from SP3+CLK products — carrier phase precision
-(~0.01m) swamped by correction product limitations. M4's real-time SSR
-corrections should eliminate this bottleneck.
+MIT-licensed. © Bob Van Valzah.
