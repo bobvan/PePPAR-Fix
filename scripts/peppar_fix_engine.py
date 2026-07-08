@@ -8022,6 +8022,17 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
 
     # Fallback to PHC adjfine — only valid when we have a PHC.
     if actuator is None:
+        # Seatbelt (main review, PR #303): if the GNSSDO+ actuator was
+        # explicitly requested (--gnssdo-transport) but failed to build —
+        # e.g. a missing/uncalibrated, sign-unconfirmed gain — REFUSE rather
+        # than silently fall back to steering a PHC.  On a dual-actuator host
+        # (i226 PHC + GNSSDO+ on TCP) have_phc is True, so without this guard
+        # a GNSSDO+ mis-config would mask itself by steering the WRONG DO.
+        if getattr(args, 'gnssdo_transport', None) is not None:
+            log.error("--gnssdo-transport was requested but its actuator "
+                      "could not be built (see above) — refusing rather than "
+                      "steering a PHC/other DO")
+            return 1
         if not have_phc:
             log.error("TICC-only servo requires a DAC or ClockMatrix actuator "
                       "(no PHC available for adjfine fallback)")
