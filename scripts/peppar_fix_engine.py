@@ -9445,6 +9445,17 @@ def _dt_rx_servo_epoch(ctx, args, n_epochs, dt_rx_ns, dt_rx_sigma):
         if n_epochs % 10 == 0:
             log.info("  [%d] No dt_rx this epoch", n_epochs)
         return "no_phase"
+    if dt_rx_sigma is None or dt_rx_sigma <= 0:
+        # do_phase (Arm 8) needs value AND sigma to update x[2]; without a
+        # valid sigma the arm is skipped, so actuating would command from a
+        # STALE/predicted DO-phase estimate (bravo #303 review b).  Skip the
+        # epoch instead — the DO holds under the firmware watchdog until a
+        # real sigma returns.
+        if n_epochs % 10 == 0:
+            log.info("  [%d] dt_rx has no valid sigma (%s) — skipping "
+                     "(won't steer from a stale DO-phase estimate)",
+                     n_epochs, dt_rx_sigma)
+        return "no_sigma"
     phase_ns = dt_rx_ns
     # Sign convention (measured on the SXT-D, 2026-07-06): applying +freq_ppb
     # speeds the OCXO up, which makes the mosaic-T's dt_rx MORE positive — so
