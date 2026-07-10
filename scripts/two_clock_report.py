@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """two_clock_report.py — one-command 4-page PDF for a two-clock head-to-head.
 
+NOTE (2026-07-09): the GENERAL N-clock report is ``scripts/clock_report.py``.
+This module is retained as the N=2 special case (single csv, chA vs chB) —
+the name is honest for exactly that.  For 3+ clocks, or clocks spread across
+multiple TICC csvs / antenna groups with group-aware budget grading, use
+``clock_report.py`` (``--host`` / ``--manifest``, or ``--from-csv`` for this
+same two-clock shape).  See docs/misnomers.md for the rename rationale.
+
 Given a single shared-reference TICC capture (chA = clock A PPS, chB =
 clock B PPS, both timestamped against the TICC's reference oscillator,
 e.g. an FE-5680A Rb), produce a 4-page 16:9 landscape PDF:

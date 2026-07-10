@@ -681,3 +681,42 @@ chase mosaic PVT-smoothing settings that don't exist for an external ref.
 **Notes**: shipped in PR #301; do NOT rename in isolation (blame churn).
 Rename when next editing servo_sim's single-osc block.  Full reasoning:
 `docs/mid-tau-servo-knobs.md` "Correction (2026-07-07)".
+
+## 2026-07-09 — N-clock report generalization
+
+### `two_clock_report.py` (module name) — Misleading
+
+**Where**: `scripts/two_clock_report.py`
+**Claim**: A report for *two* clocks — and, worse, an invitation to
+overload the "two" name to N when the fleet grew to 6 clocks across
+4 shared-Rb TICCs.
+**Actual**: The 4-page composer genuinely only handles ONE csv's
+chA/chB (exactly two clocks).  The general N-clock capability now
+lives in the new `scripts/clock_report.py` (+ `clock_report_core.py`).
+**Why it matters**: "two_clock" doing N would be a textbook misnomer
+(the exact pet peeve this file exists for).  Resolution: we did NOT
+overload it — the general tool got an honest general name
+(`clock_report`), and `two_clock_report` is retained, unchanged and
+still honest, as the N=2 special case.  Back-compat: its public
+`build_report(...)`/`main()` signatures and 4-page/16:9 output are
+preserved (existing `tests/test_two_clock_report.py` stays green);
+a docstring note points readers at `clock_report.py` for 3+ clocks.
+**Proposed**: leave `two_clock_report.py` as-is (it is honest for
+N=2).  New work targets `clock_report.py`.  Optionally, later, make
+`two_clock_report` a thin shim over `clock_report.build_report` once
+the N=2 output layout is proven identical — deferred to avoid
+churning the pinned page/summary contract.
+**Notes**: added alongside `clock_report.py` (2026-07-09).
+
+### `load_ticc_cha` — Cosmetic
+
+**Where**: `tools/plot_xhost_virtual.py` (function `load_ticc_cha`)
+**Claim**: Loads chA samples.
+**Actual**: Now channel-parameterized (`channel='chA'` default) so
+`clock_report_core` can pull any channel (chA OR chB) as a clock's
+PPS-vs-Rb stream.  The "cha" suffix is stale for the general call.
+**Why it matters**: Low — the default preserves every existing
+2-input caller; only mildly misleading when called with `channel='chB'`.
+**Proposed**: `load_ticc_channel` (or `load_channel_samples`).  Rename
+opportunistically when next touching that file's callers.
+**Notes**: 2026-07-09.

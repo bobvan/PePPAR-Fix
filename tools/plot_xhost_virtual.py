@@ -93,8 +93,17 @@ def _round_key(ts: datetime) -> float:
 
 
 def load_ticc_cha(path: Path,
-                  skip_before: datetime | None = None) -> list[Sample]:
-    """Read chA samples — schema-agnostic across ticc_capture.py and engine logs."""
+                  skip_before: datetime | None = None,
+                  channel: str = 'chA') -> list[Sample]:
+    """Read one channel's samples — schema-agnostic across ticc_capture.py
+    and engine logs.
+
+    ``channel`` selects which TICC channel to extract (default ``'chA'`` for
+    backward compatibility with existing two-input callers).  The function
+    name is kept for continuity; it reads whichever ``channel`` is asked for
+    (see docs/misnomers.md — the ``load_ticc_cha`` name is now a mild
+    misnomer since it is channel-parameterized).
+    """
     samples: list[Sample] = []
     with open(path) as f:
         reader = csv.DictReader(skip_comment_lines(f))
@@ -107,7 +116,7 @@ def load_ticc_cha(path: Path,
                 f'{path}: expected ts_iso or host_timestamp column, '
                 f'got {reader.fieldnames}')
         for row in reader:
-            if row['channel'] != 'chA':
+            if row['channel'] != channel:
                 continue
             ts = datetime.fromisoformat(row[ts_col].replace('Z', '+00:00'))
             if skip_before and ts < skip_before:
