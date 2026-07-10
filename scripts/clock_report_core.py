@@ -578,7 +578,11 @@ def analyze(host_specs: list, shared_ns: float = SHARED_NS_DEFAULT,
     samples_by_label: dict = {}
     for h in host_specs:
         # Per-clock stability: FULL trace (excursion window does NOT apply).
-        phase = load_chA_phase(h.csv, stability_skip_before, channel=h.channel)
+        # A stability-only clock is non-contemporaneous by definition, so the
+        # live-window stability skip must NOT touch it — else it trims the
+        # historical trace to nothing (n=0).
+        sb = None if h.stability_only else stability_skip_before
+        phase = load_chA_phase(h.csv, sb, channel=h.channel)
         phase, n_out = reject_gross_outliers(phase)
         tdev, adev = host_stability(phase)
         hosts[h.label] = HostResult(spec=h, n=len(phase), tdev=tdev,
