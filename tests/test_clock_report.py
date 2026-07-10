@@ -342,11 +342,15 @@ def test_stability_skip_before_spares_stability_only(tmp_path):
     but must NOT touch a non-contemporaneous stability-only clock — else it
     trims the historical trace to n=0 (2026-07-10 windowing bug)."""
     import clock_report_core as core
-    a = _phase_ps(2000, 0.10, 0.0, 200_000_000, seed=21)   # whole trace ~2026-07-09
+    a = _phase_ps(2000, 0.10, 0.0, 200_000_000, seed=21)   # live clock
+    b = _phase_ps(2000, 0.10, 0.0, -100_000_000, seed=22)  # historical trace
     csv = tmp_path / "hist.csv"
-    _write_csv(csv, {"chA": a}, fmt="capture")
-    specs = [core.HostSpec("hist", csv, "chA", "g", stability_only=True)]
+    _write_csv(csv, {"chA": a, "chB": b}, fmt="capture")
+    specs = [core.HostSpec("live", csv, "chA", "g"),
+             core.HostSpec("hist", csv, "chB", "g", stability_only=True)]
+    ssb = core.parse_iso("2030-01-01T00:00:00Z")           # after all data
     result = core.analyze(specs, work_dir=tmp_path, do_hat=False,
-                          stability_skip_before="2030-01-01T00:00:00Z")
-    assert result.hosts["hist"].n > 0     # NOT trimmed away by the live skip
+                          stability_skip_before=ssb)
+    assert result.hosts["hist"].n > 0     # stability-only NOT trimmed (the fix)
     assert result.hosts["hist"].tdev
+    assert result.hosts["live"].n == 0    # a live clock IS trimmed by the skip
