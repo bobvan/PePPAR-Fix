@@ -310,3 +310,28 @@ def test_from_csv_two_clock_convenience(tmp_path):
     result = clock_report.build_report(specs, out_pdf)
     assert len(result.pairs) == 1
     assert result.pairs[0].shared and result.pairs[0].grade == "PASS"
+
+
+def test_gross_outliers_dropped_and_flagged(tmp_path):
+    """ptBoat-style: a few ~500 ms PPS glitches must be dropped from the
+    per-clock TDEV path (else variance-based TDEV blows up) and reported,
+    while a clean co-channel on the same TICC is untouched."""
+    import clock_report_core as core
+    a = _phase_ps(4000, 0.10, 0.0, 200_000_000, seed=11)
+    for i in (500, 1500, 2500, 3200, 3800):
+        a[i] += 500_000_000_000                       # +500 ms glitch (ps)
+    b = _phase_ps(4000, 0.10, 0.0, -100_000_000, seed=12)
+    csv = tmp_path / "glitch.csv"
+    _write_csv(csv, {"chA": a, "chB": b}, fmt="capture")
+    specs = [core.HostSpec("glitchy", csv, "chA", "G"),
+             core.HostSpec("clean", csv, "chB", "G")]
+    result = core.analyze(specs, work_dir=tmp_path, do_hat=False)
+    hg = result.hosts["glitchy"]
+    assert hg.n_outliers >= 5                          # all glitches caught
+    assert hg.tdev and max(hg.tdev.values()) < 50.0    # TDEV sane, not ms-scale
+    assert result.hosts["clean"].n_outliers == 0       # co-channel untouched
+
+    # quiet clock keeps its own real ns-scale noise (nothing dropped)
+    y = np.random.default_rng(3).normal(0.0, 0.05, 5000)
+    _, ny = core.reject_gross_outliers(y)
+    assert ny == 0

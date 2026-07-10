@@ -286,6 +286,39 @@ class HostResult:
     tdev: dict = field(default_factory=dict)   # {tau_s: ns}
     adev: dict = field(default_factory=dict)   # {tau_s: dimensionless}
     phase_ns: np.ndarray = field(default_factory=lambda: np.array([]))
+    n_outliers: int = 0
+
+
+def reject_gross_outliers(phase_ns, k_mad: float = 25.0,
+                          floor_ns: float = 200.0):
+    """Drop gross per-sample outliers from a detrended phase series before TDEV.
+
+    A glitching / boundary-straddling PPS (e.g. ptBoat's ~500 ms edge
+    excursions, 2026-07-10 xhost overnight) injects a handful of samples
+    orders of magnitude beyond the clock's real noise.  TDEV is variance-based,
+    so those destroy it — while the p95 excursion is unaffected (robust to a
+    <0.1 % tail).  Flag samples where ``|x - median| > max(k_mad*1.4826*MAD,
+    floor_ns)`` and linear-interpolate over them so the evenly-sampled series
+    stays gap-free.  The floor keeps a genuinely quiet clock (tiny MAD) from
+    rejecting its own real ns-scale noise; only truly gross (>~200 ns single-
+    sample) excursions go.  Returns ``(clean_phase, n_dropped)``.
+    """
+    x = np.asarray(phase_ns, dtype=float)
+    if x.size < 8:
+        return x, 0
+    med = float(np.median(x))
+    mad = float(np.median(np.abs(x - med)))
+    thresh = max(k_mad * 1.4826 * mad, floor_ns)
+    bad = np.abs(x - med) > thresh
+    n = int(bad.sum())
+    # Never blank out (nearly) the whole series — that would signal a bad
+    # threshold, not outliers; leave the data untouched in that pathological case.
+    if n == 0 or n >= x.size - 2:
+        return x, 0
+    idx = np.arange(x.size)
+    clean = x.copy()
+    clean[bad] = np.interp(idx[bad], idx[~bad], x[~bad])
+    return clean, n
 
 
 def host_stability(phase_ns: np.ndarray) -> tuple[dict, dict]:
@@ -546,9 +579,10 @@ def analyze(host_specs: list, shared_ns: float = SHARED_NS_DEFAULT,
     for h in host_specs:
         # Per-clock stability: FULL trace (excursion window does NOT apply).
         phase = load_chA_phase(h.csv, stability_skip_before, channel=h.channel)
+        phase, n_out = reject_gross_outliers(phase)
         tdev, adev = host_stability(phase)
         hosts[h.label] = HostResult(spec=h, n=len(phase), tdev=tdev,
-                                    adev=adev, phase_ns=phase)
+                                    adev=adev, phase_ns=phase, n_outliers=n_out)
         # Excursion samples: windowed; stability-only clocks are excluded.
         if h.stability_only:
             samples_by_label[h.label] = []

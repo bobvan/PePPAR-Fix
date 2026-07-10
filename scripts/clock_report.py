@@ -340,7 +340,9 @@ def print_summary(result: core.AnalysisResult, out=sys.stdout) -> None:
             (f'{hr.tdev[t]:>12.3f}' if t in hr.tdev else f'{"—":>12s}')
             for t in core.REPORT_TAUS)
         tag = ' *' if hr.spec.stability_only else ''
-        p(f'{(lab + tag):<16s}{hr.spec.group:<14s}{hr.n:>7d}{cells}')
+        oc = getattr(hr, 'n_outliers', 0)
+        onote = f'   [{oc} gross outliers dropped]' if oc else ''
+        p(f'{(lab + tag):<16s}{hr.spec.group:<14s}{hr.n:>7d}{cells}{onote}')
     if any(result.hosts[l].spec.stability_only for l in result.order):
         p('  (* = stability-only / non-contemporaneous: TDEV from its own '
           'full trace; N/A in every excursion pair)')
