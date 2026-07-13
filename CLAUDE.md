@@ -389,7 +389,7 @@ passwordless for user `bob`.
 | PiPuss | `ssh PiPuss.local` | Dual-F9T, caster/client testing | F9T-TOP `/dev/gnss-top`, F9T-BOT `/dev/gnss-bot` | Zero-baseline (both on Patch3 via GUS #2) |
 | ~~Onocoy~~ | mothballed 2026-04-08 | F10T + PX1125T disconnected; TICC #2 moved to ocxo | – | Powered down. Never had a peppar-fix checkout. |
 | otcBob1 | `ssh otcBob1` | Timebeat OTC SBC, OCXO, Renesas ClockMatrix | F9T on `/dev/ttyAMA0` at 460800 | Stop `timebeat` before accessing I2C or GNSS |
-| ptBoat | `ssh ptBoat` | Timebeat OTC Mini PT, weatherproof, PoE | F9T on `/dev/ttyAMA0` at 115200 | Same Renesas ClockMatrix as otcBob1 |
+| ptBoat | `ssh ptBoat` | Timebeat **Open Time Appliance Mini** (portable, battery UPS) — upgraded from Open Time Card Mini 2026-07-10 (same Pi, new F9T, **double-oven OCXO "DOCXO"**) | F9T on `/dev/ttyAMA0` at 115200 | Same Renesas ClockMatrix as otcBob1; F9T-PPS on **CLK2**; battery UPS → field survey + holdover |
 | ~~ocxo~~ → ptpmon | `ssh ptpmon` | **Decommissioned 2026-06-14.** The E810-XXVDA4T x86 machine that was host `ocxo` was recommissioned as **ptpmon** (x86_64 Ubuntu utility host — NTRIP/offline captures, x86-only tools). `ocxo` and `ptpmon` are the **same physical machine** and never coexist; **do not expect to host `ocxo` again.** | – | See [[ptpmon-arch]] |
 | bbb | `ssh bbb` (→ 10.168.13.14, PTP LAN) | BeagleBone, GPS L1 only | `/dev/gps0` at 9600 | Legacy NTP/PTP GM. **Reachable ONLY via the PTP LAN** — no trusted-LAN/Tailscale/mDNS interface, so PTP-LAN SSH is the sole option here (see resolution note). |
 
