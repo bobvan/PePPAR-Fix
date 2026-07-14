@@ -844,6 +844,7 @@ here before changing anything in the areas they cover.
 | [peer-bootstrap-sketch.md](docs/peer-bootstrap-sketch.md) | NTRIP caster mode for peer-to-peer bootstrap. |
 | [caster-ephemeris.md](docs/caster-ephemeris.md) | Spec + implementation plan: encode F9T RXM-SFRBX as RTCM 1019/1042/1046 so the local caster serves broadcast ephemeris alongside observations. Removes external NTRIP dependency for peer bootstrap. |
 | [ntrip-mdns-discovery.md](docs/ntrip-mdns-discovery.md) | Spec: mDNS service advertisement for NTRIP peer discovery. Caster announces `_ntrip._tcp`, client discovers and selects by accuracy/proximity. |
+| [ntrip-recaster-options.md](docs/ntrip-recaster-options.md) | Survey of open-source NTRIP re-casters (relay/relabel/aggregate) for local lab correction distribution: `str2str` (RTKLIB) to pull GA's SSR once and re-serve relabeled over the LAN, BNC `Combi` for multi-AC combination (float only — single AC for AR, per ac-datum-mixing), BKG Icecast caster if we outgrow `str2str`.  Complements `ntrip_caster.py` (upstream/base-station role). |
 | [ticc-calibration-2026-03-19.md](docs/ticc-calibration-2026-03-19.md) | TICC calibration procedure and results. |
 | [hw-labels.md](docs/hw-labels.md) | Hardware labeling conventions for beads. |
 | [draft-dupage-inquiry.md](docs/draft-dupage-inquiry.md) | Draft inquiry to DuPage County about GNSS antenna siting. |
