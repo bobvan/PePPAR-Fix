@@ -13,6 +13,9 @@ The name is a play on **PPP-AR** — *Precise Point Positioning with Ambiguity
 Resolution*, the geodetic technique at its core.
 "Fix" is the GNSS fix it stands on.
 
+> 📊 **Talk:** this work was covered in a recent presentation —
+> [slides & materials](https://github.com/bobvan/subNanoAtHomeGnssAI).
+
 ---
 
 ## Why a stationary antenna changes everything
