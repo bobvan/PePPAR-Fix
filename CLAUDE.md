@@ -15,6 +15,13 @@ fresh session, render the dayplan to get context:**
 /home/bob/.claude/projects/-home-bob-git-PePPAR-Fix/dayplan/dayplan.py render | less
 ```
 
+That path is a stable, worktree-neutral **symlink alias**; the tool
+itself is versioned in the repo at `tools/dayplan.py` (source of
+truth — edit + commit there).  The live-log dir is a fixed shared
+path decoupled from the script's location, so every worktree's copy
+appends to the one shared log.  See
+[`docs/dayplan-cooperation.md`](docs/dayplan-cooperation.md) for why.
+
 To file a new item, comment on an existing one, or ack a review,
 **use the same CLI** (`propose` / `discuss` / `ack` / `amend` /
 `status`).  **Do not edit `/tmp/dp-*.txt`** — that's render output,

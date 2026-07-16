@@ -7,9 +7,28 @@ what blocks what, and the running discussion under each item.
 
 ## The tool — write here, not anywhere else
 
+Invoke it at this stable, worktree-neutral path (works from any
+worktree, any cwd):
+
 ```
 /home/bob/.claude/projects/-home-bob-git-PePPAR-Fix/dayplan/dayplan.py
 ```
+
+**Where it actually lives (source of truth):** the script is versioned
+in the repo at `tools/dayplan.py`.  The path above is a symlink alias
+pointing at the primary dev tree's copy
+(`/home/bob/git/PePPAR-Fix/tools/dayplan.py`).  Edit + commit the repo
+copy; the alias always runs the committed script.
+
+**Why the log dir is decoupled from the script.**  The script lives in
+the repo, so every agent's worktree (`PePPAR-Fix/`, `PePPAR-Fix-charlie/`,
+…) checks out its own copy.  All those copies must append to **one**
+shared log, so the live-log directory is a **fixed absolute path**
+(`LIVE_DIR`, overridable via `$DAYPLAN_LIVE_DIR` for tests), *not*
+derived from the script's own location.  Deriving it from `__file__`
+would splinter the log into per-worktree files and the agents would
+silently stop hearing each other — the exact failure dayplan exists to
+prevent.
 
 Same path from any worktree.  All write ops go through the CLI:
 
