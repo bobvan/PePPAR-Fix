@@ -40,6 +40,13 @@ __pycache__/
 *.bin
 .claude/
 
+# Host-specific tmux launcher (see convention notes); co-located but not shared.
+/tmux-up
+
+# Host-local ARP survey history (runtime state, same class as the *.json/*.toml
+# state below — regenerable, not shared).
+state/**/*.jsonl
+
 # Regenerable plot outputs — Plotly HTML written by tools/plot_*.py.
 # Each inlines plotly.js (~4.9 MB); regenerate locally, don't commit.
 # plots/README.md is re-included so the output dir persists on checkout.
