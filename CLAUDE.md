@@ -888,7 +888,19 @@ here before changing anything in the areas they cover.
 
 ## Lab Documentation Pointers
 
-The `timelab/` directory at the town root has authoritative lab state:
+**The `../timelab` repo is the reference for the physical timelab** used
+to develop PePPAR-Fix — wiring, gear, receivers, TICCs, antennas, surveys,
+udev rules, and lab utility scripts.  It is a **separate private GitHub
+repo** (`git@github.com:bobvan/timelab.git`, sibling checkout at
+`../timelab`, branch `main`) — **not** part of the PePPAR-Fix repo.  Treat
+it as living documentation: **when you change the physical lab (move a
+receiver, re-cable a splitter, add/retire a host, re-survey an ARP, swap an
+antenna), update the matching file in `../timelab` and `git commit` +
+`git push` it.**  A change that isn't pushed is invisible to the other
+agents and to future sessions — don't leave lab state stranded in an
+uncommitted working tree.
+
+The `timelab/` directory (same content, at the town root) has authoritative lab state:
 
 | File | Contents |
 |---|---|
