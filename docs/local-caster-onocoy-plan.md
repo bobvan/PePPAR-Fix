@@ -1,0 +1,172 @@
+# Local casters / re-casters + Onocoy contribution — architecture plan
+
+*2026-07-22 — planning doc, not a build order. Lays out the full option space
+for local NTRIP casters/re-casters, contributing our observations to Onocoy,
+and the production-vs-research split that keeps them from contaminating each
+other. Goal: don't foreclose any path. Builds on
+[ntrip-recaster-options.md](ntrip-recaster-options.md) (Delta's tool survey),
+[caster-ephemeris.md](caster-ephemeris.md), [peer-bootstrap-sketch.md](peer-bootstrap-sketch.md),
+[ac-datum-mixing.md](ac-datum-mixing.md), and
+[coordinate-reference-frames.md](coordinate-reference-frames.md).*
+
+## The organizing idea: two directions × two tiers
+
+There are **two caster directions** (Delta's key distinction) and **two
+service tiers**. Every box below is one cell of this matrix.
+
+**Directions:**
+- **Correction re-caster** — consume *corrections* upstream (GA SSR, PTBB obs),
+  re-serve *downstream* to lab consumers. No local hardware. → runs on **gt**.
+- **Observation caster** — take raw obs from *our* receivers, serve them
+  out (LAN and/or to Onocoy). Tied to the receiver's host (hardware stream).
+
+**Tiers:**
+- **Production** — calibrated ARP (UFO1), stable, durable, externally visible
+  (Onocoy). Must be trustworthy: Onocoy grades us.
+- **Research** — experimental receivers/antennas/streams, transient, may use
+  CHOKE1 (un-calibrated) or oddball configs. Never streamed externally.
+
+|  | Correction re-caster (gt, HW-free) | Observation caster (receiver host) |
+|---|---|---|
+| **Production** | SSR relay + obs fan-out (systemd on gt) | UFO1/Mosaic-T → LAN + **Onocoy** |
+| **Research** | ad-hoc capture fan-out | CHOKE1 / NetRS / F9P experiments |
+
+The production/research split is **mandatory once we stream to Onocoy** — they
+cross-check our station against their network, so production must be a
+calibrated, stable, honest station and must never carry a research experiment.
+
+## Component inventory
+
+**Receivers (Onocoy/caster fodder):**
+
+| Receiver | Bands / GNSS | RTCM3 MSM7 + NTRIP-server push? | Best role |
+|---|---|---|---|
+| **GNSSDO+ Mosaic-T** (on UFO1, 10.168.13.196) | L1/L2/L5, GPS+GLO+GAL+BDS | Yes — Septentrio built-in NTRIP server, full MSM7 + 1005/1033/1230 | **Production Onocoy station** |
+| **ZED-F9P** (idle) | L1/L2, GPS+GLO+GAL+BDS | Yes — MSM7 out; push via str2str or ArduSimple firmware | Onocoy #2 / research |
+| **Leica GRX1200 GG Pro** (on UFO1) | L1/L2, GPS+GLO | RTCM2/3 — **verify live MSM streaming** (we use it for OPUS file logging) | Keep as OPUS ARP-truth; caster only if MSM confirmed |
+| **Trimble NetRS** (just arrived) | L1/L2, **GPS-only** | RTCM3 — GPS-only limits Onocoy value | Research / external-clock PoC (per [gpsdo-noise-and-external-clock.md](gpsdo-noise-and-external-clock.md)) |
+
+**Antennas:** **UFO1** (SFESPK6618H, **NGS-calibrated**, OPUS-Static ARP σ≈6 mm,
+ITRF) — the *only* calibrated ARP → **production**. CHOKE1 (un-calibrated) →
+research only. Onocoy needs a calibrated ARP + a recognized antenna descriptor
+(1033/1008); UFO1 qualifies, CHOKE1 does not.
+
+**Upstream correction sources:** GA `SSRA03IGS0` (float SSR, our production),
+`BCEP00BKG0` (eph), PTBB/BRUX obs (known-good validation). See CLAUDE.md.
+
+**Caster software (from Delta's survey):** `str2str` (relay/relabel + `ntripc`
+caster + **NTRIP-server push** — one tool covers pull-fan-out AND Onocoy push),
+BNC `Combi` (multi-AC float combine, never AR), BKG Icecast caster (managed,
+Docker), our `ntrip_caster.py` (serves MSM4 from u-blox RAWX — pull-only, no
+push).
+
+## The boxes
+
+### Box 1 — Internal SSR relay (gt, systemd, HW-free) — *do first*
+`str2str` pulls GA `SSRA03IGS0` **once**, re-serves on the LAN under our own
+mountpoint (e.g. `gt:2101/SSR-IGS03`). Lab hosts + PTBB capture engines pull
+from gt instead of each opening a GA connection. Cuts upstream connection count,
+decouples the lab from GA outages (gt holds last-good), single point to swap
+when the upstream mount changes again (as `SSRA00BKG0`→`SSRA03IGS0` just did).
+Add `BCEP00BKG0` the same way. **Internal only.**
+
+### Box 2 — Internal obs fan-out (gt, systemd, HW-free)
+`str2str` pulls PTBB + BRUX **once** each → LAN mounts. The multi-stream PTBB
+capture then opens 1 external PTBB + 1 external BRUX instead of N — polite to
+IGS-IP and the scaling fix for >~4 correction streams. Same box class as Box 1.
+
+### Box 3 — Production observation caster + Onocoy (UFO1/Mosaic-T host)
+The Mosaic-T on UFO1 emits RTCM3 **MSM7** (1077/1087/1097/1127) + **1006** (ARP,
+ITRF) + **1033** (antenna) + **1230** (GLO biases). Fan that one stream three ways:
+1. **Onocoy push** — NTRIP-server to `servers.onocoy.com:2101` with a
+   per-station credential (Onocoy dashboard → Reference Stations → NTRIP
+   Credentials). <1 s latency for rewards. Our external consistency check.
+2. **Local LAN caster** — our own base station for local RTK / relative-baseline
+   surveys (pairs with [arp-survey-strategy.md](arp-survey-strategy.md) Tier A).
+3. **Raw log** — see Logging below.
+
+Cleanest topology: **receiver's built-in NTRIP server → Onocoy directly** (no
+extra moving parts, lowest latency), and **str2str tees** a second copy to the
+LAN caster + file log. Or the Septentrio pushes to Onocoy while `str2str`
+(client on the Mosaic's second RTCM output) handles LAN + log.
+
+### Box 4 — Research observation casters (various, transient)
+F9P/NetRS on CHOKE1 or bench, experimental RTCM, correction-stream comparisons.
+Never external. May reuse `ntrip_caster.py` or str2str ad hoc.
+
+## Onocoy specifics (contribution side)
+
+- **Endpoint:** NTRIP-server **push** to `servers.onocoy.com:2101`, per-station
+  credential; mountpoint name is cosmetic (dashboard only).
+- **Messages:** RTCM3 MSM (MSM7 preferred) + 1005/1006 + 1033 + 1230; **≥ MSM4**
+  or they drop it. **< 1 s** end-to-end latency.
+- **ARP frame:** ITRF — we already picked ITRS as the canonical frame *because*
+  of the Onocoy signup ([coordinate-reference-frames.md](coordinate-reference-frames.md));
+  UFO1's ARP is stored ITRF2020@epoch, so it's ready.
+- **Antenna descriptor:** must be a type Onocoy recognizes for PCO/PCV —
+  confirm `SFESPK6618H` maps cleanly (we already NGS-inject its antex for PRIDE).
+- **Value:** not the crypto — Onocoy validates every contributing station
+  against its network, so a green station there is an **independent third-party
+  attestation** that our UFO1 ARP + antenna + receiver chain are self-consistent
+  to their tolerance. A cheap, continuous external check on the production chain.
+
+## Engine caster vs off-the-shelf
+
+Use **str2str** for relay/fan-out (Boxes 1–2) and as the tee/push hub (Box 3):
+it already does NTRIP-server push, which `ntrip_caster.py` **cannot** — that's
+the deciding capability for Onocoy. Use the **receiver's built-in NTRIP server**
+for the actual Onocoy push where possible (lowest latency, fewest parts).
+Keep **`ntrip_caster.py`** for its niche: serving the engine's *own processed*
+observations / the peer-bootstrap + caster-ephemeris direction
+([caster-ephemeris.md](caster-ephemeris.md), [peer-bootstrap-sketch.md](peer-bootstrap-sketch.md))
+— not for corrections or Onocoy. Don't grow it into a general caster; that's
+re-inventing str2str/BKG.
+
+## Logging — yes, log the streams
+
+Worth doing for every box, cheap (RTCM is compact):
+- **Provenance / audit** — what we served/pushed and when (essential if Onocoy
+  ever flags our station: we have the raw record to defend it).
+- **Replay fodder** — raw RTCM byte streams stamped `recv_mono` are *exactly*
+  the [pos-replay-capture-manifest.md](pos-replay-capture-manifest.md) Group-A
+  inputs. A logging caster doubles as a reference-capture recorder.
+- **Debug** — reproduce a bad epoch offline.
+
+How: `str2str` can `-out file://` in parallel with its caster/push output (tee),
+or a dedicated logger consumes the LAN mount. Rotate (logrotate), timestamp
+filenames by UTC day, **pull to gt** for archival (RAIDZ-3; per the Lab Storage
+Warning). Keep production and research logs in separate trees.
+
+## Production vs research separation (concrete)
+
+| Aspect | Production | Research |
+|---|---|---|
+| Antenna / ARP | UFO1, calibrated, ITRF | CHOKE1 / bench, any |
+| Receiver | Mosaic-T (stable) | F9P / NetRS / whatever |
+| External (Onocoy) | Yes | **Never** |
+| Uptime | systemd, durable | ad-hoc |
+| Config tree | `config/production/…` | `config/research/…` |
+| Log tree | `data/caster/prod/…` | `data/caster/research/…` |
+
+## Suggested phasing (not overnight)
+
+1. **Box 1** (SSR relay on gt, systemd) — immediate win, decouples the lab from
+   GA, and we just felt the pain of a dead upstream mount.
+2. **Box 2** (obs fan-out on gt) — folds the current PTBB capture behind one
+   upstream pull; enables scaling the correction-stream comparison.
+3. **Box 3 read-only first** — bring the Mosaic-T's RTCM3 up on the LAN caster +
+   logging, validate MSM7 completeness + latency + ARP, *before* pushing to
+   Onocoy.
+4. **Onocoy push** — register the station, push, watch its dashboard grade.
+5. **Box 4 / more receivers** — F9P second station, NetRS external-clock PoC.
+
+## Open decisions for Bob
+
+- Which host runs the gt casters — literally gt, or a container on gt?
+- Mosaic-T → Onocoy via its **own** NTRIP server, or via str2str tee? (latency
+  vs one-hub simplicity)
+- Do we want a **managed** caster (BKG Icecast/Docker) from the start, or grow
+  into it from str2str?
+- Confirm `SFESPK6618H` is an Onocoy-recognized antenna descriptor.
+- Second Onocoy station (F9P) on CHOKE1 for network diversity, or keep CHOKE1
+  research-only?
