@@ -4674,6 +4674,33 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
     lat, lon, alt = ecef_to_lla(known_ecef[0], known_ecef[1], known_ecef[2])
     log.info(f"Position: {lat:.6f}, {lon:.6f}, {alt:.1f}m")
 
+    # --clock-log: per-epoch clock CSV, set up here — deliberately OUTSIDE
+    # the servo/TICC context — so it works on hardware-free capture hosts.
+    # (--dt-rx-log / --filter-state-log writers live in servo_ctx and need a
+    # TICC, so they stay empty on a receiver-less NTRIP-obs host.)  epoch_unix
+    # is the join key for comparing correction streams — see
+    # docs/known-good-obs-validation.md and docs/local-caster-onocoy-plan.md.
+    _clk_log_w = None
+    _clk_log_f = None
+    if getattr(args, 'clock_log', None):
+        try:
+            from peppar_fix.strided_writer import StridedWriter
+            _need_hdr = (not os.path.exists(args.clock_log)
+                         or os.path.getsize(args.clock_log) == 0)
+            _clk_log_f = open(args.clock_log, 'a', newline='')
+            _clk_log_csv = csv.writer(_clk_log_f)
+            if _need_hdr:
+                _clk_log_csv.writerow([
+                    'host_timestamp', 'host_monotonic', 'epoch_unix',
+                    'clk_ns', 'clk_sigma_ns', 'n_used', 'ztd_mm'])
+                _clk_log_f.flush()
+            _clk_log_w = StridedWriter(
+                _clk_log_csv, stride=getattr(args, 'clock_log_stride', 1))
+            log.info("clock CSV log: %s (stride=%d, servo-independent)",
+                     args.clock_log, _clk_log_w.stride)
+        except OSError as e:
+            log.error("Failed to open clock_log %s: %s", args.clock_log, e)
+
     # Optional ambient/oven temp sensor.  Silent no-error when absent.
     # read_onboard_temps (RPi thermal zones) imported here too so the
     # every-60-epoch [TEMP_BOARD] log doesn't re-import in the hot loop.
@@ -6097,6 +6124,25 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
                 except (OSError, ValueError):
                     pass
 
+            # --clock-log: per-epoch clock, servo-independent (no TICC
+            # needed) — the hardware-free counterpart to --dt-rx-log, with
+            # epoch_unix as the join key for cross-correction-stream compare.
+            if _clk_log_w is not None:
+                try:
+                    _clk_log_w.writerow([
+                        datetime.now(tz=timezone.utc).isoformat(),  # wallclock-ok: record timestamp
+                        f"{time.monotonic():.9f}",
+                        f"{gps_time.timestamp():.6f}",
+                        f"{dt_rx_ns:.6f}",
+                        f"{dt_rx_sigma:.6f}",
+                        int(getattr(filt, 'last_n_pr', 0)),
+                        f"{dztd_m * 1000.0:.3f}",
+                    ])
+                    if _clk_log_f is not None:
+                        _clk_log_f.flush()
+                except (OSError, ValueError, AttributeError):
+                    pass
+
             # Per-SV post-fit residuals (perSvResidLog).  One row per
             # SV that contributed to this epoch's filter update.  Lets
             # downstream analysis decompose dt_rx noise across SVs:
@@ -6512,6 +6558,11 @@ def run_steady_state(args, known_ecef, obs_queue, corrections, beph, ssr,
         log.info("Interrupted")
     finally:
         stop_event.set()
+        if _clk_log_f is not None:
+            try:
+                _clk_log_f.close()
+            except OSError:
+                pass
         if servo_ctx is not None and servo_ctx.get("correlation_gate") is not None:
             gate_stats = {
                 "strict_correlation": servo_ctx["correlation_gate"].stats.as_dict(),
@@ -13569,6 +13620,19 @@ Two-phase operation:
                            "of software-arm-vs-hardware-floor stability.")
     ticc.add_argument("--dt-rx-log-stride", type=int, default=1,
                       help="Decimation stride for --dt-rx-log.  1 = every "
+                           "PPP epoch (~1 Hz, default).  0 coerced to 1.")
+    ticc.add_argument("--clock-log", default=None,
+                      help="Optional per-epoch clock CSV log path "
+                           "(host_timestamp, host_monotonic, epoch_unix, "
+                           "clk_ns, clk_sigma_ns, n_used, ztd_mm).  Unlike "
+                           "--dt-rx-log, this writer is servo-independent — "
+                           "it works on hardware-free NTRIP-obs hosts with "
+                           "no TICC (e.g. the ptpmon correction-stream "
+                           "capture pipeline).  epoch_unix is the join key "
+                           "for comparing streams.  See "
+                           "docs/known-good-obs-validation.md.")
+    ticc.add_argument("--clock-log-stride", type=int, default=1,
+                      help="Decimation stride for --clock-log.  1 = every "
                            "PPP epoch (~1 Hz, default).  0 coerced to 1.")
     ticc.add_argument("--arm-state-log", default=None,
                       help="Optional six-arm Kalman state CSV log path.  "
