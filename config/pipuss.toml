@@ -28,7 +28,10 @@ receiver = "f9t"
 
 ntrip_conf = "ntrip.conf"
 eph_mount = "BCEP00BKG0"
-# CNES SSRA00CNE0 removed from IGS-IP 2026-06-28 -> BKG SSRA00BKG0 (float).
+# CNES SSRA00CNE0 removed from IGS-IP 2026-06-28 -> BKG SSRA00BKG0 (float);
+# BKG SSRA00BKG0 retired 2026-07-22 -> IGS-RTS combined SSRA03IGS0 (float,
+# same GA caster).  SSR mount lives in ntrip.conf (host-local).
+
 ssr_ntrip_conf = "ntrip.conf"
 systems = "gps,gal,bds"
 

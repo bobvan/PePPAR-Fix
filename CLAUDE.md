@@ -486,12 +486,22 @@ scp TimeHat:~/peppar-fix/ntrip.conf .
 ```
 
 Caster: `ntrip.data.gnss.ga.gov.au:443` (TLS).
-SSR mount: `SSRA00BKG0`.
-Broadcast ephemeris mount: `BCEP00BKG0` (same caster, pass via `--eph-mount`).
+SSR mount: `SSRA03IGS0` (IGS-RTS combined).  **`SSRA00BKG0` was retired
+2026-07-22** — BKG's real-time SSR combination vanished from both the GA
+caster and BKG's own `products.igs-ip.net` (a Wheaton host still pointed
+at it gets a silent 404 → broadcast-only PPP with no SSR).  The IGS-RTS
+combined stream `SSRA03IGS0` is the verified successor: same GA caster,
+same `bobvan`/TLS creds, HTTP 200, decodes 96 orbit / 96 clock / 480
+code-bias.  Also on `products.igs-ip.net` (`SSRA02IGS0` = IGS02 is the
+alternate).
+Broadcast ephemeris mount: `BCEP00BKG0` (same caster, pass via `--eph-mount`
+— **still alive**, unaffected by the SSR retirement).
 
 **SSR status**: Orbit + clock + code bias available. **Phase bias = 0**
 (not provided by this stream). This means PPP-AR is not possible with
-this SSR source alone.
+this SSR source alone.  (Unchanged by the BKG→IGS-combined switch — both
+are float-only; AR phase biases still need a single-AC mount like CAS/WHU
+per `ac-datum-mixing.md`.)
 
 ## Known Broken Things
 
