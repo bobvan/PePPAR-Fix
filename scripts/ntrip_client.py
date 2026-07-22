@@ -76,8 +76,13 @@ class NtripStream:
 
     def __init__(self, caster, port, mountpoint, user=None, password=None,
                  timeout=10, reconnect_delay=5, max_reconnect_delay=60,
-                 max_reconnects=None, tls=None):
+                 max_reconnects=None, tls=None, http10=False):
         self.caster = caster
+        # http10: send a minimal NTRIP-v1 / HTTP/1.0 request instead of the
+        # HTTP/1.1 default.  Needed for casters whose parser only accepts v1 —
+        # notably RTKLIB str2str's `ntripc` local re-caster (Box 1/2), which
+        # ignores HTTP/1.1 requests.  See docs/local-caster-onocoy-plan.md.
+        self.http10 = http10
         self.port = port
         self.mountpoint = mountpoint
         self.user = user
@@ -122,16 +127,25 @@ class NtripStream:
         log.info(f"Connecting to {self.caster}:{self.port}/{self.mountpoint}"
                  f"{' (TLS)' if self.tls else ''}")
 
-        # Build NTRIP request.  Use HTTP/1.1 — some casters (notably
-        # products.igs-ip.net) don't stream data with HTTP/1.0.  We
-        # handle chunked transfer encoding in _recv() if the server
-        # uses it.
-        request = (
-            f"GET /{self.mountpoint} HTTP/1.1\r\n"
-            f"Host: {self.caster}:{self.port}\r\n"
-            f"Ntrip-Version: Ntrip/2.0\r\n"
-            f"User-Agent: NTRIP PePPAR-Fix/0.5\r\n"
-        )
+        # Build NTRIP request.  Default is HTTP/1.1 — some casters (notably
+        # products.igs-ip.net) don't stream data with HTTP/1.0.  We handle
+        # chunked transfer encoding in _recv() if the server uses it.  When
+        # http10 is set, send a minimal NTRIP-v1 request instead (no Host, no
+        # Ntrip-Version) for v1-only casters like str2str's `ntripc`; the
+        # response is "ICY 200 OK" (accepted by the status check below) and is
+        # never chunked.
+        if self.http10:
+            request = (
+                f"GET /{self.mountpoint} HTTP/1.0\r\n"
+                f"User-Agent: NTRIP PePPAR-Fix/0.5\r\n"
+            )
+        else:
+            request = (
+                f"GET /{self.mountpoint} HTTP/1.1\r\n"
+                f"Host: {self.caster}:{self.port}\r\n"
+                f"Ntrip-Version: Ntrip/2.0\r\n"
+                f"User-Agent: NTRIP PePPAR-Fix/0.5\r\n"
+            )
 
         if self.user and self.password:
             credentials = base64.b64encode(
@@ -142,15 +156,20 @@ class NtripStream:
         request += "\r\n"
         self._sock.sendall(request.encode())
 
-        # Read response header
+        # Read response header.  NTRIP v2 (HTTP/1.1) ends the header block
+        # with a blank line (\r\n\r\n).  NTRIP v1 (http10, e.g. str2str's
+        # ntripc) replies "ICY 200 OK\r\n" and then streams RTCM immediately —
+        # there is NO blank line — so we must stop after the first \r\n, or we
+        # would read RTCM bytes into the "header" and mis-frame the stream.
+        _sep = b"\r\n" if self.http10 else b"\r\n\r\n"
         header = b""
-        while b"\r\n\r\n" not in header:
+        while _sep not in header:
             chunk = self._sock.recv(1024)
             if not chunk:
                 raise ConnectionError("Connection closed during header")
             header += chunk
 
-        header_str = header.split(b"\r\n\r\n")[0].decode(errors='replace')
+        header_str = header.split(_sep)[0].decode(errors='replace')
         status_line = header_str.split("\r\n")[0]
 
         if "200" not in status_line and "ICY 200" not in status_line:
@@ -183,7 +202,7 @@ class NtripStream:
                 break
 
         # Any data after the header boundary goes into our buffer
-        remainder = header.split(b"\r\n\r\n", 1)[1]
+        remainder = header.split(_sep, 1)[1]
         if remainder:
             if self._chunked:
                 self._dechunk(remainder)

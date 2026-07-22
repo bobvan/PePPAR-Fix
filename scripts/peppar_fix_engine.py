@@ -1268,6 +1268,7 @@ def start_ntrip_threads(args, beph, ssr, stop_event, raw_bundle=None):
             mountpoint=args.eph_mount,
             user=args.ntrip_user, password=args.ntrip_password,
             tls=use_tls,
+            http10=getattr(args, 'ntrip_http10', False),
         )
         t = threading.Thread(
             target=ntrip_reader,
@@ -1296,6 +1297,7 @@ def start_ntrip_threads(args, beph, ssr, stop_event, raw_bundle=None):
             mountpoint=args.ssr_mount,
             user=ssr_u, password=ssr_pw,
             tls=ssr_tls,
+            http10=getattr(args, 'ntrip_http10', False),
         )
         t = threading.Thread(
             target=ntrip_reader,
@@ -11317,7 +11319,7 @@ def run(args):
         t_serial = threading.Thread(
             target=run_msm_ntrip_source,
             args=(args, obs_queue, stop_event),
-            kwargs={'ssr': ssr, 'systems': systems},
+            kwargs={'ssr': ssr, 'systems': systems, 'beph': beph},
             daemon=True,
         )
         t_serial.start()
@@ -12815,6 +12817,12 @@ Two-phase operation:
     ntrip = ap.add_argument_group("NTRIP corrections")
     ntrip.add_argument("--ntrip-conf", help="NTRIP config file (INI format)")
     ntrip.add_argument("--ntrip-caster", help="NTRIP caster hostname")
+    ntrip.add_argument("--ntrip-http10", action="store_true",
+                       help="Send minimal NTRIP-v1 / HTTP/1.0 requests to the "
+                            "obs/eph/SSR casters instead of HTTP/1.1.  Needed "
+                            "when pulling from a v1-only local re-caster such "
+                            "as str2str's `ntripc` (Box 1/2, gt).  See "
+                            "docs/local-caster-onocoy-plan.md.")
     ntrip.add_argument("--ntrip-port", type=int, default=2101)
     ntrip.add_argument("--ntrip-tls", action="store_true")
     ntrip.add_argument("--eph-mount", help="Broadcast ephemeris mountpoint")

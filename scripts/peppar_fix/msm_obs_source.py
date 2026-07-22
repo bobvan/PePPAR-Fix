@@ -158,7 +158,7 @@ def msm_ntrip_reader(messages, obs_queue, stop_event, sig_lookup, *,
 
 
 def run_msm_ntrip_source(args, obs_queue, stop_event, *, ssr=None,
-                         sig_lookup=None, systems=None):
+                         sig_lookup=None, systems=None, beph=None):
     """Engine obs-source thread target: stream RTCM MSM from the NTRIP obs mount
     (``args.obs_ntrip_mount``, reusing the ``--ntrip-*`` caster/credentials) and
     fill ``obs_queue`` with ObservationEvents — in place of ``serial_reader``.
@@ -177,13 +177,14 @@ def run_msm_ntrip_source(args, obs_queue, stop_event, *, ssr=None,
     stream = NtripStream(
         caster=args.ntrip_caster, port=args.ntrip_port,
         mountpoint=args.obs_ntrip_mount,
-        user=args.ntrip_user, password=args.ntrip_password, tls=use_tls)
+        user=args.ntrip_user, password=args.ntrip_password, tls=use_tls,
+        http10=getattr(args, 'ntrip_http10', False))
     try:
         stream.connect()
         log.info("MSM obs source: %s:%s/%s", args.ntrip_caster,
                  args.ntrip_port, args.obs_ntrip_mount)
         n = msm_ntrip_reader(stream.messages(), obs_queue, stop_event,
-                             sig_lookup, systems=systems, ssr=ssr)
+                             sig_lookup, systems=systems, ssr=ssr, beph=beph)
         log.info("MSM obs source ended (%d epochs queued)", n)
     except Exception as e:                    # noqa: BLE001 - thread must log, not crash
         log.error("MSM obs source failed: %s", e)
