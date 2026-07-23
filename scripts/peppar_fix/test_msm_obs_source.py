@@ -122,10 +122,13 @@ class ReaderLoopTest(unittest.TestCase):
 
     def test_routes_eph_to_beph(self):
         seen = []
-        beph = SimpleNamespace(update_from_rtcm=lambda m: seen.append(m.identity))
+        beph = SimpleNamespace(
+            update_from_rtcm=lambda m, recv_mono=None: seen.append(
+                (m.identity, recv_mono is not None)))
         eph_msg = SimpleNamespace(identity="1019", DF002=1019)
         n = self._read([eph_msg, _gps_epoch_msg(100000)], beph=beph)
-        self.assertEqual(seen, ["1019"])
+        # eph routed AND recv_mono stamped (broadcast_ready depends on it)
+        self.assertEqual(seen, [("1019", True)])
         self.assertEqual(n, 1)                             # eph not counted as epoch
 
     def test_station_arp_callback(self):
