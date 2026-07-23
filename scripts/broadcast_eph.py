@@ -273,8 +273,14 @@ class BroadcastEphemeris:
     def satellites(self):
         return sorted(self._ephs.keys())
 
-    def update_from_rtcm(self, msg):
+    def update_from_rtcm(self, msg, recv_mono=None):
         """Ingest a decoded pyrtcm RTCMMessage (1019/1042/1045/1046).
+
+        ``recv_mono`` explicitly supplies the receive monotonic stamp for
+        callers that pass a bare pyrtcm message with no ``recv_mono``
+        attribute (e.g. the MSM obs reader routing in-band ephemeris).
+        Without it ``last_update_mono`` stays None and the correction gate's
+        ``broadcast_ready`` never goes True — see docs/local-caster-onocoy-plan.md.
 
         Returns the PRN string if accepted, None otherwise.
         """
@@ -346,7 +352,8 @@ class BroadcastEphemeris:
                     existing.sort(key=lambda e: e.get('toc', 0))
                     self._ephs[prn] = existing[-2:]
         self._update_count += 1
-        self._last_update_mono = getattr(msg, 'recv_mono', None)
+        self._last_update_mono = (recv_mono if recv_mono is not None
+                                  else getattr(msg, 'recv_mono', None))
         self._last_update_queue_remains = getattr(msg, 'queue_remains', None)
         self._last_update_correlation_confidence = getattr(
             msg, 'correlation_confidence', None

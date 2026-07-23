@@ -136,7 +136,10 @@ def msm_ntrip_reader(messages, obs_queue, stop_event, sig_lookup, *,
         if ident in _EPH_IDS:
             if beph is not None:
                 try:
-                    beph.update_from_rtcm(msg)
+                    # Stamp recv_mono explicitly — these are bare pyrtcm
+                    # messages (no recv_mono attr), so without this the
+                    # correction gate's broadcast_ready stays False.
+                    beph.update_from_rtcm(msg, recv_mono=_time.monotonic())
                 except Exception as e:       # noqa: BLE001 - bad eph is non-fatal
                     log.debug("beph update failed (%s): %s", ident, e)
             continue
