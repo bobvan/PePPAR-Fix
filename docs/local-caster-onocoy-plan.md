@@ -170,3 +170,55 @@ Warning). Keep production and research logs in separate trees.
 - Confirm `SFESPK6618H` is an Onocoy-recognized antenna descriptor.
 - Second Onocoy station (F9P) on CHOKE1 for network diversity, or keep CHOKE1
   research-only?
+
+## Deployment log & learnings — Box 1/2 built 2026-07-22
+
+**Deployed on gt** (`str2str`, rtklibexplorer/demo5 fork built in `~/opt/RTKLIB`,
+symlinked `~/bin/str2str`), three `systemctl --user` services (linger enabled →
+boot-start; creds in a 600 `~/opt/ntrip-relay/relay.env`; each tees a rotating
+RTCM log to `~/opt/ntrip-relay/logs/`):
+
+| Service | Serves | Source |
+|---|---|---|
+| `ntrip-ssr-relay` | `ssr.ntrip.VanValzah.Com:2101/SSR` | products.igs-ip.net `SSRA03IGS0` |
+| `ntrip-obs-relay` | `obs.ntrip.VanValzah.Com:2102/PTBB` | igs-ip.net `PTBB00DEU0` |
+| `ntrip-eph-relay` | `:2103/BCEP` (broadcast eph) | igs-ip.net `BRUX00BEL0` in-band eph |
+
+DNS: `ssr.ntrip` / `obs.ntrip` are CNAMEs → `gt.VanValzah.Com` → 10.168.60.22
+(trusted LAN). Service-class names (`SSR`/`PTBB`/`BCEP`), not backend names, so
+an upstream-AC swap is invisible to clients.
+
+**Hard-won facts about `str2str` as a re-caster:**
+- Its `ntripc` caster **fans out to many clients** ✓ (verified 2 concurrent).
+- **One mount per port** — each stream is its own str2str instance + port. This
+  is why obs/SSR/eph are on 2102/2101/2103, and why the engine needed
+  `--eph-caster`/`--eph-port` (obs and eph can't share a port here).
+- **NTRIP v1 / HTTP/1.0 only** — `ntripc` ignores HTTP/1.1 and replies
+  `ICY 200 OK\r\n` then streams immediately (no `\r\n\r\n`). Engine fixes:
+  `--ntrip-http10` (minimal v1 request) + v1 header parse (stop at first `\r\n`).
+- **No TLS input** — pull from plain-HTTP casters (products/igs-ip.net:2101),
+  not GA:443.
+
+**BCEP is inaccessible to us** — `BCEP00BKG0`/`00CAS0`/`03BKG0` all **403** on
+products.igs-ip.net for our `bob` account, and GA's is TLS-only (str2str can't).
+So the "BCEP relay" is sourced from **BRUX's in-band broadcast eph** instead —
+functionally a broadcast-eph stream, just not the BKG product. (If we ever need
+the real BCEP, write a tiny TLS-capable Python bridge using our own
+`NtripStream`, or get products BCEP entitlement.)
+
+**Engine changes committed** (74e6484, 6c3d8c7): `--ntrip-http10`, NTRIP-v1
+header parse, in-band eph routing (`run_msm_ntrip_source` forwards `beph`),
+`--eph-caster`/`--eph-port`/`--eph-tls`.
+
+**OPEN — blocks moving the capture behind the fan-out:** with obs pulled via the
+str2str relay, the correction gate reports `broadcast_ready=False`
+(`waiting_broadcast`, `broadcast_age=N/A`) **per epoch**, so 0 epochs solve —
+even with a dedicated fresh BRUX eph relay (eph loads fine: `G8 E12 C8`). The
+same engine on a **direct** feed solves normally, so it's the relay/http10 obs
+path interacting with the **obs↔correction recv_mono correlation gate** (see
+[stream-timescale-correlation.md](stream-timescale-correlation.md)), not the eph
+source or freshness. **Until this is debugged, the PTBB capture stays on its
+direct igs-ip.net feed.** Next step: instrument the correction snapshot's
+`broadcast_ready`/`broadcast_age` computation for a relayed-obs epoch vs a
+direct one, and check whether relayed-obs `recv_mono`/`gps_time` de-correlates
+from the eph store.
