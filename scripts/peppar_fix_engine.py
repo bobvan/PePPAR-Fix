@@ -1263,11 +1263,19 @@ def start_ntrip_threads(args, beph, ssr, stop_event, raw_bundle=None):
     use_tls = args.ntrip_tls or args.ntrip_port == 443
 
     if args.eph_mount:
+        # Ephemeris may come from a different caster/port than obs+SSR — needed
+        # behind the local fan-out, where obs is a str2str PTBB re-caster and a
+        # fresh broadcast-eph stream (e.g. a BRUX re-caster) lives on its own
+        # port (str2str is one-mount-per-port).  Defaults to the --ntrip-*
+        # caster.  See docs/local-caster-onocoy-plan.md.
+        _eph_caster = getattr(args, 'eph_caster', None) or args.ntrip_caster
+        _eph_port = getattr(args, 'eph_port', None) or args.ntrip_port
+        _eph_tls = getattr(args, 'eph_tls', False) or _eph_port == 443
         eph_stream = NtripStream(
-            caster=args.ntrip_caster, port=args.ntrip_port,
+            caster=_eph_caster, port=_eph_port,
             mountpoint=args.eph_mount,
             user=args.ntrip_user, password=args.ntrip_password,
-            tls=use_tls,
+            tls=_eph_tls,
             http10=getattr(args, 'ntrip_http10', False),
         )
         t = threading.Thread(
@@ -1280,7 +1288,7 @@ def start_ntrip_threads(args, beph, ssr, stop_event, raw_bundle=None):
         threads.append(t)
         # peppar-mon contract: peppar_mon/log_reader.py:_EPH_STREAM_RE
         # parses HOST:PORT/MOUNT to display the eph mount name.
-        log.info(f"Ephemeris stream: {args.ntrip_caster}:{args.ntrip_port}/{args.eph_mount}")
+        log.info(f"Ephemeris stream: {_eph_caster}:{_eph_port}/{args.eph_mount}")
 
     if args.ssr_mount:
         # SSR can use a separate caster (e.g., products.igs-ip.net for CNES
@@ -12826,6 +12834,17 @@ Two-phase operation:
     ntrip.add_argument("--ntrip-port", type=int, default=2101)
     ntrip.add_argument("--ntrip-tls", action="store_true")
     ntrip.add_argument("--eph-mount", help="Broadcast ephemeris mountpoint")
+    ntrip.add_argument("--eph-caster", default=None,
+                       help="Ephemeris caster hostname (default: same as "
+                            "--ntrip-caster).  Set to pull broadcast eph from a "
+                            "different caster/port than obs — e.g. a dedicated "
+                            "BRUX/BCEP re-caster behind the local fan-out, since "
+                            "str2str serves one mount per port.")
+    ntrip.add_argument("--eph-port", type=int, default=None,
+                       help="Ephemeris caster port (default: same as --ntrip-port).")
+    ntrip.add_argument("--eph-tls", action="store_true",
+                       help="Use TLS for the ephemeris caster (default: off, or "
+                            "auto when --eph-port is 443).")
     ntrip.add_argument("--obs-ntrip-mount", default=None,
                        help="RTCM 3 MSM observation mountpoint (a CORS/geodetic "
                             "receiver stream).  When set, the engine ingests "
