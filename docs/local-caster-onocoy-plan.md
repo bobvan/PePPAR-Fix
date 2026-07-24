@@ -222,3 +222,52 @@ direct igs-ip.net feed.** Next step: instrument the correction snapshot's
 `broadcast_ready`/`broadcast_age` computation for a relayed-obs epoch vs a
 direct one, and check whether relayed-obs `recv_mono`/`gps_time` de-correlates
 from the eph store.
+
+## Box 3 deployment log & learnings — 2026-07-24 (I-213407-main)
+
+**Blocker found: the GNSSDO+ mosaic-T cannot emit RTCM3 natively.** It's a
+timing/PPP SKU (S/N 3810231) whose permission file has **`dgnssbase=0`,
+`rtkbase=0`, `rtkrover=0`, `movingbase=0`** (`lif, Permissions`). Every
+`setRTCMv3Output` returns "Invalid command!" and `RTCMv3` is not a valid
+`setDataInOut` output. So the "receiver's built-in NTRIP server → Onocoy
+directly" option in Box 3 above is **infeasible** for this box without a
+Septentrio base-license upgrade (which buys only architectural simplicity —
+NOT a higher reward tier, since the tier depends on the obs, not the push path).
+
+**Adopted path: str2str SBF→RTCM3 transcode on gt (validated live).** The mosaic
+*does* stream SBF MeasEpoch on IPS2 (tcp 28800). `str2str` transcodes it:
+
+```
+str2str -in tcpcli://10.168.13.196:28800#sbf \
+  -msg "1077(1),1087(1),1097(1),1127(1),1006(10),1033(10),1230(10)" \
+  -out ntripc://:2104/UFO1_MSM7#rtcm3 \
+  -out file://…/logs/prod/ufo1_msm7_%Y%m%d_%h.rtcm3::T \
+  -px 157469.2017 -4756188.1927 4232767.8802 -a "SFESPK6618H,NONE" -i "mosaic-T,GNSSDO+"
+```
+
+Decoded output = 1006/1033/1077/1087/1097/1127/1230, GPS+GLO+GAL+BDS, MSM7 @1Hz.
+`-msg` MUST precede `-out`. str2str synthesizes 1006 (ARP) + 1033 (antenna
+descriptor) from `-px`/`-a`, so we stamp OUR surveyed UFO1 ARP + `SFESPK6618H`
+independent of the receiver's PVT/antenna state. This str2str hop is therefore
+the **permanent steady state** for this receiver, not a throwaway phase-1 stage —
+there is no "direct push cutover" to retire it to.
+
+**Staged, not activated** (per Bob — Onocoy feed stays off until the mosaic's own
+timing config is finished): `systemctl --user` unit `onocoy-obs-transcode.service`
+(disabled) + runbook `~/opt/ntrip-relay/onocoy-activation-README.md`. Activation =
+add the `-out ntrips://…@servers.onocoy.com:2101/…#rtcm3` push once the Onocoy
+credential exists, then `enable --now`.
+
+**Onocoy specifics reconfirmed:** self-surveys the station position (a sub-cm ARP
+in 1006 is not required of us), hardware-agnostic, MSM7 + 1 Hz + <1 s latency,
+credential-name = NTRIP username. Wheaton spacing OK (~85% of potential rewards).
+
+**Mosaic-T antenna for its own PPS-to-UTC (separate from Onocoy):** the receiver's
+antenna table (v23.3.0, a snapshot of the **NGS ANTCAL catalog** — not IGS-only)
+returns `UNKNOWN` for `SFESPK6618H NONE` because that snapshot predates the
+antenna's Aug-2023 NGS publication. Fix = install **AntInfo v25.1.0** (NGS snapshot
+01-Apr-2025, 1010 antennas), SparkFun-hosted at
+`github.com/sparkfun/SparkFun_GNSS_mosaic-T/…/antinfo/antinfo-25.1.0-mosaic-T.suf`;
+then `setAntennaOffset … "SFESPK6618H NONE"` + pin the surveyed ARP. No antenna
+swap needed (the Leica AX1202GG is in-DB but is GPS+GLO L1/L2 only — would lose
+L5+Galileo+BeiDou).
