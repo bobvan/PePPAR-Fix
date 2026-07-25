@@ -56,6 +56,15 @@ dac_max_ppb = 740.0
 dac_type = "ad5693r"
 tadd_gpio = 16
 
+# Loop-BW: LQR phase-loop gain L[2].  -0.01 (corner ~100 s) is the empirical
+# optimum for this IsoTemp OCXO from the 2026-07-25 overnight A/B/C sweep
+# (5 cycles x 3 gains): beats the -0.05 default ~20-30% at tau 64-512 s and is
+# far more consistent (kills the -0.05 excursion-tracking blow-ups); -0.001
+# blew up at long tau.  PiPuss DO-vs-GPS crossover ~=100 s (earlier than the
+# Rakon's ~1000 s in the doc because the IsoTemp OCXO is noisier).
+# See docs/gnssdo-servo-loop-bandwidth.md.
+lqr_phase_gain = -0.01
+
 ticc_port = "/dev/ticc5"
 
 rinex_out = "data/rinex/{host}-{date}.obs"
