@@ -409,6 +409,32 @@ def _close_all_shared_ports() -> None:
         port.close()
 
 
+def reset_shared_port(port: str, baud: int = 115200) -> bool:
+    """Force the cached shared port closed so the next open is fresh.
+
+    The warm-reopen path (``_SharedTiccPort.acquire`` only opens when
+    ``serial is None``, with HUPCL preserved to avoid Arduino reboots)
+    cannot recover a dead or re-enumerated fd: after the TICC USB
+    re-enumerates (e.g. a power-cycle to clear a firmware hang) the old
+    ``/dev`` node is gone, but the cached ``serial`` object is still
+    non-None, so every subsequent ``acquire`` reuses the dead fd and
+    never re-resolves the device path.  Closing here sets ``serial =
+    None`` (see ``_SharedTiccPort.close``); the next ``acquire`` re-opens
+    ``self.port`` — re-resolving the symlink to the freshly-enumerated
+    device — and re-runs boot recovery.
+
+    Only call on a *sustained* wedge: routine transient errors are
+    handled by the warm reopen and must NOT trigger this, since a
+    needless close+open can reboot the Arduino.  Returns True iff a
+    cached port existed and was closed.
+    """
+    sp = _shared_ticc_ports.get((port, baud))
+    if sp is None:
+        return False
+    sp.close()
+    return True
+
+
 atexit.register(_close_all_shared_ports)
 
 

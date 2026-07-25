@@ -385,7 +385,7 @@ from realtime_ppp import (
     Nav2PositionStore, Nav2SignalStore, NavClockStore, NavTimeGpsStore,
 )
 from peppar_fix.extint_reader import TimTm2Store
-from ticc import Ticc
+from ticc import Ticc, reset_shared_port
 from peppar_fix import (
     CorrectionFreshnessGate,
     PositionWatchdog,
@@ -8775,6 +8775,15 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
             STALE_THRESHOLD_REOPENS = 5      # ≈ 10 s with 2 s reopen cadence
             last_stale_log_mono = 0.0
             STALE_LOG_INTERVAL_S = 30.0      # how often to repeat the warning
+            # Hard re-init (I-160351a).  Warm reopens reuse the cached
+            # _SharedTiccPort fd, which acquire() only re-opens when it is
+            # None — so a dead or USB-re-enumerated device wedges the reader
+            # forever (2026-07-24 PiFace: a TICC power-cycle re-enumerated
+            # /dev/ticc2 but the running reader never re-latched).  After a
+            # SUSTAINED stale streak, evict the cached port so the next open
+            # re-resolves the /dev path.  Spaced so we retry periodically.
+            REINIT_AFTER_REOPENS = 15        # ≈ 30 s of sustained stale
+            last_reinit_at_reopens = 0
 
             while not stop_ticc.is_set():
                 events_this_open = 0
@@ -8892,6 +8901,7 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
                                  "after %d empty reopens — events flowing again",
                                  args.ticc_port, empty_reopens)
                     empty_reopens = 0
+                    last_reinit_at_reopens = 0
 
                 now_mono = time.monotonic()
                 if (empty_reopens >= STALE_THRESHOLD_REOPENS
@@ -8908,6 +8918,23 @@ def _setup_servo(args, known_ecef, qerr_store, *, extint_store=None, ptp=None,
                         "115200, dsrdtr=True).close()\"` then wait 15 s.",
                         args.ticc_port, empty_reopens, args.ticc_port)
                     last_stale_log_mono = now_mono
+
+                # Escalate a sustained wedge to a hard re-init (I-160351a):
+                # evict the cached shared port so the next `with Ticc(...)`
+                # does a fresh open that re-resolves /dev/ticcN and recovers a
+                # re-enumerated device.  Spaced by REINIT_AFTER_REOPENS so we
+                # keep retrying if the device is still absent.
+                if (empty_reopens >= REINIT_AFTER_REOPENS
+                        and empty_reopens - last_reinit_at_reopens
+                            >= REINIT_AFTER_REOPENS):
+                    last_reinit_at_reopens = empty_reopens
+                    if reset_shared_port(args.ticc_port, args.ticc_baud):
+                        log.warning(
+                            "[TICC_STALE] %s: %d empty reopens — forcing hard "
+                            "re-init (evicting cached serial; next open "
+                            "re-resolves the device path to recover a "
+                            "re-enumerated TICC).",
+                            args.ticc_port, empty_reopens)
 
         t_ticc = threading.Thread(target=ticc_reader, daemon=True)
         t_ticc.start()
