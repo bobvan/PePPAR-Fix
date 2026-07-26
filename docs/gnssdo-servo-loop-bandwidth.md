@@ -218,10 +218,10 @@ interleaved arms, detrended chA TDEV):
 | **−0.01** | **~100 s** | **1.28 / 1.33 ns** | **1.54 / 1.26 ns** | **2.6 ns (2.3–3.2)** |
 | −0.001 | ~1000 s | 1.24 / 1.27 ns *(best)* | 2.09 / **3.25** ns | 6.7 ns (4.8–8.2) |
 
-**PiFace** (CTI OSC5A2B02 OCXO + F9P; 3 cycles × {−0.05, −0.01, −0.003, −0.001}):
-same shape — −0.001 wins mid-τ (τ 64 s = 0.89 ns vs −0.05's 1.29) but −0.003 and
-−0.001 **blow up at long τ** (τ 512 s RMS 13–14 ns vs −0.01's 2.3 ns); −0.01 is
-the balance.
+**PiFace** (IsoTemp OCXO131-100 + F9T-20B — same class as PiPuss; 3 cycles ×
+{−0.05, −0.01, −0.003, −0.001}): same shape — −0.001 wins mid-τ (τ 64 s = 0.89 ns
+vs −0.05's 1.29) but −0.003 and −0.001 **blow up at long τ** (τ 512 s RMS 13–14 ns
+vs −0.01's 2.3 ns); −0.01 is the balance.
 
 **Reading it:**
 
@@ -234,10 +234,11 @@ the balance.
   (the flywheel) but **blows up at long τ**, because the loop then tracks GPS too
   weakly and the DO drifts off it. That long-τ failure *is* the loop bandwidth
   acting — the opposite of the GNSSDO+'s "L2 barely moved anything."
-- **Both hosts land at −0.01 despite different oscillators (CTI vs IsoTemp) and
-  receivers (F9P vs F9T)** → the corner is pinned by the **shared long-τ
-  GPS-tracking constraint** (same antenna + corrections, similar rx-TCXO class),
-  not by the specific DO. The mid-τ hump floor (~1.05–1.25 ns TDEV @ τ 32 s) is
+- **Both hosts land at −0.01.** They are the same class — IsoTemp OCXO131-100 +
+  F9T-20 on the shared UFO1 antenna — so −0.01 reproduces across two units, and
+  the corner is pinned by the **shared long-τ GPS-tracking constraint** (same
+  antenna + corrections + rx-TCXO class), not by unit-to-unit oscillator scatter.
+  The mid-τ hump floor (~1.05–1.25 ns TDEV @ τ 32 s) is
   the DO free-run itself; only ~0.15 ns of it is removable servo self-noise. See
   the DO-ADEV ↔ two-clock-p95-agreement relationship (`σ_y(τ) ≤ 0.625·P/τ`) for
   why the DO free-run — not the servo — is the binding floor here.

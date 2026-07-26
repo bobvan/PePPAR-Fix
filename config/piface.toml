@@ -10,7 +10,7 @@ ubx_port = "USB"
 # Receiver swapped F9T-L5 -> ZED-F9P on PATCH3 2026-06-03 (roadtrip);
 # same physical USB port so the by-path serial above still resolves.
 # NOTE: F9P is L1/L2 (not L5) — L5/B2a-I SSR-AR assumptions differ.
-receiver = "f9p"
+receiver = "f9t"  # [2026-06-30] F9T-20B (ex-MadHat) replaced the F9P
 # No ptp_dev — the engine does not use the CM4's PHC.
 # ts2phc disciplines bcm_phy_ptp from DO PPS on SYNC_IN independently.
 ntrip_conf = "ntrip.conf"
@@ -23,39 +23,24 @@ systems = "gps,gal,bds"
 # startup as an in-memory survey-class seed candidate.  Read-only;
 # only peppar-survey writes state/positions/<uid>.survey.toml.
 # UFO1 restored 2026-05-19 (CHOKE1 swap-out); see antennas.json.
-arp_label = "ufo1"
+arp_label = "ufo1"  # [2026-07-22] back in Wheaton on UFO1
 
-# CTI OSC5A2B02 OCXO via AD5693R DAC on I2C bus 1, 1× output mode.
-#
-# Empirical characterization 2026-05-16 by 3 independent runs of
-# tools/calibrate_do.py + tools/calibrate_do_consensus.py:
-#   data/piface-cal-2026-05-16-run{1,2,3}.json
-#
-# Results (median across 3 runs, 0.001% spread — PASS 1% target):
-#   ppb_per_code     = +0.03463 ppb/code  (POSITIVE — higher code →
-#                                          higher DO freq)
-#   gain             = 0.9592  (commanded vs measured, was 1.062 in
-#                               the 2026-04-14 characterization —
-#                               drift of ~10% over a month)
-#   OCXO at center   = -78.6 ppb  (was -149 per 2026-04-14 — OCXO
-#                                  has aged toward +freq by ~70 ppb)
-#   Full range       = 2215 ppb  (half-range 1108 ppb either way)
-#   Linearity        = 117 ppb max residual from best-fit line
-#                      (less linear than IsoTemp at extreme rails;
-#                      central-region linearity better — investigate
-#                      but doesn't block deploy)
-#
-# 1× gain is correct for CTI OSC5A2B02: part operates within 0..2.5V
-# Vctrl range, and 1× mode (0..Vref ≈ 0..2.5V) matches.  Sign verified
-# (positive ppb_per_code matches DAC convention "higher code = higher
-# freq").
-do_label = "ocxo-piface"
+# IsoTemp OCXO131-100 (ex-MadHat) via AD5693R DAC on I2C bus 1, 2x output mode.
+# Swapped in 2026-06-30, replacing the CTI OSC5A2B02 + TADD-2 that was here
+# (CTI char archived: gt/do-char-archive/ocxo-piface-CTI-OSC5A2B02-TADD2-saved-20260630/).
+# AUTHORITATIVE characterization = state/dos/isotemp-ocxo131-100-madhat.toml
+# (measured [steering] ~0.0262 ppb/code, code range [5000,50000], dac_gain 1;
+# freerun sigma_do_phase 0.0564 ns). The engine uses that measured steering;
+# the dac_* values below are non-authoritative fallbacks kept consistent with it.
+# 2x gain is REQUIRED for the IsoTemp OCXO (part expects 0..5V Vctrl).
+do_label = "isotemp-ocxo131-100-madhat"
 do_type = "vcocxo"
 dac_bus = 1
 dac_addr = "0x4C"
 dac_bits = 16
-dac_ppb_per_code = "0.03463"
-dac_max_ppb = 1096.0
+dac_gain = 1
+dac_ppb_per_code = "0.02617"
+dac_max_ppb = 725.3
 dac_type = "ad5693r"
 
 # TADD-2 Mini divider: ARM on GPIO 16, syncs 10 MHz → 1 PPS.
@@ -65,10 +50,9 @@ tadd_gpio = 16
 # overnight A/B/C/D sweep (4 gains -0.05/-0.01/-0.003/-0.001, 3 cycles, 45-min
 # arms).  -0.001 wins mid-τ but -0.003 and -0.001 BLOW UP at long τ (τ512 RMS
 # 13-14 ns vs -0.01's 2.3 ns) — too-low BW lets the DO drift off GPS.  -0.01 is
-# the mid-τ-vs-long-τ balance.  Matches PiPuss's optimum despite a DIFFERENT DO
-# (CTI OSC5A2B02 vs IsoTemp) + receiver (F9P vs F9T): the corner is pinned by the
-# shared long-τ GPS-tracking constraint, not the oscillator.
-# See docs/gnssdo-servo-loop-bandwidth.md.
+# the mid-τ-vs-long-τ balance, and matches PiPuss's optimum — both hosts are
+# IsoTemp OCXO + F9T-20 on the shared UFO1 antenna, so the corner is pinned by
+# the shared long-τ GPS-tracking constraint.  See docs/gnssdo-servo-loop-bandwidth.md.
 lqr_phase_gain = -0.01
 
 # pifaceShortTauGlitches mitigation (docs/piface-shorttau-glitches-2026-05-29.md).
@@ -86,7 +70,7 @@ max_adjfine_step_ppb = 2.0
 
 # TICC #3: chA = DO PPS, chB = GNSS PPS.
 # TICC competes as a servo source whenever ticc_port is configured.
-ticc_port = "/dev/ticc3"
+ticc_port = "/dev/ticc2"  # [2026-06-30] TICC #2 (ex-MadHat) now on PiFace
 
 # RINEX archival for offline PRIDE comparison + peppar-survey --pride.
 # Decimation to 30 s matches PRIDE/RTKLIB standard input; engine
