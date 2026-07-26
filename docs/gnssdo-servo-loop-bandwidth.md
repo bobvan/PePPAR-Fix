@@ -200,6 +200,55 @@ wind up the loop. For a DO we steer externally, evaluate setting the Mosaic to
 **Do not run further L2 arms** (−0.001 etc.) until knobs 1–3 are addressed — the
 sweep is measuring a term that isn't in control.
 
+## DAC-host result (2026-07-25): on PiPuss + PiFace, L2 *is* an effective bandwidth knob — optimum −0.01
+
+The §"L2 is the wrong knob" result above is **GNSSDO+-specific** (single
+oscillator, pre-`innov_gate`, the `x[3]` runaway dominating). On the
+DAC-actuator, **two-oscillator** lab clocks — with `innov_gate_nsigma` in place
+so `x[3]` no longer diverges — sweeping `lqr_phase_gain` gives a clean,
+reproducible bandwidth response, and L2 governs exactly the mid-τ-vs-long-τ
+trade the theory predicts.
+
+**PiPuss** (IsoTemp OCXO + F9T-20; 5 cycles × {−0.05, −0.01, −0.001}, 45-min
+interleaved arms, detrended chA TDEV):
+
+| gain L2 | corner | mid-τ (τ 16–32 s) | long-τ (τ 256–512 s) | whole-run RMS |
+|---|---|---|---|---|
+| −0.05 | ~20 s | 1.33 / 1.42 ns | 2.16 / 1.76 ns | 4.0 ns (2.0–**9.5**) |
+| **−0.01** | **~100 s** | **1.28 / 1.33 ns** | **1.54 / 1.26 ns** | **2.6 ns (2.3–3.2)** |
+| −0.001 | ~1000 s | 1.24 / 1.27 ns *(best)* | 2.09 / **3.25** ns | 6.7 ns (4.8–8.2) |
+
+**PiFace** (CTI OSC5A2B02 OCXO + F9P; 3 cycles × {−0.05, −0.01, −0.003, −0.001}):
+same shape — −0.001 wins mid-τ (τ 64 s = 0.89 ns vs −0.05's 1.29) but −0.003 and
+−0.001 **blow up at long τ** (τ 512 s RMS 13–14 ns vs −0.01's 2.3 ns); −0.01 is
+the balance.
+
+**Reading it:**
+
+- **−0.01 (corner ~100 s) is the optimum for both**, now committed to
+  `config/pipuss.toml` and `config/piface.toml`. It is ~20–30 % better than the
+  −0.05 default at τ 64–512 s and far more consistent — it kills −0.05's
+  occasional excursion-tracking blow-ups (the 9.5 ns RMS arm), which is what the
+  two-clock **excursion** bound actually cares about.
+- **−0.001 proves L2 is a real bandwidth knob here.** It drives the mid-τ down
+  (the flywheel) but **blows up at long τ**, because the loop then tracks GPS too
+  weakly and the DO drifts off it. That long-τ failure *is* the loop bandwidth
+  acting — the opposite of the GNSSDO+'s "L2 barely moved anything."
+- **Both hosts land at −0.01 despite different oscillators (CTI vs IsoTemp) and
+  receivers (F9P vs F9T)** → the corner is pinned by the **shared long-τ
+  GPS-tracking constraint** (same antenna + corrections, similar rx-TCXO class),
+  not by the specific DO. The mid-τ hump floor (~1.05–1.25 ns TDEV @ τ 32 s) is
+  the DO free-run itself; only ~0.15 ns of it is removable servo self-noise. See
+  the DO-ADEV ↔ two-clock-p95-agreement relationship (`σ_y(τ) ≤ 0.625·P/τ`) for
+  why the DO free-run — not the servo — is the binding floor here.
+
+**Open reconciliation with the GNSSDO+ finding:** the GNSSDO+ has **not been
+re-swept since `innov_gate` landed**. The clean hypothesis is that the gate
+stabilizes `x[3]`, restoring L2 as the effective bandwidth knob the theory
+expected — a GNSSDO+ L2 re-sweep *with the gate active* is the test. Until then:
+the Rakon's −0.001 target in this doc was calibrated for a **quieter
+single-oscillator** DO; our two-oscillator hosts want **−0.01**.
+
 ## Watch-outs
 
 - **NAV2 watchdog** still runs under `--no-antposest` and trips on a diverged

@@ -61,6 +61,16 @@ dac_type = "ad5693r"
 # TADD-2 Mini divider: ARM on GPIO 16, syncs 10 MHz → 1 PPS.
 tadd_gpio = 16
 
+# Loop-BW: LQR phase-loop gain L[2].  -0.01 (corner ~100 s) from the 2026-07-25
+# overnight A/B/C/D sweep (4 gains -0.05/-0.01/-0.003/-0.001, 3 cycles, 45-min
+# arms).  -0.001 wins mid-τ but -0.003 and -0.001 BLOW UP at long τ (τ512 RMS
+# 13-14 ns vs -0.01's 2.3 ns) — too-low BW lets the DO drift off GPS.  -0.01 is
+# the mid-τ-vs-long-τ balance.  Matches PiPuss's optimum despite a DIFFERENT DO
+# (CTI OSC5A2B02 vs IsoTemp) + receiver (F9P vs F9T): the corner is pinned by the
+# shared long-τ GPS-tracking constraint, not the oscillator.
+# See docs/gnssdo-servo-loop-bandwidth.md.
+lqr_phase_gain = -0.01
+
 # pifaceShortTauGlitches mitigation (docs/piface-shorttau-glitches-2026-05-29.md).
 # The v1 OCXO gate rejects 99.6% of TICC here (the GNSS-PPS carrier), so the loop
 # runs open between corrections and the DO drifts far; the catch-up lands as a
