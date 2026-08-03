@@ -287,8 +287,9 @@ def main(argv: list[str] | None = None) -> int:
     auto.add_argument(
         "--caster-host", default=None,
         help="With --auto: NTRIP caster host whose sourcetable is searched "
-             "for a nearby base.  Without it, --auto can't rank a baseline "
-             "and falls back to the PRIDE floor.",
+             "for a nearby base.  Only needed where the region's archive has "
+             "no station catalogue of its own (EUREF); in North America "
+             "--auto ranks the NGS CORS catalogue without any caster.",
     )
     auto.add_argument(
         "--caster-port", type=int, default=2101,

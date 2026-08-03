@@ -1,13 +1,19 @@
 """peppar-survey base discovery (S2 of I-071401): find a reference base near a
 target position and fetch its RINEX so the --baseline backend (S1) can run.
 
-Two halves, kept separate so each is testable in isolation:
+Three halves (sic), kept separate so each is testable in isolation:
 
   1. **Sourcetable discovery** — fetch an NTRIP caster's sourcetable, parse the
      STR records, and Haversine-rank the mounts by distance to a target APC.
      (Promoted from the 2026-07-03 scratchpad find_base.py.)
 
-  2. **Region -> source table + archive fetchers** — map a target lat/lon to the
+  2. **Catalogue discovery** — rank an archive's *own* station catalogue.  Not
+     every archive has a caster: NGS CORS is ~1650 operational stations that
+     appear in no sourcetable anywhere, published instead as one daily file.
+     Without this, a US site with a CORS 20 km away sees no base at all and
+     pays the PRIDE floor's product latency for nothing (Newton WI, 2026-08-03).
+
+  3. **Region -> source table + archive fetchers** — map a target lat/lon to the
      right open archive (NGS CORS for North America, EUREF for Europe), each
      carrying the base's regional datum realization (the value S1 pre-converts
      from -> ITRF2020@epoch).  Fetchers pull a named station's daily/hourly
@@ -23,7 +29,10 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import re
 import socket
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -206,6 +215,149 @@ def fetch_euref_nrt_rinex(
     return Path(rnx_path)
 
 
+# ── station catalogues (archives with no NTRIP sourcetable) ────────── #
+
+# NGS publishes every CORS ARP in one daily-refreshed file: ~2600 rows of
+#   SITE EPOCH lat(d m s N/S) lon(d m s E/W) ellHt Vn Ve Vu ctry state status
+# in ITRF2020 @ 2020.00 with computed velocities.  This is the *only* way to
+# rank NGS CORS by distance — the archive is plain HTTP with no sourcetable.
+DEFAULT_NGS_CORS_CATALOG_URL = (
+    "https://geodesy.noaa.gov/corsdata/coord/coord_20/itrf2020_geo.comp.txt")
+
+# Statuses worth offering as a base.  "Operational" is the only one that
+# guarantees current data; the rest are historical or not-a-CORS.
+CATALOG_USABLE_STATUS = ("Operational",)
+
+
+@dataclass(frozen=True)
+class CatalogStation:
+    """One station from an archive's own catalogue (no NTRIP sourcetable).
+
+    ``lat``/``lon``/``height_m`` are the ARP in the catalogue's native frame at
+    ``epoch`` (ITRF2020 @ 2020.00 for NGS), with ``vel_mm_yr`` = (Vn, Ve, Vu).
+    Discovery uses lat/lon for *ranking only* — the baseline solve still takes
+    the base coordinate from the base RINEX header and pre-converts it from the
+    region's ``base_realization``, so this frame never reaches the solution.
+    """
+    station: str                 # 4-char CORS ID, upper-case
+    lat: float
+    lon: float
+    height_m: float
+    epoch: float
+    vel_mm_yr: tuple[float, float, float]
+    country: str
+    state: str
+    status: str
+
+
+def _dms(deg: str, minute: str, sec: str, hemi: str) -> float:
+    v = abs(float(deg)) + float(minute) / 60.0 + float(sec) / 3600.0
+    return -v if hemi.upper() in ("S", "W") else v
+
+
+def parse_ngs_cors_catalog(text: str) -> list[CatalogStation]:
+    """Parse NGS's ``itrf2020_geo.comp.txt`` into CatalogStations.
+
+    Header/rule lines and any row that isn't the expected 17 whitespace-
+    separated fields are skipped, so a format tweak degrades to "fewer
+    stations" (→ PRIDE floor) rather than a crash.
+    """
+    out: list[CatalogStation] = []
+    for ln in text.splitlines():
+        f = ln.split()
+        if len(f) != 17:
+            continue
+        try:
+            lat = _dms(f[2], f[3], f[4], f[5])
+            lon = _dms(f[6], f[7], f[8], f[9])
+            station = CatalogStation(
+                station=f[0].upper(), lat=lat, lon=lon,
+                height_m=float(f[10]), epoch=float(f[1]),
+                vel_mm_yr=(float(f[11]), float(f[12]), float(f[13])),
+                country=f[14], state=f[15], status=f[16])
+        except ValueError:
+            continue
+        if not (-90 <= station.lat <= 90 and -180 <= station.lon <= 180):
+            continue
+        out.append(station)
+    return out
+
+
+def default_catalog_cache_dir() -> Path:
+    """Where fetched catalogues are cached between runs."""
+    root = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return Path(root) / "peppar-survey"
+
+
+def fetch_catalog_text(
+    url: str,
+    *,
+    cache_dir: Path | None = None,
+    max_age_s: float = 30 * 86400.0,
+    fetcher: Callable[[str], str] = _http_listing,
+) -> str | None:
+    """Fetch a catalogue, caching it on disk.
+
+    The NGS catalogue is 300 KB and moves at the pace of new monuments, so a
+    30-day cache is plenty and keeps a field run working offline.  A stale
+    cache beats no catalogue: if the refetch fails we return the cached copy
+    rather than dropping to the PRIDE floor for want of a network.
+    """
+    cache_dir = cache_dir or default_catalog_cache_dir()
+    cache_path = cache_dir / re.sub(r"[^A-Za-z0-9._-]", "_", url.split("/")[-1])
+    fresh = False
+    try:
+        age = time.time() - cache_path.stat().st_mtime
+        fresh = age <= max_age_s
+    except OSError:
+        pass
+    if fresh:
+        try:
+            return cache_path.read_text("latin-1")
+        except OSError as e:  # noqa: BLE001 - unreadable cache just refetches
+            log.debug("catalog cache unreadable (%s): %s", cache_path, e)
+    try:
+        text = fetcher(url)
+    except Exception as e:  # noqa: BLE001 - unreachable archive is non-fatal
+        log.warning("catalog fetch failed (%s): %s", url, e)
+        try:
+            return cache_path.read_text("latin-1")   # stale > nothing
+        except OSError:
+            return None
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(text, "latin-1")
+    except OSError as e:  # noqa: BLE001 - un-cacheable is not fatal
+        log.debug("catalog cache write failed (%s): %s", cache_path, e)
+    return text
+
+
+def rank_catalog_by_distance(
+    stations: Sequence[CatalogStation],
+    lat: float,
+    lon: float,
+    *,
+    max_km: float = 80.0,
+    usable_status: Sequence[str] = CATALOG_USABLE_STATUS,
+) -> list[tuple[float, CatalogStation]]:
+    """(distance_km, CatalogStation) sorted nearest-first, within ``max_km``.
+
+    Decommissioned / Non-Operational / Suspended stations are dropped — they
+    have no current data to difference against."""
+    out: list[tuple[float, CatalogStation]] = []
+    for st in stations:
+        if usable_status and st.status not in usable_status:
+            continue
+        d = haversine_km(lat, lon, st.lat, st.lon)
+        if d <= max_km:
+            out.append((d, st))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+# ── region -> archive mapping ──────────────────────────────────────── #
+
+
 @dataclass(frozen=True)
 class RegionSource:
     """One region -> open-archive mapping.
@@ -214,11 +366,18 @@ class RegionSource:
     datum the archive's station coordinates carry — the value S1's --baseline
     pre-converts from -> ITRF2020@epoch (NAD83(2011) for NGS CORS, ETRS89 for
     EUREF).  ``kind`` selects the fetcher.
+
+    ``catalog_url`` is how the archive's stations are *discovered*.  An archive
+    that publishes its own station catalogue (NGS CORS) sets it and needs no
+    caster; one whose stations are only enumerable via an NTRIP sourcetable
+    (EUREF, whose mounts carry the 9-char monument the archive is keyed by)
+    leaves it None and relies on ``discover_base(caster_host=...)``.
     """
     name: str
     kind: str                    # "ngs_cors" | "euref_nrt"
     bbox: tuple[float, float, float, float]
     base_realization: str
+    catalog_url: str | None = None
 
     def contains(self, lat: float, lon: float) -> bool:
         lo_a, hi_a, lo_o, hi_o = self.bbox
@@ -228,7 +387,8 @@ class RegionSource:
 # Ordered most-specific-first; source_for_position returns the first match.
 REGION_SOURCES: tuple[RegionSource, ...] = (
     RegionSource("NGS CORS (North America)", "ngs_cors",
-                 (15.0, 72.0, -170.0, -50.0), "NAD83(2011)"),
+                 (15.0, 72.0, -170.0, -50.0), "NAD83(2011)",
+                 catalog_url=DEFAULT_NGS_CORS_CATALOG_URL),
     RegionSource("EUREF (Europe)", "euref_nrt",
                  (34.0, 72.0, -12.0, 40.0), "ETRS89"),
 )
@@ -250,6 +410,32 @@ class BaseDescriptor:
     distance_km: float
     source: RegionSource
     base_realization: str        # == source.base_realization (convenience)
+    via: str = "sourcetable"     # "catalog" | "sourcetable" — how it was found
+
+
+def _discover_from_catalog(
+    lat: float,
+    lon: float,
+    src: RegionSource,
+    max_km: float,
+    catalog_fetcher: Callable[[str], str | None],
+) -> BaseDescriptor | None:
+    """Rank the region archive's own station catalogue."""
+    text = catalog_fetcher(src.catalog_url)
+    if not text:
+        return None
+    ranked = rank_catalog_by_distance(
+        parse_ngs_cors_catalog(text), lat, lon, max_km=max_km)
+    if not ranked:
+        log.info("No operational %s station within %.0f km of %.4f,%.4f",
+                 src.name, max_km, lat, lon)
+        return None
+    dist, st = ranked[0]
+    log.info("Nearest base: %s @ %.1f km (%s catalogue, %s/%s, datum %s)",
+             st.station, dist, src.name, st.country, st.state,
+             src.base_realization)
+    return BaseDescriptor(station=st.station, distance_km=dist, source=src,
+                          base_realization=src.base_realization, via="catalog")
 
 
 def discover_base(
@@ -260,25 +446,40 @@ def discover_base(
     caster_port: int = 2101,
     max_km: float = 80.0,
     sourcetable_fetcher: Callable[[str, int], str] = fetch_sourcetable,
+    catalog_fetcher: Callable[[str], str | None] = fetch_catalog_text,
 ) -> BaseDescriptor | None:
     """Find the nearest usable base station to (lat, lon).
 
     Selects the region source (NGS CORS / EUREF) for logging + the datum
-    realization, then — when a ``caster_host`` is given — ranks that caster's
-    sourcetable to pick the nearest fixed (non-VRS) mount.  Returns a
-    BaseDescriptor or None (no region / caster unreachable / nothing in range),
-    in which case the caller falls back to the PRIDE floor.  Fetching the base's
-    RINEX is the fetcher's job (fetch_cors_rinex / fetch_euref_nrt_rinex),
-    driven by the descriptor's source.kind.
+    realization, then ranks that region's stations two ways, catalogue first:
+
+      1. **The archive's own station catalogue** (``src.catalog_url``), when it
+         publishes one.  Required for NGS CORS: ~1650 operational stations that
+         appear in *no* NTRIP sourcetable, so this is the only way to see them.
+         It also keeps the station name a real 4-char CORS ID, which is what
+         ``fetch_cors_rinex`` is keyed by — a caster mount name would 404.
+      2. **An NTRIP caster's sourcetable**, when ``caster_host`` is given.  This
+         is how EUREF is enumerated (its mounts carry the 9-char monument the
+         archive is keyed by), and the fallback anywhere a catalogue misses.
+
+    Returns a BaseDescriptor or None (no region / nothing reachable / nothing in
+    range), in which case the caller falls back to the PRIDE floor.  Fetching
+    the base's RINEX is the fetcher's job (fetch_cors_rinex /
+    fetch_euref_nrt_rinex), driven by the descriptor's source.kind.
     """
     src = source_for_position(lat, lon)
     if src is None:
         log.info("No region source for %.4f,%.4f — fall back to PRIDE floor",
                  lat, lon)
         return None
+    if src.catalog_url:
+        found = _discover_from_catalog(lat, lon, src, max_km, catalog_fetcher)
+        if found is not None:
+            return found
     if caster_host is None:
-        log.info("Region %s selected (datum %s) but no caster given for "
-                 "sourcetable ranking", src.name, src.base_realization)
+        log.info("Region %s selected (datum %s) but no base found and no "
+                 "caster given for sourcetable ranking",
+                 src.name, src.base_realization)
         return None
     try:
         table = sourcetable_fetcher(caster_host, caster_port)
@@ -294,7 +495,8 @@ def discover_base(
     log.info("Nearest base: %s @ %.1f km (%s, datum %s)",
              mount.mount, dist, src.name, src.base_realization)
     return BaseDescriptor(station=mount.mount, distance_km=dist, source=src,
-                          base_realization=src.base_realization)
+                          base_realization=src.base_realization,
+                          via="sourcetable")
 
 
 def fetch_base_rinex(
@@ -348,7 +550,7 @@ def _main(argv: list[str] | None = None) -> int:
         print("no base discovered")
         return 1
     print(f"base: {desc.station}  {desc.distance_km:.1f} km  "
-          f"datum {desc.base_realization}  ({desc.source.kind})")
+          f"datum {desc.base_realization}  ({desc.source.kind}, via {desc.via})")
     return 0
 
 
@@ -357,6 +559,9 @@ __all__ = [
     "rank_by_distance", "RegionSource", "REGION_SOURCES", "source_for_position",
     "fetch_euref_nrt_rinex", "fetch_cors_rinex", "BaseDescriptor",
     "discover_base", "fetch_base_rinex",
+    "CatalogStation", "DEFAULT_NGS_CORS_CATALOG_URL", "CATALOG_USABLE_STATUS",
+    "parse_ngs_cors_catalog", "fetch_catalog_text", "rank_catalog_by_distance",
+    "default_catalog_cache_dir",
 ]
 
 

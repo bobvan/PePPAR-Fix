@@ -195,6 +195,9 @@ def _no_baseline_reason(
     if region_source is None:
         return "no open base archive covers this region"
     if base_desc is None:
+        if region_source.catalog_url:
+            return (f"no {region_source.name} station within --max-km "
+                    "(and no nearer caster mount)")
         return ("no fixed base found within range "
                 "(needs --caster-host and a base <= --max-km)")
     return "no faster backend viable"
@@ -230,9 +233,12 @@ def plan_auto(
         lat, lon = latlon
         region_source = source_for_position_fn(lat, lon)
         # Only bother discovering a base if the region has an archive to
-        # pre-convert from AND a caster to enumerate — otherwise baseline
-        # can't be pinned in ITRF2020 anyway.
-        if region_source is not None and caster_host and caps.dual_freq:
+        # pre-convert from AND some way to enumerate its stations — its own
+        # catalogue (NGS CORS) or a caster's sourcetable (EUREF).  Without
+        # either, baseline can't be pinned in ITRF2020 anyway.
+        enumerable = bool(caster_host) or bool(
+            region_source is not None and region_source.catalog_url)
+        if region_source is not None and enumerable and caps.dual_freq:
             base_desc = discover_base_fn(
                 lat, lon, caster_host=caster_host, caster_port=caster_port,
                 max_km=max_km)

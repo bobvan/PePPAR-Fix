@@ -152,15 +152,40 @@ to.
 ## Build status
 
 - **Tier C/D (`--pride`)** — built; the lab default. ~5 mm from 24 h + finals.
-- **Tier A (RTKLIB relative baseline)** — proven end-to-end 2026-07-03
-  (London: F9T raw + open EUREF archive base → 20 cm at 62 km float; cm at a
-  short baseline). Not yet a clean `peppar-survey` backend — currently a manual
-  `f9p_rawx_log → convbin → hatanaka → rnx2rtkp` pipeline. Promoting it (with
-  the caster/archive discovery + datum transform) is the near-term work.
-- **`--auto` selector + caster discovery + `--plan-only`** — designed here,
-  not built.
+- **Tier A (RTKLIB relative baseline)** — built as `--baseline` (#265), with
+  the base pre-converted from its regional datum → ITRF2020@epoch. Proven
+  end-to-end 2026-07-03 (London: F9T raw + open EUREF archive base → 20 cm at
+  62 km float; cm at a short baseline).
+- **`--auto` selector + `--plan-only`** — built (#271, + ETRS89/per-realization
+  base epoch #273).
+- **Base discovery** — built, two sources (`peppar_survey_discovery.py`):
+  - *NTRIP sourcetable* ranking — how EUREF is enumerated (its mounts carry
+    the 9-char monument the archive is keyed by).
+  - *Archive station catalogue* ranking — required for NGS CORS, whose ~1650
+    operational stations appear in **no** sourcetable anywhere. NGS publishes
+    them as one daily-refreshed file,
+    `corsdata/coord/coord_20/itrf2020_geo.comp.txt` (ITRF2020 @ 2020.00 ARP +
+    velocities + status), cached locally for 30 days so a field run works
+    offline. In North America `--auto` therefore needs **no** `--caster-host`.
+
+    Added 2026-08-03 (corsCatalogDiscovery, I-153034). Before it, a US site
+    saw only caster mounts: at Newton WI the nearest was 207 km (Algonquin IL,
+    rtk2go), so `--auto` fell to the PRIDE floor while CORS **WMTW** sat
+    20.6 km away in the very archive `fetch_cors_rinex` already downloads. It
+    also fixes a latent mismatch — a sourcetable mount name was being handed to
+    `fetch_cors_rinex`, which is keyed by the 4-char CORS ID.
+
+    *Follow-on*: the catalogue carries a **native ITRF2020** coordinate plus
+    velocities, so it could replace the `pyproj` NAD83(2011)→ITRF2020 round-trip
+    the baseline solve does today and its ~cm of realization noise (the `ufo1`
+    20 mm lesson). Discovery uses catalogue coordinates for **ranking only** —
+    the solve still takes the base coordinate from the base RINEX header — so
+    that change is separable and not yet made.
 - **Tier D′ self-survey** (static-averaged own solution when no products *and*
   no base) — designed; needs the honest-σ + static-mean quality-gate first.
+- **Receiver→RINEX front end** — still the manual
+  `f9p_rawx_log → convbin → hatanaka` path; promoting `convbin` to a
+  first-class front end is the remaining "works with any receiver" gap.
 
 ## Related
 

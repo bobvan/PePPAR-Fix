@@ -17,8 +17,9 @@ if _SCRIPTS_DIR not in sys.path:
 
 from peppar_fix.peppar_survey_discovery import (
     BaseDescriptor, Mount, RegionSource, discover_base, fetch_base_rinex,
-    fetch_euref_nrt_rinex, haversine_km, parse_sourcetable, rank_by_distance,
-    source_for_position,
+    fetch_catalog_text, fetch_euref_nrt_rinex, haversine_km,
+    parse_ngs_cors_catalog, parse_sourcetable, rank_by_distance,
+    rank_catalog_by_distance, source_for_position,
 )
 
 
@@ -166,36 +167,196 @@ class EurefFetchTest(unittest.TestCase):
                 "SHOE00GBR0", 2026, 163, 10, Path(td), lister=boom))
 
 
+CATALOG_HEADER = (
+    "August 02, 2026\n"
+    "\n"
+    "ITRF2020 Geod. CORS Pos. Ant. Ref. Point (ARP) [GRS80 Ellip.] "
+    "Computed Vels.\n"
+    "_______________________________________________________________\n"
+    " SITE   EPOCH       Latitude          Longitude     Ellip. Ht.   "
+    "Vn      Ve      Vu    Ctry.  State      Site \n"
+    "                                                     meters    "
+    "mm/yr   mm/yr   mm/yr   code    code     Status\n"
+    "_______________________________________________________________\n"
+)
+
+# Verbatim rows from the real file (2026-08-02), plus a synthetic
+# Decommissioned one to prove the status filter bites.
+CATALOG_ROWS = (
+    "WMTW  2020.00  44  9 15.47112 N   87 41 36.19955 W   179.585"
+    "     0.1   -16.3    -3.4    US      WI      Operational\n"
+    "WIWB  2020.00  43 25 13.99813 N   88  8 55.50334 W   234.087"
+    "     0.0   -16.0    -3.0    US      WI      Operational\n"
+    "DEAD  2020.00  44  0  0.00000 N   87 46  0.00000 W   180.000"
+    "     0.0   -16.0    -3.0    US      WI      Decommissioned\n"
+)
+CATALOG_TEXT = CATALOG_HEADER + CATALOG_ROWS
+
+# Newton, WI — the 2026-08-03 field site that motivated catalogue discovery.
+NEWTON = (43.98, -87.78)
+
+
+class ParseNgsCorsCatalogTest(unittest.TestCase):
+    def test_parses_dms_and_metadata(self):
+        rows = parse_ngs_cors_catalog(CATALOG_TEXT)
+        self.assertEqual([r.station for r in rows], ["WMTW", "WIWB", "DEAD"])
+        wmtw = rows[0]
+        self.assertAlmostEqual(wmtw.lat, 44.154297, places=5)
+        self.assertAlmostEqual(wmtw.lon, -87.693389, places=5)   # W -> negative
+        self.assertAlmostEqual(wmtw.height_m, 179.585, places=3)
+        self.assertAlmostEqual(wmtw.epoch, 2020.0, places=2)
+        self.assertEqual(wmtw.vel_mm_yr, (0.1, -16.3, -3.4))
+        self.assertEqual((wmtw.country, wmtw.state), ("US", "WI"))
+        self.assertEqual(wmtw.status, "Operational")
+
+    def test_skips_header_and_malformed_rows(self):
+        text = CATALOG_HEADER + "GARBAGE not a row\n" + CATALOG_ROWS
+        self.assertEqual(len(parse_ngs_cors_catalog(text)), 3)
+
+    def test_empty_text_is_empty_list(self):
+        self.assertEqual(parse_ngs_cors_catalog(""), [])
+
+
+class RankCatalogTest(unittest.TestCase):
+    def setUp(self):
+        self.rows = parse_ngs_cors_catalog(CATALOG_TEXT)
+
+    def test_nearest_first_and_distance(self):
+        ranked = rank_catalog_by_distance(self.rows, *NEWTON, max_km=200)
+        self.assertEqual([s.station for _d, s in ranked], ["WMTW", "WIWB"])
+        # WMTW is ~20 km from Newton — the whole point of the exercise.
+        self.assertAlmostEqual(ranked[0][0], 20.7, delta=1.5)
+
+    def test_excludes_non_operational(self):
+        # DEAD sits ~2 km away but is Decommissioned, so it must not win.
+        ranked = rank_catalog_by_distance(self.rows, *NEWTON, max_km=200)
+        self.assertNotIn("DEAD", [s.station for _d, s in ranked])
+
+    def test_max_km_filters(self):
+        ranked = rank_catalog_by_distance(self.rows, *NEWTON, max_km=25)
+        self.assertEqual([s.station for _d, s in ranked], ["WMTW"])
+
+
+class FetchCatalogTextTest(unittest.TestCase):
+    def test_caches_and_reuses(self):
+        calls = []
+
+        def fetcher(url):
+            calls.append(url)
+            return CATALOG_TEXT
+
+        with TemporaryDirectory() as td:
+            kw = dict(cache_dir=Path(td), fetcher=fetcher)
+            self.assertEqual(fetch_catalog_text("http://x/cat.txt", **kw),
+                             CATALOG_TEXT)
+            self.assertEqual(fetch_catalog_text("http://x/cat.txt", **kw),
+                             CATALOG_TEXT)
+        self.assertEqual(len(calls), 1)          # second call served from cache
+
+    def test_stale_cache_beats_failed_fetch(self):
+        """A field run with no network still gets a base."""
+        def boom(url):
+            raise OSError("no route to host")
+
+        with TemporaryDirectory() as td:
+            cache = Path(td)
+            (cache / "cat.txt").write_text(CATALOG_TEXT, "latin-1")
+            got = fetch_catalog_text("http://x/cat.txt", cache_dir=cache,
+                                     max_age_s=-1, fetcher=boom)
+        self.assertEqual(got, CATALOG_TEXT)
+
+    def test_failed_fetch_without_cache_returns_none(self):
+        def boom(url):
+            raise OSError("no route to host")
+
+        with TemporaryDirectory() as td:
+            self.assertIsNone(fetch_catalog_text(
+                "http://x/cat.txt", cache_dir=Path(td), fetcher=boom))
+
+
 class DiscoverBaseTest(unittest.TestCase):
+    # NGS CORS now has a catalogue, so every sourcetable-path test must say
+    # explicitly that the catalogue found nothing — otherwise it would hit
+    # the network.
+    NO_CATALOG = staticmethod(lambda url: None)
+
     def test_picks_nearest_fixed_base_with_region_datum(self):
         table = (_str_record("VRSNET", 41.851, -88.101, soln="1") + "\n"
                  + _str_record("CLOSE", 41.90, -88.10) + "\n"
                  + _str_record("FAR", 42.5, -88.10) + "\n")
         desc = discover_base(
             41.85, -88.10, caster_host="caster.example", caster_port=2101,
-            sourcetable_fetcher=lambda h, p: table)
+            sourcetable_fetcher=lambda h, p: table,
+            catalog_fetcher=self.NO_CATALOG)
         self.assertIsInstance(desc, BaseDescriptor)
         self.assertEqual(desc.station, "CLOSE")          # nearest non-VRS
         self.assertEqual(desc.base_realization, "NAD83(2011)")  # region datum
+        self.assertEqual(desc.via, "sourcetable")
+
+    def test_catalog_wins_over_caster_in_ngs_region(self):
+        """Newton WI: the CORS catalogue must find WMTW even though the only
+        caster mount in range is 200+ km away (the 2026-08-03 regression)."""
+        far = _str_record("RTK2GO", 42.16, -88.29) + "\n"   # ~207 km
+        desc = discover_base(
+            *NEWTON, caster_host="rtk2go.com",
+            sourcetable_fetcher=lambda h, p: far,
+            catalog_fetcher=lambda url: CATALOG_TEXT)
+        self.assertIsNotNone(desc)
+        self.assertEqual(desc.station, "WMTW")
+        self.assertEqual(desc.via, "catalog")
+        self.assertLess(desc.distance_km, 25.0)
+
+    def test_catalog_works_with_no_caster_at_all(self):
+        """--auto in North America needs no --caster-host."""
+        desc = discover_base(*NEWTON, catalog_fetcher=lambda url: CATALOG_TEXT)
+        self.assertIsNotNone(desc)
+        self.assertEqual(desc.station, "WMTW")
+
+    def test_catalog_miss_falls_through_to_sourcetable(self):
+        table = _str_record("CLOSE", 43.99, -87.79) + "\n"
+        desc = discover_base(
+            *NEWTON, caster_host="c", max_km=10,   # WMTW at 20 km is excluded
+            sourcetable_fetcher=lambda h, p: table,
+            catalog_fetcher=lambda url: CATALOG_TEXT)
+        self.assertIsNotNone(desc)
+        self.assertEqual(desc.station, "CLOSE")
+        self.assertEqual(desc.via, "sourcetable")
+
+    def test_euref_region_has_no_catalog_and_uses_caster(self):
+        def no_catalog(url):
+            raise AssertionError("EUREF must not consult a catalogue")
+
+        table = _str_record("SHOE00GBR0", 51.50, -0.13, country="GBR") + "\n"
+        desc = discover_base(
+            51.5074, -0.1278, caster_host="c",
+            sourcetable_fetcher=lambda h, p: table,
+            catalog_fetcher=no_catalog)
+        self.assertIsNotNone(desc)
+        self.assertEqual(desc.base_realization, "ETRS89")
+        self.assertEqual(desc.via, "sourcetable")
 
     def test_no_region_returns_none(self):
         self.assertIsNone(discover_base(
-            0.0, -30.0, caster_host="c", sourcetable_fetcher=lambda h, p: ""))
+            0.0, -30.0, caster_host="c", sourcetable_fetcher=lambda h, p: "",
+            catalog_fetcher=self.NO_CATALOG))
 
-    def test_no_caster_returns_none(self):
-        self.assertIsNone(discover_base(41.85, -88.10))
+    def test_no_caster_and_no_catalog_returns_none(self):
+        self.assertIsNone(discover_base(
+            41.85, -88.10, catalog_fetcher=self.NO_CATALOG))
 
     def test_unreachable_caster_returns_none(self):
         def boom(h, p):
             raise OSError("refused")
         self.assertIsNone(discover_base(
-            41.85, -88.10, caster_host="c", sourcetable_fetcher=boom))
+            41.85, -88.10, caster_host="c", sourcetable_fetcher=boom,
+            catalog_fetcher=self.NO_CATALOG))
 
     def test_nothing_in_range_returns_none(self):
         table = _str_record("FAR", 45.0, -88.10) + "\n"  # ~350 km
         self.assertIsNone(discover_base(
             41.85, -88.10, caster_host="c", max_km=80,
-            sourcetable_fetcher=lambda h, p: table))
+            sourcetable_fetcher=lambda h, p: table,
+            catalog_fetcher=self.NO_CATALOG))
 
 
 class FetchBaseRinexTest(unittest.TestCase):
