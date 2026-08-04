@@ -22,7 +22,7 @@ if _SCRIPTS_DIR not in sys.path:
 
 from peppar_fix.peppar_survey_cors import (
     CorsNtripConfig, DEFAULT_CORS_NTRIP_DURATION_S,
-    capture_cors_base_via_ntrip, ntrip_url,
+    _redact_cmd, capture_cors_base_via_ntrip, ntrip_url,
     rtcm3_to_rinex, stream_rtcm_from_ntrip,
 )
 
@@ -168,11 +168,82 @@ class FakeProc:
         return 0 if self._exited else None
 
 
+class NmeaPosValidationTest(unittest.TestCase):
+
+    def test_accepts_valid_position(self):
+        cfg = CorsNtripConfig(host="h", port=2101, mount="M",
+                              nmea_pos=(43.98, -87.78, 200.0))
+        self.assertEqual(cfg.nmea_pos, (43.98, -87.78, 200.0))
+
+    def test_rejects_wrong_arity(self):
+        with self.assertRaises(ValueError):
+            CorsNtripConfig(host="h", port=2101, mount="M",
+                            nmea_pos=(43.98, -87.78))
+
+    def test_rejects_out_of_range(self):
+        for bad in ((91.0, 0.0, 0.0), (0.0, 181.0, 0.0)):
+            with self.assertRaises(ValueError):
+                CorsNtripConfig(host="h", port=2101, mount="M", nmea_pos=bad)
+
+    def test_none_is_allowed(self):
+        self.assertIsNone(
+            CorsNtripConfig(host="h", port=2101, mount="M").nmea_pos)
+
+
+class RedactCmdTest(unittest.TestCase):
+    """The str2str command carries credentials; logs must not."""
+
+    def test_masks_password(self):
+        cmd = ["str2str", "-in", "ntrip://ind/bobvv:s3cret@h:2101/M"]
+        self.assertEqual(_redact_cmd(cmd)[2],
+                         "ntrip://ind/bobvv:***@h:2101/M")
+        self.assertNotIn("s3cret", " ".join(_redact_cmd(cmd)))
+
+    def test_leaves_unauthenticated_url_alone(self):
+        cmd = ["str2str", "-in", "ntrip://peer:2102/PEPPAR"]
+        self.assertEqual(_redact_cmd(cmd), cmd)
+
+
 class StreamRtcmFromNtripTest(unittest.TestCase):
 
-    def _cfg(self, duration_s=1):
+    def _cfg(self, duration_s=1, **kw):
         return CorsNtripConfig(host="peer", port=2102, mount="PEPPAR",
-                               duration_s=duration_s)
+                               duration_s=duration_s, **kw)
+
+    def _captured_cmd(self, cfg):
+        """Run stream_rtcm_from_ntrip and return the argv str2str got."""
+        with TemporaryDirectory() as td:
+            out = Path(td) / "stream.rtcm3"
+            fake = FakeProc(out, bytes_to_write=10)
+            with mock.patch(
+                "peppar_fix.peppar_survey_cors.subprocess.Popen",
+                return_value=fake,
+            ) as popen, mock.patch(
+                "peppar_fix.peppar_survey_cors.time.sleep",
+            ):
+                stream_rtcm_from_ntrip(cfg, out, str2str_bin="/x/str2str")
+            return popen.call_args[0][0]
+
+    def test_no_gga_flags_without_nmea_pos(self):
+        cmd = self._captured_cmd(self._cfg())
+        self.assertNotIn("-p", cmd)
+        self.assertNotIn("-n", cmd)
+
+    def test_sends_gga_position_when_set(self):
+        """Network / nearest-base mounts stream nothing without a GGA."""
+        cmd = self._captured_cmd(
+            self._cfg(nmea_pos=(43.98, -87.78, 200.0)))
+        i = cmd.index("-p")
+        self.assertEqual(cmd[i + 1:i + 4],
+                         ["43.980000000", "-87.780000000", "200.0000"])
+        j = cmd.index("-n")
+        self.assertEqual(cmd[j + 1], "10000")
+
+    def test_nmea_cycle_zero_omits_n_flag(self):
+        cmd = self._captured_cmd(
+            self._cfg(nmea_pos=(43.98, -87.78, 0.0), nmea_cycle_ms=0))
+        self.assertIn("-p", cmd)
+        self.assertNotIn("-n", cmd)
 
     def test_success_after_duration(self):
         with TemporaryDirectory() as td:

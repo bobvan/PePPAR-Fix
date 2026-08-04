@@ -275,6 +275,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Seconds of RTCM to capture from the peer.  Default 300 "
              "(5 min).  Must overlap the rover RINEX time range.",
     )
+    baseline.add_argument(
+        "--base-ntrip-conf", default=None,
+        help="Path to an ntrip.conf-format file ([ntrip] section with "
+             "caster/port/mount/user/password) for an authenticated base "
+             "caster such as WISCORS.  Supplies any of "
+             "--base-ntrip-host/-port/-mount not given explicitly.  "
+             "Credentials go in a file, never on the command line, "
+             "because argv is world-readable via ps.",
+    )
+    baseline.add_argument(
+        "--base-ntrip-gga", default=None,
+        help="'LAT,LON[,HEIGHT_M]' station position sent to the base "
+             "caster as NMEA GGA.  REQUIRED by network/nearest-base "
+             "mounts (sourcetable nmea=1, e.g. every WISCORS mount) — "
+             "they pick or synthesize the base from it, and send nothing "
+             "without it.  Defaults to --near when that is given.",
+    )
 
     auto = ap.add_argument_group("--auto options")
     auto.add_argument(
@@ -353,6 +370,96 @@ def main(argv: list[str] | None = None) -> int:
         "--baseline.  All four are implemented today."
     )
     return 2
+
+
+def read_ntrip_conf(path: str) -> dict:
+    """Read an ``ntrip.conf``-format file → dict of the ``[ntrip]`` section.
+
+    Same one-section-per-file shape the engine uses (``--ntrip-conf`` /
+    ``--ssr-ntrip-conf``): the *role* is chosen by which file you point at,
+    not by a section name.  Raises ValueError when the file is missing or has
+    no ``[ntrip]`` section, rather than quietly yielding an anonymous
+    connection that then fails at the caster.
+    """
+    import configparser
+
+    if not os.path.exists(path):
+        raise ValueError(f"--base-ntrip-conf: no such file: {path}")
+    conf = configparser.ConfigParser()
+    conf.read(path)
+    if "ntrip" not in conf:
+        raise ValueError(
+            f"--base-ntrip-conf {path}: no [ntrip] section "
+            "(see ntrip.conf.example)")
+    return dict(conf["ntrip"])
+
+
+def _parse_gga(spec: str | None,
+               near: tuple[float, float] | None
+               ) -> tuple[float, float, float] | None:
+    """'LAT,LON[,HGT]' → (lat, lon, hgt); falls back to ``near`` at h=0."""
+    if spec:
+        parts = [p.strip() for p in spec.split(",")]
+        if len(parts) not in (2, 3):
+            raise ValueError(
+                f"--base-ntrip-gga: expected 'LAT,LON[,HEIGHT_M]', got {spec!r}")
+        try:
+            lat, lon = float(parts[0]), float(parts[1])
+            hgt = float(parts[2]) if len(parts) == 3 else 0.0
+        except ValueError:
+            raise ValueError(
+                f"--base-ntrip-gga: non-numeric value in {spec!r}") from None
+        return lat, lon, hgt
+    if near is not None:
+        return near[0], near[1], 0.0
+    return None
+
+
+def _build_base_ntrip(args):
+    """Assemble the live-NTRIP base config from CLI + optional conf file.
+
+    Returns None when no live-NTRIP base was requested.  Raises ValueError on
+    a malformed conf / GGA so the caller can exit 2 instead of connecting
+    anonymously and capturing zero bytes.
+    """
+    from peppar_fix.peppar_survey_cors import (
+        CorsNtripConfig, DEFAULT_CORS_NTRIP_DURATION_S,
+    )
+
+    conf = read_ntrip_conf(args.base_ntrip_conf) if args.base_ntrip_conf else {}
+    host = args.base_ntrip_host or conf.get("caster")
+    if not host:
+        return None
+    port = args.base_ntrip_port
+    if port == 2102 and conf.get("port"):        # 2102 = the peer-caster default
+        port = int(conf["port"])
+    mount = args.base_ntrip_mount
+    if mount == "PEPPAR" and conf.get("mount"):  # ditto
+        mount = conf["mount"]
+
+    gga = _parse_gga(getattr(args, "base_ntrip_gga", None),
+                     _parse_near(getattr(args, "near", None)))
+    if conf.get("user") and gga is None:
+        # Authenticated casters are network casters in practice; every WISCORS
+        # mount is nmea=1.  Warn rather than fail — a plain single-station
+        # authenticated caster is legitimate and needs no GGA.
+        log.warning(
+            "--base-ntrip-conf supplies credentials but no station position "
+            "is set.  Network / nearest-base mounts (sourcetable nmea=1, "
+            "e.g. all WISCORS mounts) send NOTHING without a GGA — pass "
+            "--base-ntrip-gga LAT,LON or --near LAT,LON if you get 0 bytes.")
+
+    return CorsNtripConfig(
+        host=host,
+        port=port,
+        mount=mount,
+        duration_s=(args.base_ntrip_duration
+                    if args.base_ntrip_duration is not None
+                    else DEFAULT_CORS_NTRIP_DURATION_S),
+        user=conf.get("user", ""),
+        password=conf.get("password", ""),
+        nmea_pos=gga,
+    )
 
 
 def _parse_near(near: str | None) -> tuple[float, float] | None:
@@ -563,19 +670,11 @@ def _run_baseline(args) -> int:
     nav_file = (Path(args.base_nav) if args.base_nav
                 else Path(args.rtklib_nav) if args.rtklib_nav else None)
 
-    base_ntrip = None
-    if args.base_ntrip_host:
-        from peppar_fix.peppar_survey_cors import (
-            CorsNtripConfig, DEFAULT_CORS_NTRIP_DURATION_S,
-        )
-        base_ntrip = CorsNtripConfig(
-            host=args.base_ntrip_host,
-            port=args.base_ntrip_port,
-            mount=args.base_ntrip_mount,
-            duration_s=(args.base_ntrip_duration
-                        if args.base_ntrip_duration is not None
-                        else DEFAULT_CORS_NTRIP_DURATION_S),
-        )
+    try:
+        base_ntrip = _build_base_ntrip(args)
+    except ValueError as e:
+        log.error("%s", e)
+        return 2
 
     return run_rtklib_backend(
         obs_files=obs_files,

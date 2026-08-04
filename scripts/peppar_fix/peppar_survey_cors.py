@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -64,6 +65,12 @@ _TERMINATE_GRACE_S = 5
 _FLUSH_PAUSE_S = 0.5
 
 
+# NMEA GGA request cycle (ms) when a station position is configured.  Network
+# casters drop a client that stops reporting; 10 s is the usual recommendation
+# and is far below any caster's idle timeout.
+DEFAULT_NMEA_CYCLE_MS = 10000
+
+
 @dataclass
 class CorsNtripConfig:
     """Parameters for a single live-NTRIP base capture."""
@@ -73,6 +80,11 @@ class CorsNtripConfig:
     duration_s: int = DEFAULT_CORS_NTRIP_DURATION_S
     user: str = ""        # peer caster doesn't require auth
     password: str = ""
+    # Station position (lat_deg, lon_deg, ellipsoidal_height_m) for the NMEA
+    # GGA the caster needs to pick/synthesize a base.  None for a plain
+    # single-mount caster that streams one fixed station unconditionally.
+    nmea_pos: tuple[float, float, float] | None = None
+    nmea_cycle_ms: int = DEFAULT_NMEA_CYCLE_MS
 
     def __post_init__(self) -> None:
         if not self.host:
@@ -84,6 +96,15 @@ class CorsNtripConfig:
         if self.duration_s <= 0:
             raise ValueError(
                 f"duration_s must be > 0: {self.duration_s}")
+        if self.nmea_pos is not None:
+            if len(tuple(self.nmea_pos)) != 3:
+                raise ValueError(
+                    "nmea_pos must be (lat_deg, lon_deg, height_m)")
+            lat, lon, _h = self.nmea_pos
+            if not (-90.0 <= float(lat) <= 90.0):
+                raise ValueError(f"nmea_pos latitude out of range: {lat}")
+            if not (-180.0 <= float(lon) <= 180.0):
+                raise ValueError(f"nmea_pos longitude out of range: {lon}")
 
 
 def ntrip_url(cfg: CorsNtripConfig) -> str:
@@ -106,6 +127,18 @@ def ntrip_url(cfg: CorsNtripConfig) -> str:
             auth = f"{cfg.user}:{cfg.password}"
         auth += "@"
     return f"ntrip://{auth}{cfg.host}:{cfg.port}/{cfg.mount}"
+
+
+def _redact_cmd(cmd: list[str]) -> list[str]:
+    """Copy of ``cmd`` with any ntrip:// password masked, for logging.
+
+    The URL carries credentials, so the raw command must never reach a log
+    file or a dayplan paste.  (It is still visible in ``ps`` while str2str
+    runs — that's str2str's interface, not something we can fix here.)
+    """
+    # The user part may itself contain '/' — WISCORS usernames are
+    # organization-qualified ("ind/bobvv"), so only ':' and '@' delimit it.
+    return [re.sub(r"(ntrip://[^:@]+):[^@]*@", r"\1:***@", a) for a in cmd]
 
 
 def stream_rtcm_from_ntrip(
@@ -133,7 +166,17 @@ def stream_rtcm_from_ntrip(
     in_url = ntrip_url(cfg)
     out_url = f"file://{output_path}"
     cmd = [str2str_bin, "-in", in_url, "-out", out_url]
-    log.info("str2str: %s (duration=%ds)", " ".join(cmd), cfg.duration_s)
+    if cfg.nmea_pos is not None:
+        # Network / nearest-base mounts (sourcetable nmea=1) select or
+        # synthesize the base from the client's GGA.  Without -p, str2str
+        # sends none and the caster returns nothing — the same silent
+        # zero-bytes failure mode as the 2026-05-20 ntripcli:// bug.
+        lat, lon, hgt = cfg.nmea_pos
+        cmd += ["-p", f"{lat:.9f}", f"{lon:.9f}", f"{hgt:.4f}"]
+        if cfg.nmea_cycle_ms > 0:
+            cmd += ["-n", str(int(cfg.nmea_cycle_ms))]
+    log.info("str2str: %s (duration=%ds)",
+             " ".join(_redact_cmd(cmd)), cfg.duration_s)
     try:
         proc = subprocess.Popen(
             cmd,

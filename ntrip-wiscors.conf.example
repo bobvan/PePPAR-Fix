@@ -1,0 +1,65 @@
+# WISCORS — Wisconsin DOT Continuously Operating Reference Stations
+#
+# Copy to ~/peppar-fix/ntrip-wiscors.conf on the host that needs it, fill in the
+# password, and chmod 600.  Like ntrip.conf, the real file is NEVER committed
+# (both are gitignored) — only this example is.
+#
+#     cp ntrip-wiscors.conf.example ~/peppar-fix/ntrip-wiscors.conf
+#     chmod 600 ~/peppar-fix/ntrip-wiscors.conf
+#     $EDITOR ~/peppar-fix/ntrip-wiscors.conf      # set password
+#
+# One [ntrip] section per file, same shape as ntrip.conf: the *role* is chosen
+# by which file you point a flag at, not by a section name.
+#
+#     peppar-survey --baseline --base-ntrip-conf ~/peppar-fix/ntrip-wiscors.conf \
+#                   --base-ntrip-gga 43.98,-87.78,200 ...
+#
+# Account: WISCORS Real-Time Network Access, activated 2026-08-01, 3 years.
+# Password resets + extra logins: wiscors@dot.wi.gov, or the "Forgot your
+# password" link at https://wiscorsweb.dot.wi.gov/trimblepivotweb/
+
+[ntrip]
+caster = wiscors.dot.wi.gov
+port = 2101
+
+# Username is organization-qualified — the "ind/" prefix is part of it, not a
+# path.  Lower case, no spaces.
+user = ind/bobvv
+password = CHANGEME
+
+# Mountpoint.  Available (from the caster's sourcetable, 2026-08-03):
+#
+#   Network solutions (VRS — synthesized, not a real station):
+#     RTCM34       RTCM 3.4  GPS+GLO+GAL+BDS+QZS   <- best constellation set
+#     CMRxGNSS     CMRx      GPS+GLO+GAL+BDS+QZS
+#     RTCM3Net     RTCM3Net  GPS+GLO
+#     RTCM31       RTCM 3.1  GPS+GLO
+#     CMRplus      CMR+      GPS+GLO
+#     CMRplusGPS   CMR+      GPS only
+#     RTCM23       RTCM 2.3  GPS only
+#
+#   Nearest single base (a REAL fixed station, chosen from your GGA):
+#     SingleBase_RTCM31    RTCM 3.1  GPS+GLO
+#     SingleBase_CMRplus   CMR+      GPS+GLO
+#
+# For a post-processed relative baseline, prefer SingleBase_*: RTKLIB
+# differences against a physical station with a published ARP and antenna
+# (read back from the embedded RTCM 1005/1006 + 1007/1008/1033).  A VRS is a
+# synthesized observation stream with no real monument behind it, which is
+# fine for live RTK and wrong for a survey you intend to trust.
+#
+# Note SingleBase_* is GPS+GLONASS only — for a *post-processed* baseline
+# the richer RTCM34 constellation set does not compensate for losing the
+# real monument.  Use NGS CORS WMTW (~20 km from Newton, GPS+GLO+GAL+BDS,
+# free, no creds) as the primary base and treat WISCORS as the cross-check.
+mount = SingleBase_RTCM31
+
+# WISCORS is plain HTTP on 2101 (no TLS).
+tls = false
+
+# EVERY WISCORS mount is nmea=1: the caster picks (SingleBase_*) or
+# synthesizes (network mounts) the base from the GGA your client sends, and
+# streams NOTHING if you send none.  peppar-survey sends it when you pass
+# --base-ntrip-gga LAT,LON[,HEIGHT_M] (or --near LAT,LON).  There is no
+# config key for it here because it is a property of where the ROVER is,
+# not of the account.

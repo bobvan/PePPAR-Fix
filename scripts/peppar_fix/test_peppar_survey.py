@@ -266,3 +266,128 @@ class AutoCliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadNtripConfTest(unittest.TestCase):
+    """Credentials come from a file, not argv (argv is world-readable)."""
+
+    def _write(self, d, body):
+        p = os.path.join(d, "ntrip-x.conf")
+        with open(p, "w") as f:
+            f.write(body)
+        return p
+
+    def test_reads_ntrip_section(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, "[ntrip]\ncaster = c.example\nport = 2101\n"
+                               "mount = M\nuser = ind/bobvv\npassword = pw\n")
+            got = peppar_survey.read_ntrip_conf(p)
+        self.assertEqual(got["caster"], "c.example")
+        self.assertEqual(got["user"], "ind/bobvv")
+        self.assertEqual(got["password"], "pw")
+
+    def test_missing_file_raises(self):
+        with self.assertRaises(ValueError):
+            peppar_survey.read_ntrip_conf("/nonexistent/ntrip-x.conf")
+
+    def test_missing_section_raises(self):
+        """Better to fail than to connect anonymously and get 0 bytes."""
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, "[wrong]\ncaster = c\n")
+            with self.assertRaises(ValueError):
+                peppar_survey.read_ntrip_conf(p)
+
+
+class ParseGgaTest(unittest.TestCase):
+
+    def test_lat_lon_only_defaults_height_zero(self):
+        self.assertEqual(peppar_survey._parse_gga("43.98,-87.78", None),
+                         (43.98, -87.78, 0.0))
+
+    def test_lat_lon_height(self):
+        self.assertEqual(peppar_survey._parse_gga("43.98,-87.78,200", None),
+                         (43.98, -87.78, 200.0))
+
+    def test_falls_back_to_near(self):
+        self.assertEqual(peppar_survey._parse_gga(None, (43.98, -87.78)),
+                         (43.98, -87.78, 0.0))
+
+    def test_none_when_neither_given(self):
+        self.assertIsNone(peppar_survey._parse_gga(None, None))
+
+    def test_rejects_malformed(self):
+        for bad in ("43.98", "43.98,-87.78,200,extra", "a,b"):
+            with self.assertRaises(ValueError):
+                peppar_survey._parse_gga(bad, None)
+
+
+class BuildBaseNtripTest(unittest.TestCase):
+
+    class _Args:
+        base_ntrip_host = None
+        base_ntrip_port = 2102        # peer-caster default
+        base_ntrip_mount = "PEPPAR"   # peer-caster default
+        base_ntrip_duration = None
+        base_ntrip_conf = None
+        base_ntrip_gga = None
+        near = None
+
+    def _conf(self, d, body):
+        p = os.path.join(d, "ntrip-wiscors.conf")
+        with open(p, "w") as f:
+            f.write(body)
+        return p
+
+    _WISCORS = ("[ntrip]\ncaster = wiscors.dot.wi.gov\nport = 2101\n"
+                "mount = SingleBase_RTCM31\nuser = ind/bobvv\n"
+                "password = pw\ntls = false\n")
+
+    def test_none_when_no_base_requested(self):
+        self.assertIsNone(peppar_survey._build_base_ntrip(self._Args()))
+
+    def test_conf_supplies_everything(self):
+        args = self._Args()
+        with tempfile.TemporaryDirectory() as d:
+            args.base_ntrip_conf = self._conf(d, self._WISCORS)
+            args.base_ntrip_gga = "43.98,-87.78,200"
+            cfg = peppar_survey._build_base_ntrip(args)
+        self.assertEqual(cfg.host, "wiscors.dot.wi.gov")
+        self.assertEqual(cfg.port, 2101)              # overrides peer default
+        self.assertEqual(cfg.mount, "SingleBase_RTCM31")
+        self.assertEqual(cfg.user, "ind/bobvv")
+        self.assertEqual(cfg.password, "pw")
+        self.assertEqual(cfg.nmea_pos, (43.98, -87.78, 200.0))
+
+    def test_explicit_cli_beats_conf(self):
+        args = self._Args()
+        args.base_ntrip_mount = "RTCM34"
+        args.base_ntrip_port = 2102     # left at default → conf wins on port
+        with tempfile.TemporaryDirectory() as d:
+            args.base_ntrip_conf = self._conf(d, self._WISCORS)
+            cfg = peppar_survey._build_base_ntrip(args)
+        self.assertEqual(cfg.mount, "RTCM34")
+        self.assertEqual(cfg.port, 2101)
+
+    def test_near_supplies_gga_when_flag_absent(self):
+        args = self._Args()
+        args.near = "43.98,-87.78"
+        with tempfile.TemporaryDirectory() as d:
+            args.base_ntrip_conf = self._conf(d, self._WISCORS)
+            cfg = peppar_survey._build_base_ntrip(args)
+        self.assertEqual(cfg.nmea_pos, (43.98, -87.78, 0.0))
+
+    def test_peer_caster_still_works_without_conf(self):
+        """The original unauthenticated peer path must be unchanged."""
+        args = self._Args()
+        args.base_ntrip_host = "peer.local"
+        cfg = peppar_survey._build_base_ntrip(args)
+        self.assertEqual((cfg.host, cfg.port, cfg.mount),
+                         ("peer.local", 2102, "PEPPAR"))
+        self.assertEqual(cfg.user, "")
+        self.assertIsNone(cfg.nmea_pos)
+
+    def test_bad_conf_raises(self):
+        args = self._Args()
+        args.base_ntrip_conf = "/nonexistent/ntrip-x.conf"
+        with self.assertRaises(ValueError):
+            peppar_survey._build_base_ntrip(args)
