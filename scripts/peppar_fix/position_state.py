@@ -1059,6 +1059,75 @@ def invalidate_ppp_state(uid,
         return False
 
 
+def declare_arp_moved(uid,
+                      receivers_dir: Optional[str] = None,
+                      positions_dir: Optional[str] = None) -> dict:
+    """Operator declaration that the antenna has physically moved.
+
+    The NAV2 watchdog's step action already does this automatically — but
+    only while the engine is *running*.  The common physical case is the
+    opposite: you stop the engine, unplug the antenna, drive somewhere, and
+    plug it back in.  Nothing is watching, so nothing bumps ``mount_sn``, and
+    at the next launch the pre-move ``.survey.toml`` still matches the
+    (unbumped) current mount_sn and seeds the engine at the OLD site.  That is
+    the ptBoat stale-Chicago-pin failure, and it is silent.
+
+    Same state effects as ``WATCHDOG_STEP_AUTO_MOVE`` minus the servo
+    demotion and exit-5 (there's no running engine to demote): bump
+    ``mount_sn`` so every pre-move ``.survey.toml`` / ``.ppp.toml`` is
+    filtered out by ``filter_current_mount``, and delete the ``.ppp.toml``
+    outright.
+
+    Deliberately does NOT delete the old ``.survey.toml``: it is the
+    authoritative record of the *old* site and peppar-survey may want to
+    archive it.  mount_sn filtering already makes it unusable as a seed, which
+    is the safety property that matters.
+
+    Returns a dict describing what changed (see the CLI in
+    ``scripts/peppar_arp_moved.py``).
+    """
+    if uid is None:
+        raise ValueError("declare_arp_moved needs a receiver uid")
+    old = load_current_mount_sn(uid, receivers_dir=receivers_dir)
+    new = bump_mount_sn(uid, receivers_dir=receivers_dir)
+    ppp_gone = invalidate_ppp_state(uid, positions_dir=positions_dir)
+    log.warning(
+        "[ARP_MOVED_DECLARED] uid=%s mount_sn %d → %d; ppp_invalidated=%s — "
+        "pre-move survey/ppp seeds are now stale and will be filtered out",
+        uid, old, new, ppp_gone)
+    return {"uid": uid, "old_mount_sn": old, "new_mount_sn": new,
+            "ppp_invalidated": ppp_gone}
+
+
+def resolve_mount_sn(uid,
+                     explicit: Optional[int] = None,
+                     receivers_dir: Optional[str] = None
+                     ) -> tuple[int, str]:
+    """Resolve the mount_sn a writer should stamp → ``(value, source)``.
+
+    Precedence: an explicit ``--mount-sn`` override, else the receiver's
+    current mount_sn from ``state/receivers/<uid>.json``, else 0.
+
+    ``source`` is one of ``"explicit"`` / ``"receiver-state"`` / ``"default"``
+    so callers can say where the number came from.  The distinction is
+    load-bearing: ``"default"`` means *no receiver state was found*, and a
+    file stamped with a guessed 0 will be silently discarded by
+    ``filter_current_mount`` the moment the engine's mount_sn is anything
+    else.  Writers should warn on ``"default"``, not shrug.
+    """
+    if explicit is not None:
+        return int(explicit), "explicit"
+    if uid is not None:
+        try:
+            from peppar_fix.receiver_state import load_receiver_state
+            rstate = load_receiver_state(uid, state_dir=receivers_dir)
+        except ImportError:  # pragma: no cover — should never happen
+            rstate = None
+        if rstate and "mount_sn" in rstate:
+            return int(rstate["mount_sn"]), "receiver-state"
+    return 0, "default"
+
+
 def load_current_mount_sn(uid,
                           receivers_dir: Optional[str] = None) -> int:
     """Read the receiver's current ``mount_sn`` from

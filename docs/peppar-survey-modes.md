@@ -170,41 +170,61 @@ arp_epoch_id    = 7
 arp_epoch_since = 2026-08-06T13:58:04Z
 ```
 
-#### The fact that's missing: `arp_epoch_id`
+#### The ARP epoch: `mount_sn` already is one — the gaps are elsewhere
 
-Bob's case — *"peppar-fix might have to restart peppar-survey if NAV2 reported
-the antenna had moved"* — is a real gap today. `survey_state_watcher` handles a
-**mount_sn** change (receiver swapped) by shutting the engine down for a clean
-respawn. But `mount_sn` is *receiver* identity. **Moving the antenna on the
-same receiver doesn't change it** — which is precisely the PiPuss-goes-to-
-Newton case, and the general one the NAV2 watchdog exists to catch.
+> **Correction (2026-08-03).** An earlier draft of this doc proposed a new
+> `arp_epoch_id` on the premise that `mount_sn` is *receiver* identity and so
+> wouldn't change when an antenna moves. That premise was wrong. `mount_sn` is
+> documented and used as the **antenna-mount** tag; the NAV2 watchdog's `step`
+> action already calls `bump_mount_sn()` + `invalidate_ppp_state()` and exits 5
+> for respawn (`peppar_fix_engine.py` `[WATCHDOG_STEP_AUTO_MOVE]`), and
+> `filter_current_mount` already discards **every** candidate — `.survey.toml`
+> included — whose `mount_sn` disagrees with the receiver's current one. A
+> second parallel counter would have been a redundant misnomer. The epoch
+> mechanism exists; two things around it did not.
 
-Add a monotonically-increasing **`arp_epoch_id`**: the engine bumps it whenever
-it believes the antenna is no longer where the survey thinks it is —
+**Gap 1 — the survey side never read it (silent, and total).**
+`peppar-survey --mount-sn` defaulted to `0` and was never resolved from the
+receiver state. So from the first antenna move onward (mount_sn 0→1), every
+`.survey.toml` peppar-survey wrote was stamped `0`, and the engine's
+`filter_current_mount` discarded all of them. The survey ran, succeeded,
+wrote a good file — and the engine ignored it forever and fell back to NAV2.
+Nothing logged an error on either side, because from each side's point of view
+nothing failed.
 
-- the NAV2 watchdog trips (sustained-N checks at the 10 m threshold; loose
-  enough to clear the known 1.5–4 m NAV2 bias, per `docs/wrong-int-basin-2026-05-11.md`),
-- an operator declares a move (`peppar-fix --arp-moved`, for the case you
-  *know* you moved it and shouldn't have to wait for a watchdog),
-- the receiver's `mount_sn` changes (subsumes today's signal).
+Fixed by `resolve_mount_sn(uid, explicit, receivers_dir)`: precedence is
+explicit override → receiver state → 0, and it returns *where the number came
+from* so the writer can warn on `"default"` (meaning "no receiver state found
+— if the engine isn't at 0, this result will be discarded"). This is the
+[[feedback_cli_override_crutch_is_a_config_smell]] pattern: a CLI flag with a
+default standing in for a value that has an authoritative source.
 
-Then, with no command channel at all:
+**Gap 2 — nothing bumps the epoch when a human moves the antenna.** The
+watchdog only runs while the engine runs, and the ordinary physical case is the
+opposite: stop the engine, unplug, drive, plug back in. Nothing is watching, so
+`mount_sn` doesn't move, so the pre-move `.survey.toml` still *matches* the
+(unbumped) current `mount_sn` and seeds the engine at the old site — pinning a
+position kilometres wrong while reporting a centimetre σ. That is the ptBoat
+stale-Chicago-pin failure, and it is silent for the same reason the others are:
+**a stale pin's σ is small.** σ ranking structurally cannot see this class of
+error, which is why the epoch gate has to be categorical.
 
-- **The daemon** sees the bump, archives `history.jsonl` under the old epoch,
-  discards the old running mean, and restarts its cascade at Tier A. Its next
-  `.survey.toml` carries the new `arp_epoch_id`.
-- **The engine's seed resolver gates on epoch *before* σ.** A `.survey.toml`
-  or `.ppp.toml` stamped with an older epoch is not "a less certain estimate,"
-  it is an estimate *of a different place* — it must be rejected outright, not
-  weighed. This is the general form of two bugs we've already paid for: the
-  overconfident `.ppp.toml` shadowing a survey (`project_seed_resolver_ppp_shadows_survey_20260704`)
-  and ptBoat's stale Chicago `.ppp.toml` in London
-  (`project_ptboat_back_online_smoke_20260706`). Both are stale-position
-  problems that σ ranking cannot see, because the stale value's σ is *small*.
-- **A hard restart is systemd's job**, not the engine's — `Restart=on-failure`
-  plus an operator `systemctl restart` when the daemon is genuinely wedged.
-  The epoch bump is a state change, and state changes don't need process
-  lifecycles attached to them.
+Fixed by `declare_arp_moved()` + `scripts/peppar_arp_moved.py` — the same state
+effects as the watchdog's step action minus the servo demotion and exit-5, run
+by the operator with the engine stopped. It deliberately leaves the old
+`.survey.toml` on disk: it's the record of the old site, and mount_sn filtering
+already makes it unusable as a seed.
+
+**Still open (daemon-side, not yet built):** `--daemon` should watch
+`mount_sn` and, on a bump, archive `history.jsonl` under the old partition,
+discard the old running mean, and restart its cascade at Tier A.
+`arp_history.py` already partitions on `mount_sn`, so this is a watch + reset,
+not new bookkeeping.
+
+**A hard restart stays systemd's job**, not the engine's — `Restart=on-failure`
+plus an operator `systemctl restart` when the daemon is genuinely wedged. The
+mount_sn bump is a state change, and state changes don't need process
+lifecycles attached to them.
 
 #### Why not the alternatives
 
@@ -219,15 +239,17 @@ Then, with no command channel at all:
 
 ## Build order
 
-1. **`arp_epoch_id`** — publish it, bump it on NAV2-trip / operator declare /
-   mount_sn change, and make the seed resolver reject stale epochs. Smallest
-   change, biggest correctness win, and it stands alone: valuable even if the
-   daemon is never built.
+1. ~~**ARP epoch**~~ — **done 2026-08-03.** `resolve_mount_sn` (survey stamps
+   the engine's real mount_sn, warns when it's guessing) + `declare_arp_moved`
+   / `peppar_arp_moved.py` (operator declare for engine-stopped moves). Both
+   stand alone: valuable even if the daemon is never built.
 2. **`state/positions/<uid>.engine.toml`** — publish lifecycle + spool path +
-   `obs_logging`. Mostly plumbing over `survey_lifecycle.py`.
+   `obs_logging` + current `mount_sn`. Mostly plumbing over
+   `survey_lifecycle.py`.
 3. **The raw-obs spool + `.done` marker** — shared with `pos_replay`; build it
    once, for both.
-4. **`--daemon`** — consume spool, honour `arp_epoch_id`, write `.survey.toml`.
+4. **`--daemon`** — consume spool, reset on a `mount_sn` bump, write
+   `.survey.toml`.
 5. **On-demand mode** — the no-args path, the JSONL/stderr split, the
    termination predicate, and the receiver-ownership guard. Last because it
    needs the tier cascade to be robust before it's worth pointing a human at.

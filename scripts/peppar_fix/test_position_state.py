@@ -23,6 +23,8 @@ from peppar_fix.position_state import (
     load_survey_state,
     parse_antennas_frame,
     pick_seed_by_provenance,
+    declare_arp_moved,
+    resolve_mount_sn,
     save_ppp_state,
     seed_from_state_files,
     utc_now_iso,
@@ -849,6 +851,125 @@ class TestBumpMountSn(unittest.TestCase):
             self.assertEqual(new, 8)
             self.assertEqual(load_current_mount_sn("12345",
                                                    receivers_dir=d), 8)
+
+
+class TestResolveMountSn(unittest.TestCase):
+    """Writers must stamp the mount_sn the ENGINE will filter on, not a
+    guessed default — a wrong stamp is discarded silently."""
+
+    def _recv_dir(self, d, mount_sn=None):
+        import json
+        payload = {"unique_id": 12345}
+        if mount_sn is not None:
+            payload["mount_sn"] = mount_sn
+        with open(os.path.join(d, "12345.json"), "w") as f:
+            json.dump(payload, f)
+
+    def test_explicit_wins(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._recv_dir(d, mount_sn=7)
+            self.assertEqual(
+                resolve_mount_sn("12345", 2, receivers_dir=d),
+                (2, "explicit"))
+
+    def test_explicit_zero_is_honoured_not_treated_as_unset(self):
+        """0 is a legitimate mount_sn; `if explicit:` would drop it."""
+        with tempfile.TemporaryDirectory() as d:
+            self._recv_dir(d, mount_sn=7)
+            self.assertEqual(
+                resolve_mount_sn("12345", 0, receivers_dir=d),
+                (0, "explicit"))
+
+    def test_reads_receiver_state_when_no_override(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._recv_dir(d, mount_sn=7)
+            self.assertEqual(
+                resolve_mount_sn("12345", None, receivers_dir=d),
+                (7, "receiver-state"))
+
+    def test_no_receiver_file_is_default_not_receiver_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(
+                resolve_mount_sn("12345", None, receivers_dir=d),
+                (0, "default"))
+
+    def test_missing_field_is_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._recv_dir(d, mount_sn=None)
+            self.assertEqual(
+                resolve_mount_sn("12345", None, receivers_dir=d),
+                (0, "default"))
+
+    def test_uid_none_is_default(self):
+        self.assertEqual(resolve_mount_sn(None, None), (0, "default"))
+
+
+class TestDeclareArpMoved(unittest.TestCase):
+
+    def test_bumps_and_invalidates_ppp(self):
+        import json
+        with tempfile.TemporaryDirectory() as rd, \
+                tempfile.TemporaryDirectory() as pd:
+            with open(os.path.join(rd, "12345.json"), "w") as f:
+                json.dump({"unique_id": 12345, "mount_sn": 3}, f)
+            save_ppp_state(_make_state(kind="ppp", mount_sn=3), "12345",
+                           positions_dir=pd)
+            res = declare_arp_moved("12345", receivers_dir=rd,
+                                    positions_dir=pd)
+            self.assertEqual(res["old_mount_sn"], 3)
+            self.assertEqual(res["new_mount_sn"], 4)
+            self.assertTrue(res["ppp_invalidated"])
+            self.assertEqual(
+                load_current_mount_sn("12345", receivers_dir=rd), 4)
+            self.assertIsNone(load_ppp_state("12345", positions_dir=pd))
+
+    def test_stale_survey_stops_being_a_seed(self):
+        """The point of the whole exercise: a pre-move survey must not
+        seed the engine at the old site after a declared move."""
+        import json
+        from peppar_fix.position_state import save_survey_state
+        with tempfile.TemporaryDirectory() as rd, \
+                tempfile.TemporaryDirectory() as pd:
+            with open(os.path.join(rd, "12345.json"), "w") as f:
+                json.dump({"unique_id": 12345, "mount_sn": 3}, f)
+            save_survey_state(_make_state(kind="survey", mount_sn=3,
+                                          sigma_m=0.005),
+                              "12345", positions_dir=pd)
+            # Before the declaration it is a perfectly good seed.
+            self.assertIsNotNone(seed_from_state_files(
+                "12345", positions_dir=pd, receivers_dir=rd))
+            declare_arp_moved("12345", receivers_dir=rd, positions_dir=pd)
+            # After it, the tight-sigma stale survey must NOT be selected.
+            self.assertIsNone(seed_from_state_files(
+                "12345", positions_dir=pd, receivers_dir=rd))
+
+    def test_survey_file_is_kept_on_disk(self):
+        """mount_sn filtering is the safety property; the old survey is
+        still the record of the old site, so don't delete it."""
+        import json
+        from peppar_fix.position_state import save_survey_state
+        with tempfile.TemporaryDirectory() as rd, \
+                tempfile.TemporaryDirectory() as pd:
+            with open(os.path.join(rd, "12345.json"), "w") as f:
+                json.dump({"unique_id": 12345, "mount_sn": 3}, f)
+            save_survey_state(_make_state(kind="survey", mount_sn=3),
+                              "12345", positions_dir=pd)
+            declare_arp_moved("12345", receivers_dir=rd, positions_dir=pd)
+            self.assertIsNotNone(load_survey_state("12345",
+                                                   positions_dir=pd))
+
+    def test_no_prior_state_starts_at_one(self):
+        with tempfile.TemporaryDirectory() as rd, \
+                tempfile.TemporaryDirectory() as pd:
+            res = declare_arp_moved("12345", receivers_dir=rd,
+                                    positions_dir=pd)
+            self.assertEqual((res["old_mount_sn"], res["new_mount_sn"]),
+                             (0, 1))
+            self.assertFalse(res["ppp_invalidated"])
+
+    def test_uid_none_raises(self):
+        with self.assertRaises(ValueError):
+            declare_arp_moved(None)
 
 
 class TestInvalidatePppState(unittest.TestCase):

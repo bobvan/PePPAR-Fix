@@ -103,6 +103,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="Compute the survey snapshot, log what would "
                          "be written, but don't write the file.")
+    ap.add_argument("--mount-sn", type=int, default=None,
+                    help="Antenna mount serial to stamp on the result "
+                         "(also the history partition).  Default: read the "
+                         "receiver's CURRENT mount_sn from "
+                         "state/receivers/<uid>.json — pass this only to "
+                         "override deliberately.  A stamp that disagrees "
+                         "with the engine's current mount_sn is silently "
+                         "discarded as a seed.")
     ap.add_argument("-v", "--verbose", action="store_true")
 
     # --- backends --- #
@@ -158,11 +166,6 @@ def main(argv: list[str] | None = None) -> int:
         "--history-dir", default=None,
         help="Override state/arp/ directory (history.jsonl lives "
              "under <history-dir>/<uid>/history.jsonl).",
-    )
-    pride.add_argument(
-        "--mount-sn", type=int, default=0,
-        help="Antenna mount serial (per-mount history partition).  "
-             "Default 0.",
     )
     pride.add_argument(
         "--n-days", type=int, default=7,
@@ -319,6 +322,22 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         args.receiver_uid = uid
         log.info("Auto-discovered receiver_uid=%s", uid)
+
+    # Resolve the mount_sn to stamp BEFORE any backend runs.  The engine
+    # filters seed candidates on mount_sn (filter_current_mount), so a survey
+    # stamped with the wrong one is computed, written, and then silently
+    # ignored forever — the failure is invisible from the survey side.
+    from peppar_fix.position_state import resolve_mount_sn
+    args.mount_sn, _mount_src = resolve_mount_sn(
+        args.receiver_uid, args.mount_sn, receivers_dir=args.receivers_dir)
+    if _mount_src == "default":
+        log.warning(
+            "mount_sn=0 by default — no mount_sn in state/receivers/%s.json.  "
+            "If the engine's current mount_sn is not 0, this result will be "
+            "discarded as a seed.  Run the engine once, or pass --mount-sn.",
+            args.receiver_uid)
+    else:
+        log.info("mount_sn=%d (from %s)", args.mount_sn, _mount_src)
 
     if args.auto:
         return _run_auto(args)
