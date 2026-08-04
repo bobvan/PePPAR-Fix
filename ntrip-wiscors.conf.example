@@ -42,16 +42,35 @@ password = CHANGEME
 #     SingleBase_RTCM31    RTCM 3.1  GPS+GLO
 #     SingleBase_CMRplus   CMR+      GPS+GLO
 #
-# For a post-processed relative baseline, prefer SingleBase_*: RTKLIB
-# differences against a physical station with a published ARP and antenna
-# (read back from the embedded RTCM 1005/1006 + 1007/1008/1033).  A VRS is a
-# synthesized observation stream with no real monument behind it, which is
-# fine for live RTK and wrong for a survey you intend to trust.
+# MEASURED at the Newton WI site coords (43.98,-87.78) on 2026-08-03 with
+# scripts/diag_ntrip_base.py — not assumed:
 #
-# Note SingleBase_* is GPS+GLONASS only — for a *post-processed* baseline
-# the richer RTCM34 constellation set does not compensate for losing the
-# real monument.  Use NGS CORS WMTW (~20 km from Newton, GPS+GLO+GAL+BDS,
-# free, no creds) as the primary base and treat WISCORS as the cross-check.
+#   SingleBase_RTCM31   base ARP 20.58 km away = NGS CORS **WMTW**
+#                       GPS+GLONASS, LEGACY obs (1004/1012), no MSM
+#                       + 1019/1020 ephemeris
+#   RTCM34              base ARP 0.00 km = VRS synthesized at our GGA
+#                       GPS+GLONASS+Galileo+BeiDou, MSM7 (1075/85/95/1125)
+#                       RTCM 1032 names its physical reference station:
+#                       identical coords to the above — also **WMTW**
+#
+# So at Newton BOTH mounts reduce to WMTW, the same station the free NGS
+# CORS archive serves at 1 Hz with GPS+GLO+GAL+BDS and no credentials.
+# WISCORS is therefore NOT an independent base here — its value is that it
+# is real-time, and that its network adjustment is an independent
+# PROCESSING chain (NAD83(2011)) against our archive-based ITRF2020 result.
+#
+# Both mounts advertise antenna "ADVNULLANTENNA NONE": the caster has
+# already removed the base antenna's phase-centre variations.  Post-
+# processing must NOT apply a PCV model to this base or the correction is
+# double-counted.  (The NGS archive files are raw TRM115000.00 NONE and DO
+# need the antex — the two sources are not interchangeable byte-for-byte.)
+#
+# Datum: the broadcast ARP is NAD83(2011).  Verified 2026-08-03 — tagged
+# NAD83(2011) and converted to ITRF2020@2026.59 it lands 6 cm from NGS's
+# native ITRF2020 WMTW value; tagged ITRF2020 (i.e. skipping the datum
+# conversion) it is 1.56 m off.  peppar-survey --baseline does this
+# conversion; nothing here needs changing, but do not hand this coordinate
+# to anything that assumes ITRF.
 mount = SingleBase_RTCM31
 
 # WISCORS is plain HTTP on 2101 (no TLS).
