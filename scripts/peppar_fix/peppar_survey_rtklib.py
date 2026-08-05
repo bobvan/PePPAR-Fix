@@ -78,6 +78,35 @@ DEFAULT_CORS_URL_TMPL = (
     "{station_lc}/{station_lc}{doy:03d}0.{yy:02d}o.gz"
 )
 
+# Broadcast ephemeris for the relative baseline.
+#
+# NGS CORS station directories carry ONLY observations (.26o/.26d) — no nav
+# file at all.  Without ephemeris rnx2rtkp exits 0 and writes an EMPTY .pos:
+# it has both ends' observations and no way to place a satellite.  So the
+# baseline backend has to source nav itself.
+#
+# BKG's open IGS BRDC archive serves daily MULTI-GNSS broadcast nav (_MN:
+# GPS+GLO+GAL+BDS+QZS in one RINEX 3 file) with no credentials — the same
+# host the EUREF nrt fetcher already uses.  Several agencies post the same
+# day; try them in order because any single one can be missing or late.
+DEFAULT_BRDC_DIR_TMPL = (
+    "https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/")
+# arp_history's DEFAULT_MIN_N_OBS (10_000) counts PRIDE's observations; on
+# this path n_obs counts EPOCHS (RtklibSolution.n_obs = len(keep)).  10_000
+# epochs is 83 h at 30 s decimation, so the shared default rejects every
+# realistic session and no .survey.toml is ever written -- silently, since
+# "0 quality_ok" reads like a data problem.  Gate on something reachable.
+# NOTE this is a count, not a duration: 120 epochs is 1 h at 30 s but only
+# 2 min at 1 s.  Gating on span is the right fix (I-194500).
+DEFAULT_RTKLIB_MIN_N_OBS = 120
+
+DEFAULT_BRDC_PRODUCTS = (
+    "BRDC00IGS_R",    # IGS combined — preferred
+    "BRDC00WRD_R",    # BKG world
+    "BRDM00DLR_S",    # DLR multi-GNSS
+    "BRD400DLR_S",
+)
+
 
 # Reusing the regex from peppar_survey_pride for consistency.
 _DOY_FROM_NAME_RE = re.compile(r"-(\d{4})(\d{3})\b")
@@ -128,6 +157,7 @@ class RtklibSolution:
     mean.
     """
     first_epoch: datetime   # UTC, first kept epoch
+    last_epoch: datetime    # UTC, last kept epoch
     lat: float
     lon: float
     height: float
@@ -192,7 +222,7 @@ def rtklib_to_pride_solution(
         n_obs=rtk_sol.n_obs,
         mode="Static",
         first_epoch=rtk_sol.first_epoch,
-        last_epoch=rtk_sol.first_epoch,
+        last_epoch=rtk_sol.last_epoch,
         receiver_type=receiver_type,
         antenna_type=antenna_type,
         raw_header=raw_header,
@@ -201,6 +231,60 @@ def rtklib_to_pride_solution(
 
 
 # ── NOAA CORS RINEX fetch ──────────────────────────────────────── #
+
+
+def fetch_broadcast_nav(
+    year: int,
+    doy: int,
+    work_dir: Path,
+    *,
+    dir_template: str = DEFAULT_BRDC_DIR_TMPL,
+    products: tuple[str, ...] = DEFAULT_BRDC_PRODUCTS,
+    fetcher=urllib.request.urlretrieve,
+) -> Path | None:
+    """Download a daily multi-GNSS broadcast nav file → local ``.rnx`` path.
+
+    Required for the relative baseline: NGS CORS publishes observations only,
+    and rnx2rtkp silently produces an empty solution when it has no ephemeris
+    (exit code 0, zero-length .pos).  Returns None if every product is
+    unavailable — the caller reports that rather than emitting a bad fix.
+
+    Cached: an already-downloaded file for this (year, doy) is reused, so a
+    per-hour sweep downloads the day's nav once.
+    """
+    import gzip
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    for product in products:
+        local = work_dir / f"{product}_{year:04d}{doy:03d}0000_01D_MN.rnx"
+        if local.exists() and local.stat().st_size > 0:
+            log.info("Broadcast nav cached: %s", local)
+            return local
+    for product in products:
+        fname = f"{product}_{year:04d}{doy:03d}0000_01D_MN.rnx.gz"
+        url = dir_template.format(year=year, doy=doy) + fname
+        gz_path = work_dir / fname
+        local = work_dir / fname[:-3]
+        log.info("Fetching broadcast nav: %s", url)
+        try:
+            fetcher(url, str(gz_path))
+        except Exception as e:  # noqa: BLE001 - try the next product
+            log.info("  not available (%s)", e)
+            continue
+        try:
+            with gzip.open(gz_path, "rb") as gz, open(local, "wb") as out:
+                shutil.copyfileobj(gz, out)
+            gz_path.unlink(missing_ok=True)
+        except OSError as e:  # noqa: BLE001
+            log.warning("  gunzip failed: %s", e)
+            continue
+        if local.exists() and local.stat().st_size > 0:
+            log.info("Broadcast nav: %s (%d bytes)", local,
+                     local.stat().st_size)
+            return local
+    log.warning("No broadcast nav available for %d/%03d — a relative "
+                "baseline cannot solve without ephemeris", year, doy)
+    return None
 
 
 def fetch_cors_rinex(
@@ -534,6 +618,19 @@ def invoke_rnx2rtkp(
         log.info("Base %s: %s@2010.0 -> ITRF2020@%.4f pinned "
                  "(%.3f, %.3f, %.3f)", base_obs.name, base_realization,
                  obs_epoch, *base_ecef_itrf)
+        if nav_file is None:
+            # No caller-supplied nav.  NGS CORS ships none, so fetch the
+            # day's multi-GNSS broadcast rather than let rnx2rtkp exit 0
+            # with an empty .pos (the failure looks like "no solution",
+            # not like "no ephemeris").
+            nav_file = fetch_broadcast_nav(yd[0], yd[1], work_dir)
+            if nav_file is None:
+                return RtklibRunResult(
+                    obs_file=obs_file, mode=mode, returncode=-1, pos_path=None,
+                    error=("no broadcast ephemeris for "
+                           f"{yd[0]}/{yd[1]:03d}; a relative baseline cannot "
+                           "solve without it (pass --base-nav to override)"),
+                )
     config_path = write_config(work_dir, mode, base_ecef_itrf)
     pos_path = work_dir / (obs_file.stem + ".pos")
     cmd = [rnx2rtkp_bin, "-k", config_path.name, "-o", pos_path.name,
@@ -654,6 +751,7 @@ def aggregate_solution(
     sigma_3d = math.sqrt(sumsq / len(tail))
     return RtklibSolution(
         first_epoch=keep[0].utc,
+        last_epoch=keep[-1].utc,
         lat=lat, lon=lon, height=height,
         sigma_3d_m=sigma_3d, sig0_m=sigma_3d,
         n_obs=len(keep),
@@ -835,7 +933,7 @@ def run_rtklib_backend(
     mount_sn: int = 0,
     n_days: int = DEFAULT_N_DAYS,
     max_sig0_m: float = DEFAULT_MAX_SIG0_M,
-    min_n_obs: int = DEFAULT_MIN_N_OBS,
+    min_n_obs: int = DEFAULT_RTKLIB_MIN_N_OBS,
     rnx2rtkp_bin: str = DEFAULT_RNX2RTKP,
     timeout_s: int = DEFAULT_RNX2RTKP_TIMEOUT_S,
     base_ntrip=None,
@@ -919,8 +1017,10 @@ def run_rtklib_backend(
             history_path, adapter,
             mount_sn=mount_sn, quality_ok=quality_ok,
         )
-        log.info("  appended %s → %s (σ_3d=%.4fm quality_ok=%s)",
-                 sol.date_iso, history_path, sol.sigma_3d_m, quality_ok)
+        # adapter (PrideSolution) carries date_iso; RtklibSolution does not.
+        log.info("  appended %s → %s (σ_3d=%.4fm n_obs=%d quality_ok=%s)",
+                 adapter.date_iso, history_path, sol.sigma_3d_m,
+                 sol.n_obs, quality_ok)
 
     log.info("rnx2rtkp sweep complete: %d solved (%d quality_ok), %d failed",
              n_solved, n_quality_ok, n_failed)

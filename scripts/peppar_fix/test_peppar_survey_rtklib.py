@@ -161,6 +161,7 @@ class AdapterTest(unittest.TestCase):
     def test_converts_to_pridesolution_shape(self):
         rtk = RtklibSolution(
             first_epoch=datetime(2026, 5, 20, 14, 0, 0, tzinfo=timezone.utc),
+            last_epoch=datetime(2026, 5, 20, 15, 0, 0, tzinfo=timezone.utc),
             lat=40.0, lon=-90.0, height=200.0,
             sigma_3d_m=0.05, sig0_m=0.05, n_obs=120,
             mode="rtklib_ppp",
@@ -168,6 +169,11 @@ class AdapterTest(unittest.TestCase):
         adapter = rtklib_to_pride_solution(rtk, src_path="/data/host-2026140.obs")
         self.assertEqual(adapter.mode, "Static")
         self.assertEqual(adapter.n_obs, 120)
+        # last_epoch must survive the adaptation — it used to be silently
+        # overwritten with first_epoch, making every solution look
+        # instantaneous in history.jsonl.
+        self.assertEqual(adapter.last_epoch, rtk.last_epoch)
+        self.assertNotEqual(adapter.last_epoch, adapter.first_epoch)
         self.assertEqual(adapter.sig0_m, 0.05)
         # ECEF should be near the WGS-84 ECEF for (40°, -90°, 200m).
         # Quick sanity: X ≈ 0 (lon=-90° puts x≈0)

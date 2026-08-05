@@ -594,7 +594,9 @@ def _run_rtklib(args) -> int:
     from glob import glob
     from pathlib import Path
 
-    from peppar_fix.arp_history import DEFAULT_MAX_SIG0_M, DEFAULT_MIN_N_OBS
+    from peppar_fix.arp_history import DEFAULT_MAX_SIG0_M
+    from peppar_fix.peppar_survey_rtklib import (
+        DEFAULT_RTKLIB_MIN_N_OBS as DEFAULT_MIN_N_OBS)
     from peppar_fix.peppar_survey_rtklib import run_rtklib_backend
 
     if not args.rinex_glob:
@@ -637,7 +639,9 @@ def _run_baseline(args) -> int:
     from glob import glob
     from pathlib import Path
 
-    from peppar_fix.arp_history import DEFAULT_MAX_SIG0_M, DEFAULT_MIN_N_OBS
+    from peppar_fix.arp_history import DEFAULT_MAX_SIG0_M
+    from peppar_fix.peppar_survey_rtklib import (
+        DEFAULT_RTKLIB_MIN_N_OBS as DEFAULT_MIN_N_OBS)
     from peppar_fix.peppar_survey_rtklib import run_rtklib_backend
 
     if not args.rinex_glob:
