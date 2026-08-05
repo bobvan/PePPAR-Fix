@@ -233,6 +233,123 @@ def rtklib_to_pride_solution(
 # ── NOAA CORS RINEX fetch ──────────────────────────────────────── #
 
 
+# Hourly CORS RINEX.  Same tree as the daily file, but the 4th filename
+# character is the hour letter (a=00 .. x=23) instead of '0'.
+DEFAULT_CORS_HOURLY_URL_TMPL = (
+    "https://geodesy.noaa.gov/corsdata/rinex/{year}/{doy:03d}/"
+    "{station_lc}/{station_lc}{doy:03d}{hour_ch}.{yy:02d}o.gz"
+)
+
+# RINEX 2 epoch line: " yy mm dd hh mm ss.sssssss  F nn".  RINEX 3: "> yyyy ...".
+_R3_EPOCH_RE = re.compile(r"^> (\d{4}) (\d\d) (\d\d) (\d\d) (\d\d)")
+_R2_EPOCH_RE = re.compile(r"^ (\d\d) +(\d+) +(\d+) +(\d+) +(\d+) +\d+\.\d+")
+
+
+def rover_hour_span(obs_file: Path) -> tuple[int, int] | None:
+    """(first_hour, last_hour) UTC covered by a RINEX obs file, or None.
+
+    Used to decide which hourly base files to fetch.  Scans epoch lines
+    rather than trusting the header: TIME OF LAST OBS is optional and our
+    own writer omits it on a still-running capture.
+    """
+    first = last = None
+    try:
+        with open(obs_file, "r", errors="replace") as f:
+            for ln in f:
+                m = _R3_EPOCH_RE.match(ln) or _R2_EPOCH_RE.match(ln)
+                if m is None:
+                    continue
+                hour = int(m.group(4))
+                if first is None:
+                    first = hour
+                last = hour
+    except OSError as e:  # noqa: BLE001
+        log.warning("could not scan %s for its hour span: %s", obs_file, e)
+        return None
+    if first is None:
+        return None
+    return first, last
+
+
+def fetch_cors_rinex_hourly(
+    station: str,
+    year: int,
+    doy: int,
+    hours: Sequence[int],
+    work_dir: Path,
+    *,
+    url_template: str = DEFAULT_CORS_HOURLY_URL_TMPL,
+    fetcher=urllib.request.urlretrieve,
+) -> Path | None:
+    """Fetch hourly CORS files for ``hours`` and concatenate → one .26o.
+
+    Why this exists: the DAILY file only appears ~3.5-4 h after the UTC day
+    ENDS, so a capture can never be solved on the same day from dailies
+    alone.  Hourly files post ~1.6 h after each hour closes, which is what
+    makes a same-day survey possible.
+
+    Individual hours are frequently missing (observed 2026-08-05: hour 'e'
+    absent from an otherwise complete day), so a missing hour is skipped
+    rather than failing the fetch — a base with a gap still solves, it just
+    has fewer epochs.  Returns None only if NO hour could be fetched.
+    """
+    import gzip
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    station_lc = station.lower()[:4]
+    yy = year % 100
+    out_path = work_dir / f"{station_lc}{doy:03d}_h{min(hours)}-{max(hours)}.{yy:02d}o"
+    if out_path.exists() and out_path.stat().st_size > 0:
+        log.info("Hourly CORS RINEX cached: %s", out_path)
+        return out_path
+
+    parts: list[Path] = []
+    missing: list[int] = []
+    for hour in hours:
+        hour_ch = chr(ord("a") + hour)
+        local = work_dir / f"{station_lc}{doy:03d}{hour_ch}.{yy:02d}o"
+        if not (local.exists() and local.stat().st_size > 0):
+            url = url_template.format(year=year, doy=doy, yy=yy,
+                                      station_lc=station_lc, hour_ch=hour_ch)
+            gz_path = work_dir / (local.name + ".gz")
+            try:
+                fetcher(url, str(gz_path))
+                with gzip.open(gz_path, "rb") as gz, open(local, "wb") as out:
+                    shutil.copyfileobj(gz, out)
+                gz_path.unlink(missing_ok=True)
+            except Exception as e:  # noqa: BLE001 - a missing hour is normal
+                log.info("  hour %02d unavailable (%s)", hour, e)
+                missing.append(hour)
+                continue
+        parts.append(local)
+
+    if not parts:
+        log.warning("No hourly %s files available for %d/%03d hours %s",
+                    station, year, doy, list(hours))
+        return None
+    if missing:
+        log.warning("Hourly base has gaps — missing hours %s of %s; "
+                    "solving with %d of %d hours",
+                    missing, list(hours), len(parts), len(hours))
+
+    # Concatenate: full header from the first part, data-only from the rest.
+    with open(out_path, "w", errors="replace") as out:
+        for i, part in enumerate(parts):
+            with open(part, "r", errors="replace") as f:
+                in_header = True
+                for ln in f:
+                    if in_header:
+                        if i == 0:
+                            out.write(ln)
+                        if "END OF HEADER" in ln:
+                            in_header = False
+                        continue
+                    out.write(ln)
+    log.info("Hourly CORS RINEX: %s (%d hours, %d bytes)",
+             out_path, len(parts), out_path.stat().st_size)
+    return out_path
+
+
 def fetch_broadcast_nav(
     year: int,
     doy: int,
@@ -785,6 +902,7 @@ def process_one_obs(
     timeout_s: int = DEFAULT_RNX2RTKP_TIMEOUT_S,
     rnx2rtkp_runner=invoke_rnx2rtkp,
     base_fetcher=fetch_cors_rinex,
+    hourly_fetcher=fetch_cors_rinex_hourly,
     base_ntrip_capturer=None,  # injectable for tests
 ) -> tuple[RtklibSolution | None, RtklibRunResult | None]:
     """Run rnx2rtkp on one obs file and aggregate into a solution.
@@ -815,11 +933,25 @@ def process_one_obs(
             year, doy = ydoy
             base_obs = base_fetcher(base_station, year, doy, work_dir)
             if base_obs is None:
+                # The daily file appears only ~3.5-4 h after the UTC day
+                # ENDS, so it is absent for any capture made today.  Fall
+                # back to the hourly files covering the rover's own span —
+                # those post ~1.6 h after each hour and are what makes a
+                # same-day survey possible at all.
+                span = rover_hour_span(obs_file)
+                if span is not None:
+                    log.info("Daily %s unavailable for %d/%03d — falling back "
+                             "to hourly files for hours %02d-%02d",
+                             base_station, year, doy, span[0], span[1])
+                    base_obs = hourly_fetcher(
+                        base_station, year, doy,
+                        range(span[0], span[1] + 1), work_dir)
+            if base_obs is None:
                 return None, RtklibRunResult(
                     obs_file=obs_file, mode=mode, returncode=-1,
                     pos_path=None,
                     error=f"CORS fetch failed for station={base_station} "
-                          f"year={year} doy={doy}",
+                          f"year={year} doy={doy} (neither daily nor hourly)",
                 )
         elif base_ntrip is not None:
             # Lazy import: avoid pulling peppar_survey_cors (and the
@@ -940,6 +1072,7 @@ def run_rtklib_backend(
     dry_run: bool = False,
     rnx2rtkp_runner=invoke_rnx2rtkp,
     base_fetcher=fetch_cors_rinex,
+    hourly_fetcher=fetch_cors_rinex_hourly,
     base_ntrip_capturer=None,
     source_label: str | None = None,
 ) -> int:

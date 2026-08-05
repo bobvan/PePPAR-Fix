@@ -20,6 +20,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from peppar_fix.peppar_survey_rtklib import (
+    fetch_cors_rinex_hourly, rover_hour_span,
     RtklibPosEpoch, RtklibRunResult, RtklibSolution,
     _datetime_to_mjd,
     aggregate_solution, base_ecef_to_itrf2020, doy_from_obs_name,
@@ -738,3 +739,84 @@ class BaselineDatumTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoverHourSpanTest(unittest.TestCase):
+    """Which hourly base files to fetch comes from the rover's own span."""
+
+    def _write(self, d, name, body):
+        p = Path(d) / name
+        p.write_text(body)
+        return p
+
+    def test_rinex3_span(self):
+        body = ("     3.04           OBSERVATION DATA\n"
+                "                                    END OF HEADER\n"
+                "> 2026 08 05 01 09 11.9940000  0 27\n"
+                "> 2026 08 05 06 10 12.0000000  0 28\n"
+                "> 2026 08 05 11 31 42.0000000  0 28\n")
+        with TemporaryDirectory() as d:
+            p = self._write(d, "PiPuss-2026217.obs", body)
+            self.assertEqual(rover_hour_span(p), (1, 11))
+
+    def test_rinex2_span(self):
+        body = ("     2.11           OBSERVATION DATA\n"
+                "                                    END OF HEADER\n"
+                " 26  8  5  3  0  0.0000000  0  8G03G04\n"
+                " 26  8  5  7 30  0.0000000  0  8G03G04\n")
+        with TemporaryDirectory() as d:
+            p = self._write(d, "x-2026217.obs", body)
+            self.assertEqual(rover_hour_span(p), (3, 7))
+
+    def test_no_epochs_returns_none(self):
+        with TemporaryDirectory() as d:
+            p = self._write(d, "empty-2026217.obs", "END OF HEADER\n")
+            self.assertIsNone(rover_hour_span(p))
+
+
+class FetchCorsHourlyTest(unittest.TestCase):
+
+    HDR = ("     2.11           OBSERVATION DATA\n"
+           "WMTW                                    MARKER NAME\n"
+           "                                    END OF HEADER\n")
+
+    def _fake_fetcher(self, available):
+        """urlretrieve stand-in: writes a gzipped stub for available hours."""
+        import gzip
+
+        def f(url, dest):
+            hour_ch = url.split("/")[-1][7]
+            if hour_ch not in available:
+                raise OSError(f"404 for hour {hour_ch}")
+            with gzip.open(dest, "wt") as g:
+                g.write(self.HDR + f"DATA-{hour_ch}\n")
+        return f
+
+    def test_concatenates_header_once(self):
+        with TemporaryDirectory() as d:
+            out = fetch_cors_rinex_hourly(
+                "WMTW", 2026, 217, range(1, 4), Path(d),
+                fetcher=self._fake_fetcher("bcd"))
+            text = out.read_text()
+        # One header, three data lines (hours 1,2,3 -> letters b,c,d).
+        self.assertEqual(text.count("END OF HEADER"), 1)
+        for ch in "bcd":
+            self.assertIn(f"DATA-{ch}", text)
+
+    def test_missing_hours_are_skipped_not_fatal(self):
+        """A gap in the archive is normal — solve with what's there."""
+        with TemporaryDirectory() as d:
+            out = fetch_cors_rinex_hourly(
+                "WMTW", 2026, 217, range(1, 5), Path(d),
+                fetcher=self._fake_fetcher("bd"))   # hours 2 and 4 missing
+            text = out.read_text()
+        self.assertIsNotNone(out)
+        self.assertIn("DATA-b", text)
+        self.assertIn("DATA-d", text)
+        self.assertNotIn("DATA-c", text)
+
+    def test_all_hours_missing_returns_none(self):
+        with TemporaryDirectory() as d:
+            self.assertIsNone(fetch_cors_rinex_hourly(
+                "WMTW", 2026, 217, range(1, 4), Path(d),
+                fetcher=self._fake_fetcher("")))
