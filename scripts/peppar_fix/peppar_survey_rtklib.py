@@ -97,7 +97,7 @@ DEFAULT_BRDC_DIR_TMPL = (
 # realistic session and no .survey.toml is ever written -- silently, since
 # "0 quality_ok" reads like a data problem.  Gate on something reachable.
 # NOTE this is a count, not a duration: 120 epochs is 1 h at 30 s but only
-# 2 min at 1 s.  Gating on span is the right fix (I-194500).
+# 2 min at 1 s.  Gating on span is the right fix (I-194954).
 DEFAULT_RTKLIB_MIN_N_OBS = 120
 
 DEFAULT_BRDC_PRODUCTS = (
