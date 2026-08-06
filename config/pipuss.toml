@@ -35,9 +35,26 @@ eph_mount = "BCEP00BKG0"
 ssr_ntrip_conf = "ntrip.conf"
 systems = "gps,gal,bds"
 
-# Operational ARP — engine reads timelab/antennas.json[ufo1] as an in-memory
-# survey-class seed (shared lab antenna via the GUS splitter).
-arp_label = "ufo1"
+# Operational ARP — engine reads timelab/antennas.json[<label>] as an
+# in-memory survey-class seed (shared lab antenna via the GUS splitter).
+#
+# ⚠ DISABLED 2026-08-06 for the Newton WI field trip.  PiPuss is on a
+# third SPK6618H at an UNSURVEYED site, so there is no antennas.json entry
+# for where it actually is.  Leaving arp_label set would pin the engine at
+# the Wheaton UFO1 ARP ~150 km away.
+#
+# That failure is NOT self-correcting: an antennas.json seed is re-minted
+# with the CURRENT mount_sn on every start (load_arp_from_antennas takes
+# mount_sn as an argument), so it can never go stale and peppar_arp_moved.py
+# cannot invalidate it — the pin is at CONFIG level, not state level.  The
+# NAV2 watchdog would bark at 10 m but only auto-moves after 3600 s held,
+# then exits 5, respawns, re-reads this line, and repeats: a restart loop
+# with a one-hour period.  See grossSeedSanityGate (I-081000).
+#
+# With it commented out the engine bootstraps from NAV2 and peppar-survey
+# supplies the refined ARP.  RESTORE to "ufo1" when PiPuss returns to the
+# lab bench on the GUS splitter.
+# arp_label = "ufo1"
 
 # Disciplined oscillator — characterization travelled from clkPoC3 with the
 # board (state/dos/ocxo-clkpoc3.*).  NOTE: "ocxo-clkpoc3" is a host-named
