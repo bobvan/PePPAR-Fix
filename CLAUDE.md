@@ -393,7 +393,7 @@ passwordless for user `bob`.
 | Host | Access | Role | GNSS | Notes |
 |---|---|---|---|---|
 | TimeHat | `ssh TimeHat` | Primary peppar-fix dev + PHC discipline | F9T-TOP on `/dev/gnss-top` (EVK-F9T-10-00, ZED-F9T, TIM 2.20 — older firmware, no native L5/B2a-I tracking) | Has i226 PHC, TICC #1, heatsink on TCXO |
-| PiPuss | `ssh PiPuss.local` | Dual-F9T, caster/client testing | F9T-TOP `/dev/gnss-top`, F9T-BOT `/dev/gnss-bot` | Zero-baseline (both on Patch3 via GUS #2) |
+| PiPuss | `ssh PiPuss` | **Complete clock prototype** — the name means the whole clock, not just the Pi inside | EVK-F9T (ZED-F9T-20B, TIM 2.25) on `/dev/gnss-bot` @115200 | PulsePuppy OCXO DO + DAC + temp sensor, TICC #5 (`/dev/ticc5`), **2nd OCXO for the TICC reference**.  TICC ref is a cable move: bench Rb ↔ internal OCXO.  Field fallback `ssh bob@192.168.77.1` over a direct cable.  See `timelab/topology.md` |
 | ~~Onocoy~~ | mothballed 2026-04-08 | F10T + PX1125T disconnected; TICC #2 moved to ocxo | – | Powered down. Never had a peppar-fix checkout. |
 | otcBob1 | `ssh otcBob1` | Timebeat OTC SBC, OCXO, Renesas ClockMatrix | F9T on `/dev/ttyAMA0` at 460800 | Stop `timebeat` before accessing I2C or GNSS |
 | ptBoat | `ssh ptBoat` | Timebeat OTC Mini PT, weatherproof, PoE | F9T on `/dev/ttyAMA0` at 115200 | Same Renesas ClockMatrix as otcBob1 |
@@ -401,8 +401,10 @@ passwordless for user `bob`.
 | bbb | `ssh bbb` (→ 10.168.13.14, PTP LAN) | BeagleBone, GPS L1 only | `/dev/gps0` at 9600 | Legacy NTP/PTP GM. **Reachable ONLY via the PTP LAN** — no trusted-LAN/Tailscale/mDNS interface, so PTP-LAN SSH is the sole option here (see resolution note). |
 
 **Hostname resolution**: Try `<host>` first (DNS search domain VanValzah.Com).
-If that fails, try `<host>.local` (mDNS). PiPuss only resolves via
-`.local`.
+If that fails, try `<host>.local` (mDNS).  Most lab hosts also resolve
+over **Tailscale**, which is what makes them reachable when they leave
+the lab — `ssh PiPuss` worked throughout the 2026-08-06 Newton field
+prep with PiPuss on a cellular hotspot and no lab network at all.
 
 **SSH interface preference**: always prefer a host's **trusted-LAN or
 Tailscale** interface, and keep the PTP LAN (10.168.13.x) clean for
@@ -452,9 +454,10 @@ ser.close()
 ### F9T EVKs have no USB serial number
 
 All F9T EVKs report the same VID:PID (`1546:01a9`) with no serial number.
-You cannot distinguish them by USB descriptor. On PiPuss (two F9Ts),
-udev uses USB path matching which breaks if cables move. On single-F9T
-hosts (TimeHat), VID:PID matching is fine.
+You cannot distinguish them by USB descriptor.  Any host carrying two
+F9Ts must use udev USB **path** matching, which breaks if cables move.
+On single-F9T hosts (TimeHat, and PiPuss since its 2026-06-30 rebuild
+as a clock prototype) VID:PID matching is fine.
 
 Each F9T does have a unique `SEC-UNIQID` queryable via UBX protocol,
 but this is not visible to udev.
@@ -550,7 +553,7 @@ work it'll be on a different host.
 |---|---|---|
 | dev box (gt) | `/home/bob/git/PePPAR-Fix/venv` | `source /home/bob/git/PePPAR-Fix/venv/bin/activate` |
 | TimeHat | `/home/bob/peppar-fix/venv` | `source ../venv/bin/activate` |
-| PiPuss | `/home/bob/pygpsclient` | `source ~/pygpsclient/bin/activate` |
+| PiPuss | `/home/bob/peppar-fix/venv` | `source ../venv/bin/activate` |
 | ~~Onocoy~~ | mothballed 2026-04-08 | – |
 | otcBob1 | `/home/bob/peppar-fix/venv` | `source ../venv/bin/activate` |
 | ptBoat | `/home/bob/peppar-fix/venv` | `source ../venv/bin/activate` |
