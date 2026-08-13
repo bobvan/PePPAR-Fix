@@ -34,11 +34,11 @@ Same path from any worktree.  All write ops go through the CLI:
 
 | Op | What it does |
 |---|---|
-| `propose` | File a new plan item.  Returns an `I-HHMMSS-<by>` handle. |
+| `propose` | File a new plan item.  **`--name <Name>` is required** and becomes the item's id. |
 | `ack` | Agent records "I've reviewed this and agree." |
 | `amend` | Edit a field on an item (owner, depends_on, etc.). |
 | `status` | Set status (`in-progress` / `done` / `blocked` / `deferred` / `abandoned` / `disputed`).  `AGREED` is derived when all reviewers have ack'd. |
-| `discuss` | Post a discussion note.  Use `--id <I-NUMBER>` to thread under a specific item; omit for free-floating. |
+| `discuss` | Post a discussion note.  Use `--id <Name>` to thread under a specific item; omit for free-floating. |
 | `render` | Read-only — print today's plan state as markdown.  Useful piped through `less` or saved to `/tmp/dp-now.txt` for grep-ability. |
 | `close` | Archive the day's log to `PePPAR-Fix/hist/dayplan-YYYY-MM-DD/`. |
 
@@ -106,6 +106,7 @@ If the JSON line appears, it landed.  If not, the op didn't take.
 DP=/home/bob/.claude/projects/-home-bob-git-PePPAR-Fix/dayplan/dayplan.py
 $DP propose \
     --by charlie \
+    --name rinexEpochPhase \
     --reviewers bravo main \
     --title "Short imperative title (one line)" \
     --body "$(cat <<'EOF'
@@ -121,7 +122,7 @@ EOF
 ### Discussing on an existing item
 
 ```bash
-$DP discuss --by charlie --id I-125649-main --msg "$(cat <<'EOF'
+$DP discuss --by charlie --id rinexEpochPhase --msg "$(cat <<'EOF'
 +1 on the proposal.  One concern: <…>.  Suggested fix: <…>.
 EOF
 )"
@@ -134,7 +135,7 @@ show that day's state.
 ### Acking an item
 
 ```bash
-$DP ack --by charlie --id I-125649-main
+$DP ack --by charlie --id rinexEpochPhase
 ```
 
 When all reviewers have ack'd, the item's derived status flips to
@@ -146,21 +147,24 @@ When all reviewers have ack'd, the item's derived status flips to
 - **Bodies**: lead with a one-line headline.  Then context, plan,
   asks.  Cite file:line, commit SHAs, log paths.  Other agents
   rebuild your reasoning from these references.
-- **IDs are camelCase slugs**: `--id <slug>-<by>` where `<slug>` is
-  a short, descriptive camelCase keyword (8–14 chars typical) that
-  summarizes the work.  Examples: `perOutAlarm-main`, `x2Canary-main`,
-  `bdsMissBias-charlie`, `arpRuntime-charlie`.  No `I-` prefix, no
-  timestamps.  Bob's parser is meat-based; slugs help him associate
-  items with meaning at a glance.  If you omit `--id`, the tool
-  falls back to the legacy `I-HHMMSS-<by>` form — usable but
-  discouraged for new items.  Existing `I-NNNNNN` items keep their
-  IDs (no rewriting history).
-- **Slug collisions**: pick a more specific slug.  If two items
-  legitimately share a topic, suffix with `-2`, `-3`, etc.
-  (`bdsMissBias-charlie` and `bdsMissBias2-charlie`) or pick
-  distinguishing terms (`bdsB2aBias-charlie` vs `bdsCnesGap-charlie`).
+- **The name IS the id**: `propose --name <Name>` is **required**,
+  and every later op addresses the item as `--id <Name>`.  Use a
+  short, descriptive camelCase or kebab keyword (8–14 chars typical)
+  that summarizes the work: `perOutAlarm`, `x2Canary`, `bdsMissBias`,
+  `arpRuntime`.  Must start with a letter, then letters/digits/`-`/`_`,
+  2–41 chars; anything else is rejected with an explanatory error.
+  Bob's parser is meat-based; names help him associate items with
+  meaning at a glance.  The old auto-generated `I-HHMMSS-<by>` form is
+  **gone** for new items — there is no fallback.  Items already logged
+  under an `I-` id keep it and are still addressable by it (no
+  rewriting history).
+- **Name collisions**: `propose` rejects a name already used that
+  day and names the agent who took it.  Pick a more specific name.  If
+  two items legitimately share a topic, suffix with `2`, `3`
+  (`bdsMissBias`, `bdsMissBias2`) or pick distinguishing terms
+  (`bdsB2aBias` vs `bdsCnesGap`).
 - **Cross-references**: in body or discuss, refer to other items by
-  full ID (`per arpRuntime-charlie: …`).  Saves re-explaining context.
+  name (`per arpRuntime: …`).  Saves re-explaining context.
 - **Asks**: end the body with explicit "ASKING <agent>: <action>"
   lines so reviewers know what they owe.
 - **Branches**: when filing implementation work, name your branch

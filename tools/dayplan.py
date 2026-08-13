@@ -12,16 +12,21 @@ POSIX O_APPEND.  Multiple agents can write simultaneously without
 collision.  "Current state" is computed by replaying the log.
 
 Usage:
-  dayplan propose --by main --title "land A1 NL P_IB" \
-    --reviewers charlie bravo --owner main
-  dayplan ack --by bravo --id I-0915-main
-  dayplan status --by main --id I-0915-main --value in-progress
-  dayplan status --by main --id I-0915-main --value done --evidence abc123
-  dayplan amend --by bravo --id I-0915-main --field depends_on --value I-0820-charlie
+  dayplan propose --by main --name LandA1NlPib \
+    --title "land A1 NL P_IB" --reviewers charlie bravo --owner main
+  dayplan ack --by bravo --id LandA1NlPib
+  dayplan status --by main --id LandA1NlPib --value in-progress
+  dayplan status --by main --id LandA1NlPib --value done --evidence abc123
+  dayplan amend --by bravo --id LandA1NlPib --field depends_on --value ZtdStatePrep
   dayplan discuss --by charlie --msg "should we land A1 before B1?"
-  dayplan discuss --by charlie --id I-0915-main --msg "thread on A1"
+  dayplan discuss --by charlie --id LandA1NlPib --msg "thread on A1"
   dayplan render
   dayplan close --by main --lessons "..."
+
+The item's --name IS its key: `propose --name AddTwoUps` then
+`ack/status/amend/discuss --id AddTwoUps`.  Names must be unique within
+a day.  Older items keyed I-HHMM-<agent> still replay and are still
+addressable by that id; only new items are name-keyed.
 
 Status values: in-progress | done | deferred | disputed
 AGREED is derived (all reviewers ack'd); explicit status overrides.
@@ -29,6 +34,7 @@ AGREED is derived (all reviewers ack'd); explicit status overrides.
 import argparse
 import json
 import os
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,30 +112,48 @@ def read_ops(date=None):
     return ops
 
 
-def make_id(by):
-    """Time + agent suffix.  Seconds-precision keeps IDs unique across
-    rapid-fire seed proposals (8 items in the same minute would have
-    collided on minute-precision)."""
-    hms = datetime.now(LOCAL_TZ).strftime("%H%M%S")
-    return f"I-{hms}-{by}"
+SLUG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{1,40}$")
+
+
+def validate_name(name):
+    """The item key is a required meatware-friendly slug (no integer IDs).
+    A letter, then letters/digits/-/_ — no spaces, so it stays a clean key
+    you can carry in your head and retype."""
+    if not SLUG_RE.match(name):
+        raise SystemExit(
+            f"Bad --name '{name}': use a short meatware-friendly key — a "
+            f"letter, then letters/digits/-/_ (2–41 chars), no spaces. "
+            f"E.g. AddTwoUps, fix-dns-ptr, rinexEpochPhase."
+        )
+    return name
 
 
 # ── subcommand handlers ─────────────────────────────────────────── #
 
 def cmd_propose(args):
+    name = validate_name(args.name)
+    # The name IS the key, so it must be unique within the day's log.
+    items, _, _ = _build_state(read_ops(args.date or today()))
+    if name in items:
+        raise SystemExit(
+            f"--name '{name}' already exists today (proposed by "
+            f"{items[name]['proposed_by']}). Pick a distinct name, or work "
+            f"the existing item with `ack/status/amend/discuss --id {name}`."
+        )
     op = {
         "op": "propose",
-        "id": args.id or make_id(args.by),
+        "id": name,
         "by": args.by,
         "ts": now_ts(),
         "owner": args.owner or args.by,
         "reviewers": args.reviewers or [],
-        "title": args.title,
     }
+    if args.title:
+        op["title"] = args.title
     if args.body:
         op["body"] = args.body
     append_op(op, args.date)
-    print(f"Proposed {op['id']}: {args.title}")
+    print(f"Proposed {name}" + (f": {args.title}" if args.title else ""))
 
 
 def cmd_ack(args):
@@ -249,14 +273,15 @@ def _render(date):
             out.append(f"Lessons: {closed['lessons']}")
         out.append("")
     if not items and not untargeted:
-        out.append("(no items yet — use `dayplan propose --by ... --title ...`)")
+        out.append("(no items yet — use `dayplan propose --by ... --name ...`)")
         return "\n".join(out)
 
     # Sort items by proposed_ts
     for item_id in sorted(items, key=lambda i: items[i]["proposed_ts"]):
         item = items[item_id]
         label = _status_label(item)
-        out.append(f"### [{label}] {item_id}: {item['title']}")
+        _t = item.get("title") or ""
+        out.append(f"### [{label}] {item_id}" + (f": {_t}" if _t else ""))
         if item.get("owner"):
             out.append(f"  - owner: **{item['owner']}**")
         if item.get("body"):
@@ -356,17 +381,22 @@ def main():
 
     p = sub.add_parser("propose", help="Propose a plan item")
     add_by(p); add_date(p)
-    p.add_argument("--id", help="Custom ID (default: I-HHMM-by)")
+    p.add_argument("--name", required=True,
+                   help="REQUIRED short meatware-friendly key = the item's "
+                        "id (e.g. AddTwoUps, rinexEpochPhase). Unique per "
+                        "day; reused in every later --id.")
     p.add_argument("--owner", help="Owner (default: --by)")
     p.add_argument("--reviewers", nargs="+", default=[],
                    help="Agents whose ack is required for AGREED")
-    p.add_argument("--title", required=True)
+    p.add_argument("--title",
+                   help="Optional longer description (the name carries the gist)")
     p.add_argument("--body", help="Optional details (kept short)")
     p.set_defaults(func=cmd_propose)
 
     p = sub.add_parser("ack", help="Acknowledge an item")
     add_by(p); add_date(p)
-    p.add_argument("--id", required=True)
+    p.add_argument("--id", required=True,
+                   help="Item name — the key set by `propose --name`")
     p.add_argument("--note",
                    help="Optional reservation/qualifier rendered "
                         "next to the ack")
@@ -374,7 +404,8 @@ def main():
 
     p = sub.add_parser("amend", help="Amend a field on an item")
     add_by(p); add_date(p)
-    p.add_argument("--id", required=True)
+    p.add_argument("--id", required=True,
+                   help="Item name — the key set by `propose --name`")
     p.add_argument("--field", required=True)
     p.add_argument("--value", required=True)
     p.add_argument("--rationale", help="Why")
@@ -382,14 +413,15 @@ def main():
 
     p = sub.add_parser("status", help="Update item status")
     add_by(p); add_date(p)
-    p.add_argument("--id", required=True)
+    p.add_argument("--id", required=True,
+                   help="Item name — the key set by `propose --name`")
     p.add_argument("--value", required=True, choices=VALID_STATUS)
     p.add_argument("--evidence", help="Commit / path / URL")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("discuss", help="Post a discussion note")
     add_by(p); add_date(p)
-    p.add_argument("--id", help="Optional item ID for threaded discussion")
+    p.add_argument("--id", help="Item name to thread under (from propose --name)")
     p.add_argument("--msg", required=True)
     p.set_defaults(func=cmd_discuss)
 
