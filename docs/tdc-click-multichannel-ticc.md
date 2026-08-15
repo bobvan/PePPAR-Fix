@@ -4,12 +4,22 @@ Research note, 2026-08-15.  Question asked: the MIKROE-4770 carries the
 same TDC chip as our TAPR TICCs — could we put one or more on a
 mikroBUS host board and get a two-or-more-channel TICC equivalent?
 
-**Short answer: yes, and the Click is a better starting point than
-expected — but the TDC7200 is not the hard part of a TICC.  The hard
-part is a small piece of glue logic called the *stop gate*, plus a host
-that can keep a coarse counter without jitter.  Neither is on the Click
-board.  Budget the project as "design the stop gate and the coarse
-counter", not "wire up a TDC".**
+**Short answer: yes, and more cheaply and simply than first thought.
+The Click is $18 and the two-socket Pi Pico shield is $54, so two
+channels of hardware is ~$90.  The only real risk left is whether the
+RP2040 can be clocked coherently from the house 10 MHz.**
+
+> **CORRECTION 2026-08-15** — the first version of this note named the
+> *stop gate* as the hard part and the main reason a Click build would
+> be non-trivial.  That was wrong, and wrong in the expensive direction:
+> it implied per-channel glue hardware that does not need to exist.  The
+> TDC7200 has the gate **built in** as the `CLOCK_CNTR_STOP_MASK`
+> registers — "all STOP signals occurring before the value set by the
+> CLOCK_CNTR_STOP_MASK registers will be ignored" (§8.3.3.3).  At 10 MHz
+> a mask of 3 gives the same 300 ns blanking the TICC builds in
+> hardware, for the cost of a register write.  §2 and §3 below are
+> updated; the reasoning about *why the TICC needs external hardware
+> anyway* is in §2.1.
 
 ---
 
@@ -125,11 +135,26 @@ always legal.  The same gated pulse is what interrupts the host to latch
 `PICstop`, which is also why the host isn't taking a 10 kHz interrupt on
 every coarse tick per channel.
 
-**This is the single most important thing the Click board does not give
-you, and the single most likely way a naive build produces
-plausible-but-wrong numbers.**  A build without a stop gate will mostly
-work, and will silently corrupt ~0.2% of measurements — the kind of
-defect that shows up as unexplained outliers months later.
+### 2.1 …but we do not need to build one
+
+The TDC7200 already implements this internally.  Per §8.3.3.3, the
+Clock Counter starts on the first rising CLOCK edge after START, and
+**all STOP signals arriving before `CLOCK_CNTR_STOP_MASK` clock cycles
+are ignored**.  At 10 MHz (100 ns/cycle) a mask of 3 reproduces the
+TICC's 300 ns blanking exactly.  The register is 16-bit
+(`_H × 2^8 + _L`), so the window can run to 6.55 ms; the one constraint
+is that `CLOCK_CNTR_OVF` must remain **above** the mask value, or the
+overflow interrupt halts the measurement before the window expires.
+
+So why does the TICC build the gate in hardware?  Because its gate does
+**two** jobs: it blanks early STOPs, *and* the gated pulse is what
+interrupts the Arduino to latch `PICcount`.  The second job is what
+requires a physical signal.  In a design where the host itself generates
+the coarse clock, the host already knows the count — the second job
+disappears, and with it the need for external gating.
+
+**Consequence for wiring: STOP is a single free-running coarse clock,
+fanned out to every channel's STOP input.**  No per-channel logic.
 
 ---
 
@@ -142,7 +167,7 @@ defect that shows up as unexplained outliers months later.
 | START and STOP as separate inputs | **Yes** — signal connectors |
 | SPI + INTB + EN + TRG to host | **Yes** — via mikroBUS |
 | 10 MHz → 10 kHz coarse divider | **No** |
-| **Stop gate (per channel)** | **No** |
+| Stop gate (per channel) | **Not needed** — `CLOCK_CNTR_STOP_MASK` does it in-chip (§2.1) |
 | Coarse counter + STOP-edge latch | **No** (host's job) |
 | Input conditioning for 2–5 V DUT pulses | **No** — 3.3 V logic input |
 | 50 Ω termination on the reference input | **Unknown** — verify |
@@ -308,8 +333,13 @@ to choose which two clocks to look at.
 
 ## 8. Open questions
 
-1. **Can the RP2040/RP2350 system+PIO clock be driven coherently from
-   10 MHz?**  Decides option B vs C.  Answer before designing.
+1. **Can the RP2040/RP2350 be clocked coherently from the house
+   10 MHz?**  Now the *only* significant risk, and it carries all the
+   weight: if the Pico's coarse clock is not phase-locked to the same
+   reference the TDCs calibrate against, the two timescales drift and
+   the timestamps are worthless.  If yes, this build is simpler than a
+   TICC.  If no, add one external ÷1000 divider — still no per-channel
+   hardware.  **Answer this before designing anything else.**
 2. **Physical connectors on the Click** — SMA vs U.FL/N.FL for
    START/STOP, and whether the reference input is 50 Ω terminated.
    Needs a board in hand or the schematic.
@@ -331,3 +361,49 @@ All cached in `doclib` (group `timelab`) — `doclib search "<query>" --group ti
 - TAPR App Note 2020-01 multi-TICC — `doclib show multi-TICC-App-Note-2020-01`
 - TICC source: <https://github.com/TAPR/TICC> (BSD)
 - PIC divider firmware: <http://www.leapsecond.com/pic/picdiv.htm>
+
+
+---
+
+## 9. Wiring, resolved (2026-08-15)
+
+Confirmed prices: TDC Click **$18** each, Click Shield for Pi Pico
+**$54** → **~$90 for two channels**.  Clock input is **u.FL**.
+
+STOP is an **input to the TDC**, driven by the Pico — nothing flows from
+the Click's STOP pin back to the host.
+
+| Signal | From | To |
+|---|---|---|
+| 10 MHz house reference | 3-way fan-out | Click A clock (u.FL), Click B clock (u.FL), Pico clock input |
+| Coarse clock, 10 kHz | one Pico GPIO | 2-way fan-out → Click A STOP, Click B STOP |
+| PPS channel A | DUT | Click A START |
+| PPS channel B | DUT | Click B START |
+| `TRIGG` A / B | mikroBUS **PWM**, per socket | Pico GPIO (interrupt) |
+| `INTB` A / B | mikroBUS **INT**, per socket | Pico GPIO (interrupt) |
+| SPI + per-socket CS | mikroBUS | Pico SPI |
+
+Both Clicks set to `CLK SEL = EXT`.  Series resistor on the Pico's
+coarse-clock output.
+
+**Which coarse tick stopped a given channel** is recovered from
+`TRIGG`, which the Click routes to mikroBUS PWM.  Datasheet measurement
+sequence step 5: *"After receiving a START, the TDC resets the TRIGG
+pin"* — so TRIGG's falling edge marks START arrival on a pin already
+present in the mikroBUS connector, and **no PPS fan-out to the Pico is
+required**.  The host snapshots its coarse count on that edge; combined
+with the measured `tof`, the tick is unambiguous (ticks 100 µs apart,
+`tof` known to picoseconds, so tens of µs of slop in the TRIGG
+timestamp are harmless).  At 1 Hz PPS this is an ordinary GPIO
+interrupt — **no PIO and no determinism needed on this path.**  The only
+path that must be hardware-deterministic is generation of the coarse
+clock itself.
+
+Between measurements the free-running coarse clock on STOP is harmless:
+step 8 of the sequence disables the START, STOP and TRIGG pins once a
+measurement completes, so stray ticks are ignored until the host re-arms
+via `START_MEAS`.
+
+**Open cabling question:** the clock input is u.FL — are START and STOP
+also u.FL, or SMA?  If u.FL throughout, two channels need six pigtails
+plus two fan-outs, which is now the fiddliest part of the build.
