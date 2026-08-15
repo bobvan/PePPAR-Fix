@@ -59,13 +59,10 @@ The two features that matter most, and that I did not expect to find:
    coarse clock → STOP.  A board that only generated its own pulses for
    time-of-flight demos could not be used this way.
 
-**One item to confirm physically when a board is in hand:** sources
-describe the START/STOP connectors as SMA and the clock connector as
-N.FL.  Three SMAs on a 42.9 × 25.4 mm board would be crowded, and I
-could not reach MikroElektronika's schematic (mikroe.com and
-download.mikroe.com both return 403 to automated fetches).  Assume
-U.FL/N.FL pigtails may be needed until the board is inspected.  This
-changes cabling, not feasibility.
+**Connectors, confirmed 2026-08-15:** **START and STOP are SMA**; the
+external clock input is **u.FL**.  So the signal path is SMA end to end,
+matching the rest of the lab, and only the 10 MHz distribution needs
+u.FL pigtails (one per Click).
 
 Cached locally: `doclib show tdc7200`, `doclib show A700000008924024`.
 
@@ -407,3 +404,95 @@ via `START_MEAS`.
 **Open cabling question:** the clock input is u.FL — are START and STOP
 also u.FL, or SMA?  If u.FL throughout, two channels need six pigtails
 plus two fan-outs, which is now the fiddliest part of the build.
+
+
+---
+
+## 10. RP2040 clocking — read, and the answer changes the design (2026-08-15)
+
+Read from the RP2040 datasheet (cached: `doclib show rp2040-datasheet`).
+
+### The three ways in
+
+1. **Drive XIN.**  "XIN can also be used as a single-ended CMOS clock
+   input, with XOUT disconnected" (§ pin description), up to 50 MHz,
+   with the XOSC configured to pass the signal through.  Crucially,
+   "**the on-chip PLLs can be used to synthesise higher frequencies from
+   the XIN input**" (§2.15.2.3), so 10 MHz in yields a 125 MHz `clk_sys`
+   and 48 MHz USB all locked to the house standard.
+   *Costs:* "The USB bootloader requires a 12MHz crystal or 12MHz clock
+   input" — at 10 MHz, UF2 drag-and-drop programming is gone and you
+   need SWD.  On a Pico board it is also a hardware mod (disable the
+   onboard 12 MHz crystal).
+2. **GPIN0 / GPIN1 — no board modification.**  `CLK_SYS_CTRL.AUXSRC`
+   enumerates `0x4 → CLKSRC_GPIN0`, `0x5 → CLKSRC_GPIN1`.  **GPIN0 is
+   GPIO20, GPIN1 is GPIO22.**  Feeding 10 MHz to GPIO20 lets `clk_sys`
+   run from it directly, crystal and bootloader untouched, USB still fed
+   by `pll_usb` from the 12 MHz.  `clk_sys` becomes 10 MHz — slow for a
+   CPU, irrelevant at 1 Hz PPS — and **no PLL sits in the timing path**.
+3. **Don't clock it externally at all.**  See below; this is the
+   recommendation.
+
+Also relevant: the clock generators' **fractional** dividers are
+explicitly jittery ("fractional division is achieved by toggling between
+2 integer divisors", §2.15.3.3), so any divide in a timing path must be
+integer.  ÷1000 from 10 MHz is, so this is not a constraint in practice.
+
+### The parameter that decides it is not specified
+
+**RP2040 PLL jitter has no numerical spec.**  §2.18.2.1 treats it
+qualitatively — "cycle-to-cycle variation in the PLL's output clock
+period.  This is not a concern as far as system stability is concerned,
+because RP2040's digital logic is designed with margin for the
+worst-case possible jitter."  The only actionable guidance is that
+jitter is minimised by running the VCO as high as possible
+(1500 MHz / 6 / 2 = 125 MHz).
+
+That matters because of how coarse-clock error propagates.  If a coarse
+tick lands δ from its nominal time:
+
+    tof_measured = (nominal + δ) − START
+    timestamp    = nominal − tof = START − δ
+
+**Coarse-clock jitter maps 1:1 into timestamp error.**  Building a
+~60 ps instrument on top of an unspecified jitter source is how you get
+confident wrong numbers later.
+
+### Consequence: the host must NOT generate the coarse clock
+
+This supersedes §4's enthusiasm for having PIO do the divider.  Split
+the two jobs by their actual requirements:
+
+- **Coarse clock — must be coherent and clean.**  External ÷1000 from
+  the 10 MHz reference: one chip, clocked directly by the reference,
+  jitter in the few-ps range.  This is what the TICC does (a PIC running
+  `PD15`).  A 74AC-series synchronous divider or a 74HC4040 tapped at
+  Q10 (÷1024 → 102.4 µs, exactly known and still far inside Mode 2's
+  8 ms) both work; any exactly-known divisor is fine.
+- **Host — only counts ticks and watches TRIGG.**  10 kHz edge counting
+  and a 1 Hz interrupt.  Neither needs coherence, determinism, nor low
+  jitter.
+
+So **the Pico runs stock**: no board mod, no bootloader breakage, no PLL
+in the measurement path, GPIO20 left free.  The RP2040's external-clock
+capability is genuine and well documented — it just solves a problem
+this design should not have.
+
+### The one case where it would not matter
+
+Because the *same* coarse clock feeds every channel, its jitter is
+**common-mode and cancels in chA − chB**.  A design used only for
+two-clock differences could tolerate a sloppy coarse clock.  But
+CLAUDE.md's stability metric is deliberately **chA alone, detrended**
+(see `feedback_ticc_cha_not_diff`), and there it does not cancel.  That
+is what forces the clean external divider.
+
+### Updated open items
+
+- Does the Click Shield for Pi Pico leave the GPIOs we need free once
+  two sockets are populated?  (Less critical now that GPIN0/GPIO20 is
+  not needed.)
+- Jitter budget for the chosen divider chip — should be a few ps, but
+  measure rather than assume.
+- Fan-out for 10 MHz (2 × u.FL to the Clicks) and for the coarse clock
+  (2 × SMA to the Clicks, plus one line to a Pico GPIO).
