@@ -496,3 +496,97 @@ is what forces the clean external divider.
   measure rather than assume.
 - Fan-out for 10 MHz (2 × u.FL to the Clicks) and for the coarse clock
   (2 × SMA to the Clicks, plus one line to a Pico GPIO).
+
+
+---
+
+## 11. Shield pinout and input conditioning (2026-08-15)
+
+### GPIO20 is not free; GPIO22 is
+
+From the Click Shield for Pi Pico v100 schematic (cached:
+`doclib show Click-Shield-for-Pi-Pico-v100-Schematic`):
+
+| Pico GPIO | Shield net | Pico GPIO | Shield net |
+|---|---|---|---|
+| GP0 / GP1 | TX0 / RX0 | GP16 | MOSI |
+| GP2 | PWM0 = **TRIGG, socket 0** | GP17 | CS0 |
+| GP3 | INT0 = **INTB, socket 0** | GP18 | SCK |
+| GP4 / GP5 | SDA / SCL | GP19 | MISO |
+| GP6 | RST0 | **GP20** | **RST1** |
+| GP7 | PWM1 = **TRIGG, socket 1** | GP21 | INT1 = **INTB, socket 1** |
+| GP8 / GP9 | TX1 / RX1 | GP26 / GP27 | AN0 / AN1 |
+| GP13 | CS1 | | |
+
+**GP20 carries `MB_RST1`** — the second Click's `EN` pin — so **GPIN0 is
+not available** on this shield.
+
+**Free: GP10, GP11, GP12, GP14, GP15, GP22, GP28.**
+
+**GP22 is GPIN1** (`CLK_SYS_CTRL.AUXSRC = 0x5`), so the coherent-clock
+option of §10 survives — via GPIN1 rather than GPIN0.  Not needed for
+the recommended design (external divider), but it is not foreclosed.
+
+Note every mikroBUS signal crosses a **TXS0108E** auto-direction level
+translator on this shield.  Harmless here: SPI, INTB and TRIGG are all
+outside the precision timing path (TRIGG needs only ±50 µs).  It would
+*not* be acceptable to route a timing-critical signal through one.
+
+### The TICC has two different conditioning circuits, and we need both kinds
+
+From the rev-D schematic (cached: `doclib show TICC-rev-d-schem`):
+
+- **Signal inputs (ch0/ch1, sheet 2):** SMA → 1 MΩ to ground →
+  **74AC08 AND gate with the spare input tied to VCC**, used as a fast
+  buffer → straight to the TDC's START pin.  One gate per channel.  That
+  is the whole circuit, and it is what produces the manual's "trigger
+  level about 1.7 volts, input impedance 1 megohm".
+- **Reference input (sheet 1):** SMA → `TERM` jumper with a 51 Ω
+  resistor → 0.01 µF AC coupling → **two-transistor 2N3906 Wenzel
+  sine-to-square converter** → 74LUC1G04 inverter → the `100NS` net
+  feeding both TDC CLOCK pins and the PICDIV.  Per
+  `notes_on_10MHz_input_supply_24Sep16.txt`, this is "a design by Wenzel
+  with improvements by time-nuts"; rev-D runs it from 5 V after testing
+  showed no jitter penalty versus 10 V.
+- **Stop gate (sheet 3)**, for completeness: per channel a 74AC164 shift
+  register clocked by `100NS` plus two 74AC74 flip-flops — three chips
+  per channel that `CLOCK_CNTR_STOP_MASK` renders unnecessary for us
+  (§2.1).
+
+**Conditioning is mandatory, not optional.**  TDC7200 "TIMING
+REQUIREMENTS: START, STOP, CLOCK":
+
+> Maximum rise, fall time for **START, STOP** signals (20%–80%): **1 ns**
+> Maximum rise, fall time for external **CLOCK** (20%–80%): **1 ns**
+
+A GPS PPS edge is ns to tens of ns.  A 10 MHz sine from a distribution
+amp needs ~30 ns to cross the same span.  Both violate the requirement by
+an order of magnitude or more.  The TICC's two circuits exist precisely
+to manufacture sub-ns edges from real-world signals, and any Click-based
+build needs equivalents on **all three** input classes.
+
+**Second reason, blunter:** TDC7200 `VIH` max is **3.6 V absolute** on
+START/STOP.  The TICC tolerates 5 V inputs *because* the 74AC08 stands
+between its SMA and the chip.  The Click carries no such guarantee — **a
+5 V PPS into a TDC Click START SMA is a plausible way to kill the
+board.**  Do not assume Click inputs accept what TICC inputs accept.
+
+**Unknown:** whether the Click puts anything between its SMAs and the
+TDC7200.  Its intended use (pairing with a TDC1000 AFE driving fast
+logic edges) suggests direct-to-pin, but MikroElektronika 403s the
+schematic and the RS/Farnell documents are marketing sheets with no
+circuit.  Board-in-hand check.  It does not change the conclusion: our
+PPS sources and 10 MHz distribution do not meet 1 ns regardless of what
+is on the Click.
+
+### Revised BOM sketch, two channels
+
+- Click Shield for Pi Pico ($54) + 2 × TDC Click ($18) + Pico
+- 1 × ÷1000 divider for the coarse clock (§10)
+- 2 × fast buffer/squarer for the PPS inputs (74AC08-class, one gate each)
+- 1 × sine-to-square for the 10 MHz if the house distribution is sine
+  (Wenzel-style, or a modern comparator/line-receiver equivalent)
+- Fan-out: 10 MHz → 2 × u.FL (Clicks) + divider; coarse clock → 2 × SMA
+  + one Pico GPIO
+- 50 Ω terminations / 6 dB attenuators at the signal SMAs, per the TICC
+  manual's practice
