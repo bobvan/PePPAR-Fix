@@ -434,6 +434,141 @@ in an 11-year cycle for single-frequency timing.  Cycle 25 peaked around
 late 2024.  "Moderate solar activity" in his data is quieter than
 anything a box deployed now will see.
 
+## Experiment 4: Antenna Delay
+
+### Why you can't just look it up
+
+The absolute group delay of a *specific antenna model*, as a number in
+ns, is essentially never published.  This is structural, not an
+oversight: the CGGTTS/BIPM framework **defines the antenna into the
+receiver**.  From PTB's 2022 BIPM calibration report:
+
+> The sum XR + XS represents the "INT DLY" field in the CGGTTS header:
+> XR represents the receiver hardware delay… [XS is the] antenna delay,
+> between the phase center and the antenna cable connector at the
+> antenna.
+
+So the hundreds of public BIPM Group-1/Group-2 calibration reports each
+give a number valid only for *that antenna bolted to that receiver*.
+The antenna is never broken out.  Same reason Píriz reports 93.9 ns
+(F9T) and 77.9 ns (mosaic) as chain totals and attributes the 16 ns
+difference to the receivers — "same antenna used".
+
+Two sources look like the answer but are not:
+
+- **Absolute GDV catalogs** (Geo++ robot calibrations, IfE/Hannover,
+  Wübbena et al., IGS Repro3) give antenna group delay vs
+  elevation/azimuth — but as *variations*, mean removed.  The constant
+  we want is exactly what's been differenced away.
+- **IGS/NGS ANTEX** (`igs20.atx`, NGS ANTCAL) is PCO/PCV in mm.  No
+  group delay at all.
+
+### Published measured values
+
+The best free source is **JRC EUR 40306**, Tegedor & Sgammini (2025),
+*Absolute and relative calibration of GNSS timing receiver chains*.
+Its Table 8 is a straight absolute antenna calibration (ns; 3 m
+far-field, 10.01 ns propagation term removed, tare ≈ 33 ns):
+
+| Rx antenna | L1/E1 | L2 | E5a/L5 |
+|---|---|---|---|
+| Horn (control) | 0.09 | 0.18 | 0.58 |
+| BP2G | 21.47 | 15.81 | 20.47 |
+| JRCT | 19.32 | 15.27 | 19.50 |
+| BP2D | 17.69 | 20.49 | 24.99 |
+
+The antennas are identified by station name, not model — JRCT is
+described only as "a high-end choke-ring antenna" feeding a PolaRx5TR.
+Three conclusions matter more than the specific models:
+
+1. **Magnitude: 15–25 ns**, dominated by the LNA + SAW filter.  Píriz's
+   antenna term (16 ns, above) sits in the same family.
+2. **Strongly frequency-dependent.**  BP2D swings 17.69 → 24.99 ns
+   between L1 and L5 — 7.3 ns across the bands we combine iono-free.
+   A single scalar "antenna delay" is not a sufficient model for us.
+3. **Same class ≠ same number.**  Three choke-ring-class chains spread
+   17.7–21.5 ns at L1.  Buying "the model someone else measured" only
+   helps if it's the identical model, and unit-to-unit spread within a
+   model is unquantified anywhere we could find.
+
+Manufacturer datasheets almost never print the number.  The one
+exception found: Calian/Tallysman **TW3742AJ** specifies "Group Delay:
+17 ns @ GPS-L1 | <1.0 ns @ GLONASS-G1".  Plausible against the JRC
+table, but type-typical rather than unit-specific, no traceability or
+uncertainty statement, L1 only, and the second figure is clearly ripple
+rather than absolute — the two aren't the same quantity.  Sanity check,
+not a calibration.
+
+### The horn-pair method — no calibrated reference antenna needed
+
+Píriz measured his antenna against a previously calibrated reference.
+The JRC method needs no such prerequisite — it bootstraps absolute
+delay from geometry plus a symmetry assumption.  Anechoic chamber + VNA,
+three steps:
+
+1. Connect the RF cables directly through a transition → **tare delay**
+   (cables + bias-tee).
+2. Install **two identical horns** as Tx and Rx at 3 m (far-field).
+   Each horn's delay = (total − tare − 3 m propagation) / 2.
+3. Swap the antenna under test in as Rx.  Its delay = total − tare −
+   3 m propagation − horn delay.
+
+The horn-vs-horn control row (0.09–0.58 ns) is the self-consistency
+check.  NIST's Plumb & Larson use the same chamber+VNA approach with a
+flat metal sheet for the reflected-peak reference, quoting 0.2 ns
+single-frequency uncertainty — and explicitly flag as a weakness that
+"only one antenna was calibrated", recommending all antennas used for
+geodetic time transfer be done.  Two decades on that's still largely
+unfulfilled, which is why the lookup table doesn't exist.
+
+Both variants need anechoic chamber access, which the lab does not have.
+
+### What we can measure without a chamber — and why it's enough
+
+The moonshot target is **two-clock PPS agreement**, not UTC
+traceability.  For that, absolute antenna delay is common-mode and
+cancels when both boxes run the same antenna model; what actually
+threatens the 1 ns / 2 ns excursion budget is the **difference** between
+the two boxes' antennas.  That we can measure with no external
+calibration at all:
+
+    Same receiver, same cable, same sky.  Measure PPS vs the TICC with
+    antenna A, swap to antenna B, re-measure.  Receiver and cable terms
+    cancel; the residual is the antenna-to-antenna delta.
+
+Run it as an A/B/A to cancel DO drift across the swap, and take the
+delta per band (L1 and L5 separately — see the 7.3 ns frequency spread
+above).  The GUS-splitter shared-antenna config gives the
+zero-difference control case: two receivers on one antenna must show a
+delta consistent with zero.
+
+This bounds the term that matters for cross-host agreement, works on any
+antenna we can get, and needs no chamber, no reference antenna, and no
+calibration lab.  Absolute delay only becomes load-bearing if we want
+PPS OUT traceable to UTC — a separate mission.
+
+### HX-CHX600A
+
+An **HX-CHX600A** is on order for the lab (~$200, 2026-08).  This is the
+antenna Píriz used, so it lets us reproduce his *chain* calibration
+end-to-end (F9T + HX-CHX600A + measured cable → compare against his
+93.9 ns) as an independent check on our own delay budget.  It does not
+hand us an antenna constant — he didn't publish one separable from his
+reference chain.  Its practical value here is as the **second antenna**
+in the swap measurement above: HX-CHX600A vs CHOKE1/UFO1 gives the delta
+directly, and the same swap against a future second unit would give the
+unit-to-unit spread the literature is silent on.
+
+References:
+- [JRC EUR 40306 — Absolute and relative calibration of GNSS timing receiver chains (2025)](https://publications.jrc.ec.europa.eu/repository/bitstream/JRC139176/JRC139176_01.pdf)
+- [PTB G1G2_1201_2022 BIPM calibration report](https://webtai.bipm.org/ftp/pub/tai/publication/gnss-calibration/group2/2022/1201-2022/PTB_G1G2_1201_2022_Calibration_Report_V1.pdf)
+- [BIPM guidelines for GNSS equipment calibration](https://webtai.bipm.org/ftp/pub/tai/publication/gnss-calibration/guidelines/archive/annex-1_operational-procedures-20210216.pdf)
+- [Plumb & Larson, *Absolute Calibration of a Geodetic Time Transfer System*](https://www.kristinelarson.net/wp-content/uploads/2015/10/paperIrevise2.pdf)
+- [Garbin, Defraigne, Krystek, Píriz, Bertrand, Waller — Metrologia 56(1), 2018](https://iopscience.iop.org/article/10.1088/1681-7575/aaf2bc) (paywalled; peer-reviewed backing of Píriz's method)
+- [Estimation of absolute GNSS satellite antenna GDV — GPS Solutions (2021)](https://link.springer.com/article/10.1007/s10291-021-01137-8)
+- [Tallysman TW3742AJ datasheet](https://www.tallysman.com/app/uploads/2021/06/Tallysman%C2%AE-TW3742AJ-Datasheet-Rev.-202208.pdf)
+
+
 ## Data Products
 
 After all three experiments:
@@ -446,6 +581,7 @@ After all three experiments:
 | F9T PPS internal delay, **per signal** (L1 C/A, L5Q, E1, E5a) | PPS comparison vs Leica | ±2 ns |
 | F9T **inter-frequency** delay (L1−L5) | difference of the above | ±1 ns target — amplified ×2.26 in IF |
 | Cable delay (ant → F9T) | TDR or PPS swap | ±1 ns |
+| Antenna-to-antenna delay delta | A/B/A antenna swap (Exp 4) | TICC-limited, per band |
 | Absolute PPS-to-GPS alignment | position + cable + internal | ±2 ns |
 
 These calibration products enable:
@@ -539,3 +675,5 @@ that can be done today with existing hardware.
 - [ ] Verify Leica PPS output availability and connector type
 - [ ] Determine closest CORS stations and coordinates
 - [ ] Install RTKLIB on a lab Pi for baseline processing and PPP
+- [ ] HX-CHX600A on order (~$200, 2026-08) — Píriz chain cross-check +
+      second antenna for the Experiment 4 swap
