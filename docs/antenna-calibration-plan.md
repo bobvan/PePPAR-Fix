@@ -241,7 +241,7 @@ time.  The components:
 
 ### Independent F9T delay reference
 
-Ricardo Piriz at GMV (Madrid) published F9T timing calibration
+Ricardo Píriz at GMV (Madrid) published F9T timing calibration
 measurements on LinkedIn (2019-2020):
 
 - **F9T device internal delay: ~28 ns**
@@ -249,14 +249,84 @@ measurements on LinkedIn (2019-2020):
 - Day-to-day repeatability: 0.3 ns (1σ) over one week
 - PPS jitter: ±4 ns (larger than the older M8F's ±2 ns)
 - More rigorous calibration (April 2020): 93.9 ns total chain
+- **Antenna: Harxon CHX600A** (low-cost multi-band), GMV rooftop —
+  the same antenna fed both the F9T and the reference receiver
 
 The ~28 ns internal delay is our benchmark.  Our zero-baseline
 experiment should produce a consistent value when we subtract the
 known cable and antenna delays.
 
+**Note the 2 ns spread between his own two numbers** (95.9 ns Aug 2019
+→ 93.9 ns Apr 2020).  That is the same magnitude as the stated
+uncertainty of the relative-calibration method below, and is the
+realistic floor for any delay figure adopted from publication rather
+than measured against a reference in hand.
+
+### The peer-reviewed companion — and the method that matters
+
+The LinkedIn posts are the accessible summary; the substantive
+write-up is **Píriz, Garbin, Díaz & Defraigne, "Scalable, Traceable
+Time for Datacenters Using GNSS and White Rabbit," Inside GNSS**.
+Defraigne is at ROB (the BIPM-side timing authority), which is where
+the traceability claim comes from.  It is also, structurally, the
+architecture this project is heading for: GNSS-disciplined units with
+White Rabbit distribution.
+
+Two calibration methods, and the distinction is load-bearing:
+
+| method | how | uncertainty |
+|---|---|---|
+| **Absolute (AKAL)** | GNSS signal simulator for the receiver, VNA for antenna/cable, Compact Antenna Test Range | ~1 ns, whole chain |
+| **Relative (practical)** | Two receivers on one rooftop, time-interval counter on the two 1PPS outputs, known cable delays subtracted | ~2.0 ns |
+
+Chain delays reported there (a different receiver from the F9T — do
+**not** conflate with the 93.9 ns above): antenna + receiver 90 ns,
+receiver alone 68 ns, antenna 22 ns.  White Rabbit distribution over
+multi-hop fibre: ~1 ns error, 33 ps standard deviation.
+
+**The relative method is Experiment 1 of this document** — same
+geometry, same instrument, same arithmetic.  What we lack is its
+premise: *an absolutely calibrated reference receiver*.
+
+### Adopting a published delay — what it does and does not buy
+
+Replicating Píriz's chain (CHX600A + F9T, matched signals) does not
+make our receiver calibrated.  It makes our chain the same *shape* as
+his, so his published delay can be adopted as a transfer standard —
+calibration by design similarity.  That is a legitimate technique and
+it is the cheapest route to a lab reference without a national-lab
+visit, but the uncertainty is strictly worse than his 2 ns because it
+inherits, on top of his:
+
+1. **Per-signal group delay.**  Receiver delay is code-dependent.  The
+   adopted number is only valid for the exact signal/code set he used;
+   an L1+L5 chain is not an L1 C/A chain.  Record the signal set
+   alongside any delay figure — a bare "28 ns" is not a calibration.
+2. **Unit-to-unit variation.**  His 0.3 ns is *day-to-day
+   repeatability of one unit*, not spread across units.  Our own
+   [receiver-comparison-2026-06-01.md](receiver-comparison-2026-06-01.md)
+   found F9T per-unit variance exceeding the F9P-vs-F9T gap.
+3. **Firmware.**  His work is 2019-2020 (TIM 2.20 era); F9T-20B ships
+   TIM 2.25.
+4. **Cable and splitter.**  Measure, do not assume — velocity factor
+   varies by part.
+
+Once one receiver carries an adopted delay, the rest of the fleet is
+relatively calibrated against it by Experiment 1, and the fleet is
+self-consistent even where the absolute figure is off.  **For
+two-clock PPS agreement a common bias cancels exactly** (see
+[two-clock-agreement-forward-model.md](two-clock-agreement-forward-model.md)
+§5), so the absolute term only matters for outward-facing time
+delivery — where ~2 ns is comfortably inside the 50-300 ns of
+uncalibrated PHY asymmetry that PTP-over-copper carries anyway.  A
+national-lab absolute calibration becomes worth its cost in the White
+Rabbit era, not before.
+
 References:
 - [Testing the new ublox F9T (part 2)](https://www.linkedin.com/pulse/testing-new-ublox-f9t-part-2-ricardo-p%C3%ADriz) — Aug 2019
 - [Calibrating mass-market GNSS timing receivers](https://www.linkedin.com/pulse/calibrating-mass-market-gnss-timing-receivers-ricardo-p%C3%ADriz) — Apr 2020
+- [Ublox F9T: testing in the lab](https://www.linkedin.com/pulse/f9t-testing-lab-ricardo-p%C3%ADriz/) — Píriz
+- [Scalable, Traceable Time for Datacenters Using GNSS and White Rabbit](https://insidegnss.com/scalable-traceable-time-for-datacenters-using-gnss-and-white-rabbit/) — Píriz, Garbin, Díaz, Defraigne, Inside GNSS
 
 
 ## Data Products
