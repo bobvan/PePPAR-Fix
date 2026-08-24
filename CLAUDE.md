@@ -262,12 +262,17 @@ checked out in exactly one worktree — the dev tree at
 other, so the recipe above only runs for whoever holds that tree.  Every
 other agent (`bravo`, `charlie`, …) syncs gt with a direct ref push: the
 same fast-forward, no working tree involved, nobody else's tree touched.
+The obvious alternative is blocked for the same reason — `git fetch github
+main:main` gives "refusing to fetch into branch 'refs/heads/main' checked
+out at …" — so the ref push isn't one option among several, it's the only
+route that doesn't need the dev tree.
 
 ```sh
 git fetch github main
-# Confirm the fast-forward is safe — exit 0 = safe.  If this FAILS the
-# refs have diverged: stop and use the reset + force-push recipe below,
-# do not force this push.
+git fetch origin                  # else the check below reads a stale ref
+# Confirm the fast-forward is safe — exit 0 = safe.  If this FAILS the refs
+# have diverged: stop and hand off to whoever holds `main`.  Do not force
+# this push.
 git merge-base --is-ancestor origin/main github/main
 git push origin github/main:refs/heads/main   # gt now matches GitHub
 ```
