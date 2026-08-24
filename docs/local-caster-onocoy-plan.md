@@ -271,3 +271,45 @@ antenna's Aug-2023 NGS publication. Fix = install **AntInfo v25.1.0** (NGS snaps
 then `setAntennaOffset … "SFESPK6618H NONE"` + pin the surveyed ARP. No antenna
 swap needed (the Leica AX1202GG is in-DB but is GPS+GLO L1/L2 only — would lose
 L5+Galileo+BeiDou).
+
+### Log-rotation bug in the staged unit — found + fixed 2026-08-24
+
+The `-out file://…` in the transcode command above ends in `::T`, which is
+**not** a swap interval. Per RTKLIB `src/stream.c:691` it is the *time-tag* flag
+(it produces the `.rtcm3.tag` sidecars); rotation is `::S=<hours>`. With
+`swapintv=0` the `%Y%m%d_%h` template expands **once at process start** and a
+single file grows until the service restarts.
+
+This is the same defect that filled gt's `/home` on 2026-08-24 via the three
+sibling relays (`ntrip-{ssr,obs,eph}-relay`, ~480 MB/day unbounded, two files at
+4.4 GB / 4.3 GB — fixed by main under `fullSuiteTestPollution`). The Box 3 unit
+was **not** in that sweep. It had not bitten only because it is staged —
+`disabled`, never started, `logs/prod/` still empty — so activating it as
+written would have reproduced the failure on a box that had just been cleaned up.
+
+Fixed on gt (`~/.config/systemd/user`, backups in
+`~/opt/ntrip-relay/unit-backup-20260824/`):
+
+1. `::S=24` appended to the unit's `file://` output, matching its three siblings.
+2. `ntrip-relay-retention.service`'s `find` widened `-maxdepth 1` → **`-maxdepth 2`**.
+   This stream logs to `logs/prod/`, a **subdirectory**; at depth 1 the pruner
+   could not see it, so daily rotation alone would still have grown without
+   bound. Rotation and retention had to BOTH be fixed — either alone is a leak.
+
+Verified: `systemd-analyze --user verify` clean on both units; retention
+dry-run at depth 2 matches 0 files for deletion and newly sees the 12 current
+stream files; the service runs to `Result=success`.
+
+**Budget caveat:** the ~3.4 GB steady state in `RETENTION.md` covers the three
+research relays only. This stream is 4-constellation MSM7 @ 1 Hz and has never
+run, so its MB/day is **unmeasured** — measure it at activation and re-check
+`RETAIN_DAYS` before trusting that number. If production provenance later needs
+a longer window than the research relays, give `logs/prod/` its own retention
+unit rather than raising the global `RETAIN_DAYS`.
+
+**Standing exposure:** these units, `relay.env`, `RETENTION.md`, and
+`onocoy-activation-README.md` are durable tooling living **outside version
+control** (`~/.config/systemd/user`, `~/opt/ntrip-relay`). That is exactly why
+the fourth unit was missed by a fix that touched the other three — nothing
+enumerates them. Tracked with the post-London "hunt durable-tools-outside-repo"
+item; this doc is currently the only versioned record of the Box 3 unit.
