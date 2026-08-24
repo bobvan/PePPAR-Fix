@@ -11,14 +11,11 @@ the loose-Q short-τ penalty / the knee.  Default off (gain=0) → byte-identica
 Precise magnitude/scaling calibration awaits charlie's 5-point TDEV-vs-Q curve;
 these tests lock in the qualitative behaviour.
 """
-import logging
 import unittest
 
 import numpy as np
 
 from peppar_fix.servo_sim import preset, ClosedLoopSim
-
-logging.disable(logging.CRITICAL)
 
 # stable-OCXO two-oscillator base (charlie's OTC class).
 _BASE = dict(do_rwfm_ppb_per_sqrt_s=0.0018, do_wpm_ns=0.06, do_wfm_ppb=0.03,

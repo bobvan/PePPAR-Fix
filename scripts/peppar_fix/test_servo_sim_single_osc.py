@@ -29,7 +29,27 @@ import numpy as np
 
 from peppar_fix.servo_sim import preset, ClosedLoopSim
 
-logging.disable(logging.CRITICAL)
+# The sim drives DOFreqEst into its `[EKF] state-sanity` tripwire thousands
+# of times per file (by design — these tests probe the rails), which would
+# bury any real failure report.  Silence THAT logger, scoped and restored.
+#
+# Do NOT use `logging.disable()` here: it writes `logging.Logger.manager.disable`,
+# a single process-wide global with no owner.  pytest imports every test module
+# during collection, before the first test runs, so a module-scope call poisons
+# assertLogs()/caplog for the entire session no matter the ordering — that was
+# fullSuiteTestPollution (I-153714), 21 spurious failures across 7 unrelated files.
+_QUIET_LOGGER = logging.getLogger("peppar_fix.do_freq_est")
+_QUIET_SAVED_LEVEL = logging.NOTSET
+
+
+def setUpModule():
+    global _QUIET_SAVED_LEVEL
+    _QUIET_SAVED_LEVEL = _QUIET_LOGGER.level
+    _QUIET_LOGGER.setLevel(logging.CRITICAL)
+
+
+def tearDownModule():
+    _QUIET_LOGGER.setLevel(_QUIET_SAVED_LEVEL)
 
 # SXT-D-like: stable OCXO DO, clean sole observer, tight measured-Q.
 _SXTD = dict(single_oscillator=True, single_osc_obs_sigma_ns=0.16,

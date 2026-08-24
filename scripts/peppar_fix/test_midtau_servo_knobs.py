@@ -14,16 +14,12 @@ investigation (see docs/mid-tau-servo-knobs.md):
   * do_freq_clamp_ppb bounds x[3] to ±clamp of nominal (default off →
     byte-identical).
 """
-import logging
 import unittest
 
 import numpy as np
 
 from peppar_fix.do_freq_est import DOFreqEst
 from peppar_fix.servo_sim import preset, ClosedLoopSim
-
-logging.disable(logging.CRITICAL)
-
 
 class TestDoFreqClamp(unittest.TestCase):
     """The x[3] anti-windup backstop (DOFreqEst unit level)."""
