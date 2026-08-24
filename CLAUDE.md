@@ -256,8 +256,37 @@ git merge --ff-only github/main   # picks up the squash merge
 git push origin main              # gt now matches GitHub
 ```
 
+**From an agent worktree, use the ref-push form instead.**  `main` is
+checked out in exactly one worktree — the dev tree at
+`/home/bob/git/PePPAR-Fix` — and git refuses `git checkout main` in any
+other, so the recipe above only runs for whoever holds that tree.  Every
+other agent (`bravo`, `charlie`, …) syncs gt with a direct ref push: the
+same fast-forward, no working tree involved, nobody else's tree touched.
+
+```sh
+git fetch github main
+# Confirm the fast-forward is safe — exit 0 = safe.  If this FAILS the
+# refs have diverged: stop and use the reset + force-push recipe below,
+# do not force this push.
+git merge-base --is-ancestor origin/main github/main
+git push origin github/main:refs/heads/main   # gt now matches GitHub
+```
+
+`git worktree list` shows who holds `main` if you're unsure.  Two things
+to expect afterward: the mirror hook prints "Everything up-to-date"
+forwarding to GitHub (correct — GitHub already had the squash), and the
+dev tree's local `main` is left behind, which a plain `git pull` there
+fast-forwards.  Don't reach into another agent's worktree to do it for
+them.
+
+Verified 2026-08-24 syncing gt after PR #307 (`d298556` → `f42836c`),
+where the documented recipe was unrunnable for exactly this reason.
+
 If gt has already accumulated divergent local commits (because the
-sync was skipped), the only clean fix is reset + force-push:
+sync was skipped), the only clean fix is reset + force-push.  This one
+needs the dev tree — it inspects a diff and force-pushes, so it is not a
+ref-push job, and force-pushing gt is a decision worth surfacing to
+whoever holds `main` rather than doing from a side worktree:
 
 ```sh
 git fetch github main
