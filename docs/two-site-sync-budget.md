@@ -15,6 +15,12 @@ implied.
 The moonshot in CLAUDE.md (updated in lockstep with this doc) is the
 operational statement of the targets derived here.
 
+**Running this backwards?**  See
+[`two-clock-agreement-forward-model.md`](two-clock-agreement-forward-model.md)
+— the same math solved for p95 given a parts list, plus
+`tools/sync_agreement_model.py` to sweep it.  This doc is the one to read when
+grading a run; that one is the one to read when speccing hardware.
+
 ---
 
 ## 1. Why TDEV is not the right success metric on its own
