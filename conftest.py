@@ -64,7 +64,10 @@ def pytest_collection_finish(session):
     """Catch import-scope polluters — they fire before any test runs."""
     diag = _poisoned()
     if diag:
-        _ORIG_DISABLE(logging.NOTSET)  # unpoison so the run stays meaningful
+        # No unpoison here: UsageError ends the session, so there is no later
+        # test for a reset to protect.  (The identical-looking line in the
+        # fixture below IS load-bearing — that one keeps one polluter from
+        # failing every test after it.)
         raise pytest.UsageError(
             "test collection left logging globally disabled.\n" + diag
         )
