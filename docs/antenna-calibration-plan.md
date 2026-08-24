@@ -239,6 +239,14 @@ time.  The components:
 - Antenna phase center: ~mm level, negligible at ns scale
 - Splitter: ~1 ns insertion delay (characterize from VNA S21)
 
+**Do this per signal, not once for the chain.**  Record the delay
+separately for each code we track (L1 C/A, L5Q, E1, E5a) and derive the
+inter-frequency difference.  The common part of a delay error passes
+through the ionosphere-free combination at ×1; the inter-frequency part
+is amplified ×2.26 (L1/L5) to ×2.98 (L1/L2).  A single chain-total
+figure hides the term that actually propagates.  See "Dual-frequency
+amplifies the DIFFERENTIAL part of your calibration" below.
+
 ### Independent F9T delay reference
 
 Ricardo Píriz at GMV (Madrid) published F9T timing calibration
@@ -329,6 +337,103 @@ References:
 - [Scalable, Traceable Time for Datacenters Using GNSS and White Rabbit](https://insidegnss.com/scalable-traceable-time-for-datacenters-using-gnss-and-white-rabbit/) — Píriz, Garbin, Díaz, Defraigne, Inside GNSS
 
 
+### Dual-frequency amplifies the DIFFERENTIAL part of your calibration
+
+Píriz's conclusion — that "the usage of dual-frequency GPS for timing is
+not extremely advantageous" because "receiver noise and multipath error
+gets amplified by a factor of 3 in the iono-free combination", and that
+"the residual GPS calibration error is roughly doubled" — is exactly
+right for his problem and is the single most useful thing to carry into
+ours.  It changes *what* we record, not *whether* we run dual-frequency.
+
+#### Where the 3× comes from
+
+The ionosphere-free combination is a weighted difference chosen so the
+1/f² iono terms cancel:
+
+```
+IF = α·P₁ + β·P₂        α = f₁²/(f₁²−f₂²)       β = −f₂²/(f₁²−f₂²)
+```
+
+Independent errors of equal σ on the two frequencies add in quadrature,
+so `σ_IF = σ·√(α²+β²)`.  It is a lever-arm extrapolation to a virtual
+frequency *outside* the interval between the two, and lever arms
+amplify.  **L1/L5 is materially cheaper than L1/L2** because L5 is
+farther from L1 — relevant to the L5-tracking fleet:
+
+| pair | α | β | independent-error amplification |
+|---|---|---|---|
+| GPS L1/L2 | +2.546 | −1.546 | **×2.978** |
+| GPS L1/L5, GAL E1/E5a | +2.261 | −1.261 | **×2.588** |
+
+#### Why calibration only *doubles* — and the consequence for this plan
+
+**α + β = 1 exactly**, by construction (the combination must preserve
+true range).  So the amplification depends entirely on the *correlation
+structure* of the error, not on its size:
+
+| error structure | amplification (L1/L2) |
+|---|---|
+| independent per-frequency | ×2.98 |
+| **perfectly common-mode** | **×1.00 — not amplified at all** |
+| L1-only | ×2.55 |
+| L2-only | ×1.55 |
+
+Píriz's "roughly doubled, depending on the calibration technique
+employed" is the signature of *partially correlated* error.  Whatever is
+shared between the two frequencies — the antenna, the cable, the
+connector, the measurement technique — passes through at ×1.  What gets
+amplified is the **inter-frequency (DCB-like) residual**.
+
+**Therefore: record per-frequency delays, never just the chain total.**
+A bare "28 ns" is not a calibration.  Two F9Ts with identical absolute
+delay but a 1 ns difference in their L1−L5 delay disagree by ≈2.3 ns in
+the IF solution.  That differential is also the part most likely to vary
+unit-to-unit and across firmware, because it lives in the correlator and
+filter chains rather than the shared RF front end — where the absolute
+delay mostly lives.  This is the sharpest form of the per-signal caveat
+in the previous section.
+
+#### Why we stay dual-frequency anyway
+
+The 3× is applied to whatever you feed it, and we feed it carrier phase:
+
+| observable | σ | after ×2.98 |
+|---|---|---|
+| raw code | 40 cm | 1.19 m = **3.97 ns** |
+| smoothed code | 10 cm | 30 cm = **0.99 ns** |
+| **carrier phase** | 2 mm | 6 mm = **0.02 ns** |
+
+Amplified code noise *is* Píriz's error budget; amplified phase noise is
+~30 ps against our 354 ps per-clock budget — a rounding error.  Beyond
+that, his figure of merit is *absolute* uncertainty vs UTC, where a bias
+is the error; ours is differential and stability-shaped, and a common
+bias contributes exactly zero to two-clock p95 |Δ| (see
+[two-clock-agreement-forward-model.md](two-clock-agreement-forward-model.md) §5).
+
+And the reasons we need a second frequency are mostly not about the
+ionosphere at all:
+
+- **Cycle-slip detection** — the GF detector is inherently dual-frequency.
+- **Wide-lane / MW → PPP-AR** — dual-frequency by definition.  No second
+  frequency, no ambiguity resolution, no cm-class ARP.
+- **SSR and broadcast clocks are IF-referenced.**  Going single-frequency
+  does not dodge the problem; it forces a TGD/DCB conversion back to
+  single-signal, which is another calibration term with its own error —
+  and one we already know is fragile (see
+  [bds-ppp-integration.md](bds-ppp-integration.md) for the B3I-referenced
+  BDS clock, and the GPS L5 code-bias gap-fill).
+
+#### A caveat on his caveat
+
+His closing "should be taken with caution... depending on the solar
+activity" carries more weight than it appears to.  Those articles are
+**Aug 2019 and Apr 2020**, and the solar cycle 24/25 minimum was
+**December 2019** — he measured at essentially the most favourable moment
+in an 11-year cycle for single-frequency timing.  Cycle 25 peaked around
+late 2024.  "Moderate solar activity" in his data is quieter than
+anything a box deployed now will see.
+
 ## Data Products
 
 After all three experiments:
@@ -338,7 +443,8 @@ After all three experiments:
 | Antenna ARP position (ITRF) | 24h PPP + CORS baseline | ±1 cm H, ±2 cm V |
 | Antenna PCO/PCV | ANTEX file (or zero-baseline cal) | ±1 mm |
 | F9T carrier-phase noise | Zero-baseline DD residual | measured |
-| F9T PPS internal delay | PPS comparison vs Leica | ±2 ns |
+| F9T PPS internal delay, **per signal** (L1 C/A, L5Q, E1, E5a) | PPS comparison vs Leica | ±2 ns |
+| F9T **inter-frequency** delay (L1−L5) | difference of the above | ±1 ns target — amplified ×2.26 in IF |
 | Cable delay (ant → F9T) | TDR or PPS swap | ±1 ns |
 | Absolute PPS-to-GPS alignment | position + cable + internal | ±2 ns |
 
