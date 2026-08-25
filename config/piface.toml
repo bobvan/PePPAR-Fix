@@ -13,30 +13,26 @@ ubx_port = "USB"
 receiver = "f9t"  # [2026-06-30] F9T-20B (ex-MadHat) replaced the F9P
 # No ptp_dev — the engine does not use the CM4's PHC.
 # ts2phc disciplines bcm_phy_ptp from DO PPS on SYNC_IN independently.
-ntrip_conf = "ntrip.conf"
-eph_mount = "BCEP00BKG0"
-# CNES SSR for PPP-AR (credentials in ntrip-cnes.conf)
-ssr_ntrip_conf = "ntrip.conf"  # CNES SSRA00CNE0 removed from IGS-IP 2026-06-28 -> BKG (was ntrip-cnes.conf)
+
+# ── Corrections from our own re-casters on gt ────────────────────────────────
+# SSR + broadcast ephemeris come from the gt relays rather than the public
+# casters.  str2str's ntripc speaks NTRIP v1 ("ICY 200 OK", no blank line after
+# the status line), so ntrip_http10 is REQUIRED — without it the client reads
+# RTCM bytes into the header and mis-frames the stream.
+#
+# eph is a separate caster/port from SSR because str2str serves one mount per
+# port.  Verified from this host 2026-08-25: all three mounts return ICY 200 OK
+# and real RTCM3.
+#
+# To fall back to the public casters, restore:
+#   ntrip_conf = "ntrip.conf"; eph_mount = "BCEP00BKG0"; ssr_ntrip_conf = "ntrip.conf"
+# and drop eph_caster / eph_port / ntrip_http10.
+ntrip_conf   = "config/recaster-gt.conf"   # ssr.ntrip.VanValzah.Com:2101/SSR
+eph_caster   = "eph.ntrip.VanValzah.Com"
+eph_port     = 2103
+eph_mount    = "BCEP"
+ntrip_http10 = true
 systems = "gps,gal,bds"
-
-# ── Our own re-casters on gt (STAGED — do NOT uncomment until routing works) ──
-# Repoints SSR + broadcast eph from the public casters to the gt relays.
-# Uncomment these four lines (and comment the two above) to switch:
-#
-#   ntrip_conf   = "config/recaster-gt.conf"   # ssr.ntrip.VanValzah.Com:2101/SSR
-#   eph_caster   = "eph.ntrip.VanValzah.Com"
-#   eph_port     = 2103
-#   eph_mount    = "BCEP"
-#   ntrip_http10 = true                        # str2str speaks NTRIP v1, not v2
-#
-# BLOCKED 2026-08-24: this host cannot open a TCP connection to gt at all —
-# not :2101, not :2103, not even :22 — while `tailscale ping gt` succeeds in
-# 1 ms.  UDP crosses, TCP does not.  Flipping these lines today would leave the
-# engine with no corrections on its next restart, which is exactly the silent
-# degradation we are trying to avoid.  Re-test with
-#     nc -z -w5 ssr.ntrip.VanValzah.Com 2101
-# and only then uncomment.  See docs/local-caster-onocoy-plan.md.
-
 
 # Operational ARP — engine reads timelab/antennas.json[ufo1] at
 # startup as an in-memory survey-class seed candidate.  Read-only;
