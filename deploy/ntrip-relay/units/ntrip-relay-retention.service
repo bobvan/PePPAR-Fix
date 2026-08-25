@@ -1,0 +1,14 @@
+[Unit]
+Description=Prune ntrip-relay RTCM stream logs older than RETAIN_DAYS
+Documentation=file:/home/bob/opt/ntrip-relay/RETENTION.md
+
+[Service]
+Type=oneshot
+Environment=LOGDIR=/home/bob/opt/ntrip-relay/logs
+Environment=RETAIN_DAYS=7
+# Only .rtcm3 stream files and their .tag sidecars.  -mtime +N is by
+# modification time, so a file str2str is still appending to can never be
+# older than RETAIN_DAYS and is therefore never a candidate.
+ExecStart=/usr/bin/find ${LOGDIR} -maxdepth 2 -type f \
+    ( -name "*.rtcm3" -o -name "*.rtcm3.tag" ) \
+    -mtime +${RETAIN_DAYS} -print -delete

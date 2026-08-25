@@ -1,0 +1,14 @@
+[Unit]
+Description=NTRIP SSR re-caster (Box 1) — SSRA03IGS0 -> gt:2101 (ssr.ntrip.VanValzah.Com)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/home/bob/opt/ntrip-relay/relay.env
+ExecStart=/home/bob/bin/str2str -in ntrip://${PRODUCTS_USER}:${PRODUCTS_PASS}@products.igs-ip.net:2101/SSRA03IGS0 -out ntripc://:2101/SSR -out file:///home/bob/opt/ntrip-relay/logs/ssr_%%Y%%m%%d_%%h.rtcm3::T::S=24 -r 30000
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

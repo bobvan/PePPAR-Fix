@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily prune of ntrip-relay RTCM stream logs
+
+[Timer]
+OnCalendar=daily
+# Run after the 00:00 UTC swap boundary has settled, and survive downtime.
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

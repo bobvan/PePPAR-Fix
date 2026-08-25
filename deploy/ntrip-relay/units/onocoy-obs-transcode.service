@@ -1,0 +1,37 @@
+[Unit]
+# Box 3 — Production observation caster for Onocoy (UFO1 / GNSSDO+ mosaic-T).
+# The mosaic-T has NO base-station permission, so it cannot emit RTCM3 natively.
+# Instead we transcode its SBF MeasEpoch (IPS2 tcp 28800) -> RTCM3 MSM7 with
+# str2str, synthesizing 1006 (ARP) + 1033 (antenna descriptor) from OUR surveyed
+# UFO1 ARP + SFESPK6618H, which we control here (independent of the receiver's
+# antenna/PVT state).
+#
+# STAGED / NOT ACTIVATED: this unit is intentionally NOT enabled and NOT started.
+# Before activating, per I-213407-main:
+#   1. Bob installs AntInfo v25.1.0 .suf on the mosaic + pins the surveyed ARP.
+#   2. Onocoy station registered -> per-station credential added to relay.env,
+#      and the Onocoy push -out line (see onocoy-activation-README.md) appended.
+#   3. Validate the local mount (gt:2104/UFO1_MSM7) end-to-end first.
+# Local mount + rotating log are safe (LAN-only, read-only to the mosaic's SBF).
+Description=Onocoy obs transcode (Box 3, STAGED) — GNSSDO+ mosaic-T SBF -> RTCM3 MSM7 (gt:2104/UFO1_MSM7)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/home/bob/opt/ntrip-relay/relay.env
+# -msg precedes -out (str2str requirement). -px = surveyed UFO1 ARP (ITRF2020, antennas.json ufo1).
+# QZSS/NavIC omitted (region-limited, not useful at Wheaton); GPS+GLO+GAL+BDS MSM7 @1Hz + station msgs @0.1Hz.
+# ::S=24 is the DAILY SWAP INTERVAL, and is load-bearing.  ::T alone is only the
+# time-tag flag (RTKLIB src/stream.c:691) -- with no ::S= the %Y%m%d_%h template
+# expands once at process start and ONE file grows without bound.  That is what
+# filled gt's /home on 2026-08-24 via the three sibling relays; see RETENTION.md.
+# This stream logs to logs/prod/, a SUBDIR -- ntrip-relay-retention.service needs
+# -maxdepth 2 (not 1) to prune it.  Volume here is UNMEASURED (unit has never run);
+# re-measure MB/day at activation and re-check the retention budget.
+ExecStart=/home/bob/bin/str2str -in tcpcli://10.168.13.196:28800#sbf -msg "1077(1),1087(1),1097(1),1127(1),1006(10),1033(10),1230(10)" -out ntripc://:2104/UFO1_MSM7#rtcm3 -out file:///home/bob/opt/ntrip-relay/logs/prod/ufo1_msm7_%%Y%%m%%d_%%h.rtcm3::T::S=24 -px 157469.2017 -4756188.1927 4232767.8802 -a "SFESPK6618H,NONE" -i "mosaic-T,GNSSDO+" -r 10000
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

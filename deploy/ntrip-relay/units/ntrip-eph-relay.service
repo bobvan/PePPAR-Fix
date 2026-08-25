@@ -1,0 +1,14 @@
+[Unit]
+Description=NTRIP broadcast-eph re-caster (Box 1 / BCEP) — BRUX in-band eph -> gt:2103/BCEP (eph.ntrip.VanValzah.Com). NOTE: sourced from BRUX because the BCEP product itself is 403 for our account on products.igs-ip.net and TLS-only on GA (str2str can't do TLS input).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/home/bob/opt/ntrip-relay/relay.env
+ExecStart=/home/bob/bin/str2str -in ntrip://${IGS_USER}:${IGS_PASS}@igs-ip.net:2101/BRUX00BEL0 -out ntripc://:2103/BCEP -out file:///home/bob/opt/ntrip-relay/logs/bcep_%%Y%%m%%d_%%h.rtcm3::T::S=24 -r 30000
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
