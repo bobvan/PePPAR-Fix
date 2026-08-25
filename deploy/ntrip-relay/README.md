@@ -23,7 +23,7 @@ absent from `systemctl --user list-units`, which only shows *enabled* units.
 | `@ssr` | `products.igs-ip.net/SSRA03IGS0` | `:2101/SSR` — `ssr.ntrip` | `logs/ssr_*.rtcm3` |
 | `@obs` | `igs-ip.net/PTBB00DEU0` | `:2102/PTBB` — `obs.ntrip` | `logs/ptbb_*.rtcm3` |
 | `@eph` | `igs-ip.net/BRUX00BEL0` | `:2103/BCEP` — `eph.ntrip` | `logs/bcep_*.rtcm3` |
-| `@onocoy` | mosaic-T SBF, `10.168.13.196:28800` | `:2104/UFO1_MSM7` **staged** | `logs/prod/ufo1_msm7_*` |
+| `@onocoy` | SXT-D mosaic-T SBF, `sxt-d.VanValzah.Com:28800` | `:2104/UFO1_MSM7` **staged** | `logs/prod/ufo1_msm7_*` |
 
 ```sh
 systemctl --user status str2str-relay@ssr

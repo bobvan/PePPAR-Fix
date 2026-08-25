@@ -41,7 +41,7 @@ calibrated, stable, honest station and must never carry a research experiment.
 
 | Receiver | Bands / GNSS | RTCM3 MSM7 + NTRIP-server push? | Best role |
 |---|---|---|---|
-| **GNSSDO+ Mosaic-T** (on UFO1, 10.168.13.196) | L1/L2/L5, GPS+GLO+GAL+BDS | Yes — Septentrio built-in NTRIP server, full MSM7 + 1005/1033/1230 | **Production Onocoy station** |
+| **SparkPNT SXT-D** mosaic-T (on UFO1, `sxt-d.VanValzah.Com`) | L1/L2/L5, GPS+GLO+GAL+BDS | Yes — Septentrio built-in NTRIP server, full MSM7 + 1005/1033/1230 | **Production Onocoy station** |
 | **ZED-F9P** (idle) | L1/L2, GPS+GLO+GAL+BDS | Yes — MSM7 out; push via str2str or ArduSimple firmware | Onocoy #2 / research |
 | **Leica GRX1200 GG Pro** (on UFO1) | L1/L2, GPS+GLO | RTCM2/3 — **verify live MSM streaming** (we use it for OPUS file logging) | Keep as OPUS ARP-truth; caster only if MSM confirmed |
 | **Trimble NetRS** (just arrived) | L1/L2, **GPS-only** | RTCM3 — GPS-only limits Onocoy value | Research / external-clock PoC (per [gpsdo-noise-and-external-clock.md](gpsdo-noise-and-external-clock.md)) |
@@ -238,7 +238,7 @@ NOT a higher reward tier, since the tier depends on the obs, not the push path).
 *does* stream SBF MeasEpoch on IPS2 (tcp 28800). `str2str` transcodes it:
 
 ```
-str2str -in tcpcli://10.168.13.196:28800#sbf \
+str2str -in tcpcli://sxt-d.VanValzah.Com:28800#sbf \
   -msg "1077(1),1087(1),1097(1),1127(1),1006(10),1033(10),1230(10)" \
   -out ntripc://:2104/UFO1_MSM7#rtcm3 \
   -out file://…/logs/prod/ufo1_msm7_%Y%m%d_%h.rtcm3::T \
@@ -358,3 +358,28 @@ str2str unit, `::S=` on every `file://` out, every log dir inside the retention
 sweep's `-maxdepth`, no quote characters in `ARGS`, no `@`/`:`/`/` in a
 credential, and no drift from the repo. Each check was validated by injecting
 the corresponding fault.
+
+### Addressed by name, not by IP — 2026-08-25
+
+The transcode was hardcoded to `10.168.13.196`, which was a **dynamic DHCP
+lease** (`getIPSettings` on the receiver returned `DHCP, "0.0.0.0", ...` — no
+static config at all, and reverse DNS gave the generated name `Dyn196`).  The
+box was given a static address and the name `sxt-d.VanValzah.Com` the same day;
+`.196` went dead within minutes.
+
+Had the Onocoy feed been live, `str2str` would have retried a dead address
+forever (`-r 10000`) and the station would have gone **silently** off the air —
+compounding badly with the fact that onocoy has no mechanism to accept a
+downtime notice, so we would simply have looked unreliable until someone
+noticed.  It fails safe (no bad data is emitted, and a non-SBF listener on a
+reused address transcodes to nothing) but it fails quietly.
+
+Rule: reference lab instruments by DNS name in anything long-running.  The IP
+was baked into eight places across two repos and a stream-map SVG; a name makes
+a future re-IP one edit instead of an archaeology exercise.
+
+**Vendor rename:** SparkFun split its business and the product is now the
+**SXT-D** ("SXT-D GNSS Disciplined Oscillator Plus") from **SparkPNT**
+(<https://www.sparkpnt.com/products/sxt-d-gnssdo>).  Prose here uses SXT-D; the
+`gnssdo_*` host-config keys and `GnssdoActuator` are deliberately unchanged
+because they are load-bearing in deployed TOMLs.  Logged in `docs/misnomers.md`.

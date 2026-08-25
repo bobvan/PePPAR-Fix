@@ -720,3 +720,29 @@ PPS-vs-Rb stream.  The "cha" suffix is stale for the general call.
 **Proposed**: `load_ticc_channel` (or `load_channel_samples`).  Rename
 opportunistically when next touching that file's callers.
 **Notes**: 2026-07-09.
+
+## 2026-08-25 — product rebrand
+
+### `GNSSDO+` / `gnssdo_*` — Cosmetic (docs), Misleading (config keys)
+
+**Where**: ~120 occurrences across `docs/` and `scripts/`; config keys
+`gnssdo_host`, `gnssdo_port`, `gnssdo_serial`, `gnssdo_baud`,
+`gnssdo_transport`, `gnssdo_ppb_per_controlword`, `gnssdo_center_word`,
+`gnssdo_word_min`, `gnssdo_word_max`, `gnssdo_watchdog_s`; class
+`GnssdoActuator`.
+**Claim**: a SparkFun product called "GNSSDO+".
+**Actual**: the vendor split its business; the product is now the
+**SXT-D** ("SXT-D GNSS Disciplined Oscillator Plus") from **SparkPNT**.
+The product page carries no SparkFun branding at all.
+**Why it matters**: mostly searchability — someone reading our docs and
+then hunting for vendor documentation, firmware, or support will search
+"SparkFun GNSSDO+" and find a discontinued line rather than the current
+product.  Low blast radius today; grows as SparkPNT's own docs diverge.
+**Proposed**: prose → "SparkPNT SXT-D"; keep "(GNSSDO+)" as a parenthetical
+for one release so old notes stay greppable.  Config keys → **leave alone
+for now**; `gnssdo_*` appears in every SXT-D host's TOML, so renaming is a
+breaking change to deployed host configs and needs a compat shim, not a
+sed.  Same for `GnssdoActuator`.
+**Notes**: docs touched on 2026-08-25 for the Onocoy work already use
+SXT-D.  Do the rest opportunistically.  Do NOT sweep: 120 sites, no test
+signal, and the config keys are load-bearing.
