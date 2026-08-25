@@ -1,7 +1,7 @@
 # gt NTRIP re-casters — deployment
 
-The str2str re-casters that serve `ssr.` / `obs.` / `eph.ntrip.VanValzah.Com`
-on gt, plus the staged Onocoy transcode and the log-retention timer.
+The str2str relays that serve `ssr.` / `obs.` / `eph.ntrip.VanValzah.Com` on gt,
+plus the staged Onocoy transcode and the log-retention timer.
 
 ```sh
 cp relay.env.example ~/opt/ntrip-relay/relay.env   # then fill in + chmod 0600
@@ -9,84 +9,108 @@ cp relay.env.example ~/opt/ntrip-relay/relay.env   # then fill in + chmod 0600
 ./check.sh
 ```
 
+## One unit, four instances
+
+There is a single `str2str-relay@.service`. Rotation, restart policy, and
+logging are defined in it exactly once, so **a fix cannot reach three streams
+and miss the fourth** — which is precisely what happened on 2026-08-24, when a
+log-rotation fix touched three of four separate units and the fourth kept the
+bug. It was invisible because it was staged: disabled, no disk usage, and
+absent from `systemctl --user list-units`, which only shows *enabled* units.
+
+| Instance | Upstream | Serves | Log |
+|---|---|---|---|
+| `@ssr` | `products.igs-ip.net/SSRA03IGS0` | `:2101/SSR` — `ssr.ntrip` | `logs/ssr_*.rtcm3` |
+| `@obs` | `igs-ip.net/PTBB00DEU0` | `:2102/PTBB` — `obs.ntrip` | `logs/ptbb_*.rtcm3` |
+| `@eph` | `igs-ip.net/BRUX00BEL0` | `:2103/BCEP` — `eph.ntrip` | `logs/bcep_*.rtcm3` |
+| `@onocoy` | mosaic-T SBF, `10.168.13.196:28800` | `:2104/UFO1_MSM7` **staged** | `logs/prod/ufo1_msm7_*` |
+
+```sh
+systemctl --user status str2str-relay@ssr
+journalctl --user -u str2str-relay@eph -f
+```
+
 ## Where things live, and why
 
 | Thing | Home | Why there |
 |---|---|---|
-| Unit files | this directory (public repo) | No secrets in them — credentials are `${VAR}` refs resolved from an EnvironmentFile at runtime. |
-| `relay.env` | `~/opt/ntrip-relay/relay.env`, **not in git** | Same rule as `ntrip.conf` and `timelab/antennas.json`: secrets stay out of *both* repos. A private repo is still a repo. |
-| Stream logs | `~/opt/ntrip-relay/logs/` | Rotated daily by `::S=24`, pruned at `RETAIN_DAYS` by the timer. |
-| Runbooks | `~/opt/ntrip-relay/*.md` | Operator-facing; `RETENTION.md` and `onocoy-activation-README.md`. |
+| `str2str-relay@.service`, retention units | this directory (public repo) | No secrets — the unit names no credential at all. |
+| `bin/str2str-relay-exec` | installed to `~/opt/ntrip-relay/bin/` | A stable path independent of any git worktree; worktrees move and switch branches. |
+| `instances/<i>.env` | installed to `~/opt/ntrip-relay/instances/` | One stream's `IN` / `CRED` / `ARGS`. No secrets: `CRED` *names* a pair, it does not contain one. |
+| `relay.env` | `~/opt/ntrip-relay/`, **not in git** | Same rule as `ntrip.conf` and `timelab/antennas.json`: secrets stay out of *both* repos. A private repo is still a repo. |
+| Stream logs | `~/opt/ntrip-relay/logs/` | Rotated daily by `::S=24`, pruned at `RETAIN_DAYS`. |
 
-**Answering the two questions this started from.** *Can these run as scripts
-started by user-mode systemd?* They already do — `systemctl --user`, str2str
-invoked straight from `ExecStart`, no wrapper script. The mechanism was never
-the problem. *Should this live in timelab because credentials are involved?*
-No: the credentials should not be in **any** repo, and once they are out, the
-units carry nothing private, so they belong next to the code that consumes
-them. timelab documents the *physical* lab — cables, antennas, surveys — and
-these are software services.
+These already ran under user-mode systemd before this refactor — the mechanism
+was never the problem, the *inventory* was. And they do not belong in timelab:
+once credentials are out of git the units carry nothing private, and timelab
+documents the **physical** lab — cables, antennas, surveys — while these are
+software services.
 
-## What actually went wrong, and what now catches it
+## Why there is a wrapper script
 
-On 2026-08-24 a rotation bug filled gt's `/home`. The fix touched three of the
-four str2str units. The fourth was missed — not through carelessness, but
-because **nothing enumerated them**: it was staged (disabled, never started),
-so it had no disk usage to find and did not appear in `systemctl --user
-list-units`. Only `list-unit-files` shows a disabled unit.
+`ExecStart` runs `bin/str2str-relay-exec <instance>` rather than str2str
+directly, because **systemd does not recursively expand `${VAR}` references
+that appear inside a value loaded from an EnvironmentFile.** Measured
+2026-08-24: with `ARGS='-in ntrip://${IGS_USER}:x@h/M …'`, argv arrives holding
+the literal string `ntrip://${IGS_USER}:x@h/M`. str2str accepts credentials
+only inside the URL, so something must assemble that URL once the credentials
+are in scope. The wrapper does it with bash indirect expansion (`${!name}`) —
+no `eval`, so a config file never becomes a code-execution surface.
 
-`check.sh` exists for that class of failure. Every check corresponds to a
-defect that has already happened here:
+Three more behaviours this design depends on, all measured the same day:
 
-- **ORPHAN** — any unit on the box whose `ExecStart` runs str2str but which is
-  not in this directory. This is the fourth-unit bug, caught structurally.
+- An unquoted `$ARGS` **is** split at whitespace into separate argv entries.
+- Quote *removal* happens too — but only for quotes the shell/systemd parses,
+  which is why an inner quote inside a value would survive and reach str2str
+  verbatim. `check.sh` rejects any quote character in `ARGS`.
+- The instance files are **shell-sourced by the wrapper**, not parsed by
+  systemd. So `ARGS` must be quoted as a whole, `$HOME` expands, and str2str's
+  `%Y%m%d_%h` filename template is written with **single** `%` — the `%%`
+  escaping that unit files require would be wrong here.
+
+## check.sh
+
+Every check corresponds to a defect that has already happened, and each was
+verified by injecting the fault and confirming it is reported:
+
+- **ORPHAN / legacy** — anything whose `ExecStart` runs str2str outside the
+  template. This is the fourth-unit bug, caught structurally rather than by
+  diligence. It matches the `ExecStart` line only; the retention unit mentions
+  str2str in a comment, and a comment is not a process.
 - **ROTATION** — every `file://` output carries `::S=`. `::T` alone is RTKLIB's
-  *time-tag* flag, not a swap interval (`src/stream.c:691`); without `::S=` the
-  `%Y%m%d_%h` template expands once at process start and one file grows for
-  ever. Two reached 4.4 GB.
-- **REACH** — every log directory sits within the retention sweep's
-  `-maxdepth`. Rotation alone is not enough: `logs/prod/` is a subdirectory the
-  sweep could not see, and a live file's mtime is always ~now, so `-mtime +7`
-  can never match it. That combination looks covered and is not.
-- **DRIFT** — installed units match the repo.
-- **CREDENTIALS** — `relay.env` present, mode 0600, required keys set.
-- **SERVING** — each enabled mount actually answers.
+  *time-tag* flag (`src/stream.c:691`), not a swap interval; without `::S=` the
+  filename template expands once at process start and one file grows for ever.
+  Two reached 4.4 GB.
+- **REACH** — every log directory sits inside the retention sweep's
+  `-maxdepth`. Rotation alone is not enough: a live file's mtime is always
+  ~now, so `-mtime +N` can never match it. That combination *looks* covered.
+- **SPLIT** — no quote characters in `ARGS`, read from the raw file text
+  (sourcing would strip the very quote we are looking for).
+- **CREDCHAR** — no `@`, `:` or `/` in a credential; str2str takes them raw in
+  the URL and the authority would parse ambiguously. The wrapper refuses too.
+- **DRIFT** — installed units, wrapper, and instance files match the repo.
+- **SERVING** — each enabled mount answers.
 
-The checks are verified by injecting each fault and confirming it is reported;
-re-do that if you change the script.
-
-### Two probe traps worth knowing
+### Three probe traps
 
 NTRIP v1 answers `SOURCETABLE 200 OK` / `ICY 200 OK`, which is **not valid
-HTTP** — `curl` reports `000` for a perfectly healthy mount. And str2str's
-`ntripc` **requires a `User-Agent` header**: without one it accepts the
-connection and then answers nothing, which is indistinguishable from a dead
-service. Probe with a raw socket *and* a User-Agent.
+HTTP** — `curl` reports `000` for a healthy mount. str2str's `ntripc`
+**requires a `User-Agent`**; without one it accepts the connection and answers
+nothing, indistinguishable from a dead service. And it services accepted
+connections on an internal cycle, so a **single probe is unreliable**: ten
+back-to-back probes all answered, while probes spaced 2 s apart alternated
+answer / no-answer. `check.sh` retries three times — do not simplify that away.
 
-### Why `install.sh` copies instead of symlinking
+### Why install.sh copies instead of symlinking
 
 `systemctl --user disable` **deletes** a unit file that is a symlink into a
 repo — observed 2026-08-24, when `rtcm-archive-gt.service` vanished from
-`~/.config/systemd/user` on a plain `disable --now`. Copies survive; `check.sh`
-reports drift.
+`~/.config/systemd/user` on a plain `disable --now`. Copies survive, and
+`check.sh` reports drift.
 
-## Proposed next step — collapse four units into one template
+## Adding a stream
 
-Four near-identical units is the structural reason a fix can touch three of
-them. A systemd template would make that impossible:
-
-```
-str2str-relay@.service          # one unit, one ExecStart, one place to fix
-~/opt/ntrip-relay/ssr.env       # IN=, OUT=, MOUNT=, MSG=
-~/opt/ntrip-relay/obs.env
-~/opt/ntrip-relay/eph.env
-~/opt/ntrip-relay/onocoy.env
-```
-
-`systemctl --user enable --now str2str-relay@ssr` and so on. Rotation, restart
-policy, and logging are then defined once. `check.sh`'s ORPHAN check keeps
-working unchanged, since it keys on "ExecStart runs str2str".
-
-Not done here: the current units are live and working, and a refactor of
-running relays wants a maintenance window and a re-validation of all four
-mounts. It is a clean follow-up rather than something to fold into a bug fix.
+Write `instances/<name>.env` with `IN=`, optional `CRED=`, and a quoted `ARGS=`;
+run `./install.sh`; `systemctl --user enable --now str2str-relay@<name>`. Add
+the port to the `PORT` map in `check.sh` so it gets probed. Nothing else — the
+unit is already correct, which is the entire point.

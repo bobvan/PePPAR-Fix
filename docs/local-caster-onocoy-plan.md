@@ -313,3 +313,48 @@ control** (`~/.config/systemd/user`, `~/opt/ntrip-relay`). That is exactly why
 the fourth unit was missed by a fix that touched the other three — nothing
 enumerates them. Tracked with the post-London "hunt durable-tools-outside-repo"
 item; this doc is currently the only versioned record of the Box 3 unit.
+
+### Four units collapsed into one template — 2026-08-24
+
+The four str2str relays (SSR / PTBB obs / BCEP eph / Onocoy transcode) were
+separate near-identical unit files. That duplication is the structural reason a
+rotation fix earlier the same day reached three of them and missed the fourth.
+They are now one `str2str-relay@.service` with per-instance files:
+
+```
+deploy/ntrip-relay/units/str2str-relay@.service   one unit, one ExecStart
+deploy/ntrip-relay/bin/str2str-relay-exec         composes the command
+deploy/ntrip-relay/instances/{ssr,obs,eph,onocoy}.env
+~/opt/ntrip-relay/relay.env                       credentials, still not in git
+```
+
+`systemctl --user enable --now str2str-relay@ssr`, and so on. Rotation, restart
+policy, and logging are defined once. Onocoy is `@onocoy`, installed but not
+enabled.
+
+**Verified argument-identical before deployment.** Each instance's composed
+argv was diffed against the corresponding legacy unit's expanded `ExecStart`,
+credentials and `%Y%m%d_%h` templates included: 8/8/8/18 arguments, all
+identical. The refactor changes structure, not behaviour.
+
+**Why a wrapper rather than a pure `ExecStart`.** systemd does not recursively
+expand `${VAR}` inside a value loaded from an EnvironmentFile — measured: argv
+arrives holding the literal `ntrip://${IGS_USER}:x@h/M`. str2str takes
+credentials only inside the URL, so the URL has to be assembled after the
+credentials are in scope. The wrapper does that with bash indirect expansion,
+no `eval`. Related measured behaviours: unquoted `$ARGS` does word-split; the
+instance files are shell-sourced by the wrapper (not parsed by systemd), so
+`ARGS` is quoted as a whole, `$HOME` expands, and str2str's `%Y%m%d_%h` takes
+**single** `%` rather than the `%%` a unit file needs.
+
+**A third probe trap, found while writing the health check.** Beyond "NTRIP v1
+is not valid HTTP so curl reports 000" and "ntripc requires a User-Agent":
+str2str's ntripc services accepted connections on an internal cycle, so a
+single probe is unreliable. Ten back-to-back probes all answered; probes spaced
+2 s apart alternated answer / no-answer. The check retries three times.
+
+`deploy/ntrip-relay/check.sh` enforces the invariants — no orphan or legacy
+str2str unit, `::S=` on every `file://` out, every log dir inside the retention
+sweep's `-maxdepth`, no quote characters in `ARGS`, no `@`/`:`/`/` in a
+credential, and no drift from the repo. Each check was validated by injecting
+the corresponding fault.

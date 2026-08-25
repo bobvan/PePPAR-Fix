@@ -1,0 +1,28 @@
+[Unit]
+# ONE unit for every str2str relay.  Rotation, restart policy and logging are
+# defined here exactly once, so a fix cannot reach three streams and miss the
+# fourth -- which is what happened on 2026-08-24, when a log-rotation fix
+# touched three of four units and the fourth (staged, disabled, invisible to
+# `systemctl --user list-units`) kept the bug.
+#
+# Per-stream settings live in ~/opt/ntrip-relay/instances/<instance>.env.
+# Credentials live in ~/opt/ntrip-relay/relay.env and never appear here.
+#
+# Instances (see deploy/ntrip-relay/README.md):
+#   @ssr     SSRA03IGS0 -> :2101/SSR   ssr.ntrip.VanValzah.Com
+#   @obs     PTBB00DEU0 -> :2102/PTBB  obs.ntrip.VanValzah.Com
+#   @eph     BRUX00BEL0 -> :2103/BCEP  eph.ntrip.VanValzah.Com
+#   @onocoy  mosaic-T SBF -> :2104/UFO1_MSM7  (STAGED -- do not enable blindly)
+Description=NTRIP str2str relay — %i
+Documentation=file:%h/opt/ntrip-relay/RETENTION.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/opt/ntrip-relay/bin/str2str-relay-exec %i
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

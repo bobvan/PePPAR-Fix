@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# str2str-relay-exec <instance>
+#
+# Launcher for str2str-relay@<instance>.service.  Composes the str2str command
+# from two files and exec's it:
+#
+#   ~/opt/ntrip-relay/relay.env             credentials, shared, NOT in git
+#   ~/opt/ntrip-relay/instances/<i>.env     this stream's IN / CRED / ARGS
+#
+# WHY A WRAPPER AND NOT A PURE ExecStart.  systemd does NOT recursively expand
+# ${VAR} references that appear INSIDE a value loaded from an EnvironmentFile.
+# Measured 2026-08-24: with ARGS='-in ntrip://${IGS_USER}:x@h/M ...' and
+# ExecStart='... $ARGS', argv[2] arrives as the literal string
+# 'ntrip://${IGS_USER}:x@h/M'.  str2str takes credentials only inside the URL,
+# so something has to assemble that URL after the credentials are in scope.
+# This script is that something.  No eval -- bash indirect expansion (${!name})
+# is enough and does not turn a config file into a code-execution surface.
+#
+# Two systemd behaviours this design DOES rely on, both measured the same day:
+#   * an unquoted $ARGS is split at whitespace into separate argv entries
+#   * an EnvironmentFile value is NOT specifier-expanded, so '%Y%m%d_%h' is
+#     written with SINGLE percent signs here (unit files need '%%')
+set -euo pipefail
+
+STR2STR="${STR2STR:-$HOME/bin/str2str}"
+ENVDIR="${NTRIP_RELAY_DIR:-$HOME/opt/ntrip-relay}"
+
+inst="${1:?usage: str2str-relay-exec <instance>}"
+inst_env="$ENVDIR/instances/${inst}.env"
+
+[[ -r "$ENVDIR/relay.env" ]] || { echo "missing $ENVDIR/relay.env" >&2; exit 78; }
+[[ -r "$inst_env" ]]         || { echo "missing $inst_env" >&2; exit 78; }
+[[ -x "$STR2STR" ]]          || { echo "missing or non-executable $STR2STR" >&2; exit 78; }
+
+set -a
+# shellcheck disable=SC1090
+. "$ENVDIR/relay.env"
+. "$inst_env"
+set +a
+
+: "${IN:?$inst_env must define IN=}"
+: "${ARGS:?$inst_env must define ARGS=}"
+
+# CRED names a credential PAIR in relay.env (CRED=IGS -> IGS_USER / IGS_PASS).
+# Instances with no upstream auth (e.g. a raw TCP source) simply omit it.
+if [[ -n "${CRED:-}" ]]; then
+    uvar="${CRED}_USER"; pvar="${CRED}_PASS"
+    u="${!uvar-}"; p="${!pvar-}"
+    [[ -n "$u" && -n "$p" ]] || {
+        echo "CRED=$CRED but ${uvar}/${pvar} are not set in relay.env" >&2; exit 78; }
+    # An '@' or ':' in a credential would make the authority ambiguous and
+    # str2str would connect somewhere unintended.  Refuse rather than guess.
+    case "$u$p" in
+        *@*|*:*|*/*) echo "credentials for $CRED contain @, : or / -- str2str takes them raw in the URL, which would be ambiguous.  Rotate to an alphanumeric secret." >&2; exit 78 ;;
+    esac
+    IN="${IN/:\/\//://$u:$p@}"
+fi
+
+# ARGS is intentionally unquoted: it must word-split into separate arguments.
+# Values inside it therefore must not contain whitespace or quotes; check.sh
+# enforces that, because a quoted value would reach str2str with the quotes
+# still attached.
+# shellcheck disable=SC2086
+exec "$STR2STR" -in "$IN" $ARGS
