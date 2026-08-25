@@ -12048,7 +12048,13 @@ def _apply_host_config(args):
         "ptp_profile":      ("ptp_profile",      str),
         "ptp_dev":          ("servo",            str),
         "ntrip_conf":       ("ntrip_conf",       str),
+        "ntrip_http10":     ("ntrip_http10",     bool),
         "eph_mount":        ("eph_mount",        str),
+        # eph can live on a different caster/port than SSR -- str2str is
+        # one-mount-per-port, so our own re-casters split BCEP (:2103) from
+        # SSR (:2101).  Without these the split needs a second conf file.
+        "eph_caster":       ("eph_caster",       str),
+        "eph_port":         ("eph_port",         int),
         "ssr_mount":        ("ssr_mount",        str),
         "ssr_ntrip_conf":   ("ssr_ntrip_conf",   str),
         "ssr_bias_mount":     ("ssr_bias_mount",     str),
@@ -12852,7 +12858,11 @@ Two-phase operation:
     ntrip = ap.add_argument_group("NTRIP corrections")
     ntrip.add_argument("--ntrip-conf", help="NTRIP config file (INI format)")
     ntrip.add_argument("--ntrip-caster", help="NTRIP caster hostname")
-    ntrip.add_argument("--ntrip-http10", action="store_true",
+    # default=None (not the store_true default of False) so _apply_host_config
+    # can fill it from the host TOML -- that helper skips any dest whose value
+    # is not None, so a False default would make `ntrip_http10 = true` in the
+    # TOML silently inert.  All consumers truth-test it, so None reads as off.
+    ntrip.add_argument("--ntrip-http10", action="store_true", default=None,
                        help="Send minimal NTRIP-v1 / HTTP/1.0 requests to the "
                             "obs/eph/SSR casters instead of HTTP/1.1.  Needed "
                             "when pulling from a v1-only local re-caster such "

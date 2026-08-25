@@ -19,6 +19,25 @@ eph_mount = "BCEP00BKG0"
 ssr_ntrip_conf = "ntrip.conf"  # CNES SSRA00CNE0 removed from IGS-IP 2026-06-28 -> BKG (was ntrip-cnes.conf)
 systems = "gps,gal,bds"
 
+# ── Our own re-casters on gt (STAGED — do NOT uncomment until routing works) ──
+# Repoints SSR + broadcast eph from the public casters to the gt relays.
+# Uncomment these four lines (and comment the two above) to switch:
+#
+#   ntrip_conf   = "config/recaster-gt.conf"   # ssr.ntrip.VanValzah.Com:2101/SSR
+#   eph_caster   = "eph.ntrip.VanValzah.Com"
+#   eph_port     = 2103
+#   eph_mount    = "BCEP"
+#   ntrip_http10 = true                        # str2str speaks NTRIP v1, not v2
+#
+# BLOCKED 2026-08-24: this host cannot open a TCP connection to gt at all —
+# not :2101, not :2103, not even :22 — while `tailscale ping gt` succeeds in
+# 1 ms.  UDP crosses, TCP does not.  Flipping these lines today would leave the
+# engine with no corrections on its next restart, which is exactly the silent
+# degradation we are trying to avoid.  Re-test with
+#     nc -z -w5 ssr.ntrip.VanValzah.Com 2101
+# and only then uncomment.  See docs/local-caster-onocoy-plan.md.
+
+
 # Operational ARP — engine reads timelab/antennas.json[ufo1] at
 # startup as an in-memory survey-class seed candidate.  Read-only;
 # only peppar-survey writes state/positions/<uid>.survey.toml.
