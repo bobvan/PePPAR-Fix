@@ -128,3 +128,70 @@ Before swapping anything, decide and write down which the names follow — the
 mount or the hardware — and if the answer is "the mount", give the antennas
 their own identifiers.  `report_card.py`'s separate `--antenna` / `--mount`
 fields are the model to copy.
+
+## A top-of-scale anchor: PTBB, measured with the same code
+
+We already relay **PTBB00DEU0** — PTB Braunschweig, a national metrology
+institute — for the known-good-obs diagnostic, and `@obs` has been logging it.
+That log is genuine RTCM3 MSM7, so the *identical* metric can be run on it, on
+the *identical* signal pairs (GPS L1CA/L2W, GAL E1C/E5aQ). That makes it a
+calibration point for the top of the scale, obtained with no new hardware.
+
+Measured 2026-08-26, ~1 h of PTBB against 2.4 h of UFO1:
+
+| | UFO1 / SXT-D | PTBB / PTB | ratio |
+|---|---|---|---|
+| MP RMS, all arcs | 0.789 m | **0.363 m** | 2.17× |
+| MP RMS, C/N0 38–44 | 0.416 m | 0.296 m | 1.41× |
+| MP RMS, C/N0 44–50 | 0.305 m | 0.233 m | 1.31× |
+| MP RMS, C/N0 ≥50 | 0.191 m | **0.099 m** | 1.93× |
+| phase noise | 1.00 mm | **0.62 mm** | 1.61× |
+
+Three things fall out.
+
+**1. onocoy's thresholds are real, not arbitrary.**  PTBB's high-C/N0 code MP is
+**0.099 m — inside the 0.140 m bar** (0.71×), while ours is 0.191 m (1.36×).
+The top-tier threshold is calibrated to what a genuine geodetic-grade
+installation actually achieves. That is worth knowing before dismissing a score
+we fail.
+
+**2. The phase gap is the one that matters here.**  0.62 mm = **2.07 ps**
+against our 1.00 mm = 3.34 ps. Both sit inside the 5–10 ps TD-CP per-epoch
+budget, so neither is disqualifying — but a national metrology institute's chain
+is **1.6× quieter on the observable a carrier-phase clock rides on**, and that is
+a more meaningful gap for us than the 2× on code.
+
+**3. This is a scenario-1 measurement and cannot attribute anything.**  PTBB
+differs from us in receiver, antenna, mount, site, professional installation
+*and* latitude (52.3 °N vs 41.8 °N, which genuinely changes sky coverage). It
+says the *net chain* is better; it does not say which part. Attribution needs the
+simultaneous differential rig — see `bobvan/testAnt`
+`docs/future-work-signal-quality.md`.
+
+### Other national-lab anchors already reachable
+
+On `igs-ip.net` with the credentials we already hold (385 mounts; codes checked
+against national timing/metrology institutes):
+
+| Mount | Lab | Systems |
+|---|---|---|
+| `PTBB00DEU0` | PTB Braunschweig (DE) | GPS+GLO+GAL+BDS |
+| `BRUX00BEL0` | ORB Brussels (BE) | GPS+GLO+GAL+BDS+QZS+SBAS |
+| `IENG00ITA0` | INRIM Torino (IT) | GPS+GLO+GAL+BDS+QZS+SBAS |
+| `SPT000SWE0` | RISE Borås (SE) | GPS+GLO+GAL+BDS+QZS |
+| `MIZU00JPN0` | NAOJ Mizusawa (JP) | GPS+GLO+GAL+BDS+QZS+IRNSS |
+
+So a *panel* of four European/Japanese metrology institutes is available in real
+time, not just one — enough to characterise the spread at the top of the scale
+rather than trusting a single station.
+
+**NIST and USNO are not on this caster** (nor NPL, OPMT, TWTF, KRISS, METAS).
+They are IGS stations, so their observations exist as post-processed **RINEX**
+from CDDIS — which is exactly the "RINEX ingest is the missing fourth" item in
+the testAnt groundwork. Adding RINEX would unlock the whole public archive as a
+comparison corpus, including the US labs.
+
+**Caveat worth carrying:** these are the *published* streams of those stations,
+which may be decimated, filtered, or from a different antenna than the one
+feeding their timing systems. A national lab's IGS station is not necessarily the
+chain their UTC(k) rides on.
