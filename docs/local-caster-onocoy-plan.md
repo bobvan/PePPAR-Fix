@@ -464,3 +464,55 @@ is supposed to be.
 different site.  Then it is a copy of `instances/onocoy.env` with `#ubx` instead
 of `#sbf` and its own credential — the template makes that a new env file and
 nothing else.
+
+### Can a relayed stream be passed off as your own station?  (threat model, 2026-08-26)
+
+Bob's question: if a station's observations are readable without authentication,
+could someone transcode them and claim the rewards — the way open SMTP relays
+were abused early on?  **Structurally, yes**, and the analogy is apt in the way
+that matters: both designs infer trust from plausibility rather than proof.
+
+**Why onocoy's published checks do not cover it.**  Their validator network
+grades submissions on four signal properties — RMS code, RMS phase, cycle-slip
+ratio, sky visibility — plus latency, epoch rate and uptime (confirmed against
+`models.ServerStatisticsDaily` in their Public API spec).  Every one of those
+except latency is a property of *the signal*, and a relayed stream **is** real
+GNSS data, so it reproduces them perfectly.  Those metrics answer "is this
+plausible GNSS?", which detects **synthesis**.  Replay is not synthesis; it is
+**misattribution**, and no amount of signal-quality scoring separates "I
+received these signals" from "someone else received them and handed them to me."
+The bytes are identical.
+
+**What could catch it, in rough order of strength:**
+
+1. **Duplicate correlation** — two stations submitting near-identical
+   observations is trivially detectable *if both are inside onocoy*.  It fails
+   when the source sits outside their network (a public CORS caster, an IGS
+   mount, a community caster), because there is nothing to correlate against
+   unless onocoy actively ingests those networks to compare.
+2. **Position collision** — a replayed stream self-surveys to the *original*
+   station's coordinates.  Obvious if that station is also on onocoy; invisible
+   if it is not.
+3. **Latency** — the one relay-sensitive metric they publish, and it is in the
+   API schema (`latency_avg/min/max`).  But it is weak: a relay hop adds tens of
+   milliseconds against a <1 s bar.
+
+**The general problem is unsolved.**  Proving *who* observed a signal, rather
+than that the signal is genuine, is the "proof of location" problem.  Galileo
+OSNMA does not help: it authenticates the *navigation message*, so it proves the
+data genuinely came from Galileo — which is exactly as true for the relayer as
+for the original observer.  A fix needs cryptography binding an observation to a
+specific receiver at a specific place and time, which no civil GNSS service
+currently provides.
+
+**Epistemic caveat, and it matters.**  All of the above describes their
+*published* defenses.  Not documenting anti-fraud measures is itself sound
+practice, so absence from the docs is not evidence of absence — onocoy's
+validators may well run duplicate-correlation they simply do not advertise.
+This section is "their published model does not address replay", not "onocoy
+cannot detect replay."
+
+**What it means for us: nothing bad.**  We use onocoy's grading as an
+independent quality check on *our own* stream, and we know our stream is
+genuinely ours.  The threat model affects how much one should trust onocoy's
+*network-wide* station list, not their assessment of a station you control.
