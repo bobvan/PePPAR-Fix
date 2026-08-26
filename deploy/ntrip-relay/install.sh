@@ -11,8 +11,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DST="${HOME}/.config/systemd/user"
 ENVDIR="${NTRIP_RELAY_DIR:-${HOME}/opt/ntrip-relay}"
 
-RELAYS=(ssr obs eph)          # continuously running
-STAGED=(onocoy)               # present but never auto-enabled
+RELAYS=(ssr obs eph ufo1 rtkdirect)   # continuously running
+STAGED=()                             # present but never auto-enabled
 
 mkdir -p "$DST" "$ENVDIR"/{bin,instances,logs/prod}
 
@@ -28,6 +28,8 @@ chmod 0600 "$ENVDIR/relay.env"
 # Four near-identical units were collapsed into str2str-relay@.service.  They
 # bind the same ports, so they must be gone before the instances start.
 LEGACY=(ntrip-ssr-relay ntrip-obs-relay ntrip-eph-relay onocoy-obs-transcode)
+# str2str-relay@onocoy was renamed to @ufo1 when a second contribution network
+# was added; the instance is the observation stream, not one destination.
 for u in "${LEGACY[@]}"; do
     if [[ -f "$DST/$u.service" ]]; then
         echo "  - $u.service (legacy — stopping, disabling, removing)"

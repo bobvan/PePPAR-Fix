@@ -124,7 +124,8 @@ else
 fi
 
 echo "== enabled instances are serving =="
-declare -A PORT=( [ssr]=2101 [obs]=2102 [eph]=2103 [onocoy]=2104 )
+# rtkdirect serves no local mount -- it only pushes -- so it has no port here
+declare -A PORT=( [ssr]=2101 [obs]=2102 [eph]=2103 [ufo1]=2104 )
 for f in "$HERE"/instances/*.env; do
     i="$(basename "$f" .env)"; port="${PORT[$i]:-}"
     [[ -n "$port" ]] || { warn "$i has no known port — skipping probe"; continue; }

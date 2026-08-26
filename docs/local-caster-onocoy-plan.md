@@ -633,3 +633,42 @@ another day of our own measurement is high.
 networks makes the station look, to each of them, like the replay case analysed
 above. We would be the legitimate operator on both, so there is no dishonesty —
 but it is worth declaring rather than discovering.
+
+### RTKDirect added, and the 3-output wall — 2026-08-26
+
+RTKDirect turned out to be worth adding after all, for a reason the earlier
+survey under-weighted: **onocoy rewards can offset paid RTK use.** That is not
+crypto speculation, it is a service we already pay for occasionally, so tokens
+have a concrete non-financial use. A second network compounds it.
+
+RTKDirect is a **stock BKG Caster 2.0.39**, which is why it behaves so much more
+predictably than onocoy's custom server. Both push forms were accepted first
+try: v1 `SOURCE` returned `ICY 200 OK`, v2 `POST` returned `HTTP/1.1 200 OK`.
+Unlike onocoy it issues a **separate username and mountpoint**, and the
+mountpoint really is the mountpoint — no slot substitution.
+
+**The wall: `str2str` accepts at most THREE `-out` streams, and a fourth
+SEGVs.** Not an error message — a segmentation fault, because RTKLIB has no
+bounds check. Measured: 2 and 3 outputs run, 4 crashes with SIGSEGV, 5 falls
+back to printing usage. The `@ufo1` instance already used its three (local
+ntripc mount, provenance log, onocoy push), so adding a second push was not
+possible in one process.
+
+**The fix is what the local mount was always for.** A second instance
+`@rtkdirect` consumes `ntrip://127.0.0.1:2104/UFO1_MSM7` and pushes onward. The
+`:2104` mount had no consumer until now; it is the fan-out point, and this is
+the architecture working as designed rather than a workaround. Cost: one
+sub-millisecond loopback hop and a dependency on `@ufo1`, against the
+alternative of transcoding the same SBF twice.
+
+One further detail: the push URL's `#rtcm3` suffix means *convert to RTCM3*, and
+str2str refuses ("specify input format") if only one side of a conversion names
+a format. `@rtkdirect`'s input is already RTCM3, so its `PUSH_FMT` must be
+empty — the wrapper makes that per-instance.
+
+**Renamed `@onocoy` -> `@ufo1`.** The instance is the UFO1 observation stream,
+not one of its destinations; keeping a destination's name on it once there were
+two would have been exactly the misnomer class `docs/misnomers.md` exists for.
+
+Live state: five instances, `@ufo1` showing `[CCCC-]` — SBF in, local mount
+served, `@rtkdirect` consuming it, onocoy push out.
