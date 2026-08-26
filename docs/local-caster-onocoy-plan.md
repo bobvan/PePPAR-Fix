@@ -383,3 +383,46 @@ a future re-IP one edit instead of an archaeology exercise.
 (<https://www.sparkpnt.com/products/sxt-d-gnssdo>).  Prose here uses SXT-D; the
 `gnssdo_*` host-config keys and `GnssdoActuator` are deliberately unchanged
 because they are load-bearing in deployed TOMLs.  Logged in `docs/misnomers.md`.
+
+### Box 3 LIVE — 2026-08-26
+
+`str2str-relay@onocoy` enabled and pushing to `servers.onocoy.com:2101` at
+~13.3 kbps, while still serving `gt:2104/UFO1_MSM7` on the LAN and rotating
+`logs/prod/`.  Preceded by the AntInfo 26.1.0 install and ARP pin of 2026-08-25,
+so the station's 1006 carries our surveyed UFO1 ARP and the receiver applies the
+real SFESPK6618H phase-centre model rather than zero.
+
+**Credential slot mapping — counter-intuitive, cost three attempts.**  onocoy's
+dashboard shows a "Credential" and a "Mountpoint"; neither is used where the
+name suggests:
+
+  - "Credential" (station page) = the **auto-generated NTRIP username**, and it
+    goes in the **mountpoint** slot.
+  - "Mountpoint" = cosmetic, *"only informative, not public"* — **unused**.
+  - The password is the one chosen under **Reference Stations -> NTRIP
+    Credentials**, and is not shown on the station page.
+
+The reason is `str2str`: it pushes with NTRIP v1, whose handshake is
+`SOURCE <password> <mountpoint>` with **no username field**
+(`ntrips://[:passwd@]addr[:port]/mntpnt` — empty user).  onocoy documents this
+exact workaround for v1 devices: *"enter the NTRIP username as MOUNTPOINT and
+password into the password field.  Leave the device's username field, if any,
+empty."*
+
+**Failure signatures**, worth knowing because the first is silent and reads like
+a network fault:
+
+| what is wrong | caster reply |
+|---|---|
+| wrong value in the mountpoint slot | **empty**, connection dropped |
+| right slot, wrong password | **HTTP/1.1 401** |
+| both right | **HTTP/1.1 200 OK** |
+
+`GET /` returns **403 Forbidden** (no public sourcetable), which is a useful
+liveness check that the caster is reachable at all.
+
+Implementation: the wrapper composes the push from `PUSH_CRED` + `PUSH_HOST`,
+taking `<PREFIX>_CRED` for the mountpoint slot and `<PREFIX>_PASS` for the
+password.  Both live in `~/opt/ntrip-relay/relay.env` (0600) — never the repo,
+since onocoy states the mountpoint is not public and the credential obviously
+is not.

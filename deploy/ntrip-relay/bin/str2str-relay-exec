@@ -56,9 +56,44 @@ if [[ -n "${CRED:-}" ]]; then
     IN="${IN/:\/\//://$u:$p@}"
 fi
 
+# Optional outbound NTRIP-server push (e.g. Onocoy).  Composed here for the same
+# reason IN is: the wrapper does not expand ${VAR} inside ARGS, and the password
+# must not appear in the instance file (which lives in the repo).
+#
+# PUSH_CRED names a pair in relay.env: PUSH_CRED=ONOCOY -> ONOCOY_MOUNT and
+# ONOCOY_PASS.  The mountpoint lives there too, not in the repo: onocoy says it
+# is "not public", so it is account-identifying even though it is not a secret.
+#
+# str2str speaks NTRIP v1 for server push -- verified in the binary:
+#     SOURCE %s %s          (password, mountpoint)
+#     ntrips://[:passwd@]addr[:port]/mntpnt
+# There is NO username field, which matches onocoy's own instruction for v1
+# devices: "enter the NTRIP username as MOUNTPOINT ... leave the username field
+# empty".  Hence the empty user before the colon below.
+PUSH_ARG=""
+if [[ -n "${PUSH_CRED:-}" ]]; then
+    # NOTE the slot mapping, which is counter-intuitive and was proven by probe:
+    # str2str's v1 SOURCE takes (password, mountpoint) and has NO username field,
+    # and onocoy says to put the NTRIP USERNAME in the mountpoint slot.  So the
+    # thing that goes after SOURCE is <PREFIX>_CRED (onocoy's auto-generated
+    # username, shown as "Credential" on the reference-station page) -- NOT
+    # <PREFIX>_MOUNT, which is onocoy's cosmetic mountpoint and is unused here.
+    # Measured 2026-08-26: _MOUNT in that slot -> empty reply, connection
+    # dropped; _CRED in that slot -> HTTP/1.1 401, i.e. it reaches auth.
+    mvar="${PUSH_CRED}_CRED"; pvar="${PUSH_CRED}_PASS"
+    mnt="${!mvar-}"; pw="${!pvar-}"
+    [[ -n "$mnt" && -n "$pw" ]] || {
+        echo "PUSH_CRED=$PUSH_CRED but ${mvar}/${pvar} are not set in relay.env" >&2; exit 78; }
+    case "$pw$mnt" in
+        *@*|*:*|*/*) echo "push credentials contain @, : or / -- ambiguous in the URL" >&2; exit 78 ;;
+    esac
+    : "${PUSH_HOST:?PUSH_CRED set but PUSH_HOST= is missing}"
+    PUSH_ARG="-out ntrips://:${pw}@${PUSH_HOST}/${mnt}#rtcm3"
+fi
+
 # ARGS is intentionally unquoted: it must word-split into separate arguments.
 # Values inside it therefore must not contain whitespace or quotes; check.sh
 # enforces that, because a quoted value would reach str2str with the quotes
 # still attached.
 # shellcheck disable=SC2086
-exec "$STR2STR" -in "$IN" $ARGS
+exec "$STR2STR" -in "$IN" $ARGS $PUSH_ARG
