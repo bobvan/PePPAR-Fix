@@ -22,9 +22,18 @@ Root-cause column, same row:
 > one stranded slot **during adjfine** sits for 15 s, during which ptp4l TX
 > attempts also strand
 
-Both cannot be true.  If no adjfine was running when the cascade began, nothing
-in the adjfine path can be the *initiating* strand — and Patch 2 may be
-orthogonal to the failure that actually disqualifies the part.
+Read strictly the row is not self-contradictory — it tells a **two-phase**
+story: an earlier strand *during* adjfine wedges the subsystem, and the
+*observed* cascade happens later with no adjfine running, because "once wedged,
+every subsequent TX timestamp fails even without adjfine."  The contradiction
+appears only if "first timeout cascade" is read as the initiating event.
+
+So the honest statement is **ambiguity, not contradiction** — but the two-phase
+mechanism it asserts has never been demonstrated, and the row does not say
+which reading is meant.  Either way arm A settles it, and settles the *stronger*
+reading too: if adjfine is off from boot and it still wedges, there was never an
+adjfine phase to do the initiating strand, so the two-phase story dies with the
+simple one.
 
 The MTBF numbers in that doc are also not comparable: ~30 min (2026-04-01),
 ~64 h "at 1 Hz" (Patch 2 trigger section), ~44 min "at 1 Hz adjfine + 1 Hz
@@ -74,6 +83,16 @@ on any VLAN works identically, because nothing has to receive the packets.
 What matters is only that the DUT is a different interface from the management
 path.
 
+### Stop ptp4l on the DUT first
+
+Survey 2026-08-26 found `/usr/sbin/ptp4l -f /etc/linuxptp/ptp4l.conf -i eth1`
+already running on TimeHat — an *uncontrolled* hardware-TX-timestamp user on
+the exact NIC under test.  It contaminates every arm **including A**: arm A is
+"adjfine off, HW TX on", and a live ptp4l supplies uncontrolled TX timestamping
+and, depending on what is disciplining, potentially the very adjfine the arm
+exists to exclude.  Stop it and **verify** it is gone (`pgrep -a ptp4l`) before
+each arm; do not assume a previous arm left it stopped.
+
 ### Tool changes needed first (small)
 
 The tool is a *stress* reproducer — both loops run unthrottled, deliberately
@@ -96,14 +115,93 @@ Keep the unthrottled default available; do not remove it.
 
 ---
 
+## 2a. Driver identity — load known binaries, prove which one ran
+
+**Bob's call, 2026-08-26, and the survey below says he is right**: do not infer
+the driver under test from package state.  Unload and load *known binaries*
+explicitly, and record which one actually ran.
+
+### Why this is load-bearing, not ceremony
+
+The 2026-04-15 record **cannot tell us which binary produced the observation**,
+and three separate mechanisms conspire to hide it:
+
+1. **The DKMS package name understates its contents.**  `dkms status` reports
+   only `igc/6.12.0-ppsfix.1`, which names ppsfix and is silent about the v3
+   adjfine patch — but commit `cc0ca17` ("apply adjfine TX timestamp race fix
+   to *ppsfix vendored source*") folded both into that one package.  Verified
+   2026-08-26: `/usr/src/igc-6.12.0-ppsfix.1/src/igc_ptp.c:76-79` contains the
+   TSYNCTXCTL read-modify-write.  Anyone checking patch state the obvious way
+   concludes the opposite of the truth.
+2. **The timeline leaves a hole nobody logged.**  `cc0ca17` landed 15:01; the
+   incident row (`a8441d5`) was written 17:38 the same day and describes a
+   wedge "44 min after boot".  Whether TimeHat was rebooted onto the *rebuilt*
+   module inside that window is recorded nowhere — so "despite v3 patch" rests
+   on an assumption, not an observation.
+3. **Two vendored trees exist** — `drivers/igc-timehat-edge/` and
+   `drivers/igc-timehat-edge-6.8/`, both patched by `cc0ca17`.  Rebuilding the
+   wrong one for the running kernel is silent.
+
+This is very likely the source of the §1 ambiguity: not that anyone was
+careless, but that patch state was never a *recorded* fact.  This section makes
+it one.
+
+### Protocol — every arm
+
+```sh
+sudo rmmod igc
+sudo insmod /absolute/path/to/<arm>.ko          # NEVER modprobe — it searches
+cat /sys/module/igc/srcversion                  # assert == expected; abort on mismatch
+```
+
+`/sys/module/igc/srcversion` is the authoritative *runtime* identity and is
+independent of package names, file paths and DKMS bookkeeping.  Assert it after
+every load and **stamp it into every CSV** alongside the binary's sha256, so no
+results file can be misattributed later — which is precisely what went wrong in
+2026-04.
+
+### Staged binaries, measured on TimeHat 2026-08-26
+
+Kernel `6.12.75+rpt-rpi-2712`, aarch64.  Both are already on the host; nothing
+needs building.
+
+| build | path | `srcversion` | sha256 (first 32) |
+|---|---|---|---|
+| **patched** (ppsfix + v3 adjfine) | `/var/lib/dkms/igc/6.12.0-ppsfix.1/6.12.75+rpt-rpi-2712/aarch64/module/igc.ko.xz` | `34A0F0BF20444879727CD8F` | `9ad35ea23506839cf969567d8040a71c` |
+| **stock** (DKMS original) | `/var/lib/dkms/igc/original_module/6.12.75+rpt-rpi-2712/aarch64/igc.ko.xz` | `6AF1066A96C3EFD60610B4A` | `f7643ae7e5d17b286a091ea896af6508` |
+
+The two `srcversion`s differ, so the check genuinely discriminates.  Running
+module at survey time was `34A0F0BF20444879727CD8F` — **patched**, confirming
+TimeHat sits in arm A/B state despite what the package name suggests.
+
+### Safety — verified, and the check to repeat on any host
+
+`rmmod igc` drops **only** the DUT: TimeHat's management path is `eth0` on
+**`macb`** (onboard), the DUT is `eth1` on `igc`.  Before `rmmod igc` on *any*
+host, run
+
+```sh
+readlink -f /sys/class/net/<mgmt-iface>/device/driver
+```
+
+and confirm it is not `igc` — a host whose only NIC is igc becomes unreachable
+and needs a physical power cycle.
+
+---
+
 ## 3. Arms
 
-| arm | adjfine | HW TX tstamps | driver | question |
+| arm | adjfine | HW TX tstamps | driver (`srcversion` asserted at load — §2a) | question |
 |---|---|---|---|---|
-| **A** | **off** | on | v3 patched | **does it still wedge with no adjfine?** |
-| B | on, 1 Hz | on | v3 patched | production config |
-| C | on, 1 Hz | on | unpatched | does v3 help or hurt at a fixed rate? |
-| D | off | on | unpatched | control |
+| **A** | **off** | on | patched `34A0F0BF20444879727CD8F` | **does it still wedge with no adjfine?** |
+| B | on, 1 Hz | on | patched `34A0F0BF20444879727CD8F` | production config |
+| C | on, 1 Hz | on | stock `6AF1066A96C3EFD60610B4A` | does v3 help or hurt at a fixed rate? |
+| D | off | on | stock `6AF1066A96C3EFD60610B4A` | control |
+
+"Patched" and "stock" are the §2a binaries, loaded by absolute path and
+verified by `srcversion` after load.  Do not identify an arm's driver by
+package name, DKMS state, or "what was installed last" — that is the failure
+mode §2a exists to close.
 
 **Run arm A first.  It is decisive.**
 
@@ -152,10 +250,18 @@ TimeHat is the known i226 host, but the repo suggests two more:
 - `config/madhat.toml` — `ptp_dev = "/dev/ptp_i226"` (disabled 2026-05-24),
   plus extensive i226 notes including its both-halves PEROUT quirk.
 - `config/ocxo-i226.toml` — an i226 card in the box now called `ptpmon`
-  (`/dev/ptp0 → i226 (this card)`).
+  (`/dev/ptp0 → i226 (this card)`).  **This file is stale.**
 
-**Confirm the hardware is still fitted before planning around it** — MadHat is
-not in CLAUDE.md's host table and ptpmon was recommissioned 2026-06-14.
+**ptpmon has no i226 — checked 2026-08-26, host powered on for this.**  It
+carries an E810-C quad (`01:00.0-.3`, driver `ice`, as `e810p0..3`) plus an
+onboard `e1000e` for management; `igc` is not even loaded, and the only
+`igc.ko` present is the untouched in-kernel one.  So `config/ocxo-i226.toml`
+describes hardware that is no longer in the box, and **ptpmon cannot provide
+the x86-vs-aarch64 comparison this section wants.**  MadHat was unreachable at
+survey time and remains unconfirmed.
+
+Consequence: the driver-generic vs platform-specific question stays **open**,
+and a TimeHat-only result must say so rather than imply generality.
 
 If a second host is available it is worth using, for two reasons: arms run in
 parallel and halve wall-clock, and **ptpmon is x86** while TimeHat is aarch64.
