@@ -114,3 +114,43 @@ Write `instances/<name>.env` with `IN=`, optional `CRED=`, and a quoted `ARGS=`;
 run `./install.sh`; `systemctl --user enable --now str2str-relay@<name>`. Add
 the port to the `PORT` map in `check.sh` so it gets probed. Nothing else — the
 unit is already correct, which is the entire point.
+
+## Checking the Onocoy station — `onocoy-status.py`
+
+onocoy has a Public API (spec: <https://api-hub.onocoy.com/docs>, Swagger 2.0,
+host `api-hub.onocoy.com`).  It is not linked from the miner docs, and their
+support docs say no API exists — it does.
+
+```sh
+./onocoy-status.py            # last 7 days
+./onocoy-status.py --days 30
+```
+
+**Why bother**, given the web console exists: onocoy grades every contributing
+station, so these are an *independent* assessment of our observation quality,
+computed by a party with no stake in our results — `phase_rms_avg`,
+`code_rms_avg`, `cs_rate_avg` (cycle slips), `latency_avg`, `sky_vis_avg`,
+`epoch_rate_avg`.  That is exactly the third-party consistency check Box 3 was
+for, and unlike the console it is machine-readable.  It is also the only
+programmatic view of whether our station is up — onocoy provides no way to
+*announce* downtime, so this is the closest thing to monitoring.
+
+Auth is HTTP Basic with the **station** credential (`ONOCOY_CRED` /
+`ONOCOY_PASS` from `relay.env`).  Endpoints:
+
+| Endpoint | Credential needed |
+|---|---|
+| `/api/v1/my_stats/stations` | station — our daily quality stats |
+| `/api/v1/my_stats/data_usage` | station |
+| `/api/v1/stations/list` | **client** credential + active onocoyStream plan |
+| `/api/v1/stations/status` | **client** credential + active onocoyStream plan |
+
+**A station credential only works once the station "has a successful validation
+within the last 7 days."**  Before that the API answers `403 access denied`,
+which is *not* a misconfiguration — validation takes 24-36 h after first data.
+The two failures are distinguishable and the tool says which:
+
+    401 invalid credentials  -> ONOCOY_CRED/ONOCOY_PASS wrong
+    403 access denied        -> credential fine, station not yet validated
+
+Statistics reach back at most 3 months, and none exist before 2025-12-22.
