@@ -143,8 +143,58 @@ Add the separately documented [i226 PEROUT 500 ms bug](i226-perout-500ms-bug.md)
 — hardware, board-dependent, unfixable in software on affected boards.
 
 **Verdict: do not put i226 in either the ear or the indoor unit until the
-wedge is closed upstream.**  This is the largest practical risk in the sketch,
-and it is already sitting in our own docs.
+wedge is closed.**  This is the largest practical risk in the sketch, and it is
+already sitting in our own docs.
+
+#### Checked against Time-Appliances-Project/TimeHAT (2026-08-26) — nothing to adopt
+
+[TAP's TimeHAT](https://github.com/Time-Appliances-Project/TimeHAT) ships
+`intel-igc-ppsfix` DKMS trees for RPi5 kernels 6.6, 6.12 and 6.12.62.  Diffed
+all three against `drivers/igc-timehat-edge/`:
+
+- `igc_ptp.c` is the **only** file that differs anywhere in the src tree, and
+  the entire 29-line diff is **our** adjfine `TSYNCTXCTL` guard, which none of
+  their three variants has.
+- Their README claims only EXTTS dual-edge, PEROUT 1PPS, and per-channel pin
+  tracking — all of which our tree already carries (ppsfix is our base).
+- Their git history is five commits, none of it PTP-path work.
+
+**TimeHAT's driver is a strict subset of ours.**  There is nothing there we
+missed, and i226 is not rehabilitated by it.
+
+#### But the diff surfaced a concrete, untested hypothesis for the cascade
+
+Both trees carry the upstream remedy this repo's `igc-kernel-patches.md`
+proposed as fix (a) — `ptp_tx_lock` plus, in `igc_ptp_tx_hang()`:
+
+```c
+if (found) {
+        /* Reading the high register of the first set of timestamp registers
+         * clears all the equivalent bits in the TSYNCTXCTL register.
+         */
+        rd32(IGC_TXSTMPH_0);
+}
+```
+
+So the ~44 min wedge was observed **with** that remedy in place.  Looking at
+what it actually does suggests why it does not help, and may even hurt:
+
+`rd32(IGC_TXSTMPH_0)` clears **all four** slots' hardware bits, but the loop
+above it calls `igc_ptp_tx_timeout()` — and thus frees the skb and the software
+slot — only for slots that have already **expired**.  A slot that is occupied
+but not yet 15 s old keeps its `tstamp->skb`, while the hardware state it was
+waiting on has just been destroyed underneath it.  That slot can now never
+complete; it is guaranteed to sit until its own timeout fires, which is exactly
+the cascade.
+
+**Hypothesis: the upstream fix converts one expiry into up to three more
+guaranteed expiries.**  If so, the correct patch is small — when `found`, free
+*every* occupied slot, not just the expired ones, because the register read has
+already invalidated them all.
+
+Untested.  It is cheap to test (`tx_hwtstamp_timeouts` counter and dmesg on a
+box doing 1 Hz adjfine + 1 Hz ptp4l), and worth doing before writing i226 off
+permanently, because it would rehabilitate a lot of cheap hardware.
 
 ### 3.4 Multiple NICs means multiple clock domains — a real switch has one
 
@@ -239,6 +289,57 @@ sources requires **3f + 1**.  Three ears plus one local holdover = 4 → tolerat
 one Byzantine source.  That is the real reason for "three or more ears", and it
 is a good reason — subject entirely to §3.2's warning that the bound assumes
 independence the rooftop does not provide.
+
+---
+
+### 3.7 Switchberry — most of the indoor unit already exists
+
+[TAP's Switchberry](https://github.com/Time-Appliances-Project/Switchberry) is
+a CM4-controlled 5-port managed switch built around a **Microchip KSZ9567**
+switch and a **Renesas 8A34004 ClockMatrix DPLL**.  Asked narrowly — "could
+that switch chip be a component of the indoor unit?" — the answer is yes, but
+it undersells it: the board addresses four separate findings above at once.
+
+| finding | Switchberry's answer |
+|---|---|
+| §3.3 i226 wedge | no i226 in the data path at all |
+| §3.4 multi-PHC | KSZ9567 is **one** switch with one PTP clock domain across 5 ports |
+| §3.5 no SyncE | **SyncE recovery from the switch into the DPLL**, as endpoint or boundary clock |
+| §6 software forwarding | hardware forwarding at line rate; hardware TC available |
+
+And the DPLL is the **same ClockMatrix family we already drive** on otcBob1 and
+ptBoat — the register map, the combo bus, FCW steering at sub-ppt resolution
+(`timebeat-otc-register-map.md`, `clockmatrix-bootstrap-plan.md`) all transfer.
+Additional useful I/O: an OCP M.2 GNSS slot, 4× muxed rear SMA, and CM4↔DPLL
+PPS routing explicitly wired for both grandmaster and client roles.
+
+**The deepest benefit is one the feature list does not state.**  On a NIC-based
+indoor unit, frequency steering happens through `adjfine()` on a Linux PHC —
+which is precisely the trigger for §3.3's wedge.  On Switchberry, steering
+happens **in the DPLL, in hardware**.  The architecture removes the trigger
+rather than patching around it.
+
+Two caveats, both real:
+
+1. **The ClockMatrix's reference is a local TCXO.**  Holdover is exactly the
+   indoor unit's reason for existing, and a TCXO is the wrong flywheel for it
+   (`two-site-sync-budget.md` §6.1 classes TCXO as inadequate).  Fix: bring a
+   good OCXO in as a DPLL input reference over one of the muxed SMAs, so the
+   DPLL locks frequency to the OCXO and phase to GNSS/PTP — the two-tier
+   pattern already explored in `clockmatrix-bootstrap-plan.md`.  This is the
+   one modification the design actually requires.
+2. **Its default mode is a hardware transparent clock, which is wrong for us.**
+   A TC forwards PTP and preserves the end-to-end GM relationship, so
+   downstream slaves would see the ears directly and run BMCA over them — the
+   exact failure §4 exists to remove.  The indoor unit must **terminate** each
+   ear's PTP and re-originate, which is the optional Linux DSA / boundary-clock
+   mode, not the plug-and-play default.  Line-rate hardware forwarding remains
+   available for non-PTP traffic.
+
+Worth noting for §6: hardware TC is available here, so the "build a BC, never a
+TC" rule was a consequence of *software* forwarding, not a universal one.  We
+still want a BC — but for the selection-architecture reason in §4, not because
+the hardware can't do TC.
 
 ---
 
