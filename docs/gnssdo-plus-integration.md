@@ -691,3 +691,56 @@ DO edge (flip-flop metastability) — plus the scope test that resolves them, ar
 written up in [`gnssdo-plus-pps-alignment.md`](gnssdo-plus-pps-alignment.md).
 The disciplined grade run's chA cycle-slip rate is an in-situ check of the
 boundary-step concern.
+
+## mosaic-T firmware 4.15.x — read before upgrading (reviewed 2026-08-25)
+
+The SXT-D ships mosaic-T firmware **4.14.4** (2023-11-30).  v4.15.3 is
+available.  **Do not take it casually** — 4.15.0 changes the IP authorization
+default in a way that can lock you out of a receiver that has no user accounts,
+which is the state ours is in.
+
+**The lockout.**  4.15.0 release notes §2.3.3: *"On all web, file transfer and
+IP interfaces users will by default be required to log in."*  The relevant knob
+is `setDefaultAccessLevel, Web, FileTransfer, Ip, Com, Usb`.  On our receiver
+today:
+
+    DefaultAccessLevel, User, Viewer, User, User, User    <- Ip = User
+    UserAccessLevel, User1..User8, "", "", User, ""       <- ALL EMPTY
+
+Anonymous IP has full control, which is how all our scripting works — and there
+are **no credentials defined at all**.  Critically, that `Ip=User` is 4.14.4's
+*default*, not an explicit config line: `lstConfigFile,Current` lists only
+setDataInOut / setSBFGroups / setSBFOutput.  So after upgrading we would inherit
+4.15's *new* restrictive default with no account to log in with, and IP control
+would be gone.  Recovery would be front-panel USB (Usb level is separate) or the
+new factory-default-restore mechanism, which discards the config.
+
+**Blast radius if that happens.**  Two things that reach the receiver over IP:
+- The Onocoy transcode reads SBF from `IPS2:28800`.  `str2str` cannot log in.
+  The notes do not say whether a pure data-output IPS connection still works
+  under `Ip=none`.
+- Our `$W` OCXO actuator path is TCP -> mosaic `IPS1` -> `COM3` -> ESP32.
+  SparkPNT built their ESP32 firmware against 4.14.x and ours is a patch on top
+  of that; worth asking them before jumping.
+
+**It also downgrades the antenna database.**  Release notes §6: the 4.15.3
+package bundles **AntInfo 25.2.0**.  We deliberately installed **26.1.0** on
+2026-08-25 to get `SFESPK6618H NONE`.  Upgrading would roll that back and
+require re-installing 26.1.0 and re-verifying with
+`lstAntennaInfo, "SFESPK6618H NONE"`.
+
+**And the upside is small.**  §2.1 "New features in version 4.15.3: **None**."
+§2.2 is a Fugro SPEL 8.46 library bump (only relevant with AtomiChron).  From
+4.15.0 the only items that touch us are a cycle-slip fix when using non-default
+tracking loop parameters, and QZSS J08-J10 (irrelevant at this latitude).  The
+rest is the security hardening that creates the risk.
+
+**If/when you do upgrade, prepare first:**
+
+1. `setUserAccessLevel, User1, <name>, <pass>, User` -> save to boot, so a
+   credential exists to log in with afterwards.
+2. `setDefaultAccessLevel, User, Viewer, User, User, User` -> save to boot, so
+   it is an explicit line rather than an inherited default.
+3. Have `antinfo-26.1.0-mosaic-T.suf` on hand to re-install immediately after.
+4. Obtain the 4.14.4 `.suf` for rollback — we do not have one.
+5. Have physical/USB access to the box while doing it.
