@@ -426,3 +426,41 @@ taking `<PREFIX>_CRED` for the mountpoint slot and `<PREFIX>_PASS` for the
 password.  Both live in `~/opt/ntrip-relay/relay.env` (0600) — never the repo,
 since onocoy states the mountpoint is not public and the credential obviously
 is not.
+
+### Which streams may be contributed to Onocoy — and which must never be
+
+Asked 2026-08-26, worth writing down because gt now carries four RTCM streams
+and only one of them is ours.  `str2str` will happily transcode any of them, so
+the guard has to be a rule, not a technical limit.
+
+| Instance | Content | Contributable? |
+|---|---|---|
+| `@ssr` | SSR corrections (SSRA03IGS0) | **No** — corrections, not observations.  Not a reference station in any sense. |
+| `@obs` | PTBB00DEU0 observations | **NEVER** — this is **PTB's** station, pulled under our BKG account for the known-good-obs diagnostic. |
+| `@eph` | BRUX00BEL0 observations | **NEVER** — **ORB/EUREF's** station, same reasoning. |
+| `@onocoy` | our SXT-D on UFO1 | Yes — already contributing. |
+
+Re-contributing `@obs` or `@eph` would be passing third-party reference stations
+off as our own to a network that rewards contributions.  It breaches BKG's terms
+and Onocoy's, and it would corrupt a network other people use for RTK.  The fact
+that the transcode is one flag away (`#ubx` / `#sbf` in, RTCM3 out) is exactly
+why the rule needs to be explicit.
+
+**Our other lab receivers are also not candidates**, for a quieter reason: they
+are on the *same antenna*.  `piface` and `clkpoc3` both carry
+`arp_label = "ufo1"`, fed from the UFO1 GUS splitter — the identical RF the
+SXT-D already contributes.  And the only other antenna we own in Wheaton,
+CHOKE1, is **0.98 m** from UFO1 (computed from `antennas.json`).  Onocoy's
+validation and reward model is about spatial coverage; stations a metre apart
+carry no independent information and would read as gaming the network.
+
+Two further practical blockers, for completeness: the engine owns the receiver's
+serial port (a second reader needs a TCP bridge, as `peppar-bnc-glue`'s
+`f9t_broadcaster.py` did on ptpmon), and lab hosts get restarted and re-cabled
+constantly, which is the opposite of the rigid, stable mount a reference station
+is supposed to be.
+
+**When this WOULD make sense:** a receiver on its own antenna at a genuinely
+different site.  Then it is a copy of `instances/onocoy.env` with `#ubx` instead
+of `#sbf` and its own credential — the template makes that a new env file and
+nothing else.
