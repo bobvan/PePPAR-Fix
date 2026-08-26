@@ -195,3 +195,65 @@ comparison corpus, including the US labs.
 which may be decimated, filtered, or from a different antenna than the one
 feeding their timing systems. A national lab's IGS station is not necessarily the
 chain their UTC(k) rides on.
+
+## The panel, measured — and a correction to the single-anchor result above
+
+2026-08-26. `IENG00ITA0` (INRIM Torino) and `SPT000SWE0` (RISE Borås) were
+captured live for ~15 min and run through `scripts/obs_quality.py` alongside
+PTBB and our own station, all on a **matched ~15 min window** with the **same
+mask** (`--signals l1`: GPS-L1CA + GAL-E1C only).
+
+| Station | Site | MP all | MP 44–50 | MP ≥50 | phase |
+|---|---|---|---|---|---|
+| **UFO1 / SXT-D** (ours) | Wheaton IL, 41.8 °N | 0.443 m | 0.248 m | 0.171 m | 0.55 mm = 1.83 ps |
+| **PTBB** / PTB | Braunschweig DE, 52.3 °N | 0.344 m | 0.242 m | n/a | **0.40 mm = 1.33 ps** |
+| **SPT0** / RISE | Borås SE, 57.7 °N | 0.256 m | 0.140 m | 0.081 m | 0.51 mm |
+| **IENG** / INRIM | Torino IT, 45.0 °N | **0.164 m** | **0.090 m** | 0.075 m | 0.54 mm |
+
+onocoy's 0.99 bars for reference: code ≤ 0.140 m, phase ≤ 1.40 mm (4.67 ps).
+
+### The panel was necessary, and the single anchor was misleading
+
+There is a **2.7× spread among the national-lab stations themselves**
+(0.164 → 0.443 m). PTBB, which the section above used as *the* top-of-scale
+anchor, turns out to be the **worst of the three labs** on code multipath and
+only 1.3× better than our rooftop. INRIM is 2.7× better than us and 2.1× better
+than PTBB.
+
+Had we anchored the scale on PTBB alone we would have concluded our station was
+close to national-lab quality. Against the panel, it is not: on code we are last
+by a clear margin. **One anchor sets a point; a panel sets a scale.** This is the
+argument from `testAnt` `docs/future-work-signal-quality.md` §4b, now with the
+evidence that motivated it.
+
+### Correction: the phase gap was overstated
+
+The section above reported PTBB's phase noise as 0.62 mm against our 1.00 mm —
+a 1.6× gap. **Those were unmatched windows** (1 h vs 2.4 h). On matched 15 min
+windows the same two stations read **0.40 mm vs 0.55 mm — 1.38×**.
+
+The metric is **duration-sensitive**, materially so for phase: PTBB alone reads
+0.40 mm over 15 min and 0.62 mm over an hour. So *window length is itself a mask
+that has to be published*, alongside the elevation/C/N0 cut and the signal set.
+Three masks, not one, and each of them moves the answer.
+
+### What the panel actually says about us
+
+- **Code: we are last, by 2.7× against the best.** Not marginal, and not
+  explained by latitude — the ordering (IENG 45.0 °N best, SPT0 57.7 °N, PTBB
+  52.3 °N, UFO1 41.8 °N worst) has no geographic pattern. It is siting and
+  installation quality.
+- **Phase: we are last but only by 1.38×**, and **all four stations sit
+  comfortably inside onocoy's phase bar**. On the metric that predicts
+  carrier-phase timing, a rooftop station with a non-choke-ring antenna is
+  within ~40 % of national metrology institutes.
+
+That asymmetry is the useful result. It says the rooftop environment costs us a
+lot of *code* quality and comparatively little *phase* quality — which is
+precisely the split that makes onocoy's failing grade tolerable for a timing
+mission, and precisely what a choke ring would be bought to fix if the goal were
+RTK.
+
+**Caveat carried forward:** ~15 min is a short window and these are single
+captures. Treat the ordering as indicative, not settled — the numbers move by
+~10 % on code and ~50 % on phase between a 15 min and a 1 h window.
