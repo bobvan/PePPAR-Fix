@@ -313,6 +313,18 @@ ptBoat — the register map, the combo bus, FCW steering at sub-ppt resolution
 Additional useful I/O: an OCP M.2 GNSS slot, 4× muxed rear SMA, and CM4↔DPLL
 PPS routing explicitly wired for both grandmaster and client roles.
 
+**Port map** (from `Software/kernel/ksz9567-overlay.dts`): the KSZ9567 is a
+seven-port device.  `port@0..4` = `lan1`–`lan5`, phy-mode `internal` — the five
+front-panel RJ45.  `port@5` (reg 6) = `lan6-sfp`, unused.  `port@6` (**reg 5**)
+= `cpu`, rgmii-txid — the CM4, reached via its own KSZ9031 PHY.  **The CM4 does
+not consume a front-panel port**; all five stay available for ears.
+
+That the overlay is a **DSA** overlay is the other half of the answer: under DSA
+each front-panel port is a real Linux netdev, PTP frames are punted to the CPU
+port, and the `ksz9477` DSA driver provides per-port hardware timestamping
+against the switch's **single** PTP clock.  So the intercept-and-terminate mode
+§3.7's caveat 2 requires is a shipped configuration, not a research project.
+
 **The deepest benefit is one the feature list does not state.**  On a NIC-based
 indoor unit, frequency steering happens through `adjfine()` on a Linux PHC —
 which is precisely the trigger for §3.3's wedge.  On Switchberry, steering
