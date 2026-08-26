@@ -563,3 +563,33 @@ therefore not just a grade — it is an **independently computed carrier-phase
 noise figure for the UFO1/SXT-D chain, in units we can convert straight to
 picoseconds and compare against the timing budget.**  That is a better deal than
 "third-party consistency check" implied.
+
+### GEODNET, and the design trade-off it exposes — checked 2026-08-26
+
+The other large DePIN GNSS network. **We cannot contribute to it with the
+hardware we have**: their docs are explicit that *"in order to mine GEOD tokens,
+users must obtain a Base Station first from a certified vendor"*, and miner
+designs must be *"certificated and secured specifically for use on GEODNET"*.
+There is no bring-your-own-receiver path; a certified unit from an approved
+vendor is mandatory.
+
+That is worth recording not as a disappointment but as the **architectural
+answer to the replay question** analysed above:
+
+| | onocoy | GEODNET |
+|---|---|---|
+| who may contribute | any receiver emitting RTCM3 | certified hardware only |
+| joining with kit you own | yes — we did | no |
+| replay / misattribution | published defences do not address it | closed at the root by attestation |
+
+**Openness and verifiability trade directly against each other here.** onocoy's
+openness is why our own mosaic-T could join in an afternoon, and is also why a
+relayed stream would pass its quality checks. GEODNET's certification closes
+that gap by making the *hardware* the unit of trust rather than the data — at
+the cost of excluding every receiver its vendors did not sell.
+
+**Not worth pursuing for our purposes.** The value we take from onocoy is an
+independent grade on *our own* chain. A GEODNET miner would grade *their*
+hardware on our roof, which answers a question we are not asking — and we now
+measure the same quantities ourselves, absolutely and against a seven-lab
+reference band, with `obs_quality.py`.
