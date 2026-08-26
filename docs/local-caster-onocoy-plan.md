@@ -593,3 +593,43 @@ independent grade on *our own* chain. A GEODNET miner would grade *their*
 hardware on our roof, which answers a question we are not asking — and we now
 measure the same quantities ourselves, absolutely and against a seven-lab
 reference band, with `obs_quality.py`.
+
+### Survey of onocoy alternatives — 2026-08-26
+
+Evaluated against *our* criterion, which is **an independent grade on the chain
+we own**, not rewards.
+
+| Network | Bring-your-own receiver? | RTCM set | Grades your signal? |
+|---|---|---|---|
+| **onocoy** | **yes** — NTRIP push, any receiver | 1006/1033/1077/1087/1097/1107/1117/1127/1137/1230 | **yes** — 4 published metrics, thresholds, and a public API |
+| **GEODNET** | **no** — certified vendor hardware only | — | n/a to us |
+| **RTKDirect** | yes — NTRIP push | *identical set to onocoy* | **undocumented** |
+| **FrysCrypto** | yes, via virtual serial | unspecified | undocumented |
+
+**RTKDirect is the only genuine candidate**, and adding it would be nearly free:
+it wants the *same* RTCM message set we already emit, so it is one more
+`-out ntrips://…` on the existing `@onocoy` instance — str2str takes multiple
+outputs, which is how the local mount and the disk log already coexist. But it
+is only worth doing **if it grades signal quality and exposes that to the
+operator**, which is not documented anywhere we can find. Worth one email before
+any work.
+
+**FrysCrypto**: skip. Even enthusiast write-ups say not to bother.
+
+**The better judges are not crypto networks at all.** IGS, EUREF and NGS CORS
+run rigorous continuous QC and publish it — that is the gold standard. What
+excludes us is siting: a suburban first-storey roof with a second-storey wall
+3-4 m away (see `bobvan/testAnt` `docs/future-work-signal-quality.md` §0c and
+§4f) does not meet their monumentation and horizon standards, and should not.
+
+**And we have now built a better judge for our own purpose than any of them
+provide.** `obs_quality.py` measures the same physics on demand, absolutely,
+with the ionosphere cancelled and every mask declared, against a seven-lab
+reference band — where onocoy gives one daily score with undocumented masks.
+The marginal value of a *second* reward network is low; the marginal value of
+another day of our own measurement is high.
+
+**If we ever do multi-home**, note that pushing identical observations to two
+networks makes the station look, to each of them, like the replay case analysed
+above. We would be the legitimate operator on both, so there is no dishonesty —
+but it is worth declaring rather than discovering.
