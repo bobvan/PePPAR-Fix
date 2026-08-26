@@ -199,7 +199,8 @@ chain their UTC(k) rides on.
 ## The panel, measured — and a correction to the single-anchor result above
 
 2026-08-26. `IENG00ITA0` (INRIM Torino) and `SPT000SWE0` (RISE Borås) were
-captured live for ~15 min and run through `scripts/obs_quality.py` alongside
+captured live for ~15 min and run through `obs_quality.py` (which lives in
+`bobvan/testAnt`, `scripts/obs_quality.py`) alongside
 PTBB and our own station, all on a **matched ~15 min window** with the **same
 mask** (`--signals l1`: GPS-L1CA + GAL-E1C only).
 
