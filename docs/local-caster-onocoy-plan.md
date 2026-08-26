@@ -516,3 +516,50 @@ cannot detect replay."
 independent quality check on *our own* stream, and we know our stream is
 genuinely ours.  The threat model affects how much one should trust onocoy's
 *network-wide* station list, not their assessment of a station you control.
+
+#### The reward formula makes the replay point sharper — and hands us a yardstick
+
+The quality-scale page gives the actual formula:
+
+    signal quality = (RMSCode^2 + RMSPhase^2 + CycleSlipRatio^2 + SkyVisibility^2) / 4
+    Quality Scale  = constellation reward * band reward * signal quality reward
+
+**Every factor is a property of the signal.**  Constellations tracked, bands
+tracked, and the four signal metrics — a relayed stream reproduces all of them
+*exactly*, because it is the same bytes.  There is no term in the reward formula
+that a relay could degrade.  Note especially that **latency is not in the
+quality score at all**, even though `latency_avg/min/max` are collected and
+exposed in the API.  The one relay-sensitive quantity they measure does not
+appear to be priced.
+
+That also makes the incentive perverse in a specific way: rewards scale with
+quality and with spatial sparsity, so the most profitable stream to relay is a
+*high-quality station in a poorly-covered region* — exactly where genuine
+contribution is most valuable.
+
+**The economics are still bounded**, which is the honest counterweight: the
+0.99-score thresholds are geodetic-grade (see below), and stations that clean
+generally sit on authenticated casters (IGS / EUREF / BKG all require
+registration).  The casters that are genuinely open tend to carry hobbyist
+stations whose scores are lower, so the attack pays least where it is easiest.
+
+#### Their thresholds in our units
+
+Worth recording because it connects onocoy's grading to our own error budget:
+
+| onocoy threshold (0.99 score) | in time |
+|---|---|
+| RMS phase <= 0.0014 m | **4.67 ps** |
+| RMS code <= 0.14 m | **467 ps** |
+| cycle slips < 1 in 2300 | — |
+| sky visibility > 99% | — |
+
+For comparison, `two-site-sync-budget.md` puts TD-CP per-epoch precision at
+~5-10 ps and the per-clock budget at <=350 ps RMS.  So onocoy's top-tier
+carrier-phase bar sits right at our own carrier-phase measurement precision.
+
+Once the station is validated, `phase_rms_avg` from `onocoy-status.py` is
+therefore not just a grade — it is an **independently computed carrier-phase
+noise figure for the UFO1/SXT-D chain, in units we can convert straight to
+picoseconds and compare against the timing budget.**  That is a better deal than
+"third-party consistency check" implied.
