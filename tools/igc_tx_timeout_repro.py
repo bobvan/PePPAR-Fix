@@ -148,8 +148,10 @@ class ExttsCounter:
     measuring at all, so a run that asks for EXTTS must SEE events before the
     arm starts, or abort.
     """
-    PTP_EXTTS_REQUEST2 = 0x40103d0b
+    PTP_EXTTS_REQUEST = 0x40103d02          # v1: flags unvalidated
+    PTP_EXTTS_REQUEST2 = 0x40103d0b         # v2: validates flags strictly
     PTP_ENABLE_FEATURE = 1 << 0
+    PTP_RISING_EDGE = 1 << 1
     # struct ptp_extts_event: ptp_clock_time{s64 sec; u32 nsec; u32 rsv}
     # + u32 index + u32 flags + u32 rsv[2]  =  16 + 4 + 4 + 8 = 32 bytes.
     EVENT_SIZE = 32
@@ -173,20 +175,39 @@ class ExttsCounter:
             return False
 
     def enable(self):
+        """Enable the channel, preferring the validating v2 ioctl.
+
+        v2 rejects PTP_ENABLE_FEATURE unless an edge bit is also set (EINVAL),
+        so ask for rising edges explicitly.  v1 does not validate flags and is
+        the fallback for kernels/drivers without v2.
+        """
         import fcntl
         self.route_pin()
-        req = struct.pack("iiii", self.index, self.PTP_ENABLE_FEATURE, 0, 0)
-        try:
-            fcntl.ioctl(self.fd, self.PTP_EXTTS_REQUEST2, req)
-            self.ok = True
-        except OSError as e:
-            print(f"  EXTTS channel {self.index} not enabled ({e.strerror})")
-        return self.ok
+        attempts = (
+            ("PTP_EXTTS_REQUEST2", self.PTP_EXTTS_REQUEST2,
+             self.PTP_ENABLE_FEATURE | self.PTP_RISING_EDGE),
+            ("PTP_EXTTS_REQUEST", self.PTP_EXTTS_REQUEST,
+             self.PTP_ENABLE_FEATURE),
+        )
+        for name, nr, flags in attempts:
+            req = struct.pack("IIII", self.index, flags, 0, 0)
+            try:
+                fcntl.ioctl(self.fd, nr, req)
+                self.ok = True
+                self.via = name
+                return True
+            except OSError as e:
+                last = f"{name}: {e.strerror}"
+        print(f"  EXTTS channel {self.index} not enabled ({last})")
+        return False
 
     def preflight(self, need=2, timeout_s=5.0):
         """Refuse to run unless real edges are arriving on the pin."""
         if not self.ok:
-            return False
+            sys.exit(f"FATAL: --extts-index {self.index} was requested but the "
+                     f"channel could not be enabled.  Refusing to run: a "
+                     f"disabled channel reports zero events, which is "
+                     f"indistinguishable from 'EXTTS died'.")
         t0, seen = time.monotonic(), 0
         while time.monotonic() - t0 < timeout_s and seen < need:
             time.sleep(0.25)
