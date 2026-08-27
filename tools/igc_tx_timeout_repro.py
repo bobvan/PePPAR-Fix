@@ -137,27 +137,70 @@ def burst_report(times, gap=1.0):
 class ExttsCounter:
     """Count EXTTS events on one channel, to time EXTTS death vs first timeout.
 
-    Needs an actual signal on the pin.  With no PPS source wired to the NIC
-    there is nothing to count and this stays disabled -- the column is then
-    empty rather than a misleading zero.
+    On TimeHAT-class boards the PPS INPUT is **SDP1**, not SDP0 -- SDP0 is the
+    PEROUT *output*.  Tools that default to pin 0 watch the output pin and see
+    no edges (cost an afternoon on MadHat 2026-05-22).  Hence --extts-pin,
+    defaulting to 1, and the pre-flight below.
+
+    THE PRE-FLIGHT IS THE POINT.  An unrouted pin and a dead EXTTS look
+    identical from here -- both are zero events.  Reporting "EXTTS died at
+    t=0" when the pin was simply never routed would be worse than not
+    measuring at all, so a run that asks for EXTTS must SEE events before the
+    arm starts, or abort.
     """
     PTP_EXTTS_REQUEST2 = 0x40103d0b
     PTP_ENABLE_FEATURE = 1 << 0
+    # struct ptp_extts_event: ptp_clock_time{s64 sec; u32 nsec; u32 rsv}
+    # + u32 index + u32 flags + u32 rsv[2]  =  16 + 4 + 4 + 8 = 32 bytes.
+    EVENT_SIZE = 32
 
-    def __init__(self, phc_fd, index):
-        self.fd, self.index, self.count, self.ok = phc_fd, index, 0, False
+    def __init__(self, phc_fd, ptp_dev, index, pin):
+        self.fd, self.index, self.pin = phc_fd, index, pin
+        self.count, self.ok = 0, False
+        self.ptp_name = os.path.basename(os.path.realpath(ptp_dev))
+
+    def route_pin(self):
+        """Point the SDP pin at this EXTTS channel (func 1 = PTP_PF_EXTTS)."""
+        if self.pin is None:
+            return True
+        path = f"/sys/class/ptp/{self.ptp_name}/pins/SDP{self.pin}"
+        try:
+            with open(path, "w") as f:
+                f.write(f"1 {self.index}")
+            return True
+        except OSError as e:
+            print(f"  could not route SDP{self.pin} -> EXTTS ch{self.index}: {e}")
+            return False
 
     def enable(self):
         import fcntl
-        # struct ptp_extts_request { int index; unsigned int flags; int rsv[2]; }
+        self.route_pin()
         req = struct.pack("iiii", self.index, self.PTP_ENABLE_FEATURE, 0, 0)
         try:
             fcntl.ioctl(self.fd, self.PTP_EXTTS_REQUEST2, req)
             self.ok = True
         except OSError as e:
-            print(f"  EXTTS channel {self.index} not enabled ({e.strerror}); "
-                  f"liveness column will be empty")
+            print(f"  EXTTS channel {self.index} not enabled ({e.strerror})")
         return self.ok
+
+    def preflight(self, need=2, timeout_s=5.0):
+        """Refuse to run unless real edges are arriving on the pin."""
+        if not self.ok:
+            return False
+        t0, seen = time.monotonic(), 0
+        while time.monotonic() - t0 < timeout_s and seen < need:
+            time.sleep(0.25)
+            seen += self.drain() or 0
+        self.count = 0                       # don't bill pre-flight to the run
+        if seen < need:
+            sys.exit(f"FATAL: asked for EXTTS on SDP{self.pin}/ch{self.index} "
+                     f"but saw {seen} edges in {timeout_s:g}s.  An UNROUTED pin "
+                     f"and a DEAD EXTTS look identical from here — refusing to "
+                     f"run rather than report a misleading 'EXTTS died at t=0'. "
+                     f"Check the PPS source and that SDP{self.pin} is the INPUT "
+                     f"pin on this board (SDP0 is PPS OUT on TimeHAT).")
+        print(f"  EXTTS pre-flight OK: {seen} edges on SDP{self.pin}/ch{self.index}")
+        return True
 
     def drain(self):
         """Non-blocking read of pending events; returns count seen."""
@@ -166,14 +209,12 @@ class ExttsCounter:
         n = 0
         while True:
             try:
-                data = os.read(self.fd, 16)   # sizeof(struct ptp_extts_event)
-            except BlockingIOError:
-                break
-            except OSError:
+                data = os.read(self.fd, self.EVENT_SIZE)
+            except (BlockingIOError, OSError):
                 break
             if not data:
                 break
-            n += 1
+            n += len(data) // self.EVENT_SIZE
         self.count += n
         return n
 
@@ -286,7 +327,11 @@ def main():
     ap.add_argument("--expect-srcversion", metavar="HEX",
                     help="abort unless the loaded igc matches this srcversion")
     ap.add_argument("--extts-index", type=int, metavar="N",
-                    help="enable EXTTS channel N and count events per second")
+                    help="enable EXTTS channel N and count events per second; "
+                         "aborts unless real edges arrive (see --extts-pin)")
+    ap.add_argument("--extts-pin", type=int, default=1, metavar="N",
+                    help="SDP pin carrying PPS IN (default 1 — SDP0 is PPS OUT "
+                         "on TimeHAT boards, watching it sees nothing)")
     ap.add_argument("--label", default="", help="arm label, recorded in the CSV")
     args = ap.parse_args()
 
@@ -306,8 +351,9 @@ def main():
     phc_fd = os.open(args.ptp, os.O_RDWR | os.O_NONBLOCK)
     extts = None
     if args.extts_index is not None:
-        extts = ExttsCounter(phc_fd, args.extts_index)
+        extts = ExttsCounter(phc_fd, args.ptp, args.extts_index, args.extts_pin)
         extts.enable()
+        extts.preflight()
 
     base = read_counters(args.iface)
     if "tx_hwtstamp_timeouts" not in base:
