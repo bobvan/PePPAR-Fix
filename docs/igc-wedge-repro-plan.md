@@ -203,6 +203,52 @@ verified by `srcversion` after load.  Do not identify an arm's driver by
 package name, DKMS state, or "what was installed last" — that is the failure
 mode §2a exists to close.
 
+### Arm E — EXTTS liveness vs TX rate
+
+Added 2026-08-26 (Bob's approval) after arm A produced a result §4 did not
+anticipate: **EXTTS died ~14 s BEFORE the first TX timeout**, not with it and
+not after.  §4 offered only "same instant" or "later"; the answer was
+"earlier", so EXTTS death cannot be a downstream consequence of the timeout
+cascade.  Both look downstream of TX-timestamp load itself.
+
+But arm A ran TX **unthrottled** (`tx_hwtstamp_skipped` reached 8.7 million),
+which is nothing like production.  The claim that survives is narrow:
+*saturating* TX timestamping kills EXTTS within ~2 s.  Whether **1 Hz ptp4l**
+does the same is the question the lab actually cares about, and it cannot be
+inferred from one saturated data point.
+
+| arm | adjfine | TX rate | driver | duration |
+|---|---|---|---|---|
+| E1 | off | 1 Hz | patched | 20 min |
+| E2 | off | 5 Hz | patched | 15 min |
+| E3 | off | 20 Hz | patched | 15 min |
+| E4 | off | 100 Hz | patched | 10 min |
+| E5 | off | 1000 Hz | patched | 10 min |
+| E6 | off | unthrottled | patched | 10 min |
+
+adjfine is **off throughout** so TX rate is the only variable.  For each rate
+record: does EXTTS stop, how long after TX starts, and does the first TX
+timeout precede or follow it.  A rate at which EXTTS survives indefinitely is
+an operational answer on its own — it bounds how hard a host may drive TX
+timestamping before losing PPS capture.
+
+Requires a PPS source on the DUT's EXTTS pin.  Wired 2026-08-26: PiFace PPS
+OUT → TimeHat PPS IN (SDP1), verified at exactly 1 Hz.  The `--extts-index`
+pre-flight refuses to run without live edges, because an unrouted pin and a
+dead EXTTS are indistinguishable from zero events and reporting the latter
+would manufacture the very correlation being tested.
+
+### Running the arms unattended
+
+`tools/igc_arm_campaign.sh` runs the whole set back-to-back.  **Every arm
+begins with a fresh `insmod` of its named binary by absolute path** — never
+`modprobe` — which implements §2a and additionally guarantees each arm starts
+from an identical un-wedged state, so no arm can contaminate the next.  It
+asserts `srcversion` after every load, re-routes the EXTTS pin (routing does
+not survive a reload), re-resolves the PHC index (it can change across a
+reload — never hardcode `/dev/ptp0`), refuses to start if the management
+interface is on igc, and restores the patched driver on exit.
+
 **Run arm A first.  It is decisive.**
 
 - If A wedges → adjfine is exonerated, H1 and H2 both die, Patch 2 is orthogonal
