@@ -48,6 +48,7 @@ import errno
 import hashlib
 import os
 import re
+import select
 import socket
 import struct
 import subprocess
@@ -224,11 +225,21 @@ class ExttsCounter:
         return True
 
     def drain(self):
-        """Non-blocking read of pending events; returns count seen."""
+        """Read pending events without blocking; returns count seen.
+
+        Gate every read on select() rather than trusting O_NONBLOCK.  The PTP
+        chardev does NOT honour it here: with the channel enabled and the
+        queue empty, os.read() slept in the kernel's ptp_read() (observed on
+        TimeHat, kernel 6.12.75, wchan=ptp_read syscall=63) instead of raising
+        EWOULDBLOCK.  A blocking read here would hang an entire arm.
+        """
         if not self.ok:
             return None
         n = 0
         while True:
+            r, _, _ = select.select([self.fd], [], [], 0)
+            if not r:
+                break
             try:
                 data = os.read(self.fd, self.EVENT_SIZE)
             except (BlockingIOError, OSError):
