@@ -56,6 +56,7 @@ import threading
 import time
 
 ETHTOOL = "/usr/sbin/ethtool"
+DMESG_RE = re.compile(r"^\[\s*(\d+\.\d+)\] .*Tx timestamp timeout", re.M)
 # Counters we sample once per second.  tx_hwtstamp_timeouts is the one the
 # whole method rests on; the others are cheap context.
 COUNTERS = ("tx_hwtstamp_timeouts", "tx_hwtstamp_skipped", "rx_hwtstamp_cleared")
@@ -99,6 +100,36 @@ def read_counters(iface):
         if m:
             vals[name] = int(m.group(1))
     return vals
+
+
+def dmesg_timeout_times():
+    """Kernel timestamps (s, µs resolution) of every 'Tx timestamp timeout'.
+
+    This -- not the 1 Hz counter -- is the H1 discriminator.  The i226 has
+    four TX-timestamp slots and igc_ptp_tx_hang()'s rd32(IGC_TXSTMPH_0)
+    invalidates all of them at once, so orphaned slots time out together in
+    a burst microseconds wide.  Per-second counter deltas can only say "+4
+    this second"; the kernel timestamps show the burst directly.
+    """
+    try:
+        out = subprocess.run(["dmesg"], capture_output=True, text=True,
+                             timeout=10).stdout
+    except Exception:
+        return []
+    return [float(m) for m in DMESG_RE.findall(out)]
+
+
+def burst_report(times, gap=1.0):
+    """Group kernel-timestamped events into bursts split on gaps > `gap`."""
+    if not times:
+        return []
+    bursts = [[times[0]]]
+    for t in times[1:]:
+        if t - bursts[-1][-1] <= gap:
+            bursts[-1].append(t)
+        else:
+            bursts.append([t])
+    return bursts
 
 
 # ── EXTTS liveness ─────────────────────────────────────────────────────────
@@ -262,6 +293,14 @@ def main():
     if os.geteuid() != 0:
         sys.exit("ERROR: must run as root (sudo)")
 
+    # A killed run must not lose its output.  The first screening run died
+    # early and its block-buffered stdout was a 0-byte file, while the CSV
+    # (line-buffered) survived.  Don't repeat that.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass
+
     srcver = assert_driver(args.expect_srcversion)
 
     phc_fd = os.open(args.ptp, os.O_RDWR | os.O_NONBLOCK)
@@ -310,8 +349,10 @@ def main():
                   f"tx_hz={rate_str(args.tx_hz)}\n")
         csv.write(f"# started_unix={time.time():.3f}\n")
         csv.write("elapsed_s,unix_time,tx_hwtstamp_timeouts,tx_hwtstamp_skipped,"
-                  "rx_hwtstamp_cleared,d_timeouts,extts_events,driver_srcversion\n")
+                  "rx_hwtstamp_cleared,d_timeouts,extts_events,read_ok,"
+                  "driver_srcversion\n")
 
+    dmesg_base = (dmesg_timeout_times() or [0.0])[-1] + 1e-6
     t_start = time.monotonic()
     prev = base.get("tx_hwtstamp_timeouts", 0)
     first_timeout_at = None
@@ -325,6 +366,7 @@ def main():
             now = time.monotonic()
             el = now - t_start
             c = read_counters(args.iface)
+            read_ok = "tx_hwtstamp_timeouts" in c
             cur = c.get("tx_hwtstamp_timeouts", prev)
             d = cur - prev
             ev = extts.drain() if extts else None
@@ -346,7 +388,7 @@ def main():
                 csv.write(f"{el:.3f},{time.time():.3f},{cur},"
                           f"{c.get('tx_hwtstamp_skipped','')},"
                           f"{c.get('rx_hwtstamp_cleared','')},{d},"
-                          f"{'' if ev is None else ev},{srcver}\n")
+                          f"{'' if ev is None else ev},{int(read_ok)},{srcver}\n")
             prev = cur
             print(f"  {el:6.0f}s  timeouts={cur:<6d} d={d:<3d}"
                   f"{'' if ev is None else f'  extts={ev}'}", end="\r")
@@ -388,16 +430,39 @@ def main():
     # Inter-event structure is the H1 discriminator: orphaned-slot bursts
     # should arrive in clusters of up to 4 inside one 15 s window, not as
     # isolated singles.
-    gaps = [b - a for a, b in zip(event_times, event_times[1:])]
-    within15 = sum(1 for g in gaps if g <= 15.0)
-    print(f"\nfirst timeout at  : {first_timeout_at:.1f}s")
-    print(f"events            : {len(event_times)}")
-    if gaps:
-        print(f"inter-event gaps  : min={min(gaps):.1f}s "
-              f"median={sorted(gaps)[len(gaps)//2]:.1f}s max={max(gaps):.1f}s")
-        print(f"gaps <= 15 s      : {within15}/{len(gaps)}  "
-              f"({'clustered → supports H1' if within15 > len(gaps)/2 else 'spread → refutes H1'})")
-    if len(event_times) < 5:
+    print(f"\nfirst timeout at  : {first_timeout_at:.1f}s (run-relative)")
+
+    kt = [t for t in dmesg_timeout_times() if t >= dmesg_base]
+    if not kt:
+        print("no kernel-timestamped events found in dmesg — cannot judge H1 "
+              "from counters alone (1 Hz sampling cannot resolve a burst).")
+        sys.exit(1)
+
+    bursts = burst_report(kt)
+    sizes = [len(b) for b in bursts]
+    print(f"kernel events     : {len(kt)} in {len(bursts)} burst(s), "
+          f"sizes {sizes}")
+    for b in bursts:
+        span_us = (b[-1] - b[0]) * 1e6
+        print(f"  t={b[0]:.6f}  n={len(b)}  span={span_us:.0f} us")
+    if len(bursts) > 1:
+        inter = [b[0] - a[-1] for a, b in zip(bursts, bursts[1:])]
+        print(f"inter-burst gaps  : "
+              + ", ".join(f"{g:.2f}s" for g in inter))
+
+    # H1: four slots invalidated together -> bursts of up to 4, microseconds
+    # wide.  Isolated singles spread out would refute it.
+    clustered = sum(1 for n in sizes if n > 1)
+    if clustered and max(sizes) <= 4:
+        print(f"\nVERDICT: {clustered}/{len(bursts)} bursts have n>1, "
+              f"max n={max(sizes)} (<= 4 slots) -> SUPPORTS H1 "
+              f"(orphaned-slot invalidation)")
+    elif max(sizes) == 1:
+        print("\nVERDICT: all events isolated singles -> REFUTES H1")
+    else:
+        print(f"\nVERDICT: ambiguous — burst sizes {sizes}")
+
+    if len(kt) < 5:
         print("\nfewer than 5 events — report counts and window, NOT an MTBF.")
     sys.exit(1)
 
