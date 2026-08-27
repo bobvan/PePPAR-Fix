@@ -48,8 +48,20 @@ say "management=$mgmt ($mgmt_drv), DUT=$IFACE (igc) — safe to reload"
 
 # ── stage the two known binaries ───────────────────────────────────────────
 stage() {   # stage <src.xz> <name>  -> echoes the staged .ko path
-    local src="$1" name="$2" dst="$STAGE/$name.ko"
-    [ -f "$dst" ] || { xz -dc "$src" > "$dst" 2>/dev/null || return 1; }
+    # NOTE: separate `local` statements on purpose.  Bash expands the whole
+    # command line before performing any of the assignments, so writing
+    # `local src="$1" name="$2" dst="$STAGE/$name.ko"` expands $name while it
+    # is still EMPTY -- both binaries then stage to the same path and the arms
+    # become indistinguishable.  Caught by the srcversion guard below, but
+    # only after it had already happened.
+    local src="$1"
+    local name="$2"
+    local dst="$STAGE/$name.ko"
+    [ -n "$name" ] || { echo "stage: empty name" >&2; return 1; }
+    if [ ! -s "$dst" ]; then
+        xz -dc "$src" > "$dst" 2>/dev/null || return 1
+    fi
+    [ -s "$dst" ] || return 1
     echo "$dst"
 }
 PATCHED_KO=$(stage "$PATCHED_XZ" patched) || { say "ABORT: cannot stage patched"; exit 1; }
