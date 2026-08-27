@@ -69,12 +69,19 @@ def main():
     ap.add_argument("--days", type=int, default=7)
     a = ap.parse_args()
     user, pw = creds()
-    end = dt.date.today()
+    # UTC, not local: the API bins by UTC day, and west of Greenwich the local
+    # date lags it, so date.today() silently asks for the wrong window.
+    end = dt.datetime.now(dt.timezone.utc).date()
     start = end - dt.timedelta(days=a.days)
+    # end_date is EXCLUSIVE -- measured: start=08-26&end=08-26 returns [] while
+    # start=08-26&end=08-27 returns the 08-26 row.  Ask for tomorrow to include
+    # today.  This is not documented.
     rows = get("/my_stats/stations",
-               {"start_date": start.isoformat(), "end_date": end.isoformat()}, user, pw)
+               {"start_date": start.isoformat(),
+                "end_date": (end + dt.timedelta(days=1)).isoformat()}, user, pw)
     if not rows:
-        print(f"no statistics for {start} .. {end} (station may be too new)")
+        print(f"no statistics for {start} .. {end} UTC (station may be too new — "
+              f"onocoy publishes one row per COMPLETE UTC day)")
         return
     hdr = (f"{'date':11s} {'mount':14s} {'epochs/s':>9s} {'latency s':>10s} "
            f"{'code RMS':>9s} {'phase RMS':>10s} {'cs rate':>8s} {'sky':>6s} {'rewards':>9s}")

@@ -672,3 +672,54 @@ two would have been exactly the misnomer class `docs/misnomers.md` exists for.
 
 Live state: five instances, `@ufo1` showing `[CCCC-]` — SBF in, local mount
 served, `@rtkdirect` consuming it, onocoy push out.
+
+### First graded day, and two undocumented API semantics — 2026-08-27
+
+The API returned data as soon as one **complete UTC day** existed, which
+confirms the earlier guess about why it was empty. Two things about it are not
+documented anywhere and cost a false negative:
+
+- **`end_date` is EXCLUSIVE.** `start=08-26&end=08-26` returns `[]`;
+  `start=08-26&end=08-27` returns the 08-26 row. To include today you must ask
+  for tomorrow.
+- **Bins are UTC days.** `onocoy-status.py` used `date.today()`, which is
+  *local*; west of Greenwich the local date lags UTC and the tool silently
+  queried the wrong window. Both fixed.
+
+Also: **onocoy renamed our station `USAILLWHE1`.** The mountpoint we supplied is
+genuinely cosmetic — they assign their own canonical name (US / Illinois /
+Wheaton / 1).
+
+**2026-08-26, 21.26 h of uptime:**
+
+| metric | ours | 0.99 bar | |
+|---|---|---|---|
+| code RMS | 0.2458 m | 0.140 m | fail, 1.76x |
+| phase RMS | **0.00148 m** | 0.00140 m | **fail, 1.06x** |
+| cycle-slip rate | 0.00392 | 1/2300 = 0.00043 | fail, **9.0x** |
+| sky visibility | 0.858 | 0.99 | fail, 1.15x |
+| epoch rate | 0.999 | — | essentially perfect |
+| latency | **1.202 s** | their guidance <1 s | over |
+
+Four observations worth carrying:
+
+1. **Sky visibility 0.858 independently confirms the obstruction.** 14 % of the
+   expected sky is not seen. We located a reflector at bearing ~290 deg with a
+   top edge 40-50 deg up (`bobvan/testAnt` §4f); onocoy, knowing nothing about
+   the site, reports exactly the shortfall that implies. Two unrelated methods,
+   same conclusion.
+2. **Phase has slipped to a marginal fail** (1.48 mm vs the 1.40 mm bar), where
+   the console chart a day earlier showed ~1.2 mm. Our own measurement over the
+   same period gives **0.99-1.07 mm**, comfortably inside. The estimators differ
+   — theirs is undisclosed, ours is the 1 s geometry-free scatter — so this is
+   not a contradiction, but it does mean *we should not treat their phase figure
+   as authoritative for our own budget*. Ours is the better-characterised number.
+3. **Cycle slips are the worst metric by far — 9x over.** That has had no
+   attention and, unlike code multipath, it matters directly for timing: a slip
+   is a phase discontinuity. This is the metric to chase next, not code.
+4. **Latency 1.2 s exceeds their <1 s guidance**, consistently (min 1.195, max
+   1.222). Cheap to investigate and the only metric that is plausibly our
+   plumbing rather than our sky: mosaic -> SBF over TCP -> str2str transcode ->
+   push. Worth measuring where the second goes.
+
+`rewards` is 0, presumably because the day predates validation completing.
