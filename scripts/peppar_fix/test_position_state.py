@@ -4,15 +4,21 @@ import os
 import tempfile
 import unittest
 
+import numpy as np
+
 from peppar_fix.geo_frames import CANONICAL_REALIZATION, Frame
 from peppar_fix.position_state import (
     AntPosEstWatchdog,
+    MOVE_CONFIRM_FIXES,
+    MOVE_THRESHOLD_M,
     PositionState,
     PppStateWriter,
     WatchdogActor,
     _format_toml,
     bump_mount_sn,
     compute_horizontal_displacement,
+    confirm_move,
+    detect_move,
     decimal_year_from_iso,
     decimal_year_from_mjd,
     filter_current_mount,
@@ -1519,3 +1525,118 @@ class TestFrameThreading(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDetectMove(unittest.TestCase):
+    """bootstrapMoveDetection (I-171600): the gross-move gate must fire on a
+    cross-site move (ptBoat Chicago→London) and NOT on NAV2 bias / same-site
+    antenna swaps, and must fail safe on missing inputs."""
+
+    # Real ECEF: Chicago/Wheaton (ptBoat's stale .ppp.toml) and London
+    # (ufoLondon1, where it actually woke) — the exact 2026-07-06 case.
+    CHICAGO = np.array([157467.6958, -4756188.1762, 4232766.7829])
+    LONDON = np.array([3979316.0, -4257.0, 4966864.0])
+
+    def test_threshold_default(self):
+        self.assertEqual(MOVE_THRESHOLD_M, 100.0)
+
+    def test_same_position_not_moved(self):
+        moved, displ = detect_move(self.CHICAGO, self.CHICAGO)
+        self.assertFalse(moved)
+        self.assertAlmostEqual(displ, 0.0)
+
+    def test_nav2_bias_not_a_move(self):
+        # ~4 m offset (upper end of NAV2's receiver bias) must NOT trip.
+        moved, displ = detect_move(
+            self.CHICAGO, self.CHICAGO + np.array([3.0, 2.0, 1.5]))
+        self.assertFalse(moved)
+        self.assertLess(displ, MOVE_THRESHOLD_M)
+
+    def test_same_site_swap_not_a_move(self):
+        # 50 cm to a different mast on the same roof — the FixedPos absorbs it;
+        # not a move we reject.
+        moved, _ = detect_move(self.CHICAGO, self.CHICAGO + np.array([0.5, 0, 0]))
+        self.assertFalse(moved)
+
+    def test_cross_site_move_detected(self):
+        moved, displ = detect_move(self.CHICAGO, self.LONDON)
+        self.assertTrue(moved)
+        self.assertGreater(displ, 6_000_000)  # ~6142 km
+
+    def test_boundary(self):
+        # Just under vs just over the threshold.
+        near = self.CHICAGO + np.array([MOVE_THRESHOLD_M - 1.0, 0, 0])
+        far = self.CHICAGO + np.array([MOVE_THRESHOLD_M + 1.0, 0, 0])
+        self.assertFalse(detect_move(self.CHICAGO, near)[0])
+        self.assertTrue(detect_move(self.CHICAGO, far)[0])
+
+    def test_custom_threshold(self):
+        d = self.CHICAGO + np.array([50.0, 0, 0])
+        self.assertFalse(detect_move(self.CHICAGO, d, threshold_m=100.0)[0])
+        self.assertTrue(detect_move(self.CHICAGO, d, threshold_m=25.0)[0])
+
+    def test_missing_inputs_fail_safe(self):
+        # No live fix (or no seed) → never reject a good seed.
+        self.assertEqual(detect_move(self.CHICAGO, None), (False, None))
+        self.assertEqual(detect_move(None, self.LONDON), (False, None))
+
+    def test_accepts_list_and_tuple(self):
+        moved, displ = detect_move(list(self.CHICAGO), tuple(self.LONDON))
+        self.assertTrue(moved)
+        self.assertGreater(displ, 6_000_000)
+
+
+class TestConfirmMove(unittest.TestCase):
+    """confirm_move (BUG-2, main's #298 review): the DESTRUCTIVE move path must
+    require MEDIAN-over-N-fixes confirmation so a single borderline-geometry LS
+    outlier can't invalidate a good seed's history, and must report
+    'insufficient' (not a false 'not_moved') when the sky is too degraded to
+    collect enough fixes."""
+
+    def test_real_move_all_far(self):
+        # A real move: every LS fix shows ~6000 km → 'moved'.
+        seps = [6.14e6, 6.14e6, 6.13e6, 6.15e6, 6.14e6]
+        decision, med = confirm_move(seps)
+        self.assertEqual(decision, "moved")
+        self.assertGreater(med, 6_000_000)
+
+    def test_single_outlier_does_not_trip(self):
+        # Good seed, but one LS epoch threw a 500 m multipath/DOP outlier.
+        # Median stays low → 'not_moved' (does NOT destroy the seed).
+        seps = [3.0, 5.0, 500.0, 4.0, 6.0]
+        decision, med = confirm_move(seps)
+        self.assertEqual(decision, "not_moved")
+        self.assertLess(med, MOVE_THRESHOLD_M)
+
+    def test_good_seed_not_moved(self):
+        seps = [2.0, 4.0, 3.0, 5.0, 1.0]
+        self.assertEqual(confirm_move(seps)[0], "not_moved")
+
+    def test_insufficient_fixes(self):
+        # Fewer than MOVE_CONFIRM_FIXES valid fixes → 'insufficient' (defer to
+        # the runtime watchdog; never act destructively on thin evidence).
+        self.assertEqual(confirm_move([])[0], "insufficient")
+        self.assertEqual(confirm_move([6.14e6, 6.14e6])[0], "insufficient")
+        decision, med = confirm_move([6.14e6] * (MOVE_CONFIRM_FIXES - 1))
+        self.assertEqual(decision, "insufficient")
+        self.assertIsNone(med)
+
+    def test_majority_far_median_confirms(self):
+        # A real move where a couple fixes were noisy-low still confirms,
+        # because the MAJORITY (median) is far.
+        seps = [6.14e6, 6.14e6, 6.14e6, 50.0, 80.0]
+        self.assertEqual(confirm_move(seps)[0], "moved")
+
+    def test_drops_none_and_nan(self):
+        seps = [3.0, None, float("nan"), 5.0, 4.0, 2.0]  # 4 usable → enough
+        # Need >= MOVE_CONFIRM_FIXES usable; 4 usable here with default 5.
+        self.assertEqual(confirm_move(seps)[0], "insufficient")
+        seps2 = [3.0, None, 5.0, 4.0, 2.0, 6.0]  # 5 usable
+        self.assertEqual(confirm_move(seps2)[0], "not_moved")
+
+    def test_custom_threshold_and_min_fixes(self):
+        seps = [50.0, 60.0, 55.0]
+        self.assertEqual(confirm_move(seps, threshold_m=25.0, min_fixes=3)[0],
+                         "moved")
+        self.assertEqual(confirm_move(seps, threshold_m=100.0, min_fixes=3)[0],
+                         "not_moved")

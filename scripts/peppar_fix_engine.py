@@ -1106,6 +1106,11 @@ def apply_ptp_profile(args):
         args.ppp_arm_max_resid_m = profile.get("ppp_arm_max_resid_m", args.ppp_arm_max_resid_m)
     if args.ppp_arm_warmup_epochs == 3:
         args.ppp_arm_warmup_epochs = profile.get("ppp_arm_warmup_epochs", args.ppp_arm_warmup_epochs)
+    if args.bootstrap_move_threshold_m is None:
+        args.bootstrap_move_threshold_m = profile.get(
+            "bootstrap_move_threshold_m", args.bootstrap_move_threshold_m)
+    if not args.strict_arp:
+        args.strict_arp = profile.get("strict_arp", args.strict_arp)
     if args.converge_min_scale == 2.0:
         args.converge_min_scale = profile.get("converge_min_scale", args.converge_min_scale)
     if args.gain_min_scale == 0.1:
@@ -11675,24 +11680,23 @@ def run(args):
         if stop_event.is_set():
             return 0
 
-        # Validate loaded position against live pseudorange fix.
+        # Validate loaded position against a live pseudorange fix.
         # A tampered or stale position file would send the FixedPosFilter
-        # into 100+ km residuals without any warning.
+        # into 100+ km residuals without any warning — and a stale-but-
+        # CONFIDENT file (moved antenna, e.g. ptBoat's Chicago .ppp.toml in
+        # London) would sail past any σ-only gate.  So the LS gross-move
+        # check runs for EVERY seed except a NAV2-*seeded* one (which IS the
+        # live fix — it can't be stale vs itself; its hAcc<5m acquisition
+        # gate in wait_for_nav2_seed already served as the LS validation).
         #
-        # Skip validation for trusted positions:
-        #   - --known-pos (sigma_m=0, operator override).
-        #   - NAV2 seed — already validated by virtue of being a live
-        #     fix from the receiver's secondary nav engine.  The
-        #     hAcc<5m gate at seed acquisition (wait_for_nav2_seed)
-        #     IS the LS validation, just done by the receiver's own
-        #     SPP solver instead of ours.  Per I-024532-charlie #3.
-        #
-        # State-file seeds (.ppp.toml / .survey.toml) get the same
-        # σ-based trust treatment as --known-pos and NAV2.  A
-        # .survey.toml with σ ≈ 1 cm sails past _TRUSTED_POSITION_SIGMA_M
-        # and skips validation; a .ppp.toml with σ ≈ half a metre falls
-        # through to the LS validation below.  Per
-        # docs/position-state-and-monitoring.md.
+        # `skip_validation` (σ-trust) no longer gates whether the LS check
+        # RUNS — it only picks the NOT-MOVED outcome: a trusted seed
+        # (σ < _TRUSTED_POSITION_SIGMA_M: --known-pos σ=0, a .survey.toml at
+        # σ≈1 cm) is pinned as-is with no finer precision re-check, while an
+        # untrusted seed (a .ppp.toml at σ≈half a metre) is logged as
+        # "validated" against the LS fix.  Per
+        # docs/position-state-and-monitoring.md and
+        # docs/bootstrap-move-detection.md.
         seeded_from_nav2 = (pos_source is not None
                             and pos_source.startswith("NAV2"))
         skip_validation = (
@@ -11700,15 +11704,49 @@ def run(args):
             or (pos_sigma_m is not None
                 and pos_sigma_m < _TRUSTED_POSITION_SIGMA_M))
         uid = getattr(args, 'receiver_unique_id', None)
-        if skip_validation:
-            why = ("NAV2 seed (live-fix-validated)" if seeded_from_nav2
-                   else f"trusted source (σ={pos_sigma_m:.1f}m)")
-            log.info("Position from %s — skipping LS validation", why)
-            ape_sm.transition(AntPosEstState.CONVERGING,
-                              f"{why}, entering steady state")
-        elif uid is not None or args.known_pos:
-            log.info('Validating loaded position against live LS fix...')
-            for _attempt in range(30):
+
+        # bootstrapMoveDetection (I-171600, docs/bootstrap-move-detection.md):
+        # the gross-move check must run REGARDLESS of σ-trust.  "Is the seed
+        # precise?" (trust-skippable) is a DIFFERENT question from "has the
+        # antenna moved?" (must always run) — a stale-but-confident position is
+        # exactly the failure this guards (ptBoat's Chicago .ppp.toml after
+        # moving to London: 6142 km off, σ0.42 m so "trusted", FixedPos pinned
+        # at Chicago).  So the LS-fix validation loop below now runs for
+        # TRUSTED seeds too — only its NOT-MOVED outcome differs (trusted → pin
+        # without a finer precision re-check).  Signal is the broadcast-only LS
+        # fix: available as soon as obs flow, whereas NAV2-PVT has a multi-
+        # second enable latency at bootstrap (NAV2 backstops moves at runtime
+        # via the AntPosEst blend / WatchdogActor).  A NAV2-*seeded* position
+        # IS the live fix, so it is exempt.
+        from peppar_fix.position_state import (
+            invalidate_ppp_state, bump_mount_sn, detect_move, confirm_move,
+            MOVE_THRESHOLD_M, MOVE_CONFIRM_FIXES)
+        # `0.0 or 100.0 == 100.0`, so `--bootstrap-move-threshold-m 0` must use
+        # an is-None test (matches apply_ptp_profile), not `or`.
+        _bmt = getattr(args, 'bootstrap_move_threshold_m', None)
+        _move_thresh = _bmt if _bmt is not None else MOVE_THRESHOLD_M
+        if seeded_from_nav2:
+            # A NAV2-*seeded* position IS the live fix, so it can't be stale vs
+            # itself (its hAcc<5 m acquisition gate already served as the
+            # validation).  A NAV-PVT seed is also a live fix and is NOT flagged
+            # here — but it simply falls through to the median LS check below,
+            # which agrees within metres on a good live seed and so never trips
+            # the destructive path.
+            log.info("Position from NAV2 seed (live-fix-validated) — "
+                     "skipping LS validation")
+            ape_sm.transition(
+                AntPosEstState.CONVERGING,
+                "NAV2 seed (live-fix-validated), entering steady state")
+        elif (uid is not None or args.known_pos) and known_ecef is not None:
+            log.info('Checking loaded position against live LS fixes '
+                     '(median-confirmed move detection)...')
+            # Collect up to MOVE_CONFIRM_FIXES independent LS separations, then
+            # decide on the MEDIAN — a single borderline-geometry LS outlier
+            # must NOT invalidate .ppp.toml / bump mount_sn on a good seed
+            # (BUG-2, main's #298 review).  detect_move() is the shipping check
+            # (BUG-1): the same tested helper, not an inline reimplementation.
+            _separations = []
+            for _attempt in range(60):
                 if stop_event.is_set():
                     return 0
                 try:
@@ -11717,55 +11755,104 @@ def run(args):
                     continue
                 if len(observations) < 6:
                     continue
-                # Use broadcast-only ephemeris for the LS validation check,
-                # NOT the full SSR-corrected RealtimeCorrections object.
-                # CAS single-AC SSR orbit+clock corrections cause the LS
-                # solver to produce wildly wrong positions (altitude -2000m)
-                # when the SSR correction reference frame doesn't match the
-                # broadcast ephemeris's reference.  FixedPosFilter is immune
-                # (time differencing cancels the bias) but the LS solver's
-                # absolute pseudorange model is not.  Using broadcast-only
-                # for validation gives ~5-10m accuracy which is plenty for
-                # the 100m threshold check.
+                # Use broadcast-only ephemeris for the LS check, NOT the full
+                # SSR-corrected RealtimeCorrections object.  CAS single-AC SSR
+                # orbit+clock corrections make the LS solver produce wildly
+                # wrong positions (altitude -2000m) when the SSR reference frame
+                # doesn't match the broadcast ephemeris.  FixedPosFilter is
+                # immune (time differencing cancels the bias); the LS solver's
+                # absolute pseudorange model is not.  Broadcast-only gives
+                # ~5-10m, plenty for the 100m threshold.
                 x_ls, ok, n_sv = ls_init(observations, beph, gps_time,
                                           clk_file=None)
                 if not ok or n_sv < 6:
                     continue
                 ls_ecef = x_ls[:3]
-                import numpy as _np
-                separation_m = _np.linalg.norm(ls_ecef - known_ecef)
-                ls_lat, ls_lon, ls_alt = ecef_to_lla(ls_ecef[0], ls_ecef[1], ls_ecef[2])
-                log.info(f'  LS check: ({ls_lat:.4f}, {ls_lon:.4f}, {ls_alt:.0f}m) '
-                         f'separation={separation_m:.0f}m from loaded position')
-                if separation_m > 100:
-                    log.error(f'Position file disagrees with live LS fix by {separation_m:.0f}m '
-                              f'(threshold 100m). File may be stale or corrupted. '
-                              f'Falling back to bootstrap.')
-                    known_ecef = None
-                    result = run_bootstrap(args, obs_queue, corrections, stop_event,
-                                           out_w=out_w)
-                    if result is None:
-                        log.error('Bootstrap failed')
-                        return 1
-                    bootstrap_result = result
-                    known_ecef = bootstrap_result.ecef
-                    sigma_m = bootstrap_result.sigma_m
-                    uid = getattr(args, 'receiver_unique_id', None)
-                    if uid is not None:
-                        stored_sigma = max(
-                            sigma_m, _PHASE1_BOOTSTRAP_SAVE_FLOOR_M)
-                        save_position_to_receiver(
-                            uid, known_ecef, stored_sigma, "ppp_bootstrap")
-                        log.info(
-                            "Position saved to receiver state "
-                            "(re-bootstrapped; true σ=%.2fm, stored "
-                            "σ=%.2fm above trust threshold)",
-                            sigma_m, stored_sigma)
+                _, displ_m = detect_move(known_ecef, ls_ecef, _move_thresh)
+                if displ_m is None:
+                    continue
+                _separations.append(displ_m)
+                ls_lat, ls_lon, ls_alt = ecef_to_lla(
+                    ls_ecef[0], ls_ecef[1], ls_ecef[2])
+                log.info('  LS fix %d/%d: (%.4f, %.4f, %.0fm) separation=%.0fm',
+                         len(_separations), MOVE_CONFIRM_FIXES,
+                         ls_lat, ls_lon, ls_alt, displ_m)
+                if len(_separations) >= MOVE_CONFIRM_FIXES:
+                    break
+
+            _decision, _median_sep = confirm_move(_separations, _move_thresh)
+            if _decision == "moved":
+                log.error('[MOVE_DETECTED] loaded position disagrees with %d '
+                          'live LS fixes (median %.0fm > %.0fm threshold) — '
+                          'antenna moved or file stale; rejecting stale '
+                          'position history.',
+                          len(_separations), _median_sep, _move_thresh)
+                if uid is not None:
+                    try:
+                        if invalidate_ppp_state(uid):
+                            log.info("  [MOVE_DETECTED] invalidated stale "
+                                     ".ppp.toml")
+                        log.info("  [MOVE_DETECTED] mount_sn -> %d",
+                                 bump_mount_sn(uid))
+                    except Exception as _e:
+                        log.warning("  [MOVE_DETECTED] history invalidation "
+                                    "partial: %s", _e)
+                if getattr(args, 'strict_arp', False):
+                    log.error("--strict-arp: refusing to start on a stale ARP "
+                              "(%.0f m off).  Re-run peppar-survey or pass "
+                              "--known-pos.", _median_sep)
+                    return 1
+                known_ecef = None
+                result = run_bootstrap(args, obs_queue, corrections, stop_event,
+                                       out_w=out_w)
+                if result is None:
+                    log.error('Bootstrap failed')
+                    return 1
+                bootstrap_result = result
+                known_ecef = bootstrap_result.ecef
+                sigma_m = bootstrap_result.sigma_m
+                uid = getattr(args, 'receiver_unique_id', None)
+                if uid is not None:
+                    stored_sigma = max(
+                        sigma_m, _PHASE1_BOOTSTRAP_SAVE_FLOOR_M)
+                    save_position_to_receiver(
+                        uid, known_ecef, stored_sigma, "ppp_bootstrap")
+                    log.info(
+                        "Position saved to receiver state (re-bootstrapped; "
+                        "true σ=%.2fm, stored σ=%.2fm above trust threshold)",
+                        sigma_m, stored_sigma)
+            elif _decision == "not_moved":
+                if skip_validation:
+                    # Trusted seed that also passed the gross-move check — pin
+                    # as-is, no finer precision re-check.
+                    log.info("  Trusted source (σ=%.1fm), median %.0fm of %d LS "
+                             "fixes within %.0fm — no move, entering steady "
+                             "state", pos_sigma_m, _median_sep,
+                             len(_separations), _move_thresh)
+                    _why = "trusted seed"
                 else:
-                    log.info(f'  Position validated (within {separation_m:.0f}m of LS fix)')
-                    ape_sm.transition(AntPosEstState.CONVERGING,
-                                      f"LS validation passed ({separation_m:.0f}m), entering steady state")
-                break
+                    log.info("  Position validated (median %.0fm of %d LS fixes)",
+                             _median_sep, len(_separations))
+                    _why = "LS validation passed"
+                ape_sm.transition(
+                    AntPosEstState.CONVERGING,
+                    f"{_why}, move-checked ({_median_sep:.0f}m), entering "
+                    f"steady state")
+            else:  # "insufficient"
+                # Degraded sky: couldn't collect MOVE_CONFIRM_FIXES valid LS
+                # fixes in the attempt budget.  Do NOT act destructively on thin
+                # evidence, and — critically — do NOT leave ape_sm in VERIFYING
+                # (a trusted --known-pos/.survey.toml start would silently fail
+                # to transition).  Proceed with the loaded seed; the runtime
+                # NAV2 watchdog (sustained-N-checks) catches a real move later.
+                log.warning("Move-check inconclusive (%d/%d valid LS fixes — "
+                            "degraded sky); proceeding with the loaded seed and "
+                            "deferring move detection to the runtime watchdog.",
+                            len(_separations), MOVE_CONFIRM_FIXES)
+                ape_sm.transition(
+                    AntPosEstState.CONVERGING,
+                    "move-check inconclusive, proceeding with seed "
+                    "(runtime watchdog active)")
 
         if stop_event.is_set():
             return 0
@@ -12248,6 +12335,21 @@ Two-phase operation:
                           "behavior for rough-seed --known-pos use.  "
                           "Precursor to the full --surveyed-position mode "
                           "(I-013342-main).")
+    pos.add_argument("--bootstrap-move-threshold-m", type=float, default=None,
+                     help="Gross-move threshold (m) for bootstrapMoveDetection "
+                          "(I-171600): at startup, if the loaded seed position "
+                          "is more than this from the live NAV2/LS fix, the "
+                          "antenna is treated as MOVED — reject + invalidate "
+                          "the stale position history and re-acquire.  Runs "
+                          "regardless of σ-trust.  Default None → 100 m "
+                          "(position_state.MOVE_THRESHOLD_M); profile-"
+                          "overridable.  Well above NAV2 bias / same-site swaps.")
+    pos.add_argument("--strict-arp", action="store_true",
+                     help="On a detected antenna move at bootstrap, REFUSE to "
+                          "start (exit 1) instead of degrading to the coarse "
+                          "NAV2 fix.  For deployments where a wrong ARP is "
+                          "worse than no clock; the operator must re-survey "
+                          "(peppar-survey) or pass --known-pos.")
     pos.add_argument("--init-ztd-mm", type=float, default=None,
                      help="Manually seed FixedPosFilter ZTD residual "
                           "at this value (millimetres) at filter init "

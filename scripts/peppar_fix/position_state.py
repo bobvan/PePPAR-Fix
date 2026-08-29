@@ -32,8 +32,10 @@ See docs/position-state-and-monitoring.md for the full design.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
+import statistics
 import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -655,6 +657,80 @@ DEFAULT_ANTPOS_SUSTAIN_S = 60.0
 # declare an antenna move.  Set to 0 to disable auto-move (operator
 # must intervene; the bark continues showing in [CONFIDENCE] logs).
 DEFAULT_AUTO_MOVE_THRESHOLD_S = 3600.0
+
+# bootstrapMoveDetection (I-171600, docs/bootstrap-move-detection.md): the
+# gross-move threshold used at BOOTSTRAP to reject a stale saved position when
+# the host has been shut down and woken on a different antenna.  100 m is well
+# above NAV2's ~1.5-4 m receiver bias and any same-site antenna swap (which the
+# FixedPos absorbs and which we do NOT want to reject), and far below the
+# smallest cross-site move.  Same scale as the runtime WatchdogActor / the
+# pre-existing untrusted-seed LS validation.  Distinct from the runtime
+# DEFAULT_NAV2_THRESHOLD_M (10 m, graceful, sustained): this one is the
+# immediate cold-start HARD reject.
+MOVE_THRESHOLD_M = 100.0
+
+
+def detect_move(seed_ecef, live_ecef, threshold_m: float = MOVE_THRESHOLD_M):
+    """Has the antenna MOVED relative to a saved seed position?
+
+    Pure geometry: the 3D ECEF distance (metres) between the loaded seed and an
+    independent live fix (NAV2 opinion, or an LS fix).  Returns
+    ``(moved: bool, displ_m: float)``.  ``moved`` is True iff
+    ``displ_m > threshold_m``.  Answers "has it moved?", which is separate from
+    "is the seed precise?" — the caller must run this regardless of the seed's
+    claimed sigma (a stale-but-confident position is exactly the failure mode
+    this guards, e.g. ptBoat's Chicago .ppp.toml after moving to London).
+
+    Returns ``(False, None)`` if either position is missing/malformed, so a
+    missing live fix fails SAFE (no rejection of a good seed).
+    """
+    if seed_ecef is None or live_ecef is None:
+        return False, None
+    import numpy as np
+    try:
+        s = np.asarray(seed_ecef, dtype=float).reshape(3)
+        v = np.asarray(live_ecef, dtype=float).reshape(3)
+    except (TypeError, ValueError):
+        return False, None
+    displ_m = float(np.linalg.norm(s - v))
+    return displ_m > float(threshold_m), displ_m
+
+
+# Number of valid LS fixes to median over before a DESTRUCTIVE move decision.
+# Single-epoch broadcast-only LS with borderline geometry (n_sv==6, high DOP,
+# a multipath burst) can throw a >100 m outlier on a GOOD seed — so the
+# bootstrap move-check must NOT invalidate .ppp.toml / bump mount_sn on one
+# epoch.  The runtime NAV2 watchdog uses sustained-N-checks for the same reason.
+MOVE_CONFIRM_FIXES = 5
+
+
+def confirm_move(separations_m, threshold_m: float = MOVE_THRESHOLD_M,
+                 min_fixes: int = MOVE_CONFIRM_FIXES):
+    """Confirmed-move decision from a list of independent LS-fix separations.
+
+    Returns ``(decision, median_m)`` where ``decision`` is one of:
+
+      * ``"moved"``       — >= ``min_fixes`` valid separations AND their MEDIAN
+                            exceeds ``threshold_m``.  Only THIS gates the
+                            destructive invalidate-.ppp.toml + bump-mount_sn path.
+      * ``"not_moved"``   — >= ``min_fixes`` valid separations, median within
+                            threshold (a good seed).
+      * ``"insufficient"``— fewer than ``min_fixes`` usable separations
+                            (degraded sky): the caller must NOT act destructively
+                            and should fall back to the seed + the runtime
+                            watchdog.
+
+    The MEDIAN (not any single epoch) is what makes a lone borderline-geometry
+    LS outlier unable to destroy a good seed's history — a real move shows the
+    separation on *every* fix, so the median moves; an outlier does not.
+    ``median_m`` is None when the decision is ``"insufficient"``.
+    """
+    seps = [float(s) for s in (separations_m or [])
+            if s is not None and math.isfinite(float(s))]
+    if len(seps) < int(min_fixes):
+        return ("insufficient", None)
+    med = float(statistics.median(seps))
+    return (("moved" if med > float(threshold_m) else "not_moved"), med)
 
 
 class WatchdogActor:
