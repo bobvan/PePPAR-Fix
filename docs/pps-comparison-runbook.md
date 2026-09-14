@@ -60,6 +60,20 @@ The single-TICC method is preferred whenever both clocks can reach it.
 
 ## 2. Running `compare_clocks.py`
 
+> **Do not use the M600 as chB.**  Its PPS OUT is **bimodal** — two discrete
+> levels ~45 ns apart (43.8 ns at 12.5 MS/s, 47.0 ns at 25 MS/s), switching
+> with dwell times of 19–41 min.  Measured 2026-09-13 by BBGresearch; the
+> ns-domain agreement across a 2× sample-rate change places the fault upstream
+> of the converter, most likely a bistable divider in the M600's output stage.
+>
+> Against a 1–2 ns excursion budget this is a **~45 ns step that is not yours**,
+> and it will read as a discontinuity in the clock under test — exactly the
+> misattribution [[feedback_do_discontinuity_means_external_force]] warns about,
+> which has already cost this project twice.  The `M600` labels in the examples
+> below are historical; prefer **otcBob1** or the **GNSSDO+**.  Full record:
+> `timelab/gear.md` → M600.
+
+
 One command captures and analyzes a head-to-head:
 
 ```sh
