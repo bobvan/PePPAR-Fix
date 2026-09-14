@@ -12,16 +12,16 @@ POSIX O_APPEND.  Multiple agents can write simultaneously without
 collision.  "Current state" is computed by replaying the log.
 
 Usage:
-  dayplan propose --by main --name LandA1NlPib \
-    --title "land A1 NL P_IB" --reviewers charlie bravo --owner main
+  dayplan propose --by alpha --name LandA1NlPib \
+    --title "land A1 NL P_IB" --reviewers charlie bravo --owner alpha
   dayplan ack --by bravo --id LandA1NlPib
-  dayplan status --by main --id LandA1NlPib --value in-progress
-  dayplan status --by main --id LandA1NlPib --value done --evidence abc123
+  dayplan status --by alpha --id LandA1NlPib --value in-progress
+  dayplan status --by alpha --id LandA1NlPib --value done --evidence abc123
   dayplan amend --by bravo --id LandA1NlPib --field depends_on --value ZtdStatePrep
   dayplan discuss --by charlie --msg "should we land A1 before B1?"
   dayplan discuss --by charlie --id LandA1NlPib --msg "thread on A1"
   dayplan render
-  dayplan close --by main --lessons "..."
+  dayplan close --by alpha --lessons "..."
 
 The item's --name IS its key: `propose --name AddTwoUps` then
 `ack/status/amend/discuss --id AddTwoUps`.  Names must be unique within
@@ -373,7 +373,7 @@ def main():
 
     def add_by(p):
         p.add_argument("--by", required=True,
-                       help="Agent name (main/bravo/charlie/...)")
+                       help="Agent name (alpha/bravo/charlie/...)")
 
     def add_date(p):
         p.add_argument("--date", default=None,

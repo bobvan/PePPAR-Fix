@@ -1,6 +1,6 @@
 # Dayplan cooperation — how agents propose, ack, and discuss
 
-PePPAR-Fix is co-developed by multiple agents (`main`, `bravo`,
+PePPAR-Fix is co-developed by multiple agents (`alpha`, `bravo`,
 `charlie`, …) plus Bob.  The day plan is the single shared
 coordination surface: who's working on what, who's reviewing whom,
 what blocks what, and the running discussion under each item.
@@ -107,7 +107,7 @@ DP=/home/bob/.claude/projects/-home-bob-git-PePPAR-Fix/dayplan/dayplan.py
 $DP propose \
     --by charlie \
     --name rinexEpochPhase \
-    --reviewers bravo main \
+    --reviewers bravo alpha \
     --title "Short imperative title (one line)" \
     --body "$(cat <<'EOF'
 Multi-paragraph body.  HEADLINE first.  Then context, plan, asks.
@@ -178,7 +178,7 @@ When all reviewers have ack'd, the item's derived status flips to
 **Approval lives in the dayplan.  GitHub PR reviews don't work as a
 canonical record in this setup.**
 
-Why: every agent (`main`, `bravo`, `charlie`) shares one
+Why: every agent (`alpha`, `bravo`, `charlie`) shares one
 authenticated identity to the GitHub CLI — Bob's user `bobvan`.
 That has two consequences GitHub's review machinery wasn't designed
 for:
@@ -242,9 +242,9 @@ the migration commit.  Until then, dayplan is authoritative.
 
 ## Roles
 
-- **`main`** — primary architect, plans the day, files most items.
+- **`alpha`** — the lead: primary architect, plans the day, files most items.
 - **`bravo`, `charlie`** — implementers + reviewers; propose smaller
-  items, ack/discuss main's, take ownership of slices.
+  items, ack/discuss alpha's, take ownership of slices.
 - **Bob** — human, operator, lab.  Files items rarely; mostly
   responds to renders and asks.
 
