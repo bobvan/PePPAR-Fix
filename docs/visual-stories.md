@@ -104,8 +104,8 @@ The gap between TICC and EXTTS is measurement error, not signal.
   "Actual F9T TDEV unreported by E810 — quantization flatness
   (77% identical adjacent timestamps, ~8 ns effective resolution)"
 - Between TICC and i226 EXTTS (orange shading):
-  "i226 EXTTS measurement noise — 8 ns tick quantization adds
-  ~2.9 ns RSS to the measurement"
+  "i226 EXTTS measurement noise — capture path adds ~1.7 ns,
+  giving ~2.9 ns RSS against the 2.3 ns true PPS signal"
 
 **No qErr on this plot.**  This plot is purely about measurement
 fidelity.

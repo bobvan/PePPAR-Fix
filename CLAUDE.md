@@ -834,8 +834,11 @@ PPS jitter:
   low TDEV (0.34 ns for a signal that's actually 2.3 ns).  The sub-ns
   timestamp format does not reflect sub-ns measurement resolution for
   GPIO/SMA events.
-- **i226 EXTTS**: adds ~2.9 ns RSS noise but at least tracks PPS
-  movement (0% identical adjacent).  Still underreports at short tau.
+- **i226 EXTTS**: its capture path **adds ~1.7 ns**, which against the
+  2.3 ns true PPS signal gives **~2.9 ns RSS total** — the added noise
+  and the total are different numbers and must not be interchanged.
+  Reported TDEV(1s) = 1.99 ns with **0% identical adjacent**, so it at
+  least tracks PPS movement.  Still underreports at short tau.
 
 **Never report TDEV from EXTTS alone.**  EXTTS-only TDEV makes results
 look better than they are.  Always use TICC (60 ps resolution) for
