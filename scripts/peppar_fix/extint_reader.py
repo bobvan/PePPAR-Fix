@@ -91,14 +91,42 @@ class ExtintLateEdgeFilter:
 
         Mutates internal trend state on accept; a rejected edge is not
         added to the trend so the prediction keeps extrapolating from the
-        last good edge.
+        last good edge.  The extrapolation **advances with the skipping** —
+        see the ``_consec_rej`` term below; without it the predictor eats
+        itself whenever the DO drifts faster than ``reject_ns`` per edge.
         """
         acc = self._accepted
         if (len(acc) >= self.warmup
                 and self._consec_rej < self.max_consecutive_rejects):
             steps = [_wrap_ns(acc[i + 1] - acc[i]) for i in range(len(acc) - 1)]
             step = statistics.median(steps) if steps else 0.0
-            pred = acc[-1] + step
+            # Advance the prediction by one step PER EDGE ELAPSED, not one
+            # step per call.  `acc[-1]` is the last *accepted* edge, so after
+            # `_consec_rej` rejections the next edge is (1 + _consec_rej)
+            # edges later and its true phase has drifted that many steps.
+            #
+            # Without the multiplier the predictor compounds: one rejection
+            # leaves the prediction one step low, which makes the next
+            # GENUINE edge look one step late, which rejects it, which puts
+            # the prediction two steps low.  It self-sustains as soon as the
+            # per-edge drift exceeds reject_ns (50 ns/s = 50 ppb) — i.e. on
+            # any free-running or re-acquiring DO, which is exactly when
+            # EXTINT matters most on a --no-ticc host.
+            #
+            # Measured before the fix, single ringing event at 1 Hz:
+            #   drift    2 ns/s -> 1 rejection   (harmless)
+            #   drift   60 ns/s -> 8 rejections + forced re-baseline
+            #   drift 1200 ns/s -> 8 rejections + forced re-baseline
+            # After: 1 rejection at every drift rate, and a genuine 5 us
+            # phase step still re-baselines as intended.
+            #
+            # Found by BBGresearch 2026-09-19, who hit the same compounding
+            # in their own predictor — where it did NOT self-limit, because
+            # theirs fitted a window and interleaved rejects with accepts so
+            # the run-length hatch never fired.  Ours was being masked by
+            # max_consecutive_rejects, which was silently doing this job
+            # rather than the one its comment claims.
+            pred = acc[-1] + step * (1 + self._consec_rej)
             dev = _wrap_ns(phase_ns - pred)
             if dev > self.reject_ns:        # one-sided: only LATE edges
                 self.n_rejected += 1
