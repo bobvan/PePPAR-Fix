@@ -83,3 +83,63 @@ class TestPredictorDoesNotCompound(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestServoCurvatureLimitation(unittest.TestCase):
+    """The linear predictor cannot track a servo-curved trajectory.
+
+    Documents a KNOWN LIMITATION rather than asserting correct behaviour: a
+    servo changes the DO frequency every epoch, so the phase trajectory is
+    curved by design, and a median-step predictor lags it by ~a*window/2.
+    These tests pin the threshold so a future change to `reject_ns` or
+    `window` cannot move it silently.
+    """
+
+    @staticmethod
+    def _slew(accel_ppb_per_s, n=60):
+        """No ringing at all — pure servo curvature."""
+        f = ExtintLateEdgeFilter()
+        phase, vel, rejected = 0.0, 0.0, []
+        for i in range(n):
+            vel += accel_ppb_per_s
+            phase += vel
+            if not f.accept(phase):
+                rejected.append(i)
+        return [i for i in rejected if i >= f.warmup], f
+
+    def test_gentle_slew_is_tracked_cleanly(self):
+        for accel in (0.0, 1.0, 3.0, 6.0):
+            with self.subTest(ppb_per_s=accel):
+                rejected, f = self._slew(accel)
+                self.assertEqual(rejected, [], "no ringing present, so no "
+                                 "genuine edge should be rejected")
+                self.assertEqual(f.n_rebaseline, 0)
+
+    def test_fast_slew_rejects_genuine_edges(self):
+        """Above ~2*reject_ns/window the filter fights the servo."""
+        rejected, f = self._slew(10.0)
+        self.assertGreater(len(rejected), 10,
+                           "a 10 ppb/s slew should provoke the documented "
+                           "rejection cascade; if this now passes cleanly the "
+                           "limitation was fixed — update the class docstring")
+
+    def test_threshold_matches_the_documented_formula(self):
+        f = ExtintLateEdgeFilter()
+        predicted = 2.0 * f.reject_ns / f.window
+        self.assertAlmostEqual(predicted, 6.25, places=2,
+                               msg="docstring quotes 6.25 ppb/s for the "
+                                   "defaults; reject_ns or window changed")
+
+
+class TestStatsAreObservable(unittest.TestCase):
+    """The counters must be readable — see stats() docstring for why."""
+
+    def test_stats_exposes_reject_rate_and_rebaseline(self):
+        rejected, f = TestServoCurvatureLimitation._slew(25.0)
+        s = f.stats()
+        for key in ("n_accepted", "n_rejected", "n_rebaseline",
+                    "reject_rate", "reject_ns", "window"):
+            self.assertIn(key, s)
+        self.assertGreater(s["reject_rate"], 0.0)
+        self.assertEqual(s["n_rejected"] + s["n_accepted"],
+                         f.n_rejected + f.n_accepted)

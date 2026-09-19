@@ -69,6 +69,39 @@ class ExtintLateEdgeFilter:
 
     This is the TIM-TM2/EXTINT analogue of :class:`ptp_device.DualEdgeFilter`
     (which rejects i226 EXTTS dual-edge artifacts on the GNSS-PPS path).
+
+    **Known limitation — the servo bends the trajectory this filter predicts.**
+    The predictor is linear: a median per-edge step extrapolated forward.  It
+    tracks a *constant* drift exactly (at any skip count, since the fix of
+    2026-09-19), but it cannot track a *changing* drift — and a servo changes
+    the DO frequency every epoch by construction, so the phase trajectory is
+    curved on purpose.  The median over a `window`-sample history lags the
+    current step by roughly ``a * window / 2`` for a frequency slew ``a``, so
+    genuine edges start being rejected at about::
+
+        a > 2 * reject_ns / window   ==  2*50/16  ==  6.25 ppb/s
+
+    Measured against this class with **no ringing present at all**, 1 Hz:
+
+        0-6 ppb/s   ->  0/60 genuine edges rejected
+        10 ppb/s    -> 24/60 rejected, 3 forced re-baselines
+        25 ppb/s    -> 35/60 rejected, 4 forced re-baselines
+       100 ppb/s    -> 40/60 rejected, 4 forced re-baselines
+
+    So a tightly-slewing servo makes this filter reject the signal it is
+    supposed to be cleaning, and **the tighter the servo the worse it gets**.
+    Hypothesis raised by BBGresearch 2026-09-19 from a 31% rejection rate that
+    survived their own predictor fix; the threshold above is ours, measured.
+
+    NOT ACTED ON YET, deliberately: we have shown the mechanism exists above
+    ~6 ppb/s but have NOT measured whether our servo actually slews that fast
+    in normal operation.  `stats()['reject_rate']` is the number that settles
+    it — a persistently high rate with no known ringing source means the
+    predictor is failing to track, not that the signal is bad.  Candidate
+    fixes if it is real: scale `reject_ns` with the commanded frequency-slew
+    rate, or extrapolate with curvature instead of a median step.  Do not
+    simply widen `reject_ns` — that trades this failure for blindness to the
+    ringing the filter exists to catch.
     """
 
     def __init__(self, reject_ns=50.0, window=16, warmup=4,
@@ -142,6 +175,37 @@ class ExtintLateEdgeFilter:
         acc.append(phase_ns)
         self.n_accepted += 1
         return True
+
+    def stats(self):
+        """Counters, so "what is this filter actually catching?" is answerable.
+
+        These were write-only until 2026-09-19.  That mattered: the predictor
+        compounding fixed in the same commit had been driving `n_rebaseline`
+        on any drifting DO, meaning the escape hatch was mostly absorbing a
+        predictor artefact rather than catching real phase steps as its
+        docstring claims — and no counter was exported that could have shown
+        it.  A mechanism whose observed effect nobody can see is a mechanism
+        whose stated purpose nobody can check.
+
+        Raised by BBGresearch, whose framing is the one to keep: for any
+        gate, ask *what does this exist to catch, and what is it catching
+        most of the time?*  The second half needs instrumentation.
+
+        `reject_rate` is the number to watch.  A persistently high rate with
+        no known ringing source means the predictor is failing to track the
+        signal, not that the signal is bad — see the servo-curvature note in
+        the class docstring.
+        """
+        seen = self.n_accepted + self.n_rejected
+        return dict(
+            n_accepted=self.n_accepted,
+            n_rejected=self.n_rejected,
+            n_rebaseline=self.n_rebaseline,
+            last_reject_ns=self.last_reject_ns,
+            reject_rate=(self.n_rejected / seen) if seen else 0.0,
+            reject_ns=self.reject_ns,
+            window=self.window,
+        )
 
     def reset(self):
         """Forget the trend (e.g. after a servo reset / PHC step)."""
