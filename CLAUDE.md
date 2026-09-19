@@ -183,6 +183,25 @@ you want to keep as a comparison baseline.  Pull only when you have a
 reason to.  Always `git status` before pulling so you know whether
 local edits are about to land in a merge.
 
+> ⚠ **But never edit a shell script that is currently executing.**  Bash reads
+> a script **incrementally, by byte offset** — it does not load the whole file.
+> Editing a running script changes the bytes under the interpreter, and if your
+> edit shifts the file length above the point it has reached, the running copy
+> resumes **mid-token** and does something nobody wrote.  Long-running capture
+> and sweep wrappers are exactly the scripts you are most tempted to tweak
+> while they run, and exactly the ones whose corruption you will not notice
+> until the data is already wrong.
+>
+> Edit a copy and relaunch, or kill and restart.  Python is safer (it compiles
+> the whole file at import) but a long-running Python process still holds the
+> *old* code, so editing gives you no effect rather than a corrupt one —
+> a different trap in the same family.
+>
+> Reported by BBGresearch 2026-09-19 as a near-miss that nearly cost a tuning
+> run.  Their framing generalises past scripts, and covers the stale-copy trap
+> in this repo's own `timelab/` directory too: **the thing you are reading and
+> the thing that is running are not guaranteed to be the same object.**
+
 **Local edits on a lab host are encouraged**, not avoided.  When
 you're debugging something that only reproduces on a particular host,
 edit files directly in `~/peppar-fix` on that host, test there, and
