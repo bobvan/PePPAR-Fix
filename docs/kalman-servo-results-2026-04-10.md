@@ -144,6 +144,13 @@ Per kernel netdev mailing list consensus: stepping the PHC while PEROUT
 is active causes the i226 to oscillate at 62.5 MHz or lock up.  The
 corrupted state contaminates the Target Time comparator.
 
+> **Provenance, added 2026-09-19:** that paragraph is *repeated from a
+> mailing list*, not measured here — we have never observed 62.5 MHz on
+> an i226.  What we measured is the 500 ms offset in the Evidence
+> section immediately below.  The two had been sitting together long
+> enough to read as equally solid.  Keep the precaution; downgrade the
+> fear.
+
 ### Evidence
 
 Across 10 TimeHat TICC-drive runs that stepped the PHC, 9 produced

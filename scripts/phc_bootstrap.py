@@ -749,9 +749,25 @@ def main():
         # the PHC moves.  Do NOT step with PEROUT armed (see below).
         #
         # i226 PEROUT safety: disable any pre-existing PEROUT before stepping.
-        # Per kernel netdev consensus, stepping the PHC while PEROUT is active
-        # causes the hardware to oscillate at 62.5 MHz or lock up.  The
-        # resulting corrupted state persists across disable/enable cycles.
+        #
+        # WHAT WE MEASURED: across 10 TimeHat runs that stepped the PHC with
+        # PEROUT armed, 9 produced a 500 ms PEROUT offset (the half-period bug,
+        # docs/i226-perout-500ms-bug.md).  Bad, visible, recoverable.
+        #
+        # WHAT WE REPEATED FROM A MAILING LIST: that the part "oscillates at
+        # 62.5 MHz or locks up, and the corrupted state persists across
+        # disable/enable."  Sourced to kernel netdev consensus — WE HAVE NEVER
+        # OBSERVED IT.  Flagged 2026-09-19 because it had been sitting next to
+        # the measured result long enough to read as one.  62.5 MHz is not
+        # arbitrary: PEROUT's minimum half-period is 8 ns, so a period register
+        # at its floor emits exactly that (docs/wr-gm-research.md:104) — which
+        # makes the claim plausible, not verified.  Note BBGresearch scoped a
+        # 62.5 MHz sine on an i210 SDP0 that was LOUDER with the pin released
+        # (81.3 vs 76.4 dB) — the signature of SYSTIM/2 coupling onto a
+        # high-Z pin, not of a driven PEROUT.  Same frequency, different
+        # mechanism; both descend from the 125 MHz SYSTIM clock.
+        #
+        # Either way, disabling first is cheap and the 500 ms bug is real.
         if args.pps_out_pin >= 0:
             ptp.disable_perout(args.pps_out_channel)
             log.info("Disabled PEROUT before PHC step")
