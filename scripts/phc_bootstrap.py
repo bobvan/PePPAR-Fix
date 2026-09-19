@@ -737,6 +737,17 @@ def main():
         # ADJ_SETOFFSET is precise on both i226 and E810 — no readback or
         # system clock cross-referencing needed.  Verify via the next PPS.
         #
+        # UNVERIFIED SIGN (2026-09-19, I-extintTimebaseGate's sibling):
+        # BBGresearch measured ADJ_SETOFFSET to be SIGN-INVERTED on i210/igb —
+        # requested -57.7 ms, observed +58.1 ms, a clean doubling — and had it
+        # previously recorded for i226 as well.  We apply no compensation here
+        # and have never tested the sign on our own hardware.  If it inverts,
+        # this step roughly DOUBLES the phase error instead of removing it;
+        # the PPS verify below still measures the truth, so the glide corrects
+        # it, but the glide may hit track_max_ppb and saturate.  Test: request
+        # a known step on an idle host with PEROUT DISABLED and check which way
+        # the PHC moves.  Do NOT step with PEROUT armed (see below).
+        #
         # i226 PEROUT safety: disable any pre-existing PEROUT before stepping.
         # Per kernel netdev consensus, stepping the PHC while PEROUT is active
         # causes the hardware to oscillate at 62.5 MHz or lock up.  The

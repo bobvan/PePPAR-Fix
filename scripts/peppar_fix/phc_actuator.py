@@ -7,7 +7,11 @@ class PhcAdjfineActuator(FrequencyActuator):
     """Frequency steering via Linux PHC clock_adjtime(ADJ_FREQUENCY).
 
     This is the default actuator for i226 and E810 platforms.
-    Resolution ~1 ppb, range ±62.5 ppm (i226) or ±250 ppm (E810).
+    Resolution ~1 ppb, range **±62,500 ppm** (i226; `max_adj = 62499999`
+    and that field is ppb — measured 2026-09-19).  E810 was recorded as
+    "±250 ppm"; that figure is UNVERIFIED and likely the same 1000x
+    ppb/ppm misreading, but our E810 host is decommissioned so it has
+    not been re-measured.
     """
 
     def __init__(self, ptp_device):

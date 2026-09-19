@@ -48,7 +48,7 @@ The 78125 magic number comes from the i226's 25 MHz reference clock:
 fractional-increment representation.
 
 Maximum frequency adjustment range (`ptp_caps.max_adj`) is **62,499,999
-ppb ≈ ±62.5 ppm** — far larger than any OCXO's AFC pulling range
+ppb ≈ ±62,500 ppm (±6.25 %)** — far larger than any OCXO's AFC pulling range
 (TXC OK is ±3.6 ppm), so range is not a concern.  Resolution is.
 
 ## Quantization noise vs OCXO intrinsic

@@ -102,7 +102,7 @@ controller. We just need to:
 | Aspect | i226 PHC (current) | ClockMatrix (proposed) |
 |---|---|---|
 | Phase measurement | extts, 1 ns resolution | TDC, <50 ps resolution |
-| Frequency control | adjfine (±62.5 ppm, ~ppb resolution) | DCO FCW (±244 ppm, 0.11 fppb resolution) |
+| Frequency control | adjfine (±62,500 ppm, ~ppb resolution) | DCO FCW (±244 ppm, 0.11 fppb resolution) |
 | Oscillator | TCXO (100-130 ps TDEV(1s)) | OCXO (expected ~10-30 ps TDEV(1s)) |
 | Phase step | phc_ctl adj (ns) | Coarse phase alignment register |
 | Interface | ioctl/sysfs | I2C register read/write |

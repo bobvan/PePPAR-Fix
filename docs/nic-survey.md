@@ -9,11 +9,11 @@ Devices without both are disqualified.
 
 | Device | PHC Res | adjfine (ppb/LSB) | max_adj | PPS I/O | Oscillator | Interface | Price | Notes |
 |---|---|---|---|---|---|---|---|---|
-| Intel i210 | 1 ns | ~0.12 | ±62.5 ppm | 4 SDP (pin header) | 25 MHz XO | PCIe 2.1 x1, 1G | ~$50 | Best community docs, proven |
-| Intel i225 | 1 ns | ~0.12 | ±62.5 ppm | 4 SDP | 25 MHz XO | PCIe 3.1 x1, 2.5G | ~$50 | Adds PTM; early rev bugs |
-| Intel i226 | 1 ns | ~0.12 | ±62.5 ppm | 4 SDP | 25 MHz XO | PCIe 3.1 x1, 2.5G | ~$55 | Current best consumer; SDP3 is strapping pin |
-| TimeNIC | 1 ns | ~0.12 | ±62.5 ppm | 2 SMA | TCXO ±280 ppb | PCIe 3.1 x1, 2.5G | $200 | i226 + TCXO + SMA, turnkey |
-| TimeHAT | 1 ns | ~0.12 | ±62.5 ppm | 2 SMA + 2 U.FL | TCXO ±280 ppb | Pi 5 HAT, 2.5G | $200 | i226 + TCXO, Pi 5 only |
+| Intel i210 | 1 ns | ~0.12 | ±62,500 ppm | 4 SDP (pin header) | 25 MHz XO | PCIe 2.1 x1, 1G | ~$50 | Best community docs, proven |
+| Intel i225 | 1 ns | ~0.12 | ±62,500 ppm | 4 SDP | 25 MHz XO | PCIe 3.1 x1, 2.5G | ~$50 | Adds PTM; early rev bugs |
+| Intel i226 | 1 ns | ~0.12 | ±62,500 ppm | 4 SDP | 25 MHz XO | PCIe 3.1 x1, 2.5G | ~$55 | Current best consumer; SDP3 is strapping pin |
+| TimeNIC | 1 ns | ~0.12 | ±62,500 ppm | 2 SMA | TCXO ±280 ppb | PCIe 3.1 x1, 2.5G | $200 | i226 + TCXO + SMA, turnkey |
+| TimeHAT | 1 ns | ~0.12 | ±62,500 ppm | 2 SMA + 2 U.FL | TCXO ±280 ppb | Pi 5 HAT, 2.5G | $200 | i226 + TCXO, Pi 5 only |
 
 ### Solarflare (AMD/Xilinx) — Bob has ×2 SFN6322F, ×4 SFN8522
 
@@ -135,7 +135,9 @@ Intel's out-of-tree driver compiled via DKMS.
 All three use the same 31-bit INCVALUE register architecture:
 - 1 ns SYSTIM resolution
 - ~0.12 ppb per LSB adjfine granularity
-- ±62.5 ppm max_adj range
+- **±62,500 ppm** max_adj range (`max_adj = 62499999`, and that field is **ppb**
+  — measured on TimeHat 2026-09-19.  Not 62.5 ppm; the ppb/ppm confusion is a
+  1000x error that has appeared in more than one project's notes.)
 - **Dual-edge quirk**: timestamps both rising AND falling PPS edges
 
 The i210 actually measures better than the i226 for timing (76 ns vs 439 ns
