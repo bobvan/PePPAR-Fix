@@ -40,6 +40,12 @@ from peppar_fix.ptp_device import PtpDevice, DualEdgeFilter
 from peppar_fix.receiver import ensure_receiver_ready
 from solve_ppp import FixedPosFilter, ls_init
 
+
+# Reject a post-step phase residual this far from zero: phi_0 is signed
+# modulo one second, so approaching +/-500 ms makes its sign ambiguous.
+# 400 ms leaves 100 ms of margin below the boundary.
+PHI0_WRAP_GUARD_NS = 400_000_000
+
 log = logging.getLogger("phc_bootstrap")
 C = 299_792_458.0
 
@@ -807,6 +813,34 @@ def main():
             phi_0 = v_epoch_off * 1_000_000_000 + v_sub_ns
             log.info("PPS verify: phi_0 = %+.0f ns (epoch_offset=%d)",
                      phi_0, v_epoch_off)
+
+            # Wrap-boundary guard.  phi_0 is phase modulo one second signed
+            # to +/-500 ms (the v_sub_ns expression above), so +499.9 ms and
+            # -499.9 ms are ADJACENT.  A residual parked near that boundary
+            # has an ambiguous sign, and the glide below would happily steer
+            # the wrong way at full authority.
+            #
+            # This is not hypothetical: the measured consequence of stepping
+            # with PEROUT armed is a 500 ms PEROUT offset (9 of 10 TimeHat
+            # runs, docs/i226-perout-500ms-bug.md) — which lands EXACTLY on
+            # the boundary.  The failure mode and the wrap ambiguity are the
+            # same number by construction, not by coincidence.
+            #
+            # Stop loudly rather than glide from an ambiguous sign.  Raised
+            # by BBGresearch 2026-09-19, who hit the same arithmetic on an
+            # independent i210 bootstrap.  Note this is the FAR end of the
+            # wrap; the near end (phase ~0, nsec oscillating 999999997 <-> 0)
+            # is the separate rounded_sec zero-crossing bug.
+            if abs(phi_0) > PHI0_WRAP_GUARD_NS:
+                log.error(
+                    "PPS verify: phi_0 = %+.0f ns is within %.0f ms of the "
+                    "+/-500 ms wrap boundary — sign is ambiguous, refusing to "
+                    "glide.  Most likely the 500 ms PEROUT half-period bug "
+                    "(was PEROUT armed during the step?).  Re-run bootstrap; "
+                    "if it repeats, check PEROUT edge placement before trusting "
+                    "this host's PHC.",
+                    phi_0, (500_000_000 - PHI0_WRAP_GUARD_NS) / 1e6)
+                return 1
         else:
             log.warning("No PPS event — assuming step landed at 0")
             phi_0 = 0
