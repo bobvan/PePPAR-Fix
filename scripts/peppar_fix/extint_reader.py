@@ -41,15 +41,36 @@ def _wrap_ns(d):
 class ExtintLateEdgeFilter:
     """Reject spurious LATE EXTINT edges caused by input-network ringing.
 
-    Mechanism (PiFace F9P, characterised 2026-06-19):
-    the ArduSimple F9P EXTINT input-shaping network adds a fixed delay
-    (~425 ns on PiFace) AND rings.  When the ring dips back below the
-    EXTINT logic-low threshold and re-crosses, the receiver sees a SECOND
-    edge one ringing-period later (~180-400 ns).  TIM-TM2 reports the
-    later edge, which TRUMPS the real one (the store keeps the freshest
-    sample), so the EKF reads the DO PPS as *late* -> concludes the DO
-    slowed -> cranks the actuator frequency UP -> a real DO excursion
-    (measured 29 us on chA; 308 us when EXTINT is the sole observer).
+    Mechanism (PiFace F9P, characterised 2026-06-19; **decomposed into TWO
+    independent defects 2026-09-20**, per Bob via BBGresearch):
+
+    1. **~425 ns FIXED delay** — the ArduSimple carrier board places an **RC
+       network between its breakout pin and the module's EXTINT pin**.  Its
+       own documentation calls this pulse shaping; it costs microseconds.
+       Cure is to bypass it.  A calibration problem, not a noise one.
+
+    2. **+180-400 ns spurious LATE edges (24.8 % of edges)** — the **TADD-2
+       Mini's PIC defaults to 5 V**, so it drives a 5 V PPS into a 3V3 EXTINT
+       input.  That overdrive rings; when the ring dips below logic-low and
+       re-crosses, the receiver sees a SECOND edge.  TIM-TM2 reports the later
+       one, which TRUMPS the real edge (the store keeps the freshest sample),
+       so the EKF reads the DO PPS as *late* -> concludes the DO slowed ->
+       cranks the actuator frequency UP -> a real DO excursion (measured 29 us
+       on chA; 308 us when EXTINT is the sole observer).
+
+    **This filter addresses (2) only, and cannot touch (1).**  An earlier
+    version of this docstring attributed both to one "input-shaping network",
+    which accounted for the delay and left the intermittency unexplained — a
+    *fixed* delay and an *intermittent* extra edge are different kinds of
+    symptom and should not have shared a cause.  That was the tell that was
+    walked past for three months.
+
+    **The cheapest cure for (2) is at the source and makes this filter
+    unnecessary for that fault: the TADD-2's PIC is configurable — strap it
+    for 3.3 V** and the overdrive is gone for every downstream device at once.
+    Keep the filter as a safety net for interface faults not yet found, but
+    check the logic levels first: no software filter removes an artefact at
+    source, and (1) is invisible to any filter — only a schematic shows it.
 
     Empirically the spurious edges are **strictly one-directional** (169
     late / 0 early over a quiet 3000-edge window) and jump discretely
