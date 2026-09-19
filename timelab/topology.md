@@ -155,40 +155,6 @@ NTS is used on Internet sources for MITM protection.
 > rewiring** (TICC #2 is now on PiFace; MadHat's i226 was removed 2026-05-24).
 > See the 2026-06-30 change-log entry for the authoritative current DO assignments.
 
-**TICC #4** (clkPoC3, `/dev/ticc4`) — *verified on host 2026-09-19*
-
-| Channel | Source | PPS from |
-|---------|--------|----------|
-| chA | clkPoC3 **i210** PHC PEROUT (SDP0, PPS OUT) | PHC-disciplined |
-| chB | lab **GNSSDO+** 1 PPS | same signal feeding the X310 and the comb injector |
-| ref | **Geppetto GPSDO 10 MHz (OCXO)** | ⚠️ still WARMING UP as of 2026-09-19 |
-
-> **MEASUREMENT ONLY — this TICC does not close any loop.**  It observes the
-> BBG PoC servo from outside.  The i210 PHC is steered *solely* from the phase
-> error the ZED-X20P reports for our own PPS (UBX-TIM-TM2 via EXTINT); nothing
-> the TICC produces enters that loop.  Bob's constraint, recorded verbatim:
-> *"Only use the TICC as an external performance measurement.  EXTINT should
-> still be the only signal driving the PHC."*
->
-> chA is a **second copy of the SDP0 edge** that also drives the receiver's
-> EXTINT, so chA−chB compares the PoC clock against an independent GNSS PPS.
-> The Geppetto is common-mode between the channels and cancels in chA−chB, so
-> its warm-up does not corrupt the tracking number — but it is fully present in
-> any chA-alone metric, which therefore measures the Geppetto, not the PoC clock.
->
-> Note that **all three corners are GNSS-disciplined** (PHC←X20P, chB←GNSSDO+,
-> ref←Geppetto).  A three-cornered hat over them is informative at short τ,
-> where each runs on its own oscillator between corrections, and is BIASED at
-> long τ where they share the GPS ensemble.  Use `tools/plot_tch.py`
-> (`--groslambert`) and believe its negative-variance NaNs.
-
-| Identity | Value |
-|---|---|
-| Host | clkPoC3 |
-| Device | `/dev/ticc4` → `ttyACM1` |
-| Arduino serial | `44236313835351906002` |
-| udev | `99-timelab.rules`, `SYMLINK+="ticc4"`, `MODE="0664"`, `GROUP="dialout"` (no sudo needed) |
-
 ### 10 MHz reference chain
 
 ```
@@ -218,40 +184,6 @@ that's what sets the lab TICC measurement floor (now Rb-class, sub-ns).
 Record topology changes here so the history of what was connected when
 is preserved. Include date, what changed, and why.
 
-### 2026-09-19 — TICC #4 rewired on clkPoC3 for the BBG PoC servo
-
-Verified on the host, not inferred: `lsusb` shows exactly **one** Arduino Mega
-(`2341:0042`) on clkPoC3, `ID_SERIAL_SHORT=44236313835351906002`, which
-`99-timelab.rules` symlinks to `/dev/ticc4`.
-
-**Present wiring** (full table in "TICC wiring" above):
-
-| | |
-|---|---|
-| chA | clkPoC3 i210 PHC PEROUT on SDP0 — a *second copy* of the edge that also drives ZED-X20P EXTINT |
-| chB | lab GNSSDO+ 1 PPS — the same signal feeding the X310 and the comb injector |
-| ref | Geppetto GPSDO 10 MHz (OCXO), **still warming up** on this date |
-
-Purpose is to break a circularity in the BBG PoC: the servo's only error signal
-(UBX-TIM-TM2) was also its only performance metric, so the loop could not be
-contradicted by its own measurement.  chA−chB supplies an independent check.
-
-**This TICC steers nothing.**  Bob's constraint verbatim: *"Only use the TICC as
-an external performance measurement.  EXTINT should still be the only signal
-driving the PHC."*  Per `peppar-fix-30`, the separation is architectural — the
-TICC servo arm exists only in `peppar_fix_engine.py` (`DOFreqEst` Arm 4, gated
-by `--no-ticc`); `ticc_capture.py` and `compare_clocks.py` neither import nor
-can reach it.
-
-**Inventory-drift note.**  Before this change the record read: topology.md
-described TICC #4 as the clkPoC3 "GNSSDO+ / PiFace logger" (host correct,
-channel description now superseded), while `timelab/gear.md` listed **no TICC #4
-at all** and says so itself at its 2026-06-30 note.  The two files did not
-*contradict* each other on the host — one was simply silent.  TICC #5 remains on
-PiPuss per the 2026-06-30 round-2 table; its udev rule is still present on
-clkPoC3 as a harmless leftover, and a stale `SYMLINK` rule for an absent device
-is not evidence of a device.  `gear.md` still needs a TICC #4 entry.
-
 ### 2026-06-30 (round 2) — PiPuss recommissioned as a clock host
 
 Pre-London "round 2" peripheral swap.  **PiPuss** returns as a CLOCK host (it had
@@ -268,7 +200,7 @@ present by inventory 2026-06-30):
 
 Resulting DO assignments (supersedes the round-1 clkPoC3 row below):
 - **PiPuss** — DO `ocxo-clkpoc3` (OCXO + AD5693R DAC, 1× gain) + F9T-20B **`2342aa323d`** + TICC #5 + temp sensor.  CLOCK host.
-- **clkPoC3** — DO REMOVED (→ PiPuss); no receiver *as of this 2026-06-30 entry* (X20 pulled earlier).  Keeps **TICC #4**.  <br>⚠️ **Superseded 2026-09-19**: clkPoC3 now carries a **ZED-X20P + Intel i210** for the BBG PoC servo, and TICC #4 was rewired (chA = i210 PHC PPS, chB = lab GNSSDO+).  See the 2026-09-19 change-log entry.
+- **clkPoC3** — DO REMOVED (→ PiPuss); no receiver (X20 pulled earlier).  Now a TICC-only logging host (keeps **TICC #4** = GNSSDO+ / PiFace logger).
 - **PiFace** — STILL a live clock host: F9T-20B **`3b41fabd5b`** (ex-MadHat) + IsoTemp `isotemp-ocxo131-100-madhat` + TICC #2, running `--no-antposest`.  (Earlier note that PiFace went "receiver-less" was WRONG — corrected here after reading serials 2026-06-30.)
 
 **F9T-20B unit inventory (SEC-UNIQID — the only way to tell EVKs apart; no USB serial).**
