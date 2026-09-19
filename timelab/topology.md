@@ -1,3 +1,21 @@
+<!-- STALE COPY — DO NOT TRUST -->
+> # ⚠ STALE COPY — the authoritative file is in the `timelab` repo
+>
+> This is a **tracked duplicate** inside PePPAR-Fix, not a symlink and not a
+> submodule.  It is **510 lines behind** the real file and nobody
+> maintains it.  Anyone who greps the PePPAR-Fix tree finds this plausible,
+> well-formed, badly out-of-date answer with no signal that it is stale — that
+> has already caused a collaborating agent to write a correct commit into a
+> file nobody reads (2026-09-19).
+>
+> **Authoritative:** `git@github.com:bobvan/timelab.git`, sibling checkout at
+> `~/git/timelab/topology.md`.  Edit, commit and push *there*.
+>
+> Left in place rather than deleted because this directory is not a clean set
+> of duplicates: `resources.json` exists **only here**, and
+> `99-timelab.rules` is *larger* here than in the timelab repo — so some of
+> this content may be unique.  Untangling that needs Bob.
+
 # Lab Topology
 
 > **Diagram is a 2026-03-16 snapshot.**  See the change log at the

@@ -960,7 +960,24 @@ antenna), update the matching file in `../timelab` and `git commit` +
 agents and to future sessions — don't leave lab state stranded in an
 uncommitted working tree.
 
-The `timelab/` directory (same content, at the town root) has authoritative lab state:
+> ⚠ **The `timelab/` directory *inside this repo* is a set of STALE TRACKED
+> COPIES — do not read or edit them.**  `topology.md` is 510 lines behind,
+> `gear.md` 357, `calibration.md` 102, `usb-identification.md` 63.  They are
+> not symlinks and not a submodule, so a grep of this tree returns
+> plausible, well-formed, badly out-of-date lab state with no signal that it
+> is stale.  That has already cost a collaborating agent a correct commit
+> written into a file nobody reads (2026-09-19).
+>
+> **Authoritative: `~/git/timelab/` (`git@github.com:bobvan/timelab.git`).**
+> Edit, commit and push there.
+>
+> Not deleted, because the directory is not a clean set of duplicates:
+> `resources.json` exists **only** in this copy, and `99-timelab.rules` is
+> *larger* here (68 lines vs 31).  Some content may be unique — untangling
+> that needs Bob.
+
+The files below are the lab's authoritative records **in the `timelab` repo**
+(`~/git/timelab/`, not the stale copies in this tree):
 
 | File | Contents |
 |---|---|
