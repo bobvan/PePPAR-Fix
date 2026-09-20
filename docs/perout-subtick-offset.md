@@ -166,6 +166,40 @@ our disciplined hosts land there:
    is a meaningful fraction of the total at that τ.  Absence of a visible dip
    bounds the term's size; it does not disprove the mechanism.
 
+   **The caveat inverts into a measurement method (BBGresearch, `0f63c8f`).**
+   Variances add, and the staircase contributes **exactly zero at the nulls**
+   — so the total curve reads off `σ_other` *directly* there.  Interpolate
+   that baseline across the nulls and subtract in quadrature at the
+   intervening τ:
+
+   ```
+   σ_stair(τ) = sqrt( σ²_total(τ) − σ²_other,interp(τ) )
+   ```
+
+   **Interpolate in log–log, not linear** — `σ_other` falls steeply across
+   that decade and a linear baseline biases the recovery high.
+
+   So the test has **three outcomes and none of them is "inconclusive"**:
+   deep nulls → *measure* the term; shallow nulls → measure it less
+   precisely; no dip → quote an **upper bound**, which is a number that can go
+   in a budget.
+
+   **Precision is a property of the staircase-to-background ratio, not of the
+   method** — verified here against synthetic data with a known staircase,
+   mean error in the recovered amplitude:
+
+   | background | 8.0 ns pk-pk | 2.4 ns | 0.8 ns |
+   |---|---|---|---|
+   | light (white 0.2 ns + RW 0.01) | 0.2 % | 2.7 % | 20 % |
+   | moderate (white 0.5 ns + RW 0.05) | **1.5 %** | **13 %** | 90 % |
+   | heavy (white 1.5 ns + RW 0.25) | 12 % | 90 % | 400 % |
+
+   The middle row reproduces BBGresearch's quoted 1.3 % / 13 % / 77 % almost
+   exactly, which identifies the background their table assumes.  **Do not
+   quote those figures as a property of the technique** — under a heavier
+   background the same method is ten times worse.  Estimate our own ratio
+   before deciding what a null-depth measurement can resolve.
+
    **Governing caveat (theirs, and it governs the whole test):**
    `d f_m/d adj = 125×10⁶`, so **1 ppb of servo motion moves every null.**
    Compute `f_m` from the `adjfine` logged *during that run*, never from
