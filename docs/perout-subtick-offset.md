@@ -136,12 +136,51 @@ our disciplined hosts land there:
    fan does not produce an 8-second line at a frequency computable from
    `adjfine`.**
 
-2. **The ADEV/TDEV signature is a BUMP near `τ ≈ 1/(2 f_m)`, not a
-   white-phase slope.**  Read as white phase, it mis-identifies the noise type
-   and mis-sets any correction cadence downstream.  **clkPoC3: bump at
-   τ ≈ 1.33 s.  PiFace: τ ≈ 4.0 s.**  Both sit squarely in the τ range we
-   routinely plot — so this is checkable against TDEV curves we already have,
-   with no new capture at all.
+2. **The ADEV/TDEV signature is a set of NULLS at `τ = n/f_m` — not a bump.**
+   *(Corrected 2026-09-20, `bdb2b70`; an earlier version of this doc said
+   "bump near τ ≈ 1/(2 f_m)" and **looking there gives a false negative** —
+   that τ is just the top of the envelope.)*  A periodic phase term gives an
+   envelope falling as ~1/τ punctuated by minima at `τ = n/f_m`, going to an
+   **exact zero** wherever `n/f_m` lands on a sampled τ.  Verified numerically
+   on the staircases above:
+
+   ```
+   tau:      1      2      3      4      5      6      7      8      9     16
+   clkPoC3 4.899  2.001  0.943  1.414  0.566  0.666  0.700  0.000  0.544  0.000
+   PiFace  2.828  1.999  1.633  1.414  0.980  0.667  0.404  0.000  0.314  0.000
+   ```
+
+   **Both hosts null at τ = 8 s and 16 s.**  Not a coincidence: since
+   `φ = frac(−adj_ppb/8)`, an *odd* integer-ppb `adj` makes the staircase
+   repeat in exactly 8 samples whatever its value; an even one halves the
+   period.  Either way the nulls land on multiples of a small integer number
+   of seconds — squarely inside the decade we routinely plot.
+
+   **Nulls are a far stronger test than a peak.**  Noise does not make minima,
+   and a coincidence cannot match a *set* of null positions computed in
+   advance.
+
+   **Sensitivity caveat (ours):** in real data the staircase is one component
+   among several.  The null is in the *staircase term only*, so the observable
+   is a local minimum in the **total** curve, visible only where the staircase
+   is a meaningful fraction of the total at that τ.  Absence of a visible dip
+   bounds the term's size; it does not disprove the mechanism.
+
+   **Governing caveat (theirs, and it governs the whole test):**
+   `d f_m/d adj = 125×10⁶`, so **1 ppb of servo motion moves every null.**
+   Compute `f_m` from the `adjfine` logged *during that run*, never from
+   today's value.  A null at today's predicted τ in a run taken at a different
+   `adj` is a coincidence; a null at the "wrong" τ is not a refutation.  And
+   if `adj` moved appreciably *within* a run, `f_m` swept and the nulls smear
+   into **elevated broadband TDEV across a decade** — which is **consistent
+   with the mechanism, not evidence against it.**  Segment long runs by `adj`
+   before looking.
+
+   **That gives a split prediction, which is stronger than either half:** a
+   run with *stable* `adj` should show clean nulls at computable τ; a run with
+   a *moving* servo should show a raised, featureless decade.  If our archive
+   contains both kinds and they split that way, that is a better result than
+   either observation alone.
 
 3. **It is a ZERO-parameter prediction, not a one-parameter fit.**  `e_k`
    depends only on `k` and `T`, and we log both — `T` from `adjfine`, `k` from
