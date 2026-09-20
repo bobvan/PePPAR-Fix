@@ -51,7 +51,7 @@ comparison) — with `N = f_m · T`:
 | regime | condition | what you see | severity |
 |---|---|---|---|
 | **dithers** | `N_obs ≫ 1` | averages away inside each observation | benign |
-| **noisy** | `N_run ≫ 1 ≫ N_obs` | parked per observation, different each time → ~2.3 ns white, no bias | tolerable |
+| **noisy** | `N_run ≫ 1 ≫ N_obs` | parked per observation, different each time — **deterministic staircase, NOT white** (§5b) | tolerable, but *identifiable* |
 | **masquerades** | **`N_run ≈ 1–10`** | **sweeps once across the run — looks exactly like clock wander** | **worst** |
 | **parks** | `N_run ≪ 1` | one static offset, uniform in ±4 ns, different per host | bias, not noise |
 
@@ -102,6 +102,56 @@ Taking "fails to average over the run" as `N_run < 10`:
 **Short runs are the dangerous ones**, which inverts the usual intuition and
 is worth knowing before anyone "fixes" an anomaly by shortening a comparison.
 
+## 5b. The "noisy" regime is a DETERMINISTIC STAIRCASE, not white noise
+
+**Correction 2026-09-20 (BBGresearch, `ca19b51`), and it is in our favour.**
+An earlier version of this doc called the noisy regime "~2.3 ns white."  It is
+not white at all.  SYSTIM fires at the first tick at or past the target, so the
+residue is
+
+```
+    e_k = T · ( 1 − frac( k·P / T ) )
+```
+
+— **deterministic in the cycle index `k`**.  Sampling once per output cycle
+does not randomise it; it reproduces the sawtooth exactly.
+
+For a **1 Hz output the per-cycle phase advance is `φ = frac(−adj_ppb / 8)`
+exactly**, so an integer-ppb `adj` gives an **8-second periodic staircase of 8
+levels, 1 ns apart, spanning the full tick.**  Verified arithmetically; both
+our disciplined hosts land there:
+
+| host | adj | φ | `e_k` sequence (ns) | period |
+|---|---|---|---|---|
+| clkPoC3 | +21 ppb | 3/8 | 8, 5, 2, 7, 4, 1, 6, 3, … | 8 s |
+| PiFace | −135 ppb | 7/8 | 8, 1, 2, 3, 4, 5, 6, 7, … | 8 s |
+
+**Three consequences, all of which make this easier to catch, not harder:**
+
+1. **The detection test must predict a FREQUENCY, not an amplitude.**  Look
+   for a **spectral line at the predicted `f_m`** in the phase residuals — not
+   elevated scatter in small-`f_m` windows.  A matched periodicity is far
+   stronger evidence than a matched magnitude, and it can only be passed by
+   the right mechanism.  It also sharpens the thermal separation: **a ceiling
+   fan does not produce an 8-second line at a frequency computable from
+   `adjfine`.**
+
+2. **The ADEV/TDEV signature is a BUMP near `τ ≈ 1/(2 f_m)`, not a
+   white-phase slope.**  Read as white phase, it mis-identifies the noise type
+   and mis-sets any correction cadence downstream.  **clkPoC3: bump at
+   τ ≈ 1.33 s.  PiFace: τ ≈ 4.0 s.**  Both sit squarely in the τ range we
+   routinely plot — so this is checkable against TDEV curves we already have,
+   with no new capture at all.
+
+3. **It is a ZERO-parameter prediction, not a one-parameter fit.**  `e_k`
+   depends only on `k` and `T`, and we log both — `T` from `adjfine`, `k` from
+   the cycle count.  Reserve one phase parameter in practice to absorb the
+   counter origin, and accumulate `φ` across the log rather than assuming it
+   constant (since `adj` moves).  But the ambition is **predict and subtract**,
+   not fit and subtract — which matters because **the residual after
+   subtraction is then a test of the model rather than a consequence of having
+   fitted to the data.**
+
 ## 5a. The test, with a free discriminator
 
 `f_m` is computable from logged `adjfine`: `f_m = frac(125e6 · adj)`.  So on an
@@ -125,10 +175,11 @@ because we have attributed excursions to thermal causes before
   form in §7.
 - **Measure and correct per-host**, accepting that the correction is only
   valid while `adj` stays away from a degenerate point.
-- **Fit and subtract it in software — probably the right answer.**  The
-  sawtooth has **known amplitude** (one tick) and **known frequency** (from
-  logged `adjfine`); only its **phase** is unknown.  That is a *one-parameter
-  fit* over a run.  Subtracting a fitted sawtooth is far cheaper than escaping
+- **PREDICT and subtract it in software — probably the right answer.**  Per
+  §5b this is a *zero*-parameter prediction: amplitude is one tick, frequency
+  comes from logged `adjfine`, and the sequence is determined by the cycle
+  index.  (An earlier version of this doc called it a one-parameter fit; that
+  undersold it.)  Subtracting a fitted sawtooth is far cheaper than escaping
   it in silicon, and a defect this well characterised is a candidate for
   correction rather than replacement.  Derived, not yet demonstrated on either
   project's data — but worth trying before anyone specifies a clock generator
