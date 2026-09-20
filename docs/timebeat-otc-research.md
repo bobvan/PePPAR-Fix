@@ -1,10 +1,24 @@
 # peppar-fix on Timebeat OTC: Renesas ClockMatrix Integration Research
 
-## CORRECTION (2026-04-04): the chip is an 8A34012, not 8A34002
+## CORRECTION (2026-04-04), ITSELF SUPERSEDED (2026-06-23): the chip IS an 8A34002
 
-All register addresses below this notice that reference the 8A34002 are
-**wrong**. See `timebeat-otc-register-map.md` for the correct 8A34012
-register map and `timebeat-integration-paths.md` for the current plan.
+> ⚠️ **This banner used to say "the chip is an 8A34012, not an 8A34002".
+> That is wrong and was corrected on the hardware side 2026-06-23.**  The part
+> is a Renesas **8A34002**, *confirmed by Timebeat* — see
+> `timebeat-otc-register-map.md`, which is the authoritative register map and
+> carries the confirmation.  The 8A34xxx family shares a common register set
+> (the Linux kernel driver treats all variants identically), which is why the
+> mis-identification survived: everything still worked.
+>
+> Left visible rather than deleted because a stale *correction* is worse than a
+> stale fact — it carries the authority of having been checked.  Surfaced
+> 2026-09-20 when BBGresearch asked us for the exact part number and our own
+> docs gave two answers.
+
+All register addresses below this notice are still **wrong** — but for the
+original reason (page-register addressing), not the part number.  See
+`timebeat-otc-register-map.md` for the correct map and
+`timebeat-integration-paths.md` for the current plan.
 
 Key differences: 16-bit I2C addressing via i2c_rdwr (not 1B page register),
 different DPLL base addresses, runtime MODE writes work (no EEPROM needed).
@@ -12,7 +26,7 @@ different DPLL base addresses, runtime MODE writes work (no EEPROM needed).
 ## Summary
 
 **Yes, this is feasible and potentially very valuable.** The Renesas
-8A34012 ClockMatrix on the OTC SBC exposes its DPLL, DCO, and TDC via
+8A34002 ClockMatrix on the OTC SBC exposes its DPLL, DCO, and TDC via
 I2C. We can open the DPLL loop, read phase error, and steer the
 oscillator independently. This gives us a much better measurement and
 control path than the i226 PHC alone.
