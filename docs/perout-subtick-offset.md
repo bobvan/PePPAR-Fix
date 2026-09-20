@@ -40,48 +40,80 @@ Our PPS OUT is a **1 Hz PEROUT off the PHC**:
 So `f_m = frac(125×10⁶ · adj)` Hz, and the whole behaviour is governed by
 where `125e6 · adj` falls relative to an integer.
 
-## 3. What that gives on our actual hosts
+## 3. Four regimes — and the worst one is the MIDDLE, not the static end
 
-| adj | 125e6·adj | f_m | sawtooth period |
+**Correction 2026-09-20 (BBGresearch, `subtick-sawtooth-regimes.md`).  An
+earlier version of this doc framed `f_m → 0` as the hazard.  That is wrong:
+a truly static offset is at least calibratable in principle.**  Classifying it
+needs *two* timescales — `T_obs` (one observation) and `T_run` (the whole
+comparison) — with `N = f_m · T`:
+
+| regime | condition | what you see | severity |
 |---|---|---|---|
-| +1.2 ppm (TimeHat free-run) | 150.000000 | **0 Hz** | never — **static** |
-| +1.2000001 ppm | 150.000013 | 12.5 µHz | 80,000 s — static in practice |
-| −135 ppb (PiFace) | −16.875 | 0.125 Hz | 8 s — dithers, averages |
-| +21 ppb (clkPoC3) | +2.625 | 0.375 Hz | 3 s — dithers, averages |
-| 0 (perfect) | 0 | **0 Hz** | never — **static** |
+| **dithers** | `N_obs ≫ 1` | averages away inside each observation | benign |
+| **noisy** | `N_run ≫ 1 ≫ N_obs` | parked per observation, different each time → ~2.3 ns white, no bias | tolerable |
+| **masquerades** | **`N_run ≈ 1–10`** | **sweeps once across the run — looks exactly like clock wander** | **worst** |
+| **parks** | `N_run ≪ 1` | one static offset, uniform in ±4 ns, different per host | bias, not noise |
 
-**The sensitivity is the story: `d f_m / d adj = 125×10⁶`, so a 1 ppb change
-in `adj` sweeps `f_m` by 0.125 Hz.**  A disciplined servo moving `adj` at the
-ppb level therefore sweeps `f_m` across the whole 0–0.5 Hz range continuously
-— and **sweeps through the near-degenerate values where `f_m → 0` and the
-offset parks quasi-statically at up to ±4 ns.**
+The middle case is **too slow to average and too fast to calibrate, and it
+arrives wearing the costume of the thing we are trying to measure.**  Against
+1 ns and 2 ns cross-host targets, an 8 ns pk-pk sweep across a run is not a
+perturbation — it is the answer.
 
-So this is not a constant bias we could calibrate out once.  It is an
-**intermittent, servo-state-dependent, quasi-static offset** whose duration
-depends on how slowly `adj` happens to be crossing a degenerate point.
+## 4. A 1 Hz output is a special case, and it is not about `adj`
 
-## 4. The test — retrospective, on data we already have
+`f_m` aliases at `f_out / 2`.  **For a 1 Hz output that is 0.5 Hz, so
+`N_obs ≤ 0.5` at one-second sampling for *every possible value of `adj`*.**
 
-`f_m` is **computable from logged `adjfine`**: `f_m = frac(125e6 · adj)`.  We
-log `adjfine` every epoch and TICC chA every second.  So:
+> **A PPS generated from a PHC is always in a parked or noisy regime at 1 s.
+> There is no oscillator good enough, or bad enough, to dither it away.**
 
-1. For an existing capture, compute `f_m(t)` from the servo log.
-2. Find the windows where `f_m` is small (say < 10 mHz — the offset is then
-   static over minutes).
-3. Ask whether TICC chA shows an unexplained quasi-static offset in exactly
-   those windows, and dithers in the others.
+This corrects the host table this doc previously carried, which described
+PiFace (`f_m` 0.125 Hz) and clkPoC3 (0.375 Hz) as *"dithers, averages."*  They
+do not average **within** an epoch — at 1 s sampling those are `N_obs` of 0.125
+and 0.375.  They average over a long enough **run**, which puts them in the
+*noisy* row (≈2.3 ns white, no bias), not the benign one:
 
-**A positive result would explain an intermittent ±4 ns excursion class that
-appears and disappears with no external cause** — a signature we have chased
-before and attributed elsewhere.  A negative result bounds the effect and
-retires it.  Either way it costs one analysis pass, no hardware.
+| adj | 125e6·adj | f_m | N_obs @1 s | regime at T_run = 100 s |
+|---|---|---|---|---|
+| +1.2 ppm (TimeHat free-run) | 150.000000 | 0 Hz | 0 | **parks** |
+| +1.2000001 ppm | 150.000013 | 12.5 µHz | ~0 | **parks** |
+| −135 ppb (PiFace) | −16.875 | 0.125 Hz | 0.125 | noisy (N_run 12.5) |
+| +21 ppb (clkPoC3) | +2.625 | 0.375 Hz | 0.375 | noisy (N_run 37.5) |
 
-## 5. Why it matters
+Escaping into *dithers* needs `T_obs ≫ 2 s`.  This is why the same mechanism
+is a curiosity for a 32 kHz comb (`N ≈ 1900` in a 0.44 s capture) and an error
+budget for a 1 PPS: **the output rate, not the oscillator.**
 
-Our cross-host agreement targets are **1 ns (shared antenna)** and **2 ns
-(separate antennas)**, 95 %.  A per-host quasi-static offset of up to ±4 ns
-would dominate both — and because it depends on each host's own `adj`, it
-does **not** cancel between hosts.
+## 5. Nulls every 8 ppb — and SHORT runs are the dangerous ones
+
+`f_m = 0` whenever `125e6 · adj` is an integer, i.e. **every 8 ppb of `adj`**.
+A servo wandering at the ppb level visits a null *periodically, not rarely*.
+
+Taking "fails to average over the run" as `N_run < 10`:
+
+| run | `f_m` needed | half-width in `adj` | duty in the bad zone |
+|---|---|---|---|
+| 100 s | 0.10 Hz | 0.80 ppb | **20 %** |
+| 1000 s | 0.010 Hz | 0.080 ppb | 2.0 % |
+| 10000 s | 0.0010 Hz | 0.0080 ppb | 0.20 % |
+| 1 day | 0.00010 Hz | 0.0009 ppb | 0.02 % |
+
+**Short runs are the dangerous ones**, which inverts the usual intuition and
+is worth knowing before anyone "fixes" an anomaly by shortening a comparison.
+
+## 5a. The test, with a free discriminator
+
+`f_m` is computable from logged `adjfine`: `f_m = frac(125e6 · adj)`.  So on an
+existing capture: compute `f_m(t)`, find the windows where `N_run` is small,
+and ask whether TICC chA parks or sweeps in exactly those windows.
+
+**The discriminator that makes it a one-pass test:** this signature correlates
+with **`f_m`, i.e. servo state**, and *not* with temperature, load, or link
+activity.  A thermal explanation and this one make **opposite predictions about
+which windows are bad**, so a single analysis separates them — which matters,
+because we have attributed excursions to thermal causes before
+([[feedback_do_discontinuity_means_external_force]]).
 
 ## 6. What would remove it
 
@@ -93,6 +125,14 @@ does **not** cancel between hosts.
   form in §7.
 - **Measure and correct per-host**, accepting that the correction is only
   valid while `adj` stays away from a degenerate point.
+- **Fit and subtract it in software — probably the right answer.**  The
+  sawtooth has **known amplitude** (one tick) and **known frequency** (from
+  logged `adjfine`); only its **phase** is unknown.  That is a *one-parameter
+  fit* over a run.  Subtracting a fitted sawtooth is far cheaper than escaping
+  it in silicon, and a defect this well characterised is a candidate for
+  correction rather than replacement.  Derived, not yet demonstrated on either
+  project's data — but worth trying before anyone specifies a clock generator
+  on account of this.
 
 ## 7. The general question, worth applying to any candidate part
 
@@ -103,6 +143,20 @@ If it is a counter — which includes an FPGA signal generator *and* a plain
 integer output divider on a clock chip — the tick is present, equal to that
 domain's clock period, and this whole analysis applies with 8 ns replaced by
 whatever that period is.
+
+## 8. A boundary that must NOT be carried across
+
+Everything above is for a **time-domain** estimator — our TICC.  A *spectral*
+estimator behaves oppositely: the sawtooth puts **discrete sidebands** at
+`±k·f_m` on every harmonic, and a fitter does not average them, it *competes*
+with them.  Longer integration does not help at all.
+
+> **Time-domain: the enemy is `f_m` being too *slow*.
+> Frequency-domain: the enemy is the sideband being too *strong*, and `f_m`
+> only sets where it sits.**
+
+Same artefact, opposite remedies.  Our instinct to make `f_m` large is right
+for us and would be irrelevant to a spectral measurement.
 
 ## Related
 
