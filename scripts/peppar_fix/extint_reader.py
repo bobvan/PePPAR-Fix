@@ -65,6 +65,37 @@ class ExtintLateEdgeFilter:
     symptom and should not have shared a cause.  That was the tell that was
     walked past for three months.
 
+    **ONE-SIDEDNESS IS IMMUNE TO HALF THE RE-ACQUISITION HAZARD, NOT ALL OF
+    IT** (recorded 2026-09-20 after BBGresearch measured an antenna pull).
+
+    When a receiver loses its fix and re-acquires, it corrects its own clock
+    in a SINGLE SAMPLE — they measured a −174 ns step at the moment the fix
+    returned, with accEst improving 108 → 68 at the same sample.  That is
+    exactly the shape this filter exists to reject, and rejecting it would be
+    wrong: it is the one genuinely correct sample in the sequence.
+
+    Their step was *early*, so our late-only rule passed it.  **But the sign
+    is not a property of re-acquisition — it is set by which way the clock
+    drifted during the outage.**  A DO or rx TCXO with a positive free-run
+    offset drifts its PPS *late*, and the correction then arrives as a large
+    LATE step, which this filter rejects.  Our fleet has both signs on record
+    (PiFace −135 ppb, clkPoC3 +21 ppb), so do not record this filter as immune
+    to re-acquisition — it is immune to whichever half the drift sign spares.
+
+    The discriminator that survives BOTH signs is accEst: a legitimate step
+    carries a simultaneous accEst *improvement*; a glitch does not.  **That
+    rule is not expressible here — `accept()` takes only `phase_ns` and cannot
+    see accEst.**  A structural limitation, not a tuning question.  Unvalidated
+    on either project's hardware, so not implemented; recorded so the gap is
+    visible before someone assumes coverage that does not exist.
+
+    Related, and quantified: `ExtintReader.update()` drops any sample with
+    `accEst > max_acc_est_ns` (default 200 ns) BEFORE this filter sees it.
+    BBGresearch measured accEst climbing 30 → 127 ns over a six-minute
+    outage, decelerating to 0.17 ns/s — so **200 ns is reached at roughly a
+    13–20 minute outage.**  The margin is minutes, not hours, and past it we
+    discard exactly the samples carrying the receiver's own correction.
+
     **The cheapest cure for (2) is at the source and makes this filter
     unnecessary for that fault: the TADD-2's PIC is configurable — strap it
     for 3.3 V** and the overdrive is gone for every downstream device at once.
