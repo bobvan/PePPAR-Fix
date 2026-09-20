@@ -184,9 +184,40 @@ our disciplined hosts land there:
    precisely; no dip → quote an **upper bound**, which is a number that can go
    in a budget.
 
-   **Precision is a property of the staircase-to-background ratio, not of the
-   method** — verified here against synthetic data with a known staircase,
-   mean error in the recovered amplitude:
+   **Precision collapses onto ONE parameter:** `r = σ_stair(τ) / σ_other(τ)`
+   at the τ being recovered.  Propagating a fractional baseline error ε
+   through `σ_stair = √(σ²_total − σ²_other)` gives
+
+   ```
+   fractional error in recovered amplitude  ≈  ε / r²
+   ```
+
+   **Verified here across 9 cells spanning 77× in `r`.**  Raw error spans
+   0.2 % → 400 % (a factor of 2000); `err · r²` spans 11.9 % → 38.8 % (a factor
+   of 3.3).  So the **`r²` scaling is real and is the right parameterisation** —
+   amplitude and background do not enter separately.
+
+   | r | recovery | branch |
+   |---|---|---|
+   | ≥ 3 | 1–2 % | a measurement |
+   | ~1 | 10–20 % | an estimate |
+   | < 0.5 | > 40 % | **bound only** |
+
+   ⚠ **The exponent transfers; the prefactor does not.**  BBGresearch measured
+   `err·r²` ≈ **10.4 %** (spread 7.7–12.4 %); we measure **29.7 %** (spread
+   11.9–38.8 %) on the same law.  The difference is in setup details — how `r`
+   is defined, which τ are averaged, interpolation specifics — so **calibrate
+   the prefactor on your own synthetic data before quoting an accuracy.**
+   Note the recursion: reparameterising to remove a frame-dependent *table*
+   left a frame-dependent *constant*.  The law also degrades below `r ≈ 0.5`,
+   where clipping and the √ nonlinearity bite.
+
+   **Operationally this is worse than "estimate `r` first": precision degrades
+   as the SQUARE, so 3× more background costs 10× in recovered accuracy.**  For
+   a PHC on a plain XO `r` may sit near 1 — the *estimate* branch, which makes
+   the **bound** the branch that matters for us.
+
+   The underlying per-cell measurements, kept as the instance:
 
    | background | 8.0 ns pk-pk | 2.4 ns | 0.8 ns |
    |---|---|---|---|
