@@ -203,6 +203,54 @@ our disciplined hosts land there:
    | ~1 | 10–20 % | an estimate |
    | < 0.5 | > 40 % | **bound only** |
 
+   ⚠⚠ **SUPERSEDED — the prefactor difference was τ PLACEMENT, not setup.**
+   *(2026-09-20, BBGresearch.)*  The `ε/r²` law is a law about an
+   **extrapolated** baseline.  Both our τ sets put recovery points *below the
+   first null*, where `σ_other` is extrapolated rather than interpolated.
+   Recover **strictly between two measured nulls** and the picture changes
+   completely — verified here, same 9 cells, same backgrounds:
+
+   | | extrapolated (τ = 2,4,6) | **interior (τ = 9,12,14)** |
+   |---|---|---|
+   | r = 1.79 | 12.1 % | **0.1 %** |
+   | r = 0.53 | 92.3 % | **0.8 %** |
+   | r = 0.18 | 403 % | **14.2 %** |
+
+   **Interior recovery is 30–120× better at the same `r`**, and the `r²`
+   scaling stops being the binding term.
+
+   > **THE RULE: recover only at τ strictly between two *measured* nulls.
+   > Never below the first or above the last.**
+
+   Interior-only branches:
+
+   | r | error | verdict |
+   |---|---|---|
+   | ≥ 1 | < 0.5 % | a measurement |
+   | ~0.5 | ~1–3 % | good estimate |
+   | ~0.15 | ~11–14 % | estimate |
+   | < 0.1 | > 50 % | bound only |
+
+   **This moves the bound threshold from `r ≈ 1` down to `r ≈ 0.1`.**  A PHC
+   on a plain XO near `r ≈ 1` is therefore in the **measurement** branch, not
+   the estimate branch — our earlier conclusion that "the bound is the branch
+   that matters" was too pessimistic by about an order of magnitude in `r`.
+
+   **Two practical notes.**  The *measured* nulls are only those τ where
+   `n/f_m` lands on a **sampled** τ — for clkPoC3's `f_m = 0.375 Hz` that is
+   8, 16, 24, **not** 2.67 or 5.33 — so the usable interior is τ ≈ 9…23.  And
+   within that span `σ_stair` still dips at the *unsampled* nulls (10.67,
+   13.33), so choose recovery τ away from those, where `r` is largest.
+
+   **Negative result, recorded so nobody re-tries it:** BBGresearch first
+   guessed the prefactor was simply `ε` — the baseline interpolation's own
+   fractional error — and tried estimating it by leave-one-null-out
+   cross-validation.  It **failed**, spreading by a factor of 144.  The
+   prefactor is not the baseline's self-consistency; it is *whether you are
+   interpolating or extrapolating at all*.
+
+   The superseded analysis, kept as the instance:
+
    ⚠ **The exponent transfers; the prefactor does not.**  BBGresearch measured
    `err·r²` ≈ **10.4 %** (spread 7.7–12.4 %); we measure **29.7 %** (spread
    11.9–38.8 %) on the same law.  The difference is in setup details — how `r`
