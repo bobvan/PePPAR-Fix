@@ -5,6 +5,50 @@ Fix.  We carry two independent patch sets in `drivers/` to fix them.
 Both must be applied together for correct operation on any i226 host
 that runs PHC discipline + ptp4l.
 
+> ## ⚠ 2026-10-05 — A CONCRETE TRIGGER FOR THE TX HANG, AND IT IS NOT A SOFTWARE WORKLOAD
+>
+> **Measured by BBGresearch (Caleb) from TimeHat's dmesg, verified here.**
+> On 2026-10-05 the i226 logged **23 `Detected Tx Unit Hang` lines across 6
+> `Reset adapter` clusters** between 08:48 and 10:45 local — each within
+> minutes of a **USB plug event** — with `hwmon3: Undervoltage detected!` at
+> 10:45:16.  The host is a **Pi 5 with `usb_max_current_enable=0`** (USB capped
+> at 600 mA) and `vcgencmd get_throttled` = **`0x50000`** (under-voltage *has*
+> occurred, soft temperature limit *has* occurred).
+>
+> In the preceding 27 days there was **exactly one** other cluster: 2026-09-08
+> 16:46, which is ~19 minutes before another project's tool ran on that host.
+>
+> **Why this reframes `igcWedgeAttribution`: the campaign's null result is now
+> explained.**  Bravo's 2026-08-26/27 campaign ran ten arms varying adjfine
+> rate, TX rate and driver version (patched vs stock), and **every single arm
+> returned `rc=0` — no timeouts observed, on any arm, including stock.**  It
+> hammered TX timestamping in software and could not reproduce the wedge.  The
+> campaign window shows **no Tx Unit Hang at all** in dmesg.
+>
+> So the campaign varied the wrong axis.  **The correlate is a power/USB
+> event, which a scripted software sweep never produces.**
+>
+> **This also resolves the self-contradiction flagged in this doc in
+> September.**  The incident table said *"no adjfine running at time of first
+> timeout cascade"* while its root-cause column said the strand happened
+> *"during adjfine."*  Both can be true if **adjfine is irrelevant** — which is
+> what a power-side trigger implies.  The contradiction was a symptom of
+> attributing a power event to whatever software happened to be running.
+>
+> **Methodological consequence, and it is general: `/sys/class/ptp/ptpN/pins/`
+> reports DRIVER CACHE, not hardware state.**  Every igc reset zeroes
+> `TSAUXC`/`TSSDP`, so a PEROUT un-arms *in hardware* while sysfs keeps
+> printing it armed.  Any decision of the form "the pins read as armed, so X is
+> unsafe" is resting on a cached value.  Our own pin reads on this host in
+> September were therefore not evidence of hardware state, and the PEROUT
+> evidence we thought we were preserving had already been destroyed by resets
+> before it was formally released.
+>
+> **Open:** Caleb has asked Bob for a 5 V 5 A supply.  If the trigger is
+> supply margin, that is the fix — and it would mean the ~44 min MTBF this doc
+> records is a property of an under-supplied host, not of the part.  **Do not
+> quote that MTBF as an i226 characteristic until this is settled.**
+
 ## Patch inventory
 
 ### Patch 1: TimeHAT PPS dual-edge fix ("ppsfix")
