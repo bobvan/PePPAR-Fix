@@ -122,6 +122,24 @@ observations / the peer-bootstrap + caster-ephemeris direction
 — not for corrections or Onocoy. Don't grow it into a general caster; that's
 re-inventing str2str/BKG.
 
+> **⚠ 2026-10-05 — that niche may not exist.**  BBGresearch, designing the same
+> shape of thing, found the input-side inversion we missed: **have the
+> *producer* listen on a local TCP port and let `str2str` pull it with
+> `tcpcli://`, serving `ntripc://` mountpoints outward.**  str2str's
+> pull-orientation — which this doc treats as the constraint that justifies
+> keeping our own caster for engine output — is only a constraint on where the
+> *connection* is initiated, not on where the data originates.  Invert that and
+> str2str serves the engine's own observations as happily as it serves a
+> relayed upstream.
+>
+> If that holds, **`ntrip_caster.py` (16 KB, written for peer bootstrap, never
+> deployed anywhere) has no remaining niche** and the peer-bootstrap /
+> caster-ephemeris direction can be built on a maintained tool instead.  Worth
+> testing before anyone invests further in it.  It does **not** change the
+> Onocoy conclusion — that needs an NTRIP-server *push*, which is a different
+> capability and str2str does have it.  Credit: BBGresearch's
+> `docs/design/inter-clock-exchange-over-ntrip.md`.
+
 ## Logging — yes, log the streams
 
 Worth doing for every box, cheap (RTCM is compact):
