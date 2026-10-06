@@ -49,6 +49,47 @@ that runs PHC discipline + ptp4l.
 > records is a property of an under-supplied host, not of the part.  **Do not
 > quote that MTBF as an i226 characteristic until this is settled.**
 
+> ## ⚠⚠ 2026-10-06 — eth1's RX HAS BEEN DEAD FOR 40 DAYS, AND IT CONFOUNDS THE CAMPAIGN
+>
+> Live wedged state captured before any recovery, at
+> `gt:~/gt/peppar-fix-data/timehat-igc-wedge-live-20261006/`.  Reported by
+> BBGresearch's Caleb as "dead receive path"; measured here:
+>
+> ```
+> boot            2026-08-26 18:16:51
+> undervoltage    2026-08-26 18:16:57    <- SIX SECONDS AFTER BOOT
+> uptime          40.6 days
+> rx_missed       30,656,721 = 8.74/s averaged over the WHOLE uptime
+> RDH[0-3]        0 0 0 0    <- RX descriptor head never advanced, any ring
+> ethtool rx_pkts 4477       <- hardware MAC accepted a few frames
+> netdev RX pkts  0          <- driver delivered NONE upstream
+> ```
+>
+> **The receive path never initialised.**  The NIC came up during a brownout six
+> seconds after boot and `RDH` has sat at zero on all four rings for 40.6 days.
+> This is **not** a progressive wedge, **not** the documented TX-timestamp/EXTTS
+> failure, and **not** caused by the transmissions that revealed it.
+>
+> Note the diagnostic trap: `ip -s link` reports RX 0/0 while `ethtool -S`
+> reports `rx_packets: 4477`.  **Hardware counters and netdev stats disagree**,
+> because the former reads the MAC's register and the latter the driver's ring
+> counters.  Reading only one of them gets you the wrong layer.
+>
+> **⚠ THIS CONFOUNDS `igcWedgeAttribution`.**  Bravo's ten-arm campaign ran
+> 2026-08-26 21:28 → 2026-08-27 09:37 — about **three hours after this boot, on
+> an adapter whose RX was already dead.**  Every arm ran on half-broken
+> hardware.  That is a second, independent reason its `rc=0` results cannot
+> support a conclusion, on top of its having varied the wrong axis.  **Any
+> re-run must first verify the NIC is healthy** — `rx_missed_errors` near zero
+> and netdev RX counting — which nobody checked, including me.
+>
+> **The power problem is worse and more autonomous than recorded yesterday.**
+> Oct 5 alone: **36 `Reset adapter` and 40 `Undervoltage detected`**.  The
+> evening events (19:07, 20:37–21:56) happened with **no USB activity**, so the
+> brownouts are not merely USB-plug-triggered — the host browns out on its own.
+> That strengthens the case for the 5 V 5 A supply from "likely trigger" to
+> "this host's power is inadequate, full stop."
+
 ## Patch inventory
 
 ### Patch 1: TimeHAT PPS dual-edge fix ("ppsfix")
