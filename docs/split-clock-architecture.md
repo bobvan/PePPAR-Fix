@@ -123,6 +123,41 @@ none; physically separated sites once the cable run allows it.
 
 ### 3.3 i226 is the wrong NIC for this — by our own measurements
 
+> ## ⚠ RETRACTED IN PART, 2026-10-07 — the MTBF this verdict rests on was a POWER FAULT
+>
+> **A 5 V 5 A supply eliminated the wedge entirely on TimeHat.**  Before: 42
+> `Reset adapter`, 85 `Tx Unit Hang`, 40 `Undervoltage`, `rx_missed_errors`
+> 32,099,512 climbing, netdev RX dead for 42 days, `get_throttled = 0x50000`.
+> After a clean boot on adequate supply: **0 / 0 / 0, `rx_missed` 0, RX packets
+> counting, `get_throttled = 0x0`.**  Full before/after in
+> [`igc-kernel-patches.md`](igc-kernel-patches.md).
+>
+> **So the "~44 minutes at 1 Hz adjfine + 1 Hz ptp4l sync" MTBF quoted below is
+> a property of an under-supplied Pi 5, not of the i226.**  The stated trigger
+> — *"PHC frequency discipline concurrent with PTP hardware timestamping"* —
+> was never tested against a healthy supply.  Bravo's ten-arm campaign, which
+> varied exactly that axis, returned `rc=0` on every arm and was itself run on
+> a host whose RX was already dead.
+>
+> **What this does to the verdict:**
+>
+> - The **wedge** argument against i226 is withdrawn pending re-measurement on
+>   adequate power.  It may simply not exist.
+> - The **[PEROUT 500 ms bug](i226-perout-500ms-bug.md)** argument **stands** —
+>   that is separately measured (9 of 10 stepping runs), board-dependent, and
+>   unrelated to supply.
+> - So the verdict weakens from *"do not put i226 in either unit"* to **"the
+>   i226's remaining disqualifier is the PEROUT half-period bug, which is
+>   board-dependent and testable per board."**  That matters because the i226
+>   is the cheap dual-port NIC this design wanted in the first place.
+>
+> **Limit on the evidence: N = 1 host.**  No second i226 on a marginal supply
+> is available to corroborate — MadHat carries an **I210**, not an i226, and is
+> already adequately supplied.  **Do not rewrite the architecture on this
+> yet; re-measure first.**  The honest status is that the strongest argument
+> against the part turned out to be an argument about a power supply.
+
+
 `docs/igc-kernel-patches.md` documents, on TimeHat:
 
 > TX timestamp timeouts cascade into "a permanent wedge where all 4 TX
