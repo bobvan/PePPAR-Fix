@@ -83,6 +83,27 @@ that runs PHC discipline + ptp4l.
 > host, same card, one variable changed, a 42-day fault cleared completely —
 > and not yet a general claim about the part on any host.
 >
+> **⚠ WHAT THIS DOES *NOT* YET SHOW — and the test that would close it.**
+> The before/after proves the **boot-time RX-ring fault** is power-related.  It
+> does **not** prove the **TX-timestamp wedge** is, because the wedge's stated
+> trigger is a *workload* — 1 Hz adjfine concurrent with 1 Hz ptp4l sync — and
+> the post-swap host has been **idle**.  Confirmed healthy at 6 minutes uptime
+> (`rx_missed` 0, RX counting 1470 → 7777, `get_throttled` 0x0, zero fault
+> lines), but idle minutes are not the same experiment.
+>
+> **The closing test, which needs no new tooling:** run
+> `tools/igc_tx_timeout_repro.py` — it already drives both sides of the race —
+> on the healthy host under the production configuration, for **well past the
+> old ~44 min MTBF**.  Clean for several hours ⇒ the wedge was power all along
+> and the verdict in
+> [`split-clock-architecture.md`](split-clock-architecture.md) §3.3 can be
+> rewritten rather than merely hedged.  Wedges on good power ⇒ there are two
+> distinct faults, the patches keep their justification, and only the *MTBF
+> figure* was contaminated.
+>
+> Needs the i226, which is currently BBGresearch's — so it is Bob's call, not a
+> thing to schedule unilaterally.
+>
 > **What the patches were for is now in question too.**  Both patch sets in
 > this document address real, separately-observed defects (the dual-edge
 > timestamping bug and the adjfine `TSYNCTXCTL` race).  But the *wedge* they
