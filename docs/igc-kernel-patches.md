@@ -49,6 +49,49 @@ that runs PHC discipline + ptp4l.
 > records is a property of an under-supplied host, not of the part.  **Do not
 > quote that MTBF as an i226 characteristic until this is settled.**
 
+> ## ✅ 2026-10-07 — RESOLVED BY A POWER SUPPLY.  THE ~44 min MTBF IS NOT AN i226 PROPERTY.
+>
+> **A 5 V 5 A supply fixed it completely.**  Measured by BBGresearch's Caleb
+> 45 s after a clean boot, and the before/after is unambiguous:
+>
+> | | before (3 A supply) | after (5 A supply) |
+> |---|---|---|
+> | `rx_missed_errors` | **32,099,512**, +17/s | **0**, +0 over 10 s |
+> | netdev RX packets | **0** | **1252 → 1470 in 10 s — counting** |
+> | `vcgencmd get_throttled` | `0x50000` | **`0x0`** |
+> | firmware PSU `max_current` | 3000 mA | **5000 mA** |
+> | `usb_max_current_enable` | 0 | **1** |
+> | Reset adapter / Tx Hang / Undervoltage since boot | 42 / 85 / 40 | **0 / 0 / 0** |
+>
+> **The i226 is fine.**  The 42-day dead receive ring was a **boot-time brownout
+> artifact** — the card came up during an undervoltage six seconds after boot
+> and its RX ring never initialised.  On adequate supply it initialises
+> correctly and the counters stay clean.
+>
+> **Therefore the ~44 min MTBF recorded in this document is a property of an
+> under-supplied host, not of the part.**  Do not quote it as an i226
+> characteristic.  Everything downstream of it needs re-examining — see
+> `docs/split-clock-architecture.md` §3.3, where the i226 is disqualified for
+> the rooftop-ear design on exactly that figure.
+>
+> **Honest limit on the evidence: N = 1 host.**  The obvious corroboration —
+> does another i226 on a marginal supply show the same thing — **is not
+> available**, because MadHat turns out to carry an **Intel I210** (reworked
+> I210-T1, `igb`), not an i226, and it is already on an adequate supply
+> (`get_throttled = 0x0`, `usb_max_current_enable=1`, 16 days up, zero
+> undervoltage, zero resets).  So this is a strong single-host result — same
+> host, same card, one variable changed, a 42-day fault cleared completely —
+> and not yet a general claim about the part on any host.
+>
+> **What the patches were for is now in question too.**  Both patch sets in
+> this document address real, separately-observed defects (the dual-edge
+> timestamping bug and the adjfine `TSYNCTXCTL` race).  But the *wedge* they
+> were deployed against, and whose MTBF justified the urgency, was a power
+> fault.  H1 (orphaned timestamp slots) and H2 (our v3 read-modify-write)
+> were never needed to explain it.
+>
+> ---
+>
 > ## ⚠⚠ 2026-10-06 — eth1's RX HAS BEEN DEAD FOR 40 DAYS, AND IT CONFOUNDS THE CAMPAIGN
 >
 > Live wedged state captured before any recovery, at
