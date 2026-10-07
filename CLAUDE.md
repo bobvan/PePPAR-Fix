@@ -672,6 +672,33 @@ After any significant capture or test, pull results back to the GT
 server (`/home/bob/gt/`) which has RAIDZ-3 + offsite backup. Large
 datasets can stay on lab hosts; everything else should be pulled.
 
+> ⚠ **We under-apply this rule, and it fails in a specific direction: the
+> habit covers DERIVED data and misses the IRREPLACEABLE data.**  Measured
+> 2026-10-07 on MadHat:
+>
+> ```
+> data/*.csv   1044 files   ALL 1044 on gt   (content-verified)
+> data/*.ubx     11 files     0 of 11 on gt  <- raw GNSS observations
+> ```
+>
+> **That asymmetry is backwards.**  The CSVs are regenerable from the `.ubx`;
+> the `.ubx` are regenerable from nothing.  Yet the archiving habit was
+> perfect on the derived product and absent on the source — 314 MB of raw
+> observations sat on one SD card from May to October.
+>
+> **Both of this week's near-misses were found by someone else's disk audit,
+> not by us** — BBGresearch's cleanup surveys turned up MadHat's unarchived
+> `.ubx` and, days earlier, `~/igc-wedge-data` (the only copy of a campaign's
+> results, six weeks on eMMC).  We have **no mechanism that detects
+> unarchived raw data**; we rely on remembering, and the evidence says we
+> don't.
+>
+> **Concrete check, worth running before trusting any host's storage:** for
+> each host, list `*.ubx` / `*.rtcm` / raw spools and compare against
+> `find ~/gt -name '<basename>'`.  Basename match is enough to find the gap;
+> verify content with `md5sum` before deleting anything.  **Raw first, derived
+> second** — the opposite of the order the habit actually follows.
+
 ## Resource Allocation
 
 Lab hardware is shared. Before using a host or device, check that no
