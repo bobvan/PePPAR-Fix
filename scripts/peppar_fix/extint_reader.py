@@ -356,7 +356,24 @@ class TimTm2Store:
         tow_sub_ms_ns = int(getattr(parsed, "towSubMsR", 0))
         acc_est = int(getattr(parsed, "accEst", -1))
         count = int(getattr(parsed, "count", 0))
-        flags = int(getattr(parsed, "flags", 0))
+        # pyubx2 does NOT expose a raw `flags` byte for TIM-TM2 — it expands
+        # the bitfield into named attributes.  `getattr(parsed, "flags", 0)`
+        # therefore returned the DEFAULT 0 on every message ever logged, and
+        # the `flags` column in every extint CSV we hold is a constant zero
+        # (verified: 758,017 samples across 137 captures, all 0x00).  Worse
+        # than missing, because a column of zeros looks like data.
+        # Reconstruct the real byte from the named attributes, u-blox layout:
+        #   bit0 mode  bit1 run  bit2 newFallingEdge  bits3-4 timeBase
+        #   bit5 utc   bit6 time (timestamp VALID)    bit7 newRisingEdge
+        flags = (
+            (int(getattr(parsed, "mode", 0)) & 1)
+            | ((int(getattr(parsed, "run", 0)) & 1) << 1)
+            | ((int(getattr(parsed, "newFallingEdge", 0)) & 1) << 2)
+            | ((int(getattr(parsed, "timeBase", 0)) & 3) << 3)
+            | ((int(getattr(parsed, "utc", 0)) & 1) << 5)
+            | ((int(getattr(parsed, "time", 0)) & 1) << 6)
+            | ((int(getattr(parsed, "newRisingEdge", 0)) & 1) << 7)
+        )
 
         residual_ns = phase_residual_ns(tow_ms, tow_sub_ms_ns)
 
