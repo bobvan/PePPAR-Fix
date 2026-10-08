@@ -1,3 +1,32 @@
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ ⚠ RETIRED 2026-10-07 — MadHat IS NO LONGER A PePPAR-FIX HOST.        ║
+# ║                                                                      ║
+# ║ The ~/peppar-fix checkout was removed from MadHat on Bob's           ║
+# ║ instruction.  The host now belongs to BBGresearch as its shared      ║
+# ║ measurement machine.  This file is kept as the record of what the    ║
+# ║ host WAS, not as a live configuration — do not deploy it.            ║
+# ║                                                                      ║
+# ║ Two things in here are now factually wrong about that hardware:      ║
+# ║   * ptp_dev = "/dev/ptp_i226"  — MadHat carries an Intel **I210**    ║
+# ║     (reworked I210-T1, igb), confirmed by lspci 2026-10-07.  It was  ║
+# ║     never re-verified after the i226 era.                            ║
+# ║   * ticc_port — TICC #2's location is unconfirmed; the TICC          ║
+# ║     inventory moved repeatedly through 2026.                         ║
+# ║                                                                      ║
+# ║ Everything of ours was archived off that host, sha256-verified:      ║
+# ║   gt:~/gt/peppar-fix-data/madhat-ubx-raw-20260707/        11 .ubx    ║
+# ║   gt:~/gt/peppar-fix-data/madhat-remainder-20261007/      515 files  ║
+# ║   gt:~/gt/peppar-fix-data/madhat-home-remainder-20261007/ 81 files   ║
+# ║   gt:~/gt/peppar-fix-data/peppar-madhat-checkout-20261007.tar        ║
+# ║        both worktrees whole + git bundles + UNTRACKED STATE          ║
+# ║        (state/dos, state/receivers, antennas.json, ntrip*.conf)      ║
+# ║        mode 0600 — holds credentials and surveyed positions          ║
+# ║   MadHat:~/PEPPAR-RETIRED.txt lists it all on the host itself        ║
+# ║                                                                      ║
+# ║ If MadHat is ever rebuilt as a clock, re-derive this file from the   ║
+# ║ hardware rather than trusting it.                                    ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
 [peppar]
 # MadHat has run a NEO-F10T (ArduSimple breakout) since the F9T
 # swap-out on 2026-05-12.  Two F10T-specific realities encoded
