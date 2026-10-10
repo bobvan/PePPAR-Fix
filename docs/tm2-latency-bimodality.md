@@ -234,3 +234,60 @@ Note this mechanism is distinct from the both-edges one killed above.  That one
 needed TM2's own `towMsF` fields to be read (they are not, by either codebase);
 this one needs no software error at all — a second physical edge arrives and is
 correctly timestamped.
+
+### Difference `count` per unit TIME, not per message
+
+My absolute branch table above (+2 = extra capture, +1 = mistiming) does not
+transfer to a 50%-duty EXTINT.  BBGresearch corrected it: on NewHat both edges
+are counted, so normal steps are *already* +1 or +2, and an extra capture shows
+as "one more than the normal step".  Measured on 10-09: +1 ×31,287 and
++2 ×19,005 normally, with +2 ×900 and +3 ×266 into strays.
+
+But the relative form inherits a confound, and their own numbers expose it:
+
+```
+advance per message = (31287·1 + 19005·2) / 50292 = 1.3779
+  count = rising only, no message loss        -> 1.0000
+  count = both edges, 1 msg/s, no loss        -> 2.0000
+  observed                                    -> 1.3779   <- neither
+```
+
+So the +1/+2 mix is not explained by edge-counting alone.  The other reading is
+**message loss**: `count` is a hardware counter that does not drop events even
+when the message carrying it is dropped, so a lost message makes the *next*
+message's per-message delta larger.  37.8% of steps being +2 is then a ~38%
+loss rate, not an edge-counting property.
+
+The two readings are not distinguishable per-message, which is the problem: a
+"+3 into strays" could be one extra edge on a normal +2, or a lost message on a
+normal +2, or two lost messages.  Differencing per message conflates a property
+of the *signal* with a property of the *message stream*.
+
+**The fix removes the confound rather than modelling it.**  Edges arrive at a
+hardware-determined rate — 2/s for a 50%-duty 1 Hz pulse if both edges count,
+1/s if rising only.  Over any window:
+
+```
+expected count advance = (edges per second) x window_seconds
+```
+
+An extra captured edge raises that **rate**.  A lost message does not change it
+at all — the counter kept counting while the message was missing.  So the
+per-second count rate is immune to delivery loss, where the per-message delta is
+not.  It also measures the edge rate directly, which settles "both edges or
+rising only" as a by-product: ≈2.0/s ⇒ both, ≈1.0/s ⇒ rising only.
+
+### A consequence worth testing before anything else
+
+If +2 steps really are lost messages at ~38%, that sits close to the 46–51%
+late fraction — and "late by ~1000 ms" would then have a mundane explanation:
+**the message for that second was lost, and what arrives ~1 s later is the
+next epoch's message.**  That would dissolve the latency bimodality into
+message loss rather than a latency mechanism, and it would make the
+off-by-one-edge hazard in Arm 3 (documented above) concrete rather than
+hypothetical.
+
+Two checks, both on data already logged: on a late-regime message, (a) does
+`count` show the extra advance of a missed predecessor, and (b) does `towMsR`
+correspond to the *previous* second rather than the current one?  Both yes ⇒
+message loss, not latency.
