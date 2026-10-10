@@ -291,3 +291,71 @@ Two checks, both on data already logged: on a late-regime message, (a) does
 `count` show the extra advance of a missed predecessor, and (b) does `towMsR`
 correspond to the *previous* second rather than the current one?  Both yes ⇒
 message loss, not latency.
+
+### Message loss refuted; the count rate is 1.44/s and unexplained
+
+Measured on NewHat with the per-unit-time method, deltas unwrapped mod 65,536
+(`count` is U2 and wrapped in the long log):
+
+| Window | Span | Delivered | count rate | late |
+|---|---|---|---|---|
+| 10-09 15:06Z → 10-10 03:16Z | 43,007 s | 99.49% | 1.441/s | 50.3% |
+| from 10-10 03:16Z | 1,214 s | 100% | 1.432/s | 0% |
+
+**Message loss is refuted as the late regime** — 0.5% missing against 50% late.
+The late messages are delayed, not substituted for lost predecessors.  That
+retires the hypothesis in the previous section, in one line, from data already
+on disk.
+
+What remains unexplained is **1.44/s on a 1 Hz input, in both regimes** —
+neither rising-only (1.0) nor both-edges (2.0).  Read as an edge rate it means
+EXTINT sees ~0.44 extra counted transitions per second.
+
+#### The counter/reporter rate mismatch is expected, not evidence against extras
+
+BBGresearch note the extras are far more frequent than the strays (~16× by our
+arithmetic: 0.441/s vs 1166 events / 43,007 s = 0.027/s) and read that as "most
+extras don't produce one".  But **a counter sees every event while TM2 reports
+at most one rising and one falling edge per message**, so count rate ≫ stray
+rate is the predicted behaviour of the pair, not a problem for the coupling
+picture.  The mismatch carries no information either way.
+
+#### The real constraint is phase concentration
+
+What *does* constrain it: if extras occurred at random phases, then whenever an
+extra happened to be the last rising edge of its second, the reported residual
+would land at that random phase — so reported residuals would be **scattered
+across the second**.  They are not; they are bimodal at ≈0 and +100 ms.
+
+So either the extras are phase-concentrated (a deterministic aggressor, which
+is what the TP1 story predicts — see the falling-edge section above), or **they
+are not EXTINT edges at all** and `count` is incrementing on something internal.
+
+A phase histogram of *all* reported residuals, not just the classified ones,
+separates those: scattered ⇒ random coupling; clean bimodal ⇒ deterministic
+aggressor or a non-edge counter.
+
+#### Test whether `count` is an edge counter before buying 0.44 extra edges
+
+Cheaper than a scope and it decides whether a scope would even be measuring the
+right thing: **change the input rate.**  Take the PEROUT to 2 Hz.
+
+- count rate → ~2.88/s (scales with input) ⇒ `count` tracks edges, and the
+  0.44/s excess is real extra transitions.
+- count rate stays ~1.44/s ⇒ `count` is counting something internal, the
+  "extras" are not edges, and the whole 0.44/s line of inquiry is void.
+
+#### Do not read 44.1% ≈ 50.3% as an identity
+
+0.441 extras/s is a 44.1% per-second probability, close to the 50.3% late
+fraction.  **That resemblance is not evidence.**  One message earlier in this
+same investigation we matched a 37.8% implied loss rate against the same 46–51%
+late fraction and it was refuted outright by the delivery measurement.  Two
+aggregate rates being close is the weakest form of agreement available.
+
+The test that would make it more than coincidence is **per-second pairing**:
+build the 2×2 contingency table of (count advanced above the normal step) ×
+(message was late), second by second.  Aggregate rates matching is compatible
+with the two phenomena being independent; a per-second correlation is not.
+Same rule as everywhere else here — compare each event to its neighbours, never
+to a pooled statistic of a population you already know is bimodal.
