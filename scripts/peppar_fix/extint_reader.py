@@ -311,7 +311,7 @@ class TimTm2Store:
         Args:
           log_writer: optional csv.writer.  Header expected:
               host_timestamp,host_monotonic,wn,tow_ms,tow_sub_ms_ns,
-              acc_est_ns,phase_residual_ns,count,flags
+              acc_est_ns,phase_residual_ns,count,flags,ch
           log_file: file handle for flush() after each row.
           max_acc_est_ns: accEst values above this are recorded but
               not exposed to the engine — the F9T's nav engine is
@@ -351,6 +351,11 @@ class TimTm2Store:
         """
         host_mono = time.monotonic() if recv_mono is None else recv_mono
         host_wall = time.time()  # wallclock-ok: extint log wall stamp; correlation uses host_mono (recv_mono)
+        # TM2 `ch` is the EXTINT input the pulse arrived on (0 = EXTINT0,
+        # 1 = EXTINT1).  Logged because it is the only field that can tell a
+        # stray edge on a *different physical input* from a mistimed edge on
+        # the expected one — see docs/tm2-latency-bimodality.md.
+        ch = int(getattr(parsed, "ch", 0))
         wnR = int(getattr(parsed, "wnR", 0))
         tow_ms = int(getattr(parsed, "towMsR", 0))
         tow_sub_ms_ns = int(getattr(parsed, "towSubMsR", 0))
@@ -383,7 +388,7 @@ class TimTm2Store:
                     f"{host_wall:.6f}",
                     f"{host_mono:.9f}",
                     wnR, tow_ms, tow_sub_ms_ns,
-                    acc_est, residual_ns, count, f"0x{flags:02x}",
+                    acc_est, residual_ns, count, f"0x{flags:02x}", ch,
                 ])
                 if self._log_file is not None:
                     self._log_file.flush()

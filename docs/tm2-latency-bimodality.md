@@ -116,3 +116,77 @@ which is its own finding) or accepted (in which case they are biasing x[2]).
 - Our own `flags` column was a constant zero until `e2c1e45`, and our `wn`
   column mixes 10-bit-rolled and full week numbers — so our archive cannot
   contribute flag or absolute-time evidence, only neighbour-relative latency.
+
+## The +100 ms stray: TM2 carries both edges, so one pulse width is in reach
+
+Checked against pyubx2's payload definition rather than assumed — **every
+TIM-TM2 message carries two complete timestamps**:
+
+```
+ch  flags{mode,run,newFallingEdge,timeBase,utc,time,newRisingEdge}  count
+wnR  wnF  towMsR  towSubMsR  towMsF  towSubMsF  accEst
+```
+
+`wnR/towMsR/towSubMsR` is the last **rising** edge, `wnF/towMsF/towSubMsF` the
+last **falling** edge, each with its own validity flag.  So any consumer that
+reads the F fields, or reads "whichever edge is new", is wrong by **exactly one
+pulse width** — not by a jitter-like amount, by a hardware constant.
+
+This matters because the F9T's factory timepulse width is **100 ms**, which is
+the stray's magnitude.  It also reproduces the regime-dependence BBGresearch
+established empirically (strays require the late latency regime) with no
+walking boundary of any kind: the on-time regime's 74–84 ms latency is *less*
+than a 100 ms pulse, so those messages are emitted **before the falling edge
+exists** and there is nothing to confuse; the late regime's ~1080 ms is after
+it, so both edges are new.
+
+**But the pulse width that matters is the width on the EXTINT pin, not the
+F9T's timepulse-output default** — and on neither fleet is the F9T's own
+timepulse the signal being timestamped:
+
+- **NewHat** (BBGresearch) is fed from an i226 SDP0 PEROUT.  Our
+  `ptp_device.py` documents, verified empirically and cross-checked against
+  SatPulse, that **igc uses a 50% duty cycle regardless of the duty-cycle
+  flag** — a requested 1 ms ON time is ignored.  At 1 Hz that is a **500 ms**
+  pulse, which predicts a +500 ms stray.  Not what they see.
+- **PiFace** (ours) is fed from a **TADD-2 Mini** divider (10 MHz → 1 PPS,
+  `config/piface.toml`).  Its output width has never been measured here.  We
+  already owe that board a scope probe for an unrelated reason — whether it
+  drives 5 V into a 3V3 EXTINT — so width goes on the same probe.
+
+So the hypothesis reduces to one read-only measurement with the verdict fixed
+in advance: scope the EXTINT pin.  100 ms ⇒ live; 500 ms ⇒ dead; anything not
+equal to the stray ⇒ dead.  This is worth spending *before* the 200 ms PEROUT
+offset test, which needs code and moves the watermark.
+
+**Excluded on our side regardless:** nothing in this repo reads the
+falling-edge fields — `extint_reader.py` takes `wnR/towMsR/towSubMsR` only, and
+a repo-wide grep for `towMsF`/`towSubMsF`/`wnF` finds no other consumer.  Our
+18 strays therefore cannot be reader-side field confusion; the mechanism would
+have to be the receiver populating `towMsR` from a falling edge.
+
+### Are the two fleets' strays even one phenomenon?
+
+Open, and currently unarguable.  Different EXTINT sources (PEROUT vs TADD-2),
+different receivers, and MadHat turns out to run a **ZED-X20P**, not the F9T
+that timelab's table claimed — which voided the two-host firmware comparison as
+cross-model.  If the pin widths differ and the stray is 100 ms on both, that is
+two causes wearing one number, and pooling the evidence would hide it.
+
+### A note on what the ±60/+30 ns phase scan could not have shown
+
+That scan (~120k samples, late fraction flat at 46–51%) cleanly killed the
+"boundary sits at the GPS second" model.  It cannot speak to a boundary at the
+receiver's own measurement epoch, which sits ~2 ms out — about 20,000× outside
+the scanned span.  Falsifying one model is not support for the next by
+elimination.
+
+And the receiver-epoch model has its own problem: NewHat's RAWX `rcvTow`
+fraction reads **+0.002000000 s exactly**.  Exactly-round values are scheduled
+or quantised, never the residue of a free-running clock bias — so the boundary
+is *stationary*, and a stationary boundary cannot produce a regime that switches
+24×/hour.  The hypothesis needs `rcvTow` to be observed moving before it earns
+any instrumentation.  (Our engine notes ~N.997 as the F9T norm at
+`peppar_fix_engine.py:9236`, where `round()` instead of `floor()` was once a
+real +1 s bug; the X20P reads 0.993.  NewHat's +0.002 is the outlier against
+our own baseline — why *that* differs is the prior question to why it walks.)

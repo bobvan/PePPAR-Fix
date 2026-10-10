@@ -11201,6 +11201,7 @@ def run(args):
                         'host_timestamp', 'host_monotonic',
                         'wn', 'tow_ms', 'tow_sub_ms_ns',
                         'acc_est_ns', 'phase_residual_ns', 'count', 'flags',
+                        'ch',
                     ])
                     extint_log_f.flush()
                 from peppar_fix.strided_writer import StridedWriter
@@ -13651,7 +13652,11 @@ Two-phase operation:
                            "one TIM-TM2 message from the F9T with "
                            "(host_timestamp, host_monotonic, wn, tow_ms, "
                            "tow_sub_ms_ns, acc_est_ns, phase_residual_ns, "
-                           "count, flags).  Pair with --ticc-log to "
+                           "count, flags, ch).  `ch` is the EXTINT input the "
+                           "pulse arrived on; it was added 2026-10-09, so "
+                           "ROTATE an existing log rather than appending to "
+                           "it — the old header has no `ch` column and mixed "
+                           "rows parse ragged.  Pair with --ticc-log to "
                            "post-hoc compare TIM-TM2 (DOFreqEst Arm 3) "
                            "against TICC chA-chB (Arm 4) and quantify "
                            "their static offset + dynamic noise — the "
