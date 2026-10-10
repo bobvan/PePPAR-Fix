@@ -423,3 +423,56 @@ either way about the +100 ms strays.  Keep them apart:
 | strays | ~0.027/s, in-gate only | +100 ms | open; TP1 falling edge predicted |
 
 Different rates, different phases, and now probably different causes.
+
+### Ringing refuted on NewHat — and their clean EXTINT is the control we lacked
+
+Measured, same 12 h window, 50 ns bins:
+
+```
+-100..-50 ns      63   0.147%
+ -50..0       20,569  48.072%
+   0..+50     22,114  51.683%
+ +50..+100        42   0.098%
++100 ns..+1 µs     0   0.000%
+```
+
+Unimodal, 99.755% within ±50 ns, **zero beyond ±100 ns**.  Nothing in the
+predicted +180–400 ns band, so **ringing is refuted on NewHat** and bbgld's
+EXTINT has no late-edge servo exposure.
+
+That negative result is worth more to us than the hypothesis was.  We had no
+clean-EXTINT control: every EXTINT phase distribution we have characterized is
+PiFace's, which carries the defect.  NewHat's i210-driven pin at ±50 ns
+retro-supports something we had only inferred — PiFace's +180–400 ns late edges
+on 24.8% of edges are specific to the **TADD-2 Mini's 5 V overdrive into a 3V3
+input**, not a generic property of EXTINT inputs, of TIM-TM2, or of our
+measurement chain.  Cite NewHat's histogram as the control when that question
+comes up again.
+
+### The +1/+2 structure rules out both readings of `count`
+
+Per-second deltas are **exactly +1 or +2 — never 0, never 3**: 23,796 vs
+18,771 (55.9% / 44.1%), mean 1.4410/s.  That excludes both candidates:
+
+- **rising-only** ⇒ every second +1.  Observed +2 on 44%.
+- **both-edges hardware counter** on a 1 Hz 50%-duty pulse ⇒ every second +2.
+  Observed +1 on 56%.
+
+So `count` increments on something occurring one or two times per second, which
+on a 500 ms pulse points at *both edges, but only those captured within that
+message's window*.
+
+**Next test needs no hardware change, no 2 Hz, no watermark disturbance:
+correlate delta=+2 against the `newFallingEdge` flag.**  If +2 ⟺
+`newFallingEdge` set, the extras are simply falling edges, the 0.44/s puzzle
+dissolves with no extra physical edges, and the 2 Hz test buys nothing.
+Second confirmation in the same frames: `towMsF`/`towSubMsF` should place the
+falling edge at ≈+500 ms, the 50% duty point.
+
+### Method note: twice now the discriminator was already on disk
+
+**Neither codebase reads `towMsF`** (verified repo-wide here; confirmed on
+theirs), exactly as neither logged `ch`.  Both times the field that
+discriminates the live hypotheses was present in every frame and undecoded
+while we reasoned about what the data *could* be.  Decode the fields the
+message already carries before modelling what it might mean.
