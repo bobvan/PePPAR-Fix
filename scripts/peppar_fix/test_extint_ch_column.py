@@ -6,8 +6,12 @@ logged TM2 for months without it, which is why the 18 archived PiFace
 strays cannot be checked for channel provenance retrospectively.  See
 docs/tm2-latency-bimodality.md.
 
-It is appended LAST in the row so existing positional readers and
-csv.DictReader consumers of older logs stay valid.
+It is appended after the original nine columns so existing positional
+readers and csv.DictReader consumers of older logs stay valid.  `ch` was
+briefly the last column; the falling-edge fields (wn_f, tow_ms_f,
+tow_sub_ms_f_ns, fall_minus_rise_ns) now follow it, so these tests pin
+`ch` at its INDEX rather than at the end -- a column's position is a
+contract, "being last" is not.
 """
 from __future__ import annotations
 
@@ -26,6 +30,9 @@ class _FakeMsg:
     def __init__(self, **kw):
         for k, v in kw.items():
             setattr(self, k, v)
+
+
+_CH = 9  # column index of `ch`: after the original nine, before the F fields
 
 
 class _RecordingWriter:
@@ -53,19 +60,19 @@ def _msg(ch, tow_ms=322391000):
 
 class ExtintChColumnTest(unittest.TestCase):
 
-    def test_ch_is_logged_and_is_the_last_column(self):
+    def test_ch_is_logged_at_index_9(self):
         w = _RecordingWriter()
         store = TimTm2Store(log_writer=w)
         store.update(_msg(ch=0))
         self.assertEqual(len(w.rows), 1)
-        self.assertEqual(w.rows[0][-1], 0)
+        self.assertEqual(w.rows[0][_CH], 0)
 
     def test_ch_1_is_preserved_not_coerced(self):
         """EXTINT1 must be distinguishable from EXTINT0 in the log."""
         w = _RecordingWriter()
         store = TimTm2Store(log_writer=w)
         store.update(_msg(ch=1))
-        self.assertEqual(w.rows[0][-1], 1)
+        self.assertEqual(w.rows[0][_CH], 1)
 
     def test_missing_ch_defaults_to_zero_rather_than_raising(self):
         """A TM2 variant without `ch` must not kill the reader thread."""
@@ -74,7 +81,7 @@ class ExtintChColumnTest(unittest.TestCase):
         m = _msg(ch=0)
         del m.ch
         store.update(m)
-        self.assertEqual(w.rows[0][-1], 0)
+        self.assertEqual(w.rows[0][_CH], 0)
 
     def test_appending_ch_did_not_shift_the_earlier_columns(self):
         """Older positional consumers index 0..8; those must not move."""
@@ -82,7 +89,7 @@ class ExtintChColumnTest(unittest.TestCase):
         store = TimTm2Store(log_writer=w)
         store.update(_msg(ch=1, tow_ms=322391001))
         row = w.rows[0]
-        self.assertEqual(len(row), 10)
+        self.assertEqual(len(row), 14)
         self.assertEqual(row[2], 2300)        # wn
         self.assertEqual(row[3], 322391001)   # tow_ms
         self.assertEqual(row[4], 0)           # tow_sub_ms_ns

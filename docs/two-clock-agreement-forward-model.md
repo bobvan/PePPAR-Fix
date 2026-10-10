@@ -217,6 +217,38 @@ $ python3 tools/sync_agreement_model.py backfit --p95 8.04 --do ocxo-hobby --ts 
   sigma_ref dominates: a better timestamper or a better DO will not help.
 ```
 
+> ⚠ **The back-fit assumes the disagreement is NOISE, and part of it may be a
+> deterministic BIAS.**  BBGresearch measured on NewHat 2026-10-10 that
+> TIM-TM2's EXTINT series is **two populations**, separated by whether the line
+> re-crosses the threshold within one 8 ns timestamper tick of the rise (TM2
+> then reports the *last* rise).  On 44.1% of seconds it did.  The two
+> populations' mean phases sat **16.3 ns apart**, and a servo steering the
+> *mixture* to zero therefore leaves the clock offset by `-p x Δ` on clean
+> seconds — predicted −7.17 ns, measured −7.05 ns, agreeing to 0.12 ns.
+>
+> That offset is **per-host and static**, set by each host's glitch fraction.
+> Two hosts with different fractions disagree by `(p_A − p_B) x Δ` *before any
+> noise term*.  At Δ = 16.3 ns it would take a differential fraction of 0.49 to
+> account for all of the measured 8.04 ns — implausible on its own, but it does
+> not have to explain all of it to corrupt the back-fit, and PiFace's TADD-2
+> defect runs at **+180–400 ns on 24.8% of edges**, where even a small
+> differential is tens of ns.
+>
+> `sync_agreement_model.py backfit` has no way to separate a static offset from
+> white noise: feed it a bias and it returns a σ_ref.  So the conclusion "a
+> better timestamper or a better DO will not help" may be right for the wrong
+> reason — a bias is not cured by a better timestamper either, but it *is*
+> cured by fixing the input, which the σ_ref framing hides.
+>
+> **Untested on our hardware.**  `ExtintLateEdgeFilter` defaults to
+> `reject_ns=50`, which blocks the 180–400 ns TADD-2 edges but **passes a
+> 16 ns sub-tick split unchallenged**, and we never logged TM2's falling-edge
+> fields, so the archive cannot answer it.  Added 2026-10-09
+> (`fall_minus_rise_ns` in the `--extint-log`); needs a fresh capture on PiFace
+> and PiPuss, then compare each host's p and Δ against the measured p95.
+> Until then, treat the 2.90 ns σ_ref as an **upper bound that may contain a
+> deterministic term**.  See `docs/tm2-latency-bimodality.md`.
+
 The 2026-07-24 analysis named the mechanism: **the servo steering the DO to
 chase the per-receiver rx TCXO through the PPP clock arm.**  PiFace 6 % slewing
 vs PiPuss 47 % on the *same antenna and the same corrections*, with

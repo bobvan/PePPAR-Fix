@@ -476,3 +476,92 @@ theirs), exactly as neither logged `ch`.  Both times the field that
 discriminates the live hypotheses was present in every frame and undecoded
 while we reasoned about what the data *could* be.  Decode the fields the
 message already carries before modelling what it might mean.
+
+## RESOLVED: the extras are a sub-tick re-crossing, and they bias the clock
+
+BBGresearch decoded `towMsF`/`towSubMsF` on 2,342 raw frames (NewHat, from
+03:03Z 2026-10-10).  The falling-edge timestamp separates the two populations
+cleanly:
+
+| `count` step | fall − rise | n | reading |
+|---|---|---|---|
+| +1 | **−500.000 ms** | 1,336 | normal — the *previous* pulse's falling edge |
+| +2 | **−8 ns** (min −8, max −7) | 1,012 | the line rose, dipped and rose again **inside one 8 ns tick**, and TM2 reported the LAST rise |
+
+8 ns is the F9T's timestamper tick (125 MHz), so the two events are one tick
+apart — the minimum resolvable separation.  **`newFallingEdge` was set on every
+frame (0xcd), so no flag distinguishes them; only the timestamps do.**
+
+### It is not cosmetic — it biases the disciplined clock
+
+Dense log, same 12 h window:
+
+| population | mean phase | sd | n |
+|---|---|---|---|
+| clean (+1) | **−7.05 ns** | 13.4 | 23,796 |
+| glitched (+2) | **+9.22 ns** | 14.2 | 18,771 |
+
+The two sit **16.3 ns apart**, and bbgld steers the *mixture* to zero — so
+NewHat's PHC actually sits ~7 ns early on clean seconds, and much of the ~12 ns
+EXTINT scatter is just the two populations superposed rather than noise.
+
+> ⚠ **A retracted claim, kept because the error is instructive.**  I presented
+> `−p·Δ = −7.17 ns` against the measured clean-second mean of `−7.05 ns` as an
+> independent quantitative confirmation of the mechanism, "predicted, not
+> fitted".  **It is neither independent nor a prediction** — BBGresearch caught
+> it.  The mixture mean is `p·m₂ + (1−p)·m₁` *by construction, from the same
+> samples*, so `m₁ = mix − p·Δ` is a rearrangement of that definition.  The
+> residual is exactly the mixture mean, identically:
+>
+> ```
+> (−p·Δ) − m₁ = −mix = −0.1247 ns      <- the "0.12 ns agreement", algebraically
+> ```
+>
+> So the check restates only that bbgld holds **what it sees** near zero.  True,
+> and worth stating as a servo fact, but it tests nothing about the mechanism.
+> This is precisely the failure mode recorded in
+> [[feedback_audit_the_parameters_you_did_not_argue_about]] — agreement between
+> two quantities coupled by construction is not corroboration — committed here
+> one message after warning them about the weaker aggregate-rate version of it.
+
+**What actually carries the mechanism** is per-sample and deterministic, not
+aggregate:
+
+- `fall − rise = −8 ns` on **every** count+2 frame and `−500.000 ms` on
+  **every** count+1 frame, across 2,342 frames.  No overlap, no distribution.
+- the 16.3 ns phase split **keyed to that same per-frame flag**, so the two
+  populations are identified by a signal independent of their phases.
+- the TP1 null.
+
+The servo fact, stated without overreach: the mixture mean is +0.125 ns, so
+bbgld steers the *mixture* to zero.  Given the split is real — which the
+per-frame evidence above establishes — the clean population therefore sits
+~7 ns early.  The bias follows from the split being real, not from the algebra.
+
+### Why our filter would not have caught it, and our archive cannot test it
+
+Same class as the PiFace TADD-2 hazard, at **16 ns instead of 180–400 ns** —
+and that difference is exactly what makes it dangerous:
+`ExtintLateEdgeFilter`'s default `reject_ns=50` blocks the TADD-2 edges and
+**passes a 16 ns split unchallenged**.  Below anything a ±100 ns look resolves.
+
+We also never logged TM2's falling-edge fields, so **no capture in our archive
+can answer whether PiFace has a sub-tick sibling** — the same gap as `ch`, for
+the third time in one investigation.  Added 2026-10-09: `wn_f`, `tow_ms_f`,
+`tow_sub_ms_f_ns` and the derived `fall_minus_rise_ns` now go to
+`--extint-log`, with `fall_minus_rise_ns` returning `None` across a GPS-week
+rollover rather than guessing.
+
+**Open on our side** — needs a fresh PiFace + PiPuss capture:
+
+1. Does PiFace show a `fall_minus_rise_ns ≈ −8 ns` population, and at what `p`?
+2. Does the clean/glitched mean phase split, and by how much?
+3. Does `(p_PiFace − p_PiPuss) · Δ` account for any of the measured
+   **p95 |Δ| = 8.04 ns** cross-host disagreement, which
+   `two-clock-agreement-forward-model.md` currently attributes entirely to
+   σ_ref noise?  A static per-host offset and white noise are not
+   distinguishable by `sync_agreement_model.py backfit`, so that doc now
+   carries a caveat.
+
+Credit: mechanism and measurement BBGresearch; the falling-edge pointer came
+from this side after `towMsF` turned out to be the field neither codebase read.

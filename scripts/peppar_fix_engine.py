@@ -11201,7 +11201,8 @@ def run(args):
                         'host_timestamp', 'host_monotonic',
                         'wn', 'tow_ms', 'tow_sub_ms_ns',
                         'acc_est_ns', 'phase_residual_ns', 'count', 'flags',
-                        'ch',
+                        'ch', 'wn_f', 'tow_ms_f', 'tow_sub_ms_f_ns',
+                        'fall_minus_rise_ns',
                     ])
                     extint_log_f.flush()
                 from peppar_fix.strided_writer import StridedWriter
@@ -13652,7 +13653,13 @@ Two-phase operation:
                            "one TIM-TM2 message from the F9T with "
                            "(host_timestamp, host_monotonic, wn, tow_ms, "
                            "tow_sub_ms_ns, acc_est_ns, phase_residual_ns, "
-                           "count, flags, ch).  `ch` is the EXTINT input the "
+                           "count, flags, ch, wn_f, tow_ms_f, "
+                           "tow_sub_ms_f_ns, fall_minus_rise_ns).  "
+                           "`fall_minus_rise_ns` is -500 ms on a clean "
+                           "50%%-duty pulse but ~one timestamper tick when "
+                           "the line re-crosses within a tick of the rise "
+                           "and TM2 reports the LAST rise -- a sub-tick "
+                           "glitch no flag exposes.  `ch` is the EXTINT input the "
                            "pulse arrived on; it was added 2026-10-09, so "
                            "ROTATE an existing log rather than appending to "
                            "it — the old header has no `ch` column and mixed "

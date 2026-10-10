@@ -38,6 +38,27 @@ def _wrap_ns(d):
     return d
 
 
+def fall_minus_rise_ns(wn_r, tow_ms_r, tow_sub_ms_r_ns,
+                       wn_f, tow_ms_f, tow_sub_ms_f_ns):
+    """Falling-edge time minus reported rising-edge time, in ns.
+
+    On a clean 50%-duty 1 Hz pulse this is -500 ms: the falling edge on
+    record belongs to the *previous* pulse.  A value of roughly one
+    timestamper tick (-8 ns on a 125 MHz F9T) means the line re-crossed
+    the threshold within a tick of the rise and TM2 reported the LAST
+    rise -- a sub-tick glitch that no flag exposes and that a +/-50 ns
+    outlier filter passes unchallenged.
+
+    Returns None when the two edges are in different GPS weeks, rather
+    than guessing across the rollover.  Analysis can handle that case
+    with the raw columns, which are logged alongside.
+    """
+    if wn_r != wn_f:
+        return None
+    return ((tow_ms_f * 1_000_000 + tow_sub_ms_f_ns)
+            - (tow_ms_r * 1_000_000 + tow_sub_ms_r_ns))
+
+
 class ExtintLateEdgeFilter:
     """Reject spurious LATE EXTINT edges caused by input-network ringing.
 
@@ -311,7 +332,8 @@ class TimTm2Store:
         Args:
           log_writer: optional csv.writer.  Header expected:
               host_timestamp,host_monotonic,wn,tow_ms,tow_sub_ms_ns,
-              acc_est_ns,phase_residual_ns,count,flags,ch
+              acc_est_ns,phase_residual_ns,count,flags,ch,
+              wn_f,tow_ms_f,tow_sub_ms_f_ns,fall_minus_rise_ns
           log_file: file handle for flush() after each row.
           max_acc_est_ns: accEst values above this are recorded but
               not exposed to the engine — the F9T's nav engine is
@@ -356,6 +378,18 @@ class TimTm2Store:
         # stray edge on a *different physical input* from a mistimed edge on
         # the expected one — see docs/tm2-latency-bimodality.md.
         ch = int(getattr(parsed, "ch", 0))
+        # Falling-edge timestamp.  Logged (never consumed) because
+        # `fall_minus_rise_ns` is what exposes a SUB-TICK re-crossing: on a
+        # clean 50%-duty pulse it sits at -500 ms (the previous pulse's fall),
+        # but when the line rises, dips and rises again inside one 8 ns tick,
+        # TM2 reports the LAST rise and the fall lands a single tick BEFORE it.
+        # BBGresearch measured exactly that on NewHat 2026-10-10: -500.000 ms
+        # on count+1 seconds, -8 ns on every count+2 second.  No flag shows
+        # it -- newFallingEdge was set on all of them -- only the timestamps
+        # do.  See docs/tm2-latency-bimodality.md.
+        wnF = int(getattr(parsed, "wnF", 0))
+        tow_ms_f = int(getattr(parsed, "towMsF", 0))
+        tow_sub_ms_f_ns = int(getattr(parsed, "towSubMsF", 0))
         wnR = int(getattr(parsed, "wnR", 0))
         tow_ms = int(getattr(parsed, "towMsR", 0))
         tow_sub_ms_ns = int(getattr(parsed, "towSubMsR", 0))
@@ -389,6 +423,9 @@ class TimTm2Store:
                     f"{host_mono:.9f}",
                     wnR, tow_ms, tow_sub_ms_ns,
                     acc_est, residual_ns, count, f"0x{flags:02x}", ch,
+                    wnF, tow_ms_f, tow_sub_ms_f_ns,
+                    fall_minus_rise_ns(wnR, tow_ms, tow_sub_ms_ns,
+                                       wnF, tow_ms_f, tow_sub_ms_f_ns),
                 ])
                 if self._log_file is not None:
                     self._log_file.flush()
