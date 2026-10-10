@@ -359,3 +359,67 @@ build the 2×2 contingency table of (count advanced above the normal step) ×
 with the two phenomena being independent; a per-second correlation is not.
 Same rule as everywhere else here — compare each event to its neighbours, never
 to a pooled statistic of a population you already know is bimodal.
+
+### The 1.44/s extras are EXTINT input ringing — already characterized here
+
+NewHat's remaining measurements (10-09 15:06Z → 10-10 03:16Z, consecutive-TOW
+pairs) resolve this:
+
+- **Per-second 2×2**: late +1 12,016 / +2 9,523 (P(+2) 44.2%); on-time +1
+  11,780 / +2 9,248 (44.0%).  **Independent** — so the 44.1%-vs-50.3%
+  resemblance warned about above was pure coincidence, as predicted.
+- **All 42,788 reported residuals are within ±1 µs**, with nothing between
+  1 µs and 1 ms.  The extras never surface at a random phase.
+
+Extra counted transitions that are phase-concentrated at the real edge is the
+signature of **a second threshold crossing on one physical transition** — and
+that is characterized in this repo already, on PiFace
+(`scripts/peppar_fix/extint_reader.py:41`,
+`docs/piface-shorttau-glitches-2026-05-29.md`, analyzer
+`scripts/analyze_extint_ringing.py`): the EXTINT input is overdriven, the edge
+rings, and when the ring dips below logic-low and re-crosses the receiver sees a
+second edge — **+180–400 ns on 24.8% of edges**.
+
+NewHat: extras within ±1 µs on **44.1%** of seconds.  Same signature, same
+order of rate.
+
+**±1 µs is too coarse to see it.**  A 180–400 ns second mode lives entirely
+inside ±1 µs, so that bound — which reads like it rules out a distinct extra
+edge — could not have detected the mechanism that best fits the count rate.
+The test is a **ns-resolution histogram of the residuals inside the ±1 µs
+band**, predicting: bimodal; primary mode at the fixed input-network delay;
+secondary mode a few hundred ns later; secondary fraction ≈ 44%, matching the
+count excess.  Unimodal at ns resolution ⇒ ringing is out and `count` is not
+counting edges, which is then the argument for the 2 Hz test.
+
+#### Why this outranks the stray question
+
+TM2 reports the later edge, and a store that keeps the freshest sample lets it
+**trump** the real one.  The EKF reads the DO PPS as late → concludes the DO
+slowed → cranks the actuator frequency **up**.  On PiFace that produced
+measured DO excursions of **29 µs on chA, and 308 µs with EXTINT as the sole
+observer** — a real clock error, not a counter cosmetic.  Any consumer using
+EXTINT as a servo input with last-write-wins semantics has that exposure at the
+observed extra-edge rate.  Mitigation here is `ExtintLateEdgeFilter`
+(`reject_ns=50.0, window=16, warmup=4, max_consecutive_rejects=8`).
+
+**Cause does not transfer, only mechanism.**  PiFace's driver is a TADD-2 Mini
+whose PIC defaults to 5 V, overdriving a 3V3 input.  An i210 SDP0 is a 3.3 V
+output, so overdrive is probably not NewHat's cause — but impedance mismatch,
+an unterminated line, cable length, or a slow rise time all produce a second
+crossing too.  This makes the queued scope *more* useful, with a specific
+target: ringing on the rising transition, not a second signal at +100 ms.
+
+#### Two phenomena, separately docketed
+
+That window contains **no strays at all** — nothing between 1 µs and 1 ms in
+42,788 residuals.  **A window with zero strays cannot discriminate stray
+mechanisms**, so this result is evidence about extras only and says nothing
+either way about the +100 ms strays.  Keep them apart:
+
+| | rate | phase | status |
+|---|---|---|---|
+| extras | ~44% of seconds | at the real edge (≲1 µs) | ringing, characterized |
+| strays | ~0.027/s, in-gate only | +100 ms | open; TP1 falling edge predicted |
+
+Different rates, different phases, and now probably different causes.
