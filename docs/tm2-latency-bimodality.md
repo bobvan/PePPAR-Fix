@@ -190,3 +190,47 @@ any instrumentation.  (Our engine notes ~N.997 as the F9T norm at
 `peppar_fix_engine.py:9236`, where `round()` instead of `floor()` was once a
 real +1 s bug; the X20P reads 0.993.  NewHat's +0.002 is the outlier against
 our own baseline — why *that* differs is the prior question to why it walks.)
+
+### `ch` and `count`: what each branch can and cannot conclude
+
+`ch` is recoverable retrospectively from raw TM2 frames (it is the first
+payload byte), so BBGresearch can read it for the in-gate strays without new
+instrumentation.  Measured on NewHat as of 03:03Z: every frame `ch=0`, all
+outside the 07–15Z gate, no strays yet.
+
+The two branches are **not symmetric**, and the asymmetry has to be registered
+before the read-out or the result will be over-read:
+
+- **stray at `ch=1`** ⇒ a second signal on a second input.  Conclusive.
+- **stray at `ch=0`** ⇒ refutes a second *input*, and nothing more.  It does
+  **not** refute TP1 coupling, because crosstalk onto EXTINT0 itself lands on
+  `ch=0` exactly like a genuine edge.
+
+For the `ch=0` branch the discriminator is **`count`**, which is already
+logged.  A stray second shows:
+
+- **`count` +2** ⇒ two edges were detected — the real one *and* a spurious
+  extra.  The stray is an additional capture, not a mistimed one.
+- **`count` +1** ⇒ one edge, reported at the wrong time.  A mistiming.
+
+### If TP1 is the source, the stray is its FALLING edge
+
+TP1's rising edge is aligned to the second and is therefore indistinguishable
+from the real PPS edge.  Its falling edge sits at **+100 ms** — exactly the
+stray.  So "TP1 reaching an EXTINT input" is specifically *TP1's falling edge
+being captured*, which carries three consequences worth pre-registering:
+
+1. **The 100 → 10 ms VALSET predicts strays at +10 ms.**  If they stay at
+   exactly +100 ms after the width change, TP1 is not the source at all.
+2. **Capacitive coupling differentiates**, so a fast falling transition appears
+   on the victim input as a transient whose *recovery* is a rising edge — which
+   is how a falling-edge event gets captured by a rising-edge timestamper, and
+   why marginal coupling would fire intermittently (~50%) rather than every
+   second.
+3. It predicts **`count` +2**, per the branch table above: the real edge plus
+   the coupled one.
+
+Note this mechanism is distinct from the both-edges one killed above.  That one
+needed TM2's own `towMsF` fields to be read (they are not, by either codebase);
+this one needs no software error at all — a second physical edge arrives and is
+correctly timestamped.
