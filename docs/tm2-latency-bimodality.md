@@ -565,3 +565,97 @@ rollover rather than guessing.
 
 Credit: mechanism and measurement BBGresearch; the falling-edge pointer came
 from this side after `towMsF` turned out to be the field neither codebase read.
+
+## Aftermath: thermal gating, the TP1 confound, and the first independent test
+
+### Thermal evidence (BBGresearch, NewHat, 5 mornings)
+
+| KDPA in-gate minimum | strays |
+|---|---|
+| 8.3 °C | yes |
+| 8.9 °C | yes |
+| 9.4 °C | yes |
+| 11.1 °C | none |
+| 14.4 °C | none |
+
+10-10 was a **valid** zero-stray day: the late latency regime was present
+throughout the gate (08Z 100%, 11Z 99%, 14Z 99%), so the absence is not an
+instrumentation gap.  The guarded 11:00Z reset stood down untriggered.
+
+Their statistic is right and correctly hedged: under the null that strays are
+independent of temperature, P(the stray-free days are exactly the warmest) =
+`1/C(5,3) = 1/10`.  Suggestive, not a finding.
+
+**Ranks throw away the informative part.**  The cold cluster spans 1.1 °C while
+the gap to the next day is **1.7 °C** — wider than the cluster itself — so the
+data are consistent with a *threshold* somewhere in (9.4, 11.1) °C rather than
+a gradual response.  That converts the observation into a forecast, which is
+worth more than the p-value: the next sub-9.5 °C morning should have strays and
+any >11 °C morning should not.  Budgeting from `1/C(n,k)`, two more
+correctly-predicted mornings reach **p ≈ 0.03** (n=7, k=4); four more reach
+**p ≈ 0.008**.
+
+### TP1 is void on this day for the right reason, but the cells matter
+
+10-10 changed **two** variables at once relative to the stray mornings — TP1
+width (100 → 10 ms) *and* temperature (14.4 vs 8–9 °C).  A zero-stray day
+cannot separate them, so "TP1 void" rests on the pre-registered table, not on
+this day's evidence.  The design is a 2×2:
+
+| | TP1 = 100 ms | TP1 = 10 ms |
+|---|---|---|
+| cold (<9.5 °C) | **strays** (3 days) | ← **the decisive pending cell** |
+| warm (>11 °C) | ? — *was the 11.1 °C day at 100 ms?* | no strays (10-10) |
+
+Keeping TP1 at 10 ms for the next cold morning (their plan) fills the decisive
+cell.  But the warm/100 ms cell may already be filled by the 11.1 °C day: **if
+that day ran TP1 at 100 ms and had no strays, temperature alone is sufficient
+and TP1 is void on stronger grounds than a confounded day.**  Worth checking
+before spending another morning.
+
+### The bbgld glitch correction is the first chance at an independent test
+
+Bob had bbgld correct the glitch (deployed 01:55Z 10-11): a learned population
+delay seeded at 16.3 ns, so a live `+15 ns` sample with `F−R = −8` was consumed
+as `−1`.
+
+This is the out-of-sample test the retracted `−p·Δ` check could never be.
+Before the fix the servo steered the *mixture* to zero, leaving the clean
+population at −7.05 ns; after it, corrected samples read like clean ones, so
+the servo steers *those* to zero and the clock's physical phase should move by
+
+```
+step = +p·Δ = +7.17 ns   (clean seconds move from -7.17 to ~0)
+```
+
+**But only an observer outside the loop can see it.**  A servo drives its own
+input to zero by construction, so EXTINT will read ~0 after the fix whether or
+not the clock moved — the servo's own input cannot measure this step.  It is
+visible only to a TICC channel, a scope, or **a second clock**.  Which ties
+their fix directly to our open question: a per-host bias of this size is
+precisely what `(p_A − p_B)·Δ` contributes to cross-host disagreement, so the
+natural instrument for confirming their fix is the same two-clock comparison
+that our 8.04 ns caveat needs.
+
+Two hazards worth watching on a *learned* delay:
+
+1. **Seeded at 16.3 ns from one host on one day.**  If the delay tracks the
+   physical dip, it may differ per host and move with temperature — and the
+   whole phenomenon already looks thermal.  Learning is right; the seed is a
+   prior that must be allowed to move, and monitored when it does.
+2. **The correction is only as good as the `F−R` classification.**  A sample
+   mis-classified as glitched gets 16.3 ns subtracted for nothing, which is a
+   16 ns error in the opposite direction.  The classifier is `F−R ≈ −8 ns`
+   against `−500 ms` — a 6-decade separation, so this is safe today, but it is
+   the thing to assert in a test rather than assume.
+
+### Nobody else looks at the falling edge either
+
+BBGresearch checked **SatPulse 0.2** (our kindred PHC-sync project, see
+[[reference_satpulse_kindred_project]]) at Bob's suggestion: its tracking mode
+accepts any sample within 50 ns, its dual-edge filter works at 100–200 ns
+tolerances on NIC EXTTS, and it has **no TM2 falling-edge field at all**.  So a
+16 ns sub-tick population would pass SatPulse unchallenged exactly as it passes
+our `reject_ns=50`.  This is not a defect peculiar to our filter — the whole
+small-ecosystem convention is to threshold the rising-edge series and never
+decode `towMsF`.
