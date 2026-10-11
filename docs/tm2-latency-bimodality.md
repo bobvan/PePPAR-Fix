@@ -607,11 +607,29 @@ this day's evidence.  The design is a 2×2:
 | cold (<9.5 °C) | **strays** (3 days) | ← **the decisive pending cell** |
 | warm (>11 °C) | ? — *was the 11.1 °C day at 100 ms?* | no strays (10-10) |
 
-Keeping TP1 at 10 ms for the next cold morning (their plan) fills the decisive
-cell.  But the warm/100 ms cell may already be filled by the 11.1 °C day: **if
-that day ran TP1 at 100 ms and had no strays, temperature alone is sufficient
-and TP1 is void on stronger grounds than a confounded day.**  Worth checking
-before spending another morning.
+The warm/100 ms cell **is** filled: 10-07 (11.1 °C, no strays) ran TP1 at
+100 ms — the 10 ms write was 10-09 15:06Z.  (Caveat theirs: 10-07 was also the
+day after a boot.)
+
+> ⚠ **I misread what that cell buys, and the error is necessary-vs-sufficient.**
+> I argued that warm/100 ms = "none" makes temperature *sufficient* and voids
+> TP1.  It does not — BBGresearch corrected it.  The cell shows cold is
+> **necessary**, and the conjunction **"cold AND TP1's falling edge"** fits all
+> four filled cells exactly as well as "cold alone" does.  The filled cells
+> cannot discriminate; only **cold / 10 ms** can.
+
+Pre-registered outcomes for that cell:
+
+| cold + TP1 = 10 ms gives… | conclusion |
+|---|---|
+| strays at **+10 ms** | TP1 **is** the source — magnitude tracks the width |
+| strays at **+100 ms** | TP1 **void** — magnitude ignored the width |
+| **no strays** | TP1 was **necessary** (the conjunction holds) |
+| strays at **some other magnitude** | neither — the magnitude tracks something else |
+
+That fourth row is added here deliberately: a registered table without a
+"none of the above" row is the one most likely to be quietly reinterpreted
+after the fact.
 
 ### The bbgld glitch correction is the first chance at an independent test
 
@@ -636,6 +654,40 @@ their fix directly to our open question: a per-host bias of this size is
 precisely what `(p_A − p_B)·Δ` contributes to cross-host disagreement, so the
 natural instrument for confirming their fix is the same two-clock comparison
 that our 8.04 ns caveat needs.
+
+#### The common-view observer is under-powered, and noise is not the limit
+
+Their outside-loop observer is **pn511 common view** — both sites time the same
+ch19/24/33 stations, so NewHat's step should appear in the cross-site
+station-phase difference at 01:55Z.  At 100 ns per session and 45 samples/h
+(15 sessions/h × 3 channels):
+
+| window | σ_step | SNR vs 7.17 ns |
+|---|---|---|
+| 4 h/side | 10.54 ns | 0.68 |
+| 12 h/side | 6.09 ns | 1.18 |
+| 24 h/side | 4.30 ns | 1.67 |
+| 36 h/side | 3.51 ns | 2.04 |
+| 78 h/side | 2.39 ns | 3.00 |
+
+"Several hours each side" is SNR ≈ 0.7 — under-powered, not merely marginal.
+2σ needs ~35 h/side, 3σ ~78 h/side.
+
+**And the binding constraint is drift, not noise.**  The step sits at a known
+instant, so it competes with slow drift across that instant — and averaging
+longer to beat the noise accumulates more drift.  At 35 h/side the window spans
+~3 days, and this host has a *demonstrated diurnal thermal term*, which aliases
+straight into a two-block-mean difference.  Two analysis-only fixes: **fit** a
+drift-plus-step-at-known-t0 model rather than differencing (the drift/step
+covariance then tells you whether the step is identifiable at all), and run
+**placebo steps** at times where nothing happened to measure the method's
+false-positive rate on its own data.
+
+**A better instrument may be on our bench.**  If PiFace carries the same
+sub-tick population, the step can be measured with a **TICC** (60 ps) instead
+of a 100 ns/session link — three orders of magnitude better, and it makes the
+clean confirmation cheaper here than there.  Needs a PiFace capture with the
+new `fall_minus_rise_ns` column plus a deploy; Bob's hardware, Bob's schedule.
 
 Two hazards worth watching on a *learned* delay:
 
