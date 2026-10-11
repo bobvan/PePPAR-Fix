@@ -1,4 +1,30 @@
 [peppar]
+# ######################################################################
+# ⚠ 2026-10-10 — PiPuss WAS ACCIDENTALLY OVERVOLTED.  Extent of damage is
+# NOT YET DIAGNOSED.  Reported by Bob via BBGresearch; not verified here.
+#
+# **Every calibrated number below, and the on-host measured
+# characterization they defer to, is SUSPECT until re-measured.**  The
+# DO chain is a 0-5 V analog path (AD5693R DAC at i2c-1 0x4C → OCXO EFC),
+# and the dangerous outcome of an overvolt is not a dead part — it is a
+# PARTIALLY degraded one: a shifted DAC gain or offset, a reduced output
+# range, or an OCXO whose pull slope moved.  The engine would consume
+# `dac_ppb_per_code` / `dac_max_ppb` and the measured [steering] without
+# complaint and produce a servo that looks healthy and is wrong.
+#
+# Before running peppar-fix on this host again:
+#   1. Verify the DAC answers and sweeps its full code range.
+#   2. RE-MEASURE the steering (ppb/code, code_min, slope) from scratch.
+#      Do NOT reuse state/dos/ocxo-clkpoc3.toml — it characterizes the
+#      hardware as it was BEFORE the overvolt.
+#   3. Re-measure the free-running floor before trusting any A/B.
+# Per feedback_no_default_actuator_gain: refuse until measured — and that
+# rule now bites the stored measurement too, not just a default.
+#
+# Also 2026-10-10: PiFace is POWERED DOWN (can be brought back; not a
+# priority).  The PiFace + PiPuss `fall_minus_rise_ns` capture named in
+# docs/tm2-latency-bimodality.md is therefore BLOCKED on both hosts.
+# ######################################################################
 # PiPuss — RECOMMISSIONED as a CLOCK host 2026-06-30 (pre-London "round 2"
 # peripheral swap), mirroring PiFace: F9T-20 receiver + IsoTemp-class OCXO
 # disciplined oscillator + per-clock TICC.  Supersedes the prior

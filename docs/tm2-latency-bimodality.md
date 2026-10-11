@@ -552,7 +552,12 @@ the third time in one investigation.  Added 2026-10-09: `wn_f`, `tow_ms_f`,
 `--extint-log`, with `fall_minus_rise_ns` returning `None` across a GPS-week
 rollover rather than guessing.
 
-**Open on our side** — needs a fresh PiFace + PiPuss capture:
+**Open on our side — BLOCKED as of 2026-10-10.**  PiPuss was accidentally
+overvolted (extent undiagnosed) and PiFace is powered down, so neither host can
+supply the capture.  Nothing below is actionable until that changes, and the
+PiPuss half additionally needs a full DO re-characterization first — its stored
+steering describes pre-overvolt hardware (see the banner in
+`config/pipuss.toml`).  Needs a fresh PiFace + PiPuss capture:
 
 1. Does PiFace show a `fall_minus_rise_ns ≈ −8 ns` population, and at what `p`?
 2. Does the clean/glitched mean phase split, and by how much?
@@ -683,11 +688,12 @@ covariance then tells you whether the step is identifiable at all), and run
 **placebo steps** at times where nothing happened to measure the method's
 false-positive rate on its own data.
 
-**A better instrument may be on our bench.**  If PiFace carries the same
-sub-tick population, the step can be measured with a **TICC** (60 ps) instead
-of a 100 ns/session link — three orders of magnitude better, and it makes the
-clean confirmation cheaper here than there.  Needs a PiFace capture with the
-new `fall_minus_rise_ns` column plus a deploy; Bob's hardware, Bob's schedule.
+**A better instrument may be on our bench — but not right now.**  If PiFace
+carries the same sub-tick population, the step can be measured with a **TICC**
+(60 ps) instead of a 100 ns/session link — three orders of magnitude better,
+and it would make the clean confirmation cheaper here than there.  **Deferred
+2026-10-10**: PiFace is powered down and PiPuss was accidentally overvolted, so
+this route is unavailable and the common-view attempt is the only one standing.
 
 Two hazards worth watching on a *learned* delay:
 
