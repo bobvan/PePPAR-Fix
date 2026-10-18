@@ -914,7 +914,7 @@ receiver access and no bbgld stop.
 
 
 
-### Open: the +10 ms rows may have already fired the TP1 discriminator
+### The +10 ms rows: width-tracking REFUTED, but they are an ADDED edge
 
 BBGresearch report that the stale regime surfaces glitch seconds as **"the
 +10 ms rows (13,131 of them)"** rather than flagging them `glitch=1`.
@@ -954,3 +954,82 @@ the verdict is **cold necessary, TP1 sufficient-given-cold** — the conjunction
 registered as the cell's "no strays" outcome — so the cell would be filled by
 two observations rather than one clean result, and should be written up that
 way.
+
+#### Measured: the onset is 10-16, not 10-09
+
+Read-only on NewHat's extint CSVs (coverage starts 10-11 01:55Z, so there is no
+data before the 10-09 TP1 write):
+
+- **Zero** rows at +100 ms in any file.
+- **Zero** at +10 ms from 10-11 01:55Z until **10-16 09:22:16Z**, despite
+  ~250k stale rows in that span.  After that every stale hour has 100–850.
+
+**So the population did not appear with the width change — a week separates
+them.  Width-tracking is refuted.**
+
+File 10-13 13:38 → 10-18 16:46, split at 10-16 09:22Z, normalized by exposure
+(67.7 h before, 55.4 h after; total row rate 3575/h vs 3570/h ≈ 1 Hz, so the
+durations check out):
+
+| population | before | after | Δ |
+|---|---|---|---|
+| on-time −500 ms | 1090/h | 1503/h | +413 |
+| on-time glitch −8 ns | **833/h** | **319/h** | **−515** |
+| stale +500 ms | 1649/h | 1389/h | −261 |
+| stale +10 ms | 0/h | **237/h** | +237 |
+| stale 1–3 ms | 0/h | **122/h** | +122 |
+
+The on-time glitch fraction fell **43% → 17.5%** at the same instant the ms-scale
+populations appeared.  No bbgld restart or deploy at that time.
+
+#### The pulse is intact — this is an added edge, not a moved one
+
+Every +10 ms row carries `fall − rise = +490 ms`, and that pins the geometry:
+
+```
+fall − reported_rise = +490,  reported_rise = T+10 ms
+  => fall = T + 10 + 490 = T+500 ms
+```
+
+The fall sits **500 ms after the TRUE rise T**, exactly where a normal pulse's
+fall belongs.  A pulse that genuinely arrived 10 ms late would carry its fall
+to T+510 and leave `fall − rise` at +500.  It reads +490.
+
+So: real rise at T, real fall at T+500, **plus a spurious rising edge at
+T+10**, with TM2's last-rise-wins reporting picking the spurious one.  Same
+class as the 8 ns sub-tick glitch, three decades larger — and the input pulse
+geometry is unchanged, so nothing about the PEROUT's width or period is
+implicated.
+
+#### Rates nearly trade, but the books do not close
+
+The glitch rate fell 515/h while the new ms-scale populations total 359/h —
+**70%**.  Suggestive of Caleb's relabeling reading, but a real conversion
+should balance, and 156/h is unaccounted (the on-time −500 ms population rose
+413/h, which is where the residual would have to hide).  Recorded as partial
+on purpose: rate-matching across populations is the error made twice already in
+this document.
+
+#### The 1–3 ms population argues against any fixed-width aggressor
+
+A 10 ms pulse width can only produce 10 ms.  A mechanism producing *both* 1–3 ms
+and ~10 ms spurious rises is producing a **distribution**.  The decisive free
+check is whether the phase histogram from 0 to 15 ms is **continuous** (one
+variable mechanism with a heavy tail — then "+10 ms" is a bin label, not a
+constant, and TP1's live value is irrelevant) or shows **two separated modes**
+(two mechanisms, and only then is the 10 ms/TP1 coincidence worth pursuing).
+
+#### A persistent step at a cold hour is latching, not diurnal
+
+Onset 10-16 09:22:16Z = 04:22 local, and it **stuck** — every stale hour since
+has the population.  A diurnal driver would have come and gone over the
+following nights.  That is a different animal from the thermal *gating* of the
+strays: something changed state under thermal stress and stayed changed.
+
+Unrun check: bbgld's journal was clear at that timestamp, but that is the
+*application* log.  A **USB re-enumeration or `cdc_acm` reset, an undervoltage
+event, or a thermal throttle** lands in the kernel log — and NewHat's F9T is
+USB CDC-ACM.  Something that simultaneously makes sub-tick re-crossings 2.5×
+less likely *and* adds ms-scale spurious rises points at the input's electrical
+conditions changing, which is what such an event would mark.
+`journalctl -k` around 10-16 09:22:16Z is free and read-only.
