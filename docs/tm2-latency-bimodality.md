@@ -1257,3 +1257,60 @@ NewHat for the first week at 10 ms.  A fresh bench F9T with identical TP1
 settings therefore has no particular reason to exhibit it, so **a bench null is
 a false negative, not evidence for the internal hypothesis.**  "We couldn't
 reproduce it" is the easiest result here to misread.
+
+## Priorities: the strays are the smaller problem
+
+BBGresearch's call, and it is the right one: bbgld rejects the strays, and they
+only cost samples while the stale regime is on.  **The decision-sized effect is
+the 1 s staleness, which TP1 does not explain.**  Shortest path for the strays
+is TP1 off (if nothing uses it); the mechanism tests stay optional because the
+HAT layout rule covers both coupling and internal capture, making the
+distinction moot for the thing that matters.
+
+Two notes on that path:
+
+- **TP1-off is itself the strongest confirmation of the TP1 story, free.**
+  Population gone ⇒ TP1 confirmed as the aggressor; population persists ⇒ the
+  width-tracking was coincidence.  It cannot separate coupling from internal
+  (TP1 off kills both), but it settles the aggressor question at no extra cost.
+  Log the before/after rate so the result is captured, not just the fix.
+- **"Nothing uses it" deserves a board check for a second reason.**  The
+  coupling evidence weakly implies TP1 is *routed somewhere* — an unconnected
+  pin with a short stub couples less than a trace that goes somewhere.  Where
+  TP1 goes and what it runs near is the content of the layout rule, so it is
+  worth capturing while the question is live.
+
+## The staleness: profile, and the free lever nobody pulled
+
+The host contrast is a comparison, not an experiment — no approval, no receiver
+access, no bench:
+
+```
+NewHat stale : 47.5%   (209,103 / 440,323 over 10-13→18)
+MadHat stale : 0.2-0.5%
+ratio        : ~100-240x
+```
+
+Same tooling, same message set, **a hundredfold difference in the
+decision-sized phenomenon.**  Enumerate what differs — receiver model (X20P vs
+F9T TIM 2.20), transport and whether both are USB CDC-ACM, host and kernel, USB
+topology and hub, bbgld version and load, baud if either is UART — and the
+mechanism is probably in that list.  Same move that made the mod-5 test and the
+TP2 control productive: find the thing that already varies.
+
+**And the shape says what kind of thing to look for.**  On-time median 34.9 ms,
+p90 39.5 ms — then ~1022 ms, with **nothing in between**.  Not a tail; a ~1 s
+gap.  So the staleness is a **discrete one-epoch delivery slip**: the question
+is *which epoch the message rides in*, not *how long it takes*.
+
+That also makes the flat mod-5 result consistent rather than puzzling — batch
+size scales drain *time*, and a whole-epoch slip is not a drain-time effect at
+all.  And hours-long episodes mean the slipped state **latches** until
+something resyncs it, which is why a port reopen is a plausible resync
+mechanism even though 1-of-2 proves nothing.
+
+Constrained target, in summary: **bimodal with a 1 s gap, latching for hours,
+~100× host-dependent, unaffected by batch size, not message loss.**
+
+Current knob values from the readback, for whoever picks this up:
+`DRSTR_TP1 = 3`, `DRSTR_TP2 = 3` in RAM.
