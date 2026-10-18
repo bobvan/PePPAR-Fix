@@ -1033,3 +1033,69 @@ USB CDC-ACM.  Something that simultaneously makes sub-tick re-crossings 2.5×
 less likely *and* adds ms-scale spurious rises points at the input's electrical
 conditions changing, which is what such an event would mark.
 `journalctl -k` around 10-16 09:22:16Z is free and read-only.
+
+#### MEASURED: two separate modes — the 10 ms is a constant
+
+NewHat file 10-13→18, phase 0.2–20 ms in 0.25 ms bins:
+
+| population | shape | n |
+|---|---|---|
+| +10 ms | **spike**: all rows in the 10.0 ms bin (±0.125), **nothing between 2.75 and 9.875 ms** | 13,131 |
+| broad | −0.75 to +2.75 ms, includes negatives | ~15k |
+
+`fall − rise − 500 ms`: **−10.0 ms on 12,721 rows**, plus a thin tail of ~450
+between −9.75 and −7.25.
+
+So my continuous-distribution reading is **refuted** — the 10 ms is a constant,
+not the tail of anything.  And the kernel-log check came back **empty**:
+`journalctl -k` for 10-16 09:00–09:40Z has no entries at all — no USB
+re-enumeration, no `cdc_acm` reset, no undervoltage, no throttle.
+
+The broad ±ms population is a different mechanism; its negative half and spread
+look like bbgld's own slew/acquire episodes rather than strays.
+
+**Cross-check that the two histograms describe one population:** 13,131 phase-
+spike rows vs 12,721 in the `−10.0 ms` bin — a difference of 410, close to the
+~450-row tail.  Those tail rows have the rise pinned (the spike is tight) and
+the *fall* arriving up to 2.75 ms late.  Not chased: ~3% of a population that
+is itself ~6% of rows.
+
+#### Relabeling is refuted; common cause fits without any balance
+
+Dropping the broad population from the arithmetic makes the books **worse**,
+not better — 70% → 46% of the glitch drop accounted. But the decisive point is
+that relabeling makes a hard prediction and fails it. If a glitch second and a
++10 ms second are the *same* second wearing different labels, their **union is
+conserved**:
+
+```
+union before : 834/h  (glitch)
+union after  : 556/h  (319 glitch + 237 spike)
+             : -278/h  -> NOT conserved
+```
+
+So the books never closed because **nothing is being relabeled** — not because
+a population was mis-scoped.
+
+**Common cause fits and needs no balance.** One change at 10-16 09:22:16Z both
+made sub-tick re-crossings 2.5× less likely *and* exposed a 10 ms aggressor:
+two independent consequences of one event, with no reason for the rates to
+trade. Their failure to trade then stops being a puzzle.
+
+#### Magnitude and onset are separate questions with different answers
+
+This dissolves the TP1 contradiction rather than deciding it:
+
+- **Magnitude ← TP1's width.** A spike at 10.0 ms ±0.125 with a 7 ms dead zone
+  below it is a constant, and it equals TP1's configured width exactly.
+- **Onset ← the latching change at 10-16.** TP1 may have been 10 ms since
+  10-09 while the *coupling path* only latched on at 10-16.
+
+Under that split the week-long gap was never evidence against TP1 as the
+aggressor — it was evidence about when the coupling began, a separate
+mechanism. The two measurements stop conflicting.
+
+**So the readback has one specific job: confirm TP1's live value.** 10 ms ⇒ a
+constant at exactly the configured width is hard to dismiss, and the open
+question becomes what latched. 100 ms ⇒ TP1 is dead as the aggressor (there are
+zero +100 ms rows anywhere) and the 10.0 ms constant needs another source.
