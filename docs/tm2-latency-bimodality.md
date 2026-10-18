@@ -1215,3 +1215,45 @@ information about whether a reopen clears the regime.  **5 consecutive**
 restarts each followed by on-time would reach p < 0.05.  The available test is
 to count restarts against regime state over the full history, which needs only
 the journal and the per-file states already on disk.
+
+### Coupling vs internal cross-capture without a scope
+
+NewHat is at FoB1 and cannot be touched physically, so there is no EXTINT
+probe there; the only scope route is reproducing the effect on a bench F9T at
+FoB0.  But the two mechanisms are separable in software.
+
+**`CFG_TP_DRSTR_TP1` (key `0x20050035`, enum) is decisive.**  It sets the
+timepulse pin's **pad drive strength**, which sits *downstream* of any internal
+capture path:
+
+| | physical coupling | internal cross-capture |
+|---|---|---|
+| lower TP1 drive strength | population weakens or dies | **no change at all** |
+
+Opposite predictions, one key, RAM-only, no physical access, and it leaves the
+watermark alone.  Worth running *before* the 7/50 ms bracket: the width tests
+say what sets the magnitude (largely answered), while drive strength says what
+**class** of mechanism is in play — and therefore whether the fix is
+layout/termination or firmware.
+
+**TP2's silence already leans toward coupling, for free.**  TP2 is enabled at
+100 ms and produces nothing while TP1's width sets the population.  An internal
+path would need an extra assumption — that it exists for TP1's channel only —
+whereas different pins with different routing coupling differently is exactly
+what coupling predicts.  Evidence, not proof, but the explanations are
+asymmetric.  Follow-on once TP2 is done serving as the 100 ms control: give it
+a distinctive width (33 ms) and see whether a +33 ms population appears, which
+would push back toward a shared internal path.
+
+**`CFG_TP_POL_TP1` (`0x1005000B`) as a secondary.**  Inversion holds the timing
+fixed and flips the edge *direction* at T+width.  A coupling path through a
+differentiated transient is direction-sensitive (a falling transition recovers
+upward and reads as a rise); indifference favours internal.  Weaker than drive
+strength, since it needs an assumption about the transient's shape.
+
+**Pre-registered, so a bench null is not over-read:** the onset was a
+**latched, persistent change at a cold hour**, and the coupling was absent on
+NewHat for the first week at 10 ms.  A fresh bench F9T with identical TP1
+settings therefore has no particular reason to exhibit it, so **a bench null is
+a false negative, not evidence for the internal hypothesis.**  "We couldn't
+reproduce it" is the easiest result here to misread.
