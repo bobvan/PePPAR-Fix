@@ -135,7 +135,7 @@ pulse width** — not by a jitter-like amount, by a hardware constant.
 This matters because the F9T's factory timepulse width is **100 ms**, which is
 the stray's magnitude.  It also reproduces the regime-dependence BBGresearch
 established empirically (strays require the late latency regime) with no
-walking boundary of any kind: the on-time regime's 74–84 ms latency is *less*
+walking boundary of any kind: our PiFace on-time latency of 74–84 ms is *less*
 than a 100 ms pulse, so those messages are emitted **before the falling edge
 exists** and there is nothing to confuse; the late regime's ~1080 ms is after
 it, so both edges are new.
@@ -738,6 +738,20 @@ the entire epoch's output precedes a 36-byte TM2:
 
 NAV-SIG alone is 496 B, 29% of the ordinary batch.
 
+> ⚠ **Whose latency?  The 74–84 ms figure in this document is OURS (PiFace),
+> and I quoted it at BBGresearch's hosts three times before they caught it.**
+> Their measured on-time latencies are **NewHat 35 ms** and **MadHat 20 ms** —
+> half to a third of ours.  The numbers in the table at the top of this file
+> come from `piface-default-extint.csv` and `piface-no-ticc-extint.csv`; they
+> describe *our* host and were never evidence about theirs.
+>
+> The both-edges argument above survives the correction only by luck: it needed
+> on-time latency to fall *below* a 100 ms pulse width, and 35 ms clears that
+> bar more easily than 74–84 ms did.  Reasoning from the wrong host's data and
+> getting away with it is not rigor.  **Any cross-fleet claim in this document
+> needs its host named** — two fleets, two receivers, two EXTINT sources, and
+> now demonstrably different latencies.
+
 ### The free test: period-5 structure
 
 NAV-SAT, NAV-TIMEGPS and NAV2-PVT are all configured at **rate 5**, so every
@@ -747,14 +761,16 @@ present in every capture taken on a peppar-configured receiver, testable with
 no config change, no reset, and no hardware access.
 
 Flat across epoch mod 5 ⇒ batch-drain refuted.  Present ⇒ confirmed, and it
-would explain both regimes: 74–84 ms on-time is drain time, and the ~1080 ms
-late regime is a batch that failed to drain before the next epoch's was queued.
+would explain both regimes: on-time latency is drain time, and the late regime
+is a batch that failed to drain before the next epoch's was queued.
 
 ### Falsifiable prediction for the NAV-SIG arm
 
-If drain time is linear in batch size, removing NAV-SIG (29%) should move the
-on-time latency from **74–84 ms to 52–59 ms**.  Unchanged ⇒ refuted.  ~55 ms ⇒
-confirmed and linear.  Near zero ⇒ threshold-like, a different finding.
+If drain time is linear in batch size, removing NAV-SIG (29%) should cut
+on-time latency by ~29% — which on their measured baselines means
+**35 → ~25 ms (NewHat)** and **20 → ~14 ms (MadHat)**.  (My original form of
+this prediction said "74–84 → 52–59 ms", using *our* PiFace baseline for
+*their* hosts; see the correction above.)
 
 **Guard the arm at the signal, not the procedure.**  A RAM-only VALSET is the
 right safety choice, but a power cycle restores NAV-SIG=1 from Flash — and a
@@ -774,3 +790,49 @@ id 0x07 = PVT, rate 5, plus the global `CFG_NAV2_OUT_ENABLED`), while
 **NAV-TIMEUTC and NMEA GNZDA are not ours** and our own **NAV-CLOCK was absent
 from their sniff** — so that receiver's config is a mixture and cannot be
 attributed wholesale to either side.
+
+### Batch drain: REFUTED
+
+Measured by BBGresearch 2026-10-18, TM2 latency binned by the edge's own GPS
+second (`towMsR`) mod 5:
+
+| host | window | on-time median | late fraction |
+|---|---|---|---|
+| NewHat | 6 h before 19:07Z | **34.9 ms in all five bins** (p90 39.1–39.5) | 37.4–38.3% every bin |
+| NewHat | after 19:07Z | 33.6–34.2 ms | 94.0–95.4% |
+| MadHat | 6 h | **19.7–19.8 ms in all five bins** | 0.2–0.5% |
+
+The prediction was +30% on every 5th epoch — **+10 ms on NewHat, +6 ms on
+MadHat**.  The bins differ by **≤0.3 ms**.  Refuted with a ~30× margin, and at
+better than 0.5 ms resolution.
+
+**One caveat is load-bearing, and they raised it themselves:** the test assumes
+the rate-5 messages were still emitting.  The 10-10 sniff saw NAV-SAT,
+NAV-TIMEGPS and NAV2-PVT at 0.2/s on both hosts, but that was eight days
+earlier.  If any had been disabled since, the test had **no independent
+variable** and would read flat trivially — a flat result would then be
+uninformative rather than refuting.  One sniff closes it.
+
+### Open: the late fraction has three incompatible values
+
+Not resolved, and it bears on results already computed:
+
+```
+10-09 15:06Z -> 10-10 03:16Z (12 h)   50.3%
+  per-second 2x2, same window         50.6%
+6 h BEFORE 19:07Z                     37.4-38.3%
+AFTER 19:07Z                          94.0-95.4%
+```
+
+This document records raw-frame logging starting **2026-10-08 19:07Z**.  If
+that is the same 19:07Z, the 12 h window lies entirely after it and cannot also
+be 50.3%.  Either it is a different 19:07Z, "late" is defined differently
+between the analyses, or something changed in between.
+
+**If 19:07Z is the logging change, a 38% → 94% jump is the instrumentation
+moving what it measures** — the late regime would then be partly an observer
+effect.  That would need to be settled before trusting anything computed on the
+12 h window, which includes the **per-second 2×2 independence result** and the
+**44.1% glitch fraction** (and hence the 16.3 ns split and the −7.17 ns bias
+estimate).  Flagged, not asserted: which 19:07Z is meant is not knowable from
+here.
