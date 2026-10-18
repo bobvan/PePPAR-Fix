@@ -813,26 +813,68 @@ earlier.  If any had been disabled since, the test had **no independent
 variable** and would read flat trivially — a flat result would then be
 uninformative rather than refuting.  One sniff closes it.
 
-### Open: the late fraction has three incompatible values
+### RESOLVED: the late fraction is window-dependent, not inconsistent
 
-Not resolved, and it bears on results already computed:
+The three values reconcile, and my observer-effect concern was wrong.  The two
+19:07Zs are **different days**: raw-frame logging began 2026-10-08 19:07Z,
+while 2026-10-18 19:07:06Z is a latency step in bbgld's journal
+("TM2 LATENCY +1022 ms (#1)").  Nothing in their instrumentation changed at
+today's step.
+
+The underlying structure is **one two-state receiver regime with episodes
+lasting hours** (per-file late-row counts: 10-11→12 29,673; 10-12→13 36,353;
+10-13→18 209,103; 10-18 16:46 file stale from bbgld start to 17:42:09Z; 10-18
+17:49 file on time until 19:07:06Z).  Any fixed window therefore reads a
+different mix — 50% over 10-09/10, 38% in the 6 h before today's step, 94%
+since.  **The 50.3% and 44.1% figures stand for their windows; state the
+window with any of them.**
+
+#### The sign of `fall − rise` IS the latency classifier
+
+A geometric result worth having explicitly.  On a 50%-duty 1 Hz pulse:
 
 ```
-10-09 15:06Z -> 10-10 03:16Z (12 h)   50.3%
-  per-second 2x2, same window         50.6%
-6 h BEFORE 19:07Z                     37.4-38.3%
-AFTER 19:07Z                          94.0-95.4%
+emitted in (T, T+500 ms) -> latest fall is the PREVIOUS pulse at T-500 -> -500 ms = on-time
+emitted after T+500 ms   -> latest fall is THIS pulse                  -> +500 ms = late
 ```
 
-This document records raw-frame logging starting **2026-10-08 19:07Z**.  If
-that is the same 19:07Z, the 12 h window lies entirely after it and cannot also
-be 50.3%.  Either it is a different 19:07Z, "late" is defined differently
-between the analyses, or something changed in between.
+So "late" means exactly "emitted more than 500 ms after the rise", pinning the
+late regime's latency to >500 ms with no clock involved — and their measured
++1022 ms sits inside it.  BBGresearch report every late row at +500 ms and
+every on-time row at −500 ms, consistent with this.
 
-**If 19:07Z is the logging change, a 38% → 94% jump is the instrumentation
-moving what it measures** — the late regime would then be partly an observer
-effect.  That would need to be settled before trusting anything computed on the
-12 h window, which includes the **per-second 2×2 independence result** and the
-**44.1% glitch fraction** (and hence the 16.3 ns split and the −7.17 ns bias
-estimate).  Flagged, not asserted: which 19:07Z is meant is not knowable from
-here.
+#### Open: so where is the −8 ns population?
+
+The 10-10 frame decode found **three** values of `fall − rise`, not two:
+`−500.000 ms` on count+1 rows and **`−8 ns` on count+2 rows, 44.1%**.  "Every
+late +500, every on-time −500" cannot be a complete description alongside that.
+Three readings, with different consequences:
+
+1. **Shorthand** — the −8 ns rows coexist at ~44%.  The glitch is still live.
+2. **The glitch stopped** — genuinely absent from 10-11 on.  Then the 16.3 ns
+   split and −7.17 ns bias describe a condition that no longer obtains.
+3. **The correction masks it** — bbgld's fix deployed 01:55Z 10-11, exactly
+   where their per-file counts begin.  If the logged `fall − rise` is
+   *post*-correction, the glitch is invisible by construction.
+
+Reading 3 is the hazard: **a correction that rewrites the logged value destroys
+the evidence needed to monitor the thing it corrects.**  The alarm they added
+for the learned delta wandering from 16.3 ns cannot see that drift if its input
+sits downstream of the correction.  Log raw *and* corrected; alarm on raw.
+
+#### A config readback does not test emission
+
+Their plan is a paginated VALGET to close the mod-5 caveat, as "a stronger
+check than a sniff".  For *configuration* it is.  For "were the rate-5 messages
+**emitting** during the test window" it is strictly weaker — and NewHat is its
+own counterexample: we set `CFG_MSGOUT_UBX_NAV_CLOCK_USB = 1` unconditionally
+whenever SFRBX is on, their 10-10 sniff saw SFRBX, and it **did not see
+NAV-CLOCK**.  Config and emission demonstrably disagree on that receiver.
+
+Better than either, and retroactive: both a sniff and a readback measure *now*,
+while the test window was hours earlier.  If bbgld's capture from that window
+logs UBX arrivals, check whether NAV-SAT / NAV-TIMEGPS / NAV2-PVT appear at
+0.2/s **inside the window** — evidence about the right interval, with no
+receiver access and no bbgld stop.
+
+
