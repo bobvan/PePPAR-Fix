@@ -843,24 +843,54 @@ late regime's latency to >500 ms with no clock involved — and their measured
 +1022 ms sits inside it.  BBGresearch report every late row at +500 ms and
 every on-time row at −500 ms, consistent with this.
 
-#### Open: so where is the −8 ns population?
+#### The −8 ns population is live, and the raw value is preserved
 
-The 10-10 frame decode found **three** values of `fall − rise`, not two:
-`−500.000 ms` on count+1 rows and **`−8 ns` on count+2 rows, 44.1%**.  "Every
-late +500, every on-time −500" cannot be a complete description alongside that.
-Three readings, with different consequences:
+Resolved: "every on-time row −500" meant the *non-glitch* on-time rows.  Both
+populations sit side by side in NewHat's extint CSV, which logs corrected and
+raw separately — `phase_ns` (corrected), `phase_reported_ns` (raw),
+`fall_minus_rise_ns` (raw, straight from TM2), a glitch flag, and
+`glitch_delta_ns`:
 
-1. **Shorthand** — the −8 ns rows coexist at ~44%.  The glitch is still live.
-2. **The glitch stopped** — genuinely absent from 10-11 on.  Then the 16.3 ns
-   split and −7.17 ns bias describe a condition that no longer obtains.
-3. **The correction masks it** — bbgld's fix deployed 01:55Z 10-11, exactly
-   where their per-file counts begin.  If the logged `fall − rise` is
-   *post*-correction, the glitch is invisible by construction.
+```
+…,  1, -499999998, 0,  0.00     on-time, non-glitch
+…, 21,         -8, 1, 16.30     glitch: raw 21 ns, corrected to ~5 ns
+```
 
-Reading 3 is the hazard: **a correction that rewrites the logged value destroys
-the evidence needed to monitor the thing it corrects.**  The alarm they added
-for the learned delta wandering from 16.3 ns cannot see that drift if its input
-sits downstream of the correction.  Log raw *and* corrected; alarm on raw.
+So the hazard I raised — that a correction rewriting the logged value would
+destroy the evidence needed to monitor it — **does not apply**; their schema
+already keeps raw alongside corrected, and the learned-delta alarm can run on
+raw.  Worth recording as the right shape for anyone adding a correction here:
+**log raw and corrected as separate columns, and alarm on raw.**
+
+Per-file counts give the two populations' relative weights over 10-13→18:
+`glitch=1` on **74,104** on-time rows against **176** stale rows.  So glitch
+and staleness are near-disjoint over those five days — the glitch common, the
+staleness rare — the reverse of the 12 h window where late ran ~50%.  Another
+reason to state the window with any of these figures.
+
+#### A possible free diagnostic — unconfirmed, n=1
+
+Their illustrative on-time row reads `fall_minus_rise_ns = -499999998`, **2 ns
+short of exactly −500 ms** (2 ppb of a second).  If that is tight across the
+non-glitch on-time population it measures either a PEROUT half-period that
+isn't exactly 5×10⁸ ns, or a ~2 ns rise/fall asymmetry in the output path —
+and it would be a standing diagnostic on every such row, free, flagging any
+change in the output path.
+
+**Not a finding.**  That row was pasted to illustrate the CSV format, and one
+row cannot distinguish a systematic from a sample.  The test is the
+*distribution* of `fall_minus_rise_ns` over non-glitch on-time rows: tight at
+−499999998 ⇒ systematic; scattered around −500000000 ⇒ noise read off a single
+line.
+
+#### No retroactive check exists
+
+My suggestion to confirm the mod-5 test's independent variable from the test
+window's own capture **does not work**: bbgld parses TM2 and logs RAWX
+`rcvTow`, reading and dropping every other class with no arrival log.  Nothing
+in the record can be queried.  Their plan — paginated readback **plus** 15 s of
+passive per-class sniff counts, both inside one bbgld stop — is the right call,
+and doing both beats either alone for the reason below.
 
 #### A config readback does not test emission
 
