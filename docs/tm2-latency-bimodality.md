@@ -862,26 +862,31 @@ already keeps raw alongside corrected, and the learned-delta alarm can run on
 raw.  Worth recording as the right shape for anyone adding a correction here:
 **log raw and corrected as separate columns, and alarm on raw.**
 
-Per-file counts give the two populations' relative weights over 10-13→18:
-`glitch=1` on **74,104** on-time rows against **176** stale rows.  So glitch
-and staleness are near-disjoint over those five days — the glitch common, the
-staleness rare — the reverse of the 12 h window where late ran ~50%.  Another
-reason to state the window with any of these figures.
+Per-file counts over 10-13→18: `glitch=1` on **74,104** on-time rows against
+**176** stale rows.  **What is near-disjoint is glitch vs stale, not the
+rarity of staleness** — that file holds 209,103 stale rows against 231,220 on
+time, about half.  (I first read "176 stale rows" as the file's total stale
+count and wrote that staleness was rare; it is a count of rows that are *both*
+glitched and stale.  Corrected by BBGresearch.)
 
-#### A possible free diagnostic — unconfirmed, n=1
+So glitch=1 sits almost entirely in on-time rows.  Caleb's reading: the stale
+regime **relabels** glitch seconds rather than flagging them, surfacing them as
+the +10 ms rows (13,131 of them) — see the TP1 question below.
 
-Their illustrative on-time row reads `fall_minus_rise_ns = -499999998`, **2 ns
-short of exactly −500 ms** (2 ppb of a second).  If that is tight across the
-non-glitch on-time population it measures either a PEROUT half-period that
-isn't exactly 5×10⁸ ns, or a ~2 ns rise/fall asymmetry in the output path —
-and it would be a standing diagnostic on every such row, free, flagging any
-change in the output path.
+#### The −2 ns was noise off a single row — closed
 
-**Not a finding.**  That row was pasted to illustrate the CSV format, and one
-row cannot distinguish a systematic from a sample.  The test is the
-*distribution* of `fall_minus_rise_ns` over non-glitch on-time rows: tight at
-−499999998 ⇒ systematic; scattered around −500000000 ⇒ noise read off a single
-line.
+I floated the `-499999998` on one illustrative row as a possible systematic
+(a PEROUT half-period off by 2 ns, or rise/fall asymmetry), while flagging that
+n=1 cannot separate a systematic from a sample.  It was a sample: their 18:05Z
+on-time rows read −499999990, −499999997/−998, and −500000005/−006.
+
+Scattered, not tight — and the scatter sits on an **8 ns grid** (…990, …998,
+…006 are 8 apart; …997, …005 likewise, offset 1 ns), which is just the F9T's
+8 ns edge quantization appearing in the difference of two quantized
+timestamps.  The same grid the −8/−7 ns glitch readings sit on.  That closes
+it rather than opening it: no diagnostic, nothing to chase, and it changes no
+decision — correctly dropped under Bob's rule on few-ns mysteries that decide
+nothing.
 
 #### No retroactive check exists
 
@@ -908,3 +913,44 @@ logs UBX arrivals, check whether NAV-SAT / NAV-TIMEGPS / NAV2-PVT appear at
 receiver access and no bbgld stop.
 
 
+
+### Open: the +10 ms rows may have already fired the TP1 discriminator
+
+BBGresearch report that the stale regime surfaces glitch seconds as **"the
++10 ms rows (13,131 of them)"** rather than flagging them `glitch=1`.
+
+**TP1 is at 10 ms**, written 10-09 15:06Z.  Before that it was 100 ms and the
+strays were at **+100 ms**.  The pre-registered discriminator for the cold /
+10 ms cell was exactly this: *strays at +10 ms ⇒ TP1 is the source (magnitude
+tracks width); strays at +100 ms ⇒ void.*  A population at precisely the new
+pulse width is that signature.
+
+And it does not need the cold morning.  Temperature was established as
+**necessary** for strays; the registered question for the 10 ms cell is about
+**magnitude**, a separate axis.
+
+**Free retroactive check, on files already on disk:**
+
+1. Any rows at +10 ms *before* 10-09 15:06Z?  If none, the population arrived
+   with the width change.
+2. Any rows at +100 ms *after* it?  If none, the old population left with the
+   old width.
+3. Does 13,131 stand in a sensible ratio to the pre-change +100 ms count,
+   scaled by exposure?
+
+(1) no and (2) no ⇒ the stray magnitude tracked TP1's width, and **TP1's
+falling edge is reaching an EXTINT input.**
+
+Note this does *not* resurrect what we killed earlier.  The both-edges
+mechanism — TM2's own `towMsF` fields being read instead of `towMsR` — was
+refuted on magnitude: NewHat's EXTINT is a 500 ms i210 PEROUT, so that
+confusion predicts +500 ms.  **TP1 physically coupling onto the input is a
+different claim**, and the 500 ms argument only ever killed the reporting-side
+version.
+
+Caveat: "the +10 ms rows" is read here as phase readings near +10 ms.  If it
+means something else in Caleb's taxonomy this collapses.  And if it does hold,
+the verdict is **cold necessary, TP1 sufficient-given-cold** — the conjunction
+registered as the cell's "no strays" outcome — so the cell would be filled by
+two observations rather than one clean result, and should be written up that
+way.
