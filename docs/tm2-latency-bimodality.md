@@ -995,11 +995,23 @@ The fall sits **500 ms after the TRUE rise T**, exactly where a normal pulse's
 fall belongs.  A pulse that genuinely arrived 10 ms late would carry its fall
 to T+510 and leave `fall − rise` at +500.  It reads +490.
 
-So: real rise at T, real fall at T+500, **plus a spurious rising edge at
-T+10**, with TM2's last-rise-wins reporting picking the spurious one.  Same
-class as the 8 ns sub-tick glitch, three decades larger — and the input pulse
-geometry is unchanged, so nothing about the PEROUT's width or period is
+So the real pulse is intact — fall at T+500 from the TRUE rise — and the
+reported rise is spurious.  Nothing about the PEROUT's width or period is
 implicated.
+
+> ⚠ **I overclaimed this as "a spurious added rising edge on the INPUT".**  The
+> geometry proves a spurious *rise report*, which is equally consistent with
+> **physical coupling** (TP1's falling edge appears as a real transient on the
+> EXTINT pin and is captured) and **internal cross-capture** (TP1's edge is
+> latched into TM2's rising register with no electrical event on the pin).
+> What it does rule out is the version killed earlier on magnitude — TM2's own
+> `towMsF` being read in place of `towMsR`, which a 500 ms EXTINT pulse would
+> make +500 ms.  Three mechanisms, three different fixes
+> (layout/termination, firmware, software); keep them apart.
+>
+> **The queued scope discriminates them with a binary outcome:** probe EXTINT
+> at T+width.  An electrical glitch ⇒ coupling.  A clean pin while TM2 still
+> reports the offset ⇒ internal.
 
 #### Rates nearly trade, but the books do not close
 
@@ -1099,3 +1111,107 @@ mechanism. The two measurements stop conflicting.
 constant at exactly the configured width is hard to dismiss, and the open
 question becomes what latched. 100 ms ⇒ TP1 is dead as the aggressor (there are
 zero +100 ms rows anywhere) and the 10.0 ms constant needs another source.
+
+## RESOLVED: the magnitude tracks TP1's width
+
+The registered discriminator fired, in older NewHat files a first scan had
+skipped (different column layout).  Rows at **+100 ms (or −900 ms, the same
+phase under the other file's wrap convention)**:
+
+| window | rows at +100 ms | rows at +10.0 ms |
+|---|---|---|
+| files up to 10-09 15:06Z | 2,113 / 1,436 / 1,169 | 0 |
+| from the TP1 100→10 ms write onward (~600k rows, 10 days) | **0** | 0 until 10-16 09:22Z |
+
+And the readback (read-only, Bob-approved, 21:31Z) pins the live value:
+**CFG-TP RAM has TP1 `LEN` and `LEN_LOCK` both 10,000 µs = 10 ms, live since
+10-09, not in Flash.  TP2 is enabled with `LEN_LOCK_TP2` = 100 ms.**
+
+So the stray magnitude tracked TP1's width across the change, and the +10.0 ms
+spike equals TP1's live width.  **TP1 sets the magnitude.**  Onset is a
+separate, gated condition — something latched on 10-16 09:22Z.
+
+**TP2 is a free in-situ control:** unchanged at 100 ms and producing nothing,
+while the population tracks TP1.  That argues the coupling is specific to TP1's
+net rather than generic timepulse leakage, and TP2 should stay at 100 ms
+through any TP1 sweep.
+
+### The asymmetry is the remaining puzzle
+
+```
++100 ms population : vanished IMMEDIATELY at the 10-09 15:06Z write
++10 ms population  : appeared a WEEK later, 10-16 09:22Z
+```
+
+A RAM write is effective at once, so the aggressor was live and coupling *at
+the moment of the write* — and a still-coupled TP1 at 10 ms should have
+produced +10 ms rows from 15:06Z.  It produced none for seven days.  Either the
+coupling switched off at the exact instant of the write (an uncomfortable
+coincidence) or **the coupling is width-dependent**.
+
+A concrete form: if the EXTINT capture path has a **post-capture holdoff of
+order 10 ms**, TP1's fall at +100 ms lands outside it and is captured while at
++10 ms it sits at the window's edge and is suppressed — until a marginal shift
+at 10-16 (cold hour, latched, persistent) let it through.  That would account
+for the gap, the cold onset, the persistence, *and* the intermittency.
+
+### The 7 ms test needs a second point in the other direction
+
+Caleb's proposal is TP1 → 7 ms predicting +7 ms rows.  Under width-dependent
+coupling, **7 ms sits deeper inside the holdoff than 10 ms, so the population
+should weaken or vanish** — and a null is then ambiguous between "TP1 isn't the
+source" and "the mechanism suppressed it".  Bracket it:
+
+| TP1 | pure width-tracking | width-dependent |
+|---|---|---|
+| 7 ms | +7 ms, similar rate | weak or absent |
+| 50 ms | +50 ms, similar rate | strong |
+
+7 ms alone cannot separate those, and its most likely outcome under the model
+that explains the week-long gap is a null that reads as a refutation.
+
+## Readback: retractions and confirmations
+
+**MON-VER: ZED-F9T, TIM 2.20, PROTVER 29.20.**
+
+- **"NewHat's config is not purely ours" — WITHDRAWN.**  `0x01-0x22` is
+  **NAV-CLOCK**; `0x01-0x21` is NAV-TIMEUTC (verified against pyubx2's
+  `UBX_MSGIDS`).  Their 10-10 table mislabeled it, NAV-CLOCK *is* emitting, and
+  my inference rested entirely on that label error.  The config is ours plus a
+  firmware default.
+- **My "config and emission demonstrably disagree" counterexample — VOID.**
+  The principle holds in general, but the NAV-CLOCK instance was never real and
+  I presented it as demonstrated.  Doing both readback and sniff was still the
+  right call, and the sniff is what closed the mod-5 caveat.
+- **mod-5 refutation now has its independent variable**: NAV-SAT, NAV-TIMEGPS
+  and NAV2-PVT each 3 per 15 s = 0.2/s.  Batch drain is properly refuted.
+- **Flash confirmed empirically**: 16 keys = our 10 MSGOUT keys + the 6 USB
+  NMEA zeros, exactly as `send_cfg`'s `layers=7` predicted.  BBR NAK'd, empty.
+- **ZDA confirmed a firmware default** — on all five ports, not in Flash.  That
+  confirms the `configure_nmea_off` misnomer logged in `docs/misnomers.md`: our
+  six-key sweep never covered ZDA, so we would never have disabled it.
+
+**A gap in that readback that matters for the trim:** `CFG_NAV2_OUT_ENABLED` is
+key `0x10170001` — **group 0x1017**, not MSGOUT's `0x2091` — so the wildcard
+could not see it, and it is in Flash.  Clearing
+`CFG_MSGOUT_UBX_NAV2_PVT_USB` stops the *output* while leaving the **secondary
+navigation engine running** and costing receiver CPU.  A complete trim needs
+that key via a separate VALGET group and a Flash write.
+
+## The port reopen is not evidence yet
+
+After the 21:32Z bbgld restart TM2 latency was ~38 ms and on time; the stale
+regime broke.  But Caleb's 16:46Z restart did not break it, and against the
+**52.5% on-time** base rate over 10-13→18:
+
+```
+P(exactly 0 of 2 by chance) = 0.23
+P(exactly 1 of 2 by chance) = 0.50   <- observed
+P(exactly 2 of 2 by chance) = 0.28
+```
+
+1 of 2 is the *most likely* outcome under pure chance, so it carries no
+information about whether a reopen clears the regime.  **5 consecutive**
+restarts each followed by on-time would reach p < 0.05.  The available test is
+to count restarts against regime state over the full history, which needs only
+the journal and the per-file states already on disk.
