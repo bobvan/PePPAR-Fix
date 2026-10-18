@@ -720,3 +720,33 @@ PPS-vs-Rb stream.  The "cha" suffix is stale for the general call.
 **Proposed**: `load_ticc_channel` (or `load_channel_samples`).  Rename
 opportunistically when next touching that file's callers.
 **Notes**: 2026-07-09.
+
+## Found while answering a BBGresearch config audit — 2026-10-18
+
+### `configure_nmea_off` — Misleading
+
+**Where**: `scripts/peppar_fix/receiver.py:1303` (function
+`configure_nmea_off`)
+**Claim**: "Disable NMEA output on the port to save bandwidth" — the name
+and docstring both read as *all* NMEA output off.
+**Actual**: sets exactly six keys to 0 — `GGA`, `GLL`, `GSA`, `GSV`,
+`RMC`, `VTG`.  Every other NMEA message the F9/F10 can emit is left
+untouched: `ZDA`, `GST`, `GRS`, `GBS`, `DTM`, `VLW`, and the
+`CFG_MSGOUT_NMEA_ID_*` set for PUBX variants.
+**Why it matters**: surfaced concretely 2026-10-18.  BBGresearch sniffed
+an F9T we had configured and found **NMEA GNZDA being emitted**.  We had
+never enabled it — but we had also never disabled it, because it is not
+in the six.  The function's name is why nobody checked: "NMEA off" was
+read as a completed action rather than a partial sweep, so a live NMEA
+stream on a timing receiver went unnoticed and then had to be attributed
+across two teams' tooling.
+**Proposed**: `configure_nmea_off_common` (honest about the subset), or
+keep the name and enumerate the full `CFG_MSGOUT_NMEA_ID_*` group so the
+name becomes true.  The latter is better if the intent really is "off" —
+a bandwidth-saving sweep that misses messages is worth little.
+**Notes**: the full-group route wants a wildcard or an explicit list; a
+VALGET readback would make it verifiable, and we have **no VALGET
+readback at all** (only the message-ID mapping at `receiver.py:860`).
+That gap is why "did our config actually take?" is currently
+unanswerable from our own tooling — it had to be answered by someone
+else's packet sniff.

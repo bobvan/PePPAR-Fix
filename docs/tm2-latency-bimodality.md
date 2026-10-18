@@ -717,3 +717,60 @@ tolerances on NIC EXTTS, and it has **no TM2 falling-edge field at all**.  So a
 our `reject_ns=50`.  This is not a defect peculiar to our filter — the whole
 small-ecosystem convention is to threshold the rising-edge series and never
 decode `towMsF`.
+
+## A candidate for the latency bimodality itself: the epoch output batch
+
+Surfaced 2026-10-18 while answering a BBGresearch config audit (Bob suspected
+PePPAR-era message output was delaying their timing messages).
+
+**Bandwidth is not the mechanism.**  Our full enabled set
+(`receiver.py::configure_messages`) is ~1824 B/s at 30 SV — 16% of even a
+115200 UART, negligible on USB CDC-ACM.  That version of the worry is dead.
+
+**Batch position is a live mechanism.**  TIM-TM2 is an *event* message that
+queues behind the epoch batch, and u-blox emits NAV, then RXM, then TIM — so
+the entire epoch's output precedes a 36-byte TM2:
+
+| | bytes ahead of TM2 |
+|---|---|
+| ordinary epoch | 1688 B |
+| every 5th epoch | 2188 B (**+30%**) |
+
+NAV-SIG alone is 496 B, 29% of the ordinary batch.
+
+### The free test: period-5 structure
+
+NAV-SAT, NAV-TIMEGPS and NAV2-PVT are all configured at **rate 5**, so every
+5th epoch carries ~500 B more ahead of TM2.  **If batch-drain sets TM2 latency,
+latency must run ~30% higher on every 5th epoch** — a mod-5 signature already
+present in every capture taken on a peppar-configured receiver, testable with
+no config change, no reset, and no hardware access.
+
+Flat across epoch mod 5 ⇒ batch-drain refuted.  Present ⇒ confirmed, and it
+would explain both regimes: 74–84 ms on-time is drain time, and the ~1080 ms
+late regime is a batch that failed to drain before the next epoch's was queued.
+
+### Falsifiable prediction for the NAV-SIG arm
+
+If drain time is linear in batch size, removing NAV-SIG (29%) should move the
+on-time latency from **74–84 ms to 52–59 ms**.  Unchanged ⇒ refuted.  ~55 ms ⇒
+confirmed and linear.  Near zero ⇒ threshold-like, a different finding.
+
+**Guard the arm at the signal, not the procedure.**  A RAM-only VALSET is the
+right safety choice, but a power cycle restores NAV-SIG=1 from Flash — and a
+power cycle is also the event most likely to silently invalidate a long run
+(TimeHat's igc wedge was an under-supplied 5 V rail).  Verify NAV-SIG is
+*absent from the stream* continuously, not that the command was sent.
+
+### Our config persisted to Flash
+
+Worth recording because it bears on every reset discussion in this document:
+`send_cfg()` defaults to `layers=7` = RAM|BBR|**Flash**.  Every
+`CFG_MSGOUT_*` key we set is in Flash, so **no reset — including the guarded
+hot reset weighed earlier — clears the message configuration.**
+
+Also from the audit: a sniffed `0x29-07` is **ours** (class 0x29 = NAV2,
+id 0x07 = PVT, rate 5, plus the global `CFG_NAV2_OUT_ENABLED`), while
+**NAV-TIMEUTC and NMEA GNZDA are not ours** and our own **NAV-CLOCK was absent
+from their sniff** — so that receiver's config is a mixture and cannot be
+attributed wholesale to either side.
