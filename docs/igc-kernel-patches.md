@@ -271,6 +271,72 @@ combined tree is built and installed via DKMS as a single module.
 | clkPoC3 | No (Pi 4, bcmgenet only) | No | DKMS tree installed but igc never loads |
 | ocxo | Yes (E810-XXVDA4T) | No — uses `ice` driver | Different driver, different bugs |
 
+## Which patches are deployed, and why — decision 2026-11-03
+
+**Bob's call: ppsfix stays everywhere; adjfine is dropped while PTP runs slow.**
+Recorded so nobody re-applies adjfine reflexively, and — more importantly — so
+nobody drops ppsfix by treating the two as one decision.
+
+### The two patches have different triggers
+
+| | Patch 1 — ppsfix | Patch 2 — adjfine |
+|---|---|---|
+| Fixes | PPS **input** (EXTTS dual edge) + PEROUT 1 Hz frequency mode | TIMINCA write racing an in-flight **TX timestamp** capture |
+| Triggered by | the GPS pulse itself | **PTP transmit rate** |
+| Rate-dependent? | **No** | **Yes** |
+| Verdict | **keep** | **drop, conditionally** |
+
+**Why adjfine is droppable now.**  The race needs an adjfine call to land while
+the hardware is capturing a TX timestamp, and TX timestamps come from PTP
+transmit.  When the race was discovered the lab ran **6+ hosts at 128
+updates/s** (~768 sync events/s).  Measured 2026-11-03:
+
+```
+TimeHat   ptp4l@eth1.service   active 3 weeks 5 days   serverOnly 1
+          logSyncInterval 4  ->  one Sync every 16 SECONDS (0.0625/s)
+          logAnnounceInterval 1, logMinDelayReqInterval 0
+          clients: NONE (journal silent since the Oct 7 boot)
+MadHat    ptp4l inactive
+ptpmon / otcBob1 / ptBoat / PiFace / PiPuss / bbb : unreachable
+```
+
+That is **~12,000× below** the rate that produced the failure.  The engine still
+calls adjfine at servo cadence, but there is nothing in flight to collide with.
+Corroboration from 26 days of uptime on the patched driver:
+`tx_hwtstamp_timeouts: 0`, `tx_hwtstamp_skipped: 0`, zero `Tx timestamp
+timeout` in dmesg, and the only two `FAULTY` events are from link-up at boot.
+
+**The decision is conditional on the rate, not permanent.**  `logMinDelayReqInterval
+0` lets each client Delay_Req at 1/s, and every Delay_Resp is a TX timestamp —
+so returning clients raise the rate directly.  Watch the tripwires in the
+checklist below; if they fire, re-apply adjfine.
+
+**Why ppsfix is not droppable.**  It is not a PTP fix at all.  Stock igc hands
+userspace **both edges** of the 100 ms GPS pulse — 2 events/sec, 100 ms apart,
+and the engine picks the wrong one about half the time — and separately turns a
+1 Hz PEROUT request into a 500 ms square wave.  Both sit on the PPS measurement
+path, which is the path the lab depends on below 10 ns.  PTP rate is irrelevant
+to either.
+
+> Worth noting the shape: "a 100 ms pulse reaches the consumer as two edges and
+> the wrong one is taken ~50% of the time" is **the same bug as the TM2 +100 ms
+> stray** chased on BBGresearch's hosts through late October — different
+> subsystem (igc EXTTS vs F9T TIM-TM2), same 100 ms (the F9T timepulse width),
+> same ~50%.  Two independent instances of one failure shape.
+
+### Deployment after this decision
+
+| Kernel line | Tree | Contents |
+|---|---|---|
+| 6.12 | `drivers/igc-timehat-edge/` | ppsfix + adjfine (TSYNCTXCTL = 12) |
+| 6.18 | `drivers/igc-timehat-edge-6.18/` | **ppsfix only** (TSYNCTXCTL = 9, by design) |
+| 6.8 (x86-64) | `drivers/igc-timehat-edge-6.8/` | ppsfix |
+
+So the ppsfix-only 6.18 tree — recovered from MadHat and committed 2026-11-03,
+see that directory's README for provenance — is **the intended module for a
+6.18 host**, not a defective one.  On 6.18, `grep -c TSYNCTXCTL` returning 9 is
+the expected result.
+
 ## Deployment verification checklist
 
 Run on each i226 host after any driver install or kernel update:
