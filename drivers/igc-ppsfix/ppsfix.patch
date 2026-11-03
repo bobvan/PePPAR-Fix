@@ -1,0 +1,212 @@
+--- a/igc_defines.h
++++ b/igc_defines.h
+@@ -12,6 +12,8 @@
+ 
+ #define IGC_CTRL_EXT_SDP2_DIR	0x00000400 /* SDP2 Data direction */
+ #define IGC_CTRL_EXT_SDP3_DIR	0x00000800 /* SDP3 Data direction */
++#define IGC_CTRL_EXT_SDP2_VAL	0x00000040 /* SDP2 Data value */
++#define IGC_CTRL_EXT_SDP3_VAL	0x00000080 /* SDP3 Data value */
+ #define IGC_CTRL_EXT_DRV_LOAD	0x10000000 /* Drv loaded bit for FW */
+ 
+ /* Definitions for power management and wakeup registers */
+@@ -142,6 +144,8 @@
+ 
+ #define IGC_CTRL_SDP0_DIR	0x00400000  /* SDP0 Data direction */
+ #define IGC_CTRL_SDP1_DIR	0x00800000  /* SDP1 Data direction */
++#define IGC_CTRL_SDP0_VAL	0x00040000  /* SDP0 Data value */
++#define IGC_CTRL_SDP1_VAL	0x00080000  /* SDP1 Data value */
+ 
+ /* As per the EAS the maximum supported size is 9.5KB (9728 bytes) */
+ #define MAX_JUMBO_FRAME_SIZE	0x2600
+--- a/igc.h
++++ b/igc.h
+@@ -335,6 +335,11 @@
+ 	bool pps_sys_wrap_on;
+ 
+ 	struct ptp_pin_desc sdp_config[IGC_N_SDP];
++	/* PPS fix: per-channel EXTTS pin and flags tracking */
++	unsigned int ts0_pin;
++	unsigned int ts0_flags;
++	unsigned int ts1_pin;
++	unsigned int ts1_flags;
+ 	struct {
+ 		struct timespec64 start;
+ 		struct timespec64 period;
+--- a/igc_main.c
++++ b/igc_main.c
+@@ -32,10 +32,18 @@
+ 
+ static int debug = -1;
+ 
++/* PPS edge filtering workaround parameters */
++static int edge_check_delay_us = 20;
++static int edge_check_invert = 0;
++
+ MODULE_DESCRIPTION(DRV_SUMMARY);
+ MODULE_LICENSE("GPL v2");
+ module_param(debug, int, 0);
+ MODULE_PARM_DESC(debug, "Debug level (0=none,...,16=all)");
++module_param(edge_check_delay_us, int, 0644);
++MODULE_PARM_DESC(edge_check_delay_us, "Microsecond delay before GPIO read for edge filtering (default=20)");
++module_param(edge_check_invert, int, 0644);
++MODULE_PARM_DESC(edge_check_invert, "Invert GPIO level check for edge filtering (0=normal, 1=inverted, default=1)");
+ 
+ char igc_driver_name[] = "igc";
+ static const char igc_driver_string[] = DRV_SUMMARY;
+@@ -5572,6 +5580,10 @@
+ 	u32 tsauxc, sec, nsec, tsicr;
+ 	struct ptp_clock_event event;
+ 	struct timespec64 ts;
++	static const u32 igc_sdp_val[IGC_N_SDP] = {
++		IGC_CTRL_SDP0_VAL, IGC_CTRL_SDP1_VAL,
++		IGC_CTRL_EXT_SDP2_VAL, IGC_CTRL_EXT_SDP3_VAL,
++	};
+ 
+ 	tsicr = rd32(IGC_TSICR);
+ 
+@@ -5612,21 +5624,94 @@
+ 		spin_unlock(&adapter->tmreg_lock);
+ 	}
+ 
++	/* PPS fix: edge filtering workaround for EXTTS.
++	 * The hardware timestamps both rising and falling edges.
++	 * To filter for a single edge, read the GPIO pin state
++	 * after the interrupt and skip events that don't match.
++	 *
++	 * edge_check_delay_us: configurable delay before GPIO read
++	 * edge_check_invert: flip the expected pin level (some I226
++	 *   chips report the opposite GPIO level due to internal delays)
++	 */
+ 	if (tsicr & IGC_TSICR_AUTT0) {
++		bool skip_event = false;
++		unsigned int pin = adapter->ts0_pin;
++		unsigned int pin_val = 0;
++
++		/* Configurable delay to ensure GPIO read is valid */
++		udelay(edge_check_delay_us);
++
++		if ((adapter->ts0_flags & PTP_RISING_EDGE) &&
++		    !(adapter->ts0_flags & PTP_FALLING_EDGE)) {
++			if (pin < 2)
++				pin_val = rd32(IGC_CTRL) & igc_sdp_val[pin];
++			else
++				pin_val = rd32(IGC_CTRL_EXT) & igc_sdp_val[pin];
++
++			/* Normal: rising edge => pin HIGH. Inverted: pin LOW */
++			if (edge_check_invert ? pin_val : !pin_val)
++				skip_event = true;
++		}
++
++		if ((adapter->ts0_flags & PTP_FALLING_EDGE) &&
++		    !(adapter->ts0_flags & PTP_RISING_EDGE)) {
++			if (pin < 2)
++				pin_val = rd32(IGC_CTRL) & igc_sdp_val[pin];
++			else
++				pin_val = rd32(IGC_CTRL_EXT) & igc_sdp_val[pin];
++
++			/* Normal: falling edge => pin LOW. Inverted: pin HIGH */
++			if (edge_check_invert ? !pin_val : pin_val)
++				skip_event = true;
++		}
++
+ 		nsec = rd32(IGC_AUXSTMPL0);
+ 		sec  = rd32(IGC_AUXSTMPH0);
+ 		event.type = PTP_CLOCK_EXTTS;
+ 		event.index = 0;
+ 		event.timestamp = sec * NSEC_PER_SEC + nsec;
+-		ptp_clock_event(adapter->ptp_clock, &event);
++
++		if (!skip_event)
++			ptp_clock_event(adapter->ptp_clock, &event);
+ 	}
+ 
+ 	if (tsicr & IGC_TSICR_AUTT1) {
++		unsigned int pin = adapter->ts1_pin;
++		unsigned int pin_val = 0;
++
++		/* Configurable delay to ensure GPIO read is valid */
++		udelay(edge_check_delay_us);
++
++		if ((adapter->ts1_flags & PTP_RISING_EDGE) &&
++		    !(adapter->ts1_flags & PTP_FALLING_EDGE)) {
++			if (pin < 2)
++				pin_val = rd32(IGC_CTRL) & igc_sdp_val[pin];
++			else
++				pin_val = rd32(IGC_CTRL_EXT) & igc_sdp_val[pin];
++
++			/* Normal: rising edge => pin HIGH. Inverted: pin LOW */
++			if (edge_check_invert ? pin_val : !pin_val)
++				return;
++		}
++
++		if ((adapter->ts1_flags & PTP_FALLING_EDGE) &&
++		    !(adapter->ts1_flags & PTP_RISING_EDGE)) {
++			if (pin < 2)
++				pin_val = rd32(IGC_CTRL) & igc_sdp_val[pin];
++			else
++				pin_val = rd32(IGC_CTRL_EXT) & igc_sdp_val[pin];
++
++			/* Normal: falling edge => pin LOW. Inverted: pin HIGH */
++			if (edge_check_invert ? !pin_val : pin_val)
++				return;
++		}
++
+ 		nsec = rd32(IGC_AUXSTMPL1);
+ 		sec  = rd32(IGC_AUXSTMPH1);
+ 		event.type = PTP_CLOCK_EXTTS;
+ 		event.index = 1;
+ 		event.timestamp = sec * NSEC_PER_SEC + nsec;
++
+ 		ptp_clock_event(adapter->ptp_clock, &event);
+ 	}
+ }
+--- a/igc_ptp.c
++++ b/igc_ptp.c
+@@ -257,11 +257,13 @@
+ 
+ 	switch (rq->type) {
+ 	case PTP_CLK_REQ_EXTTS:
+-		/* Reject requests failing to enable both edges. */
+-		if ((rq->extts.flags & PTP_STRICT_FLAGS) &&
+-		    (rq->extts.flags & PTP_ENABLE_FEATURE) &&
+-		    (rq->extts.flags & PTP_EXTTS_EDGES) != PTP_EXTTS_EDGES)
+-			return -EOPNOTSUPP;
++		/* PPS fix: force rising edge only, bypass strict dual-edge
++		 * requirement. The I226 hardware on TimeHAT only produces
++		 * clean rising-edge PPS signals.
++		 */
++		if (rq->extts.flags & PTP_ENABLE_FEATURE) {
++			rq->extts.flags = PTP_ENABLE_FEATURE | PTP_RISING_EDGE;
++		}
+ 
+ 		if (on) {
+ 			pin = ptp_find_pin(igc->ptp_clock, PTP_PF_EXTTS,
+@@ -272,9 +274,13 @@
+ 		if (rq->extts.index == 1) {
+ 			tsauxc_mask = IGC_TSAUXC_EN_TS1;
+ 			tsim_mask = IGC_TSICR_AUTT1;
++			igc->ts1_pin = pin;
++			igc->ts1_flags = rq->extts.flags;
+ 		} else {
+ 			tsauxc_mask = IGC_TSAUXC_EN_TS0;
+ 			tsim_mask = IGC_TSICR_AUTT0;
++			igc->ts0_pin = pin;
++			igc->ts0_flags = rq->extts.flags;
+ 		}
+ 		spin_lock_irqsave(&igc->tmreg_lock, flags);
+ 		tsauxc = rd32(IGC_TSAUXC);
+@@ -303,8 +309,13 @@
+ 		ts.tv_nsec = rq->perout.period.nsec;
+ 		ns = timespec64_to_ns(&ts);
+ 		ns = ns >> 1;
++		/* PPS fix: removed 500000000LL from freq-mode condition.
++		 * When testptp -p 1000000000 is used, ns = period/2 = 500000000.
++		 * Without this fix, 1PPS would incorrectly use frequency mode
++		 * producing a 1Hz square wave instead of proper PPS pulses.
++		 */
+ 		if (on && (ns <= 70000000LL || ns == 125000000LL ||
+-			   ns == 250000000LL || ns == 500000000LL)) {
++			   ns == 250000000LL)) {
+ 			if (ns < 8LL)
+ 				return -EINVAL;
+ 			use_freq = 1;
